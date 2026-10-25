@@ -1,0 +1,182 @@
+import json
+import os
+import stat
+from pathlib import Path
+
+from . import store
+
+
+_CONFIG_KEYS = {'default_profile', 'profiles'}
+_PROFILE_KEYS = {'skills'}
+
+
+def _refusal(message):
+    raise store.Refusal(f'worker skills: {message}')
+
+
+def _json(path):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                _refusal(f'duplicate JSON key in {path}')
+            result[key] = value
+        return result
+    try:
+        return json.loads(path.read_text(), object_pairs_hook=pairs)
+    except (OSError, json.JSONDecodeError) as error:
+        raise store.Refusal(f'worker skills: invalid JSON in {path}') from error
+
+
+def _id(value, what):
+    if not isinstance(value, str):
+        _refusal(f'{what} must be an ID')
+    try:
+        return store.validate_id(value)
+    except ValueError as error:
+        raise store.Refusal(f'{what} has an invalid ID') from error
+
+
+def _frontmatter(path, skill_id):
+    try:
+        lines = path.read_text().splitlines()
+    except (OSError, UnicodeDecodeError) as error:
+        raise store.Refusal(f'worker skills: cannot read {path}') from error
+    if not lines or lines[0] != '---':
+        _refusal(f'{skill_id}: SKILL.md needs simple frontmatter')
+    try:
+        end = lines.index('---', 1)
+    except ValueError:
+        _refusal(f'{skill_id}: SKILL.md frontmatter is unterminated')
+    values = {}
+    for line in lines[1:end]:
+        if ': ' not in line:
+            _refusal(f'{skill_id}: unsupported frontmatter')
+        key, value = line.split(': ', 1)
+        if key not in ('name', 'description') or key in values or not value:
+            _refusal(f'{skill_id}: unsupported frontmatter')
+        if key == 'name':
+            if value != value.strip() or value.startswith('"'):
+                _refusal(f'{skill_id}: name must be a plain ID')
+            values[key] = _id(value, f'{skill_id} name')
+        elif value.startswith('"'):
+            try:
+                decoded = json.loads(value)
+            except json.JSONDecodeError as error:
+                raise store.Refusal(f'worker skills: {skill_id}: invalid description') from error
+            if not isinstance(decoded, str):
+                _refusal(f'{skill_id}: description must be a string')
+            values[key] = decoded
+        else:
+            values[key] = value
+    if set(values) != {'name', 'description'} or not values['description'].strip() or '\n' in values['description']:
+        _refusal(f'{skill_id}: frontmatter needs a nonempty single-line name and description')
+    if values['name'] != skill_id:
+        _refusal(f'{skill_id}: catalog directory and frontmatter name differ')
+    return values['description']
+
+
+def _bundle(path, skill_id):
+    try:
+        root = os.lstat(path)
+    except OSError as error:
+        raise store.Refusal(f'worker skills: cannot stat {skill_id}') from error
+    if not stat.S_ISDIR(root.st_mode) or stat.S_ISLNK(root.st_mode):
+        _refusal(f'{skill_id}: bundle must be a real directory')
+    stack = [path]
+    while stack:
+        directory = stack.pop()
+        try:
+            entries = sorted(directory.iterdir(), key=lambda item: item.name)
+        except OSError as error:
+            raise store.Refusal(f'worker skills: cannot inspect {skill_id}') from error
+        for entry in entries:
+            if entry.name == '.git':
+                _refusal(f'{skill_id}: .git content is forbidden')
+            identity = os.lstat(entry)
+            if stat.S_ISLNK(identity.st_mode):
+                _refusal(f'{skill_id}: symlinks are forbidden')
+            if stat.S_ISDIR(identity.st_mode):
+                stack.append(entry)
+            elif stat.S_ISREG(identity.st_mode):
+                if identity.st_nlink != 1:
+                    _refusal(f'{skill_id}: hard-linked files are forbidden')
+            else:
+                _refusal(f'{skill_id}: bundle contains a non-regular file')
+    skill = path/'SKILL.md'
+    if not skill.is_file() or skill.is_symlink():
+        _refusal(f'{skill_id}: bundle lacks a regular SKILL.md')
+    return _frontmatter(skill, skill_id)
+
+
+def catalog(home: Path) -> list[dict]:
+    root = Path(home)/'config'/'worker-skills'
+    if not root.exists():
+        return []
+    if root.is_symlink() or not root.is_dir():
+        _refusal('catalog must be a real directory')
+    result = []
+    for path in sorted(root.iterdir(), key=lambda item: item.name):
+        skill_id = _id(path.name, 'catalog entry')
+        if not skill_id.startswith('agd-'):
+            _refusal(f'{skill_id}: provisioned skill IDs must start agd-')
+        result.append({'id': skill_id, 'description': _bundle(path, skill_id)})
+    return result
+
+
+def profiles(home: Path) -> dict:
+    path = Path(home)/'config'/'workers.json'
+    if not path.exists():
+        return {'default_profile': None, 'profiles': {}}
+    data = _json(path)
+    if not isinstance(data, dict) or set(data) != _CONFIG_KEYS:
+        _refusal('workers.json must contain only default_profile and profiles')
+    default = _id(data['default_profile'], 'default_profile')
+    if not isinstance(data['profiles'], dict):
+        _refusal('profiles must be an object')
+    result = {}
+    for name, profile in data['profiles'].items():
+        name = _id(name, 'profile')
+        if not isinstance(profile, dict) or set(profile) != _PROFILE_KEYS or not isinstance(profile['skills'], list):
+            _refusal(f'{name}: profile must contain only a skills array')
+        skills = [_id(value, f'{name} skill') for value in profile['skills']]
+        if len(skills) != len(set(skills)):
+            _refusal(f'{name}: duplicate skill')
+        result[name] = {'skills': skills}
+    if default not in result:
+        _refusal('default_profile does not name a profile')
+    return {'default_profile': default, 'profiles': result}
+
+
+def resolve(home: Path, *, profile: str | None = None, skill_mode: str = 'profile',
+            skills: tuple[str, ...] = ()) -> dict:
+    if skill_mode not in ('profile', 'curated'):
+        _refusal('unsupported skill mode')
+    if profile is not None and skill_mode != 'profile':
+        _refusal('profiles and curated skills cannot be combined')
+    if skill_mode == 'profile' and skills:
+        _refusal('individual skills require curated mode')
+    if skill_mode == 'curated' and not skills:
+        _refusal('curated mode requires at least one skill')
+    config_path = Path(home)/'config'/'workers.json'
+    if skill_mode == 'profile' and profile is None and not config_path.exists():
+        return {'schema': 1, 'mode': 'none', 'profile': None, 'skills': []}
+    available = {entry['id'] for entry in catalog(home)}
+    if skill_mode == 'curated':
+        selected = [_id(value, 'selected skill') for value in skills]
+        if len(selected) != len(set(selected)):
+            _refusal('duplicate selected skill')
+        missing = set(selected) - available
+        if missing:
+            _refusal(f'unknown selected skill: {sorted(missing)[0]}')
+        return {'schema': 1, 'mode': 'curated', 'profile': None, 'skills': sorted(selected)}
+    config = profiles(home)
+    requested = _id(profile, 'profile') if profile is not None else config['default_profile']
+    if requested not in config['profiles']:
+        _refusal(f'unknown profile: {requested}')
+    for name, item in config['profiles'].items():
+        missing = set(item['skills']) - available
+        if missing:
+            _refusal(f'{name}: missing catalog skill {sorted(missing)[0]}')
+    return {'schema': 1, 'mode': 'profile', 'profile': requested,
+            'skills': sorted(config['profiles'][requested]['skills'])}
