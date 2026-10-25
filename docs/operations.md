@@ -16,6 +16,8 @@ For Herdr, run the operator/central CLI inside a Herdr-managed pane (`HERDR_ENV=
 
 The central extension starts one watcher per session and re-arms it once after unexpected exit. `session status`, `session reconcile`, `events list` and `events acknowledge EVENT_ID` inspect and handle durable wakes. Acknowledging a wake does **not** answer a decision: use `task status NAME` to inspect `open_decisions`, obtain the requested answer, and `decision resolve NAME KEY --answer FILE` to persist and enqueue it. Event receipt survives acknowledgement separately. A competing central must not take over while the first owner is alive. Worker phase `ready` can still mean its process is alive; stop it before cleanup.
 
+Routine supervision is hidden from the conversation but stays available to the agent. Interactive OMP shows `Distro · watching · N pending` in the status footer; actionable task events still wake the agent visibly, and an unrecoverable watcher exit raises an error notification. Clients that do not render extension status requests can inspect `session status` and `events list`.
+
 Cursor Agent still needs user authentication and a live transcript bound to its runner before either Cursor/backend combination can be claimed operational. Herdr 0.8.2 with protocol 20 has live OMP worker evidence only inside an explicitly named session. `doctor --harness cursor --backend herdr` diagnoses executable versions; it does not authenticate Cursor or provision a Herdr session.
 
 ## Landing, publication, and retention

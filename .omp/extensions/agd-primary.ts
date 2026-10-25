@@ -37,8 +37,12 @@ async function readSessionHealth(): Promise<Health> {
   return { delegatedWork: health.delegatedWork, watcherHealthy: health.watcherHealthy };
 }
 
+type Context = { isIdle: () => boolean; ui: {
+  setStatus: (key: string, text: string | undefined) => void;
+  notify: (message: string, type?: 'info' | 'warning' | 'error') => void;
+} };
 type ExtensionAPI = {
-  on: (event: string, handler: (event: { stop_hook_active?: boolean }, context: { isIdle: () => boolean }) => unknown) => void;
+  on: (event: string, handler: (event: { stop_hook_active?: boolean }, context: Context) => unknown) => void;
   sendUserMessage: (text: string, options?: { deliverAs?: string }) => unknown;
 };
 
@@ -51,7 +55,18 @@ export default function primary(api: ExtensionAPI) {
   let outstanding = new Set<string>();
   let restarted = false;
   let inFlight = new Set<string>();
-  let sessionContext: { isIdle: () => boolean } | undefined;
+  let sessionContext: Context | undefined;
+
+  function showStatus(context: Context, result = command('session', 'status')) {
+    const data = result.ok && result.data && typeof result.data === 'object'
+      ? result.data as { watcherHealthy?: boolean; pending?: unknown[] }
+      : undefined;
+    const count = Array.isArray(data?.pending) ? data.pending.length : 0;
+    context.ui.setStatus('agd', data?.watcherHealthy
+      ? `Distro · watching · ${count} pending`
+      : 'Distro · watcher unavailable');
+    return result;
+  }
 
   async function ring(ids: string[], active: number) {
     if (active !== generation) return;
@@ -61,6 +76,7 @@ export default function primary(api: ExtensionAPI) {
     try {
       await api.sendUserMessage(`New durable task events: ${fresh.join(', ')}. Run ${cli} --home ${home} events list, handle them, then acknowledge exact IDs with that CLI and home. Inspect open decisions independently.`, sessionContext?.isIdle() ? undefined : { deliverAs: 'followUp' });
       if (active === generation) fresh.forEach(id => outstanding.add(id));
+      if (active === generation && sessionContext) showStatus(sessionContext);
     } catch {
       if (active === generation) {
         startup = 'Supervision wake enqueue failed; retrying durable events.';
@@ -101,7 +117,10 @@ export default function primary(api: ExtensionAPI) {
         try {
           const item: unknown = JSON.parse(row);
           if (!item || typeof item !== 'object' || !('type' in item)) continue;
-          if (item.type === 'ready') startup = 'Supervision watcher ready.';
+          if (item.type === 'ready') {
+            startup = 'Supervision watcher ready.';
+            if (sessionContext) showStatus(sessionContext);
+          }
           if (item.type === 'events' && 'ids' in item && Array.isArray(item.ids)) {
             const ids = item.ids.filter((id): id is string => typeof id === 'string');
             void ring(ids, active);
@@ -117,16 +136,20 @@ export default function primary(api: ExtensionAPI) {
       child = null;
       if (!restarted && code !== 3) {
         restarted = true;
+        sessionContext?.ui.setStatus('agd', 'Distro · reconnecting');
         startup = 'Supervision watcher exited; attempting one restart.';
         launchWatch(active);
       } else {
         startup = 'Supervision watcher stopped; delegated work is not monitored.';
+        sessionContext?.ui.setStatus('agd', 'Distro · watcher unavailable');
+        sessionContext?.ui.notify(startup, 'error');
       }
     });
   }
 
-  async function startSession(_event: unknown, context: { isIdle: () => boolean }) {
+  async function startSession(_event: unknown, context: Context) {
     sessionContext = context;
+    context.ui.setStatus('agd', 'Distro · starting');
     const active = ++generation;
     outstanding = new Set();
     restarted = false;
@@ -136,18 +159,19 @@ export default function primary(api: ExtensionAPI) {
   }
   api.on('session_start', startSession);
   api.on('session_switch', startSession);
-  api.on('before_agent_start', () => {
-    const status = command('session', 'status');
+  api.on('before_agent_start', (_event, context) => {
+    const status = showStatus(context);
     const events = command('events', 'list');
     const content = [startup, `Home: ${home}`,
       status.ok ? `Supervision: ${JSON.stringify(status.data)}` : `Supervision unavailable: ${status.data}`,
       events.ok ? `Pending events: ${JSON.stringify(events.data)}` : `Pending events unavailable: ${events.data}`].join('\n');
     startup = '';
-    return { message: content.slice(0, 16000) };
+    return { message: { customType: 'agd:supervision', content: content.slice(0, 16000), display: false } };
   });
   api.on('session_stop', async event => stopDecision(event.stop_hook_active === true, await readSessionHealth()));
   api.on('session_shutdown', () => {
     generation++;
+    sessionContext?.ui.setStatus('agd', undefined);
     if (process.env.AGD_OWNER === token) delete process.env.AGD_OWNER;
     return stop();
   });

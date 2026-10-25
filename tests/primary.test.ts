@@ -18,8 +18,13 @@ test('session switch replaces only its owned watcher', async () => {
   process.env.AGD_HOME = home;
   // Exercise a second module instance with its own home; the static import above binds the default home.
   const { default: primary } = await import('../.omp/extensions/agd-primary.ts?switch-test');
-  const hooks: Record<string, (event: { stop_hook_active?: boolean }, context: { isIdle: () => boolean }) => unknown> = {};
+  const hooks: Record<string, (event: { stop_hook_active?: boolean }, context: {
+    isIdle: () => boolean; ui: { setStatus: (key: string, text: string | undefined) => void;
+      notify: (message: string, type?: string) => void };
+  }) => unknown> = {};
   const deliveries: ({ deliverAs?: string } | undefined)[] = [];
+  const statuses: { key: string; text: string | undefined }[] = [];
+  const notifications: string[] = [];
   primary({ on: (name, handler) => { hooks[name] = handler; }, sendUserMessage: (_text, options) => { deliveries.push(options); } });
   // Real watcher subprocess and filesystem notifications cannot use a fake clock.
   async function owner(generation: string) {
@@ -35,10 +40,20 @@ test('session switch replaces only its owned watcher', async () => {
     throw new Error(`watcher generation ${generation} never became ready`);
   }
   let idle = true;
-  const context = { isIdle: () => idle };
+  const context = { isIdle: () => idle, ui: {
+    setStatus: (key: string, text: string | undefined) => { statuses.push({ key, text }); },
+    notify: (message: string) => { notifications.push(message); },
+  } };
   try {
     await hooks.session_start({}, context);
     const first = await owner('1');
+    const routine = hooks.before_agent_start({}, context) as {
+      message: { customType: string; content: string; display: boolean };
+    };
+    expect(routine.message).toMatchObject({ customType: 'agd:supervision', display: false });
+    expect(routine.message.content).toContain(`Home: ${home}`);
+    expect(statuses.at(-1)).toEqual({ key: 'agd', text: 'Distro · watching · 0 pending' });
+    expect(notifications).toEqual([]);
     await hooks.session_switch({}, context);
     const second = await owner('2');
     expect(second.owner_pid).toBe(first.owner_pid);
@@ -50,16 +65,33 @@ test('session switch replaces only its owned watcher', async () => {
     const deadline = Date.now() + 5000;
     while (!deliveries.length && Date.now() < deadline) await Bun.sleep(50);
     expect(deliveries).toEqual([undefined]);
+    hooks.before_agent_start({}, context);
+    expect(statuses.at(-1)).toEqual({ key: 'agd', text: 'Distro · watching · 1 pending' });
     idle = false;
     writeFileSync(join(home, 'state', 'events', '22222222-2222-4222-8222-222222222222.json'),
       JSON.stringify({ id: '22222222-2222-4222-8222-222222222222', task: 'scout', kind: 'blocked' }));
     const nextDeadline = Date.now() + 5000;
     while (deliveries.length < 2 && Date.now() < nextDeadline) await Bun.sleep(50);
     expect(deliveries[1]).toEqual({ deliverAs: 'followUp' });
+    // The watcher is a real subprocess; wait for its persisted replacement PID before stopping it.
+    process.kill(second.watcher_pid, 'SIGTERM');
+    let replacement: number | undefined;
+    const restartDeadline = Date.now() + 5000;
+    while (!replacement && Date.now() < restartDeadline) {
+      const record = JSON.parse(readFileSync(join(home, 'state', 'owner.json'), 'utf8'));
+      if (record.watcher_pid !== second.watcher_pid) replacement = record.watcher_pid;
+      else await Bun.sleep(50);
+    }
+    expect(replacement).toBeDefined();
+    process.kill(replacement!, 'SIGTERM');
+    const failureDeadline = Date.now() + 5000;
+    while (!notifications.length && Date.now() < failureDeadline) await Bun.sleep(50);
+    expect(notifications).toEqual(['Supervision watcher stopped; delegated work is not monitored.']);
+    expect(statuses.at(-1)).toEqual({ key: 'agd', text: 'Distro · watcher unavailable' });
   } finally {
-    await hooks.session_shutdown({}, { isIdle: () => true });
+    await hooks.session_shutdown({}, context);
     if (previous === undefined) delete process.env.AGD_HOME;
     else process.env.AGD_HOME = previous;
     rmSync(home, { recursive: true, force: true });
   }
-});
+}, 15000);
