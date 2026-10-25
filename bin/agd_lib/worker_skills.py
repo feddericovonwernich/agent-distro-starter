@@ -444,16 +444,13 @@ def _exclude(home, task, paths, add):
         managed = set(data.setdefault('managed', []))
         excludes = info/'exclude'
         if add:
+            text = excludes.read_text() if excludes.exists() else ''
+            inserted = {path for path in paths if f'/{path}/\n' not in text}
             owners[key] = paths
+            managed.update(inserted)
             data['managed'] = sorted(managed)
             store.atomic_json(registry, data)
-            text = excludes.read_text() if excludes.exists() else ''
-            for path in paths:
-                line = f'/{path}/\n'
-                if line not in text:
-                    text += line
-                    managed.add(path)
-            excludes.write_text(text)
+            excludes.write_text(text + ''.join(f'/{path}/\n' for path in paths if path in inserted))
         else:
             owners.pop(key, None)
             remaining = {path for values in owners.values() for path in values}
