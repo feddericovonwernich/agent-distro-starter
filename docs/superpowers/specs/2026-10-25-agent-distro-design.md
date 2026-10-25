@@ -1,4 +1,4 @@
-# Agent distro starter — design for review
+# Agent distro starter — approved design
 
 ## Goal
 A company can distribute one versioned directory of instructions, skills, executable tools, and harness integration. Users launch omp in its central home and work across managed projects, directly or through supervised workers. Existing company tools remain independent tools composed by the distro, not reimplemented behind a generic plugin framework.
@@ -92,7 +92,7 @@ Keep focused deterministic regression checks for lifecycle invariants. Real cred
 Claude Code; Cursor as central harness; persistent secondmates; remote execution; quota/model auto-routing; public relays; email/voice; autonomous merging; Firstmate's full validation pipeline; fleet dashboards; generic plugin/package management; automatic company-tool installation beyond explicitly approved setup.
 
 ## Handoff
-This is a design draft, not implemented or runtime-verified software. Destination repository and starter name have not been selected. Save the approved spec into that repository before preparing executable implementation plans. Plan delivery in dependency order: project/task workspaces, worker execution, then omp background supervision and recovery; no intermediate slice substitutes for the complete agreed deliverable.
+The design and lifecycle were approved in conversation. The selected local repository is `projects/agent-distro-starter`; implementation planning is authorized, while this document does not claim implemented or runtime-verified software. Plan delivery in dependency order: project/task workspaces, worker execution, then omp background supervision and recovery; no intermediate slice substitutes for the complete agreed deliverable.
 
 ## Sources reviewed
 - https://github.com/kunchenguid/firstmate/blob/main/AGENTS.md
