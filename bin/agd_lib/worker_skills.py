@@ -22,7 +22,7 @@ def _private_path(home, *parts):
         raise store.Refusal('worker skills: private home is unavailable') from error
     if stat.S_ISLNK(identity.st_mode) or not stat.S_ISDIR(identity.st_mode):
         _refusal('private home must be a real directory')
-    for part in parts:
+    for index, part in enumerate(parts):
         path /= part
         try:
             identity = os.lstat(path)
@@ -32,6 +32,8 @@ def _private_path(home, *parts):
             raise store.Refusal(f'worker skills: cannot inspect {path}') from error
         if stat.S_ISLNK(identity.st_mode):
             _refusal(f'private-home path is symlinked: {path}')
+        if index < len(parts) - 1 and not stat.S_ISDIR(identity.st_mode):
+            _refusal(f'private-home path component must be a real directory: {path}')
     return path
 
 

@@ -143,6 +143,21 @@ def test_catalog_and_config_symlinks_cannot_escape_private_home():
             raise AssertionError(f'dangling {name} symlink was treated as absent')
 
 
+def test_config_parent_must_be_a_real_directory():
+    from agd_lib import worker_skills, store
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory)
+        (home/'config').write_text('not a directory')
+        for action in (lambda: worker_skills.catalog(home),
+                       lambda: worker_skills.resolve(home)):
+            try:
+                action()
+            except store.Refusal as error:
+                assert 'path component must be a real directory' in str(error)
+                continue
+            raise AssertionError('regular config parent was treated as missing')
+
+
 def test_launch_selection_flags_resolve_before_an_endpoint_starts():
     from support import lab, command
     from agd_lib import tasks
@@ -168,4 +183,5 @@ if __name__ == '__main__':
     test_catalog_rejects_missing_or_malformed_bundles()
     test_worker_skill_and_profile_lists_are_deterministic_json()
     test_catalog_and_config_symlinks_cannot_escape_private_home()
+    test_config_parent_must_be_a_real_directory()
     test_launch_selection_flags_resolve_before_an_endpoint_starts()
