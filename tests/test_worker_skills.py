@@ -543,6 +543,22 @@ def test_prompt_names_assigned_skill_paths():
     assert 'Assigned worker skills: agd-probe.' in argv[-1]
     assert '/tmp/.omp/skills/agd-probe/SKILL.md' in argv[-1]
 
+
+def test_cli_curated_selection_freezes_before_backend_failure():
+    from support import lab, command
+    from agd_lib import tasks
+    with lab() as (home, project):
+        os.environ['PATH'] = '/tmp/agd-treehouse-v3.1.6:' + os.environ['PATH']
+        add_skill(home, 'agd-probe')
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'curated', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        command(home, 'worker', 'launch', 'curated', '--backend', 'herdr',
+                '--skill-mode', 'curated', '--skill', 'agd-probe', expected=4)
+        assert tasks.read(home, 'curated')['phase'] == 'prepared'
+        assert (home/'data'/'tasks'/'curated'/'worker-skills.json').is_file()
+        assert (Path(task['worktree'])/'.omp'/'skills'/'agd-probe'/'SKILL.md').is_file()
+
 if __name__ == '__main__':
     test_verified_omp_skill_root_is_project_local()
     test_unverified_cursor_has_no_skill_provisioning_root()
@@ -568,3 +584,4 @@ if __name__ == '__main__':
     test_ensure_refuses_removed_skill_set()
     test_retry_after_post_exclude_write_failure_releases_only_owned_line()
     test_prompt_names_assigned_skill_paths()
+    test_cli_curated_selection_freezes_before_backend_failure()
