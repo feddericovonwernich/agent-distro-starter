@@ -215,12 +215,23 @@ def _sha256(path):
 
 
 def _files(root):
-    result = []
-    for path in sorted(root.rglob('*')):
-        if path.is_file() and not path.is_symlink():
-            result.append({'path': str(path.relative_to(root)), 'size': path.stat().st_size,
-                           'mode': path.stat().st_mode & 0o777, 'sha256': _sha256(path)})
-    return result
+    result, stack = [], [root]
+    while stack:
+        directory = stack.pop()
+        for path in sorted(directory.iterdir(), key=lambda item: item.name):
+            identity = os.lstat(path)
+            relative = str(path.relative_to(root))
+            if stat.S_ISLNK(identity.st_mode):
+                _refusal(f'worker skill tree contains a symlink: {relative}')
+            if stat.S_ISDIR(identity.st_mode):
+                result.append({'path': relative, 'kind': 'directory', 'mode': identity.st_mode & 0o777})
+                stack.append(path)
+            elif stat.S_ISREG(identity.st_mode) and identity.st_nlink == 1:
+                result.append({'path': relative, 'kind': 'file', 'size': identity.st_size,
+                               'mode': identity.st_mode & 0o777, 'sha256': _sha256(path)})
+            else:
+                _refusal(f'worker skill tree contains an unsafe entry: {relative}')
+    return sorted(result, key=lambda item: item['path'])
 
 
 def _task_dir(home, task):
@@ -238,13 +249,20 @@ def _snapshot(home, task):
 def _copy_tree(source, destination):
     import shutil
     destination.mkdir(parents=True)
-    for item in source.rglob('*'):
-        target = destination/item.relative_to(source)
-        if item.is_dir():
-            target.mkdir(exist_ok=True)
-        else:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(item, target)
+    stack = [source]
+    while stack:
+        directory = stack.pop()
+        for item in directory.iterdir():
+            target = destination/item.relative_to(source)
+            identity = os.lstat(item)
+            if stat.S_ISDIR(identity.st_mode):
+                target.mkdir(exist_ok=True)
+                stack.append(item)
+            elif stat.S_ISREG(identity.st_mode) and identity.st_nlink == 1:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(item, target)
+            else:
+                _refusal(f'worker skill source contains an unsafe entry: {item}')
 
 
 def _manifest(home, task):
@@ -323,6 +341,9 @@ def verify(home: Path, task: dict) -> None:
         if not destination.is_dir() or destination.is_symlink():
             _refusal(f'worker skill artifact is missing: {record["id"]}')
         _check(record, destination)
+        relative = str(destination.relative_to(task['worktree']))
+        if store.run(['git', 'ls-files', '-z', '--', relative], cwd=task['worktree'], check=False).stdout:
+            _refusal(f'worker skill artifact is tracked: {record["id"]}')
 
 
 def remove(home: Path, task: dict) -> None:
