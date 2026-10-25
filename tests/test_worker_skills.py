@@ -503,6 +503,37 @@ def test_ensure_refuses_removed_skill_set():
             return
         raise AssertionError('removed skill set was resurrected')
 
+
+def test_retry_after_post_exclude_write_failure_releases_only_owned_line():
+    from unittest.mock import patch
+    from agd_lib import worker_skills, store
+    from test_projects import run
+    with tempfile.TemporaryDirectory() as directory:
+        home, worktree = Path(directory)/'home', Path(directory)/'worktree'
+        worktree.mkdir(); run(['git', 'init', '-b', 'main', worktree])
+        add_skill(home, 'agd-probe')
+        common = (worktree/run(['git', 'rev-parse', '--git-common-dir'], cwd=worktree).stdout.strip()).resolve()
+        exclude = common/'info'/'exclude'; exclude.write_text('/.omp/skills/agd-user/\nuser\n')
+        task = {'id': 'exclude-final', 'worktree': str(worktree), 'harness': 'omp', 'lease_id': 'lease'}
+        original, count = store.atomic_json, [0]
+        def interrupted(path, value):
+            original(path, value)
+            if Path(path).name == 'agd-worker-skills.json':
+                count[0] += 1
+                if count[0] == 2:
+                    raise RuntimeError('injected post-exclude failure')
+        with patch.object(store, 'atomic_json', interrupted):
+            try:
+                worker_skills.prepare(home, task, {'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError('post-exclude fault was not injected')
+        worker_skills.prepare(home, task, {'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+        worker_skills.remove(home, task)
+        assert '/.omp/skills/agd-probe/\n' not in exclude.read_text()
+        assert exclude.read_text() == '/.omp/skills/agd-user/\nuser\n'
+
 if __name__ == '__main__':
     test_verified_omp_skill_root_is_project_local()
     test_unverified_cursor_has_no_skill_provisioning_root()
@@ -526,3 +557,4 @@ if __name__ == '__main__':
     test_preexisting_identical_exclude_line_is_not_removed()
     test_ensure_refuses_post_prepare_native_parent_symlink()
     test_ensure_refuses_removed_skill_set()
+    test_retry_after_post_exclude_write_failure_releases_only_owned_line()
