@@ -27,7 +27,7 @@ def _private_path(home, *parts):
         try:
             identity = os.lstat(path)
         except FileNotFoundError:
-            return path
+            return path.joinpath(*parts[index + 1:])
         except OSError as error:
             raise store.Refusal(f'worker skills: cannot inspect {path}') from error
         if stat.S_ISLNK(identity.st_mode):
@@ -203,3 +203,130 @@ def resolve(home: Path, *, profile: str | None = None, skill_mode: str = 'profil
             _refusal(f'{name}: missing catalog skill {sorted(missing)[0]}')
     return {'schema': 1, 'mode': 'profile', 'profile': requested,
             'skills': sorted(config['profiles'][requested]['skills'])}
+
+
+def _sha256(path):
+    import hashlib
+    digest = hashlib.sha256()
+    with path.open('rb') as source:
+        for block in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _files(root):
+    result = []
+    for path in sorted(root.rglob('*')):
+        if path.is_file() and not path.is_symlink():
+            result.append({'path': str(path.relative_to(root)), 'size': path.stat().st_size,
+                           'mode': path.stat().st_mode & 0o777, 'sha256': _sha256(path)})
+    return result
+
+
+def _task_dir(home, task):
+    return _private_path(home, 'data', 'tasks', task['id'])
+
+
+def _journal(home, task):
+    return _task_dir(home, task)/'worker-skills.json'
+
+
+def _snapshot(home, task):
+    return _task_dir(home, task)/'worker-skills'
+
+
+def _copy_tree(source, destination):
+    import shutil
+    destination.mkdir(parents=True)
+    for item in source.rglob('*'):
+        target = destination/item.relative_to(source)
+        if item.is_dir():
+            target.mkdir(exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target)
+
+
+def _manifest(home, task):
+    path = _journal(home, task)
+    if not path.is_file() or path.is_symlink():
+        _refusal('worker skill journal is missing')
+    data = _json(path)
+    if not isinstance(data, dict) or data.get('schema') != 1:
+        _refusal('invalid worker skill journal')
+    return data
+
+
+def prepare(home: Path, task: dict, selection: dict) -> dict:
+    if selection.get('schema') != 1 or not isinstance(selection.get('skills'), list):
+        _refusal('invalid worker skill selection')
+    journal = _journal(home, task)
+    if journal.exists():
+        existing = _manifest(home, task)
+        if existing.get('selection') != selection:
+            _refusal('pending worker skill journal selects different skills')
+        ensure(home, task)
+        return existing
+    frozen = _snapshot(home, task)
+    if frozen.exists() or frozen.is_symlink():
+        _refusal('worker skill snapshot destination already exists')
+    from . import harnesses
+    roots = harnesses.worker_skill_roots(task['harness'])
+    root = Path(task['worktree'])/roots[0]
+    records = []
+    available = {row['id'] for row in catalog(home)}
+    for skill_id in selection['skills']:
+        if skill_id not in available:
+            _refusal(f'missing catalog skill {skill_id}')
+        source = _private_path(home, 'config', 'worker-skills', skill_id)
+        destination = root/skill_id
+        if destination.exists() or destination.is_symlink():
+            _refusal(f'worker skill destination exists: {destination}')
+        frozen_skill = frozen/skill_id
+        _copy_tree(source, frozen_skill)
+        records.append({'id': skill_id, 'snapshot': str(frozen_skill),
+                        'destination': str(destination), 'files': _files(frozen_skill)})
+    manifest = {'schema': 1, 'selection': selection, 'harness': task['harness'],
+                'roots': list(roots), 'skills': records, 'state': 'pending'}
+    store.atomic_json(journal, manifest)
+    for record in records:
+        _copy_tree(Path(record['snapshot']), Path(record['destination']))
+    manifest['state'] = 'complete'
+    store.atomic_json(journal, manifest)
+    return manifest
+
+
+def _check(record, root):
+    if _files(root) != record['files']:
+        _refusal(f'worker skill artifacts changed: {record["id"]}')
+
+
+def ensure(home: Path, task: dict) -> None:
+    manifest = _manifest(home, task)
+    for record in manifest['skills']:
+        snapshot = Path(record['snapshot'])
+        _check(record, snapshot)
+        destination = Path(record['destination'])
+        if destination.exists() or destination.is_symlink():
+            _check(record, destination)
+        else:
+            _copy_tree(snapshot, destination)
+    if manifest['state'] != 'complete':
+        manifest['state'] = 'complete'
+        store.atomic_json(_journal(home, task), manifest)
+
+
+def verify(home: Path, task: dict) -> None:
+    for record in _manifest(home, task)['skills']:
+        _check(record, Path(record['snapshot']))
+        destination = Path(record['destination'])
+        if not destination.is_dir() or destination.is_symlink():
+            _refusal(f'worker skill artifact is missing: {record["id"]}')
+        _check(record, destination)
+
+
+def remove(home: Path, task: dict) -> None:
+    import shutil
+    verify(home, task)
+    for record in _manifest(home, task)['skills']:
+        shutil.rmtree(record['destination'])

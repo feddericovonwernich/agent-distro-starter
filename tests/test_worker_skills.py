@@ -174,6 +174,40 @@ def test_launch_selection_flags_resolve_before_an_endpoint_starts():
         assert tasks.read(home, 'selection')['lease_id'] == task['lease_id']
 
 
+def test_prepare_freezes_and_materializes_a_skill_bundle():
+    from agd_lib import worker_skills
+    from test_projects import run
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory)/'home'
+        worktree = Path(directory)/'worktree'
+        worktree.mkdir()
+        run(['git', 'init', '-b', 'main', worktree])
+        run(['git', 'config', 'user.email', 'test@example.invalid'], cwd=worktree)
+        run(['git', 'config', 'user.name', 'Distro Test'], cwd=worktree)
+        (worktree/'value.txt').write_text('base\n')
+        run(['git', 'add', 'value.txt'], cwd=worktree)
+        run(['git', 'commit', '-m', 'initial'], cwd=worktree)
+        skill = add_skill(home, 'agd-probe')
+        resource = skill/'references'/'token.txt'
+        resource.parent.mkdir()
+        resource.write_text('frozen token\n')
+        resource.chmod(0o755)
+        task = {'id': 'freeze', 'worktree': str(worktree), 'harness': 'omp',
+                'lease_id': 'lease'}
+        manifest = worker_skills.prepare(home, task, {
+            'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+        generated = worktree/'.omp'/'skills'/'agd-probe'/'references'/'token.txt'
+        assert generated.read_text() == 'frozen token\n'
+        assert generated.stat().st_mode & 0o111
+        resource.write_text('changed source\n')
+        worker_skills.ensure(home, task)
+        assert generated.read_text() == 'frozen token\n'
+        worker_skills.verify(home, task)
+        worker_skills.remove(home, task)
+        assert not generated.exists()
+        assert manifest['selection']['skills'] == ['agd-probe']
+
+
 if __name__ == '__main__':
     test_verified_omp_skill_root_is_project_local()
     test_unverified_cursor_has_no_skill_provisioning_root()
@@ -185,3 +219,4 @@ if __name__ == '__main__':
     test_catalog_and_config_symlinks_cannot_escape_private_home()
     test_config_parent_must_be_a_real_directory()
     test_launch_selection_flags_resolve_before_an_endpoint_starts()
+    test_prepare_freezes_and_materializes_a_skill_bundle()
