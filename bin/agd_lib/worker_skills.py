@@ -270,8 +270,17 @@ def _manifest(home, task):
     if not path.is_file() or path.is_symlink():
         _refusal('worker skill journal is missing')
     data = _json(path)
-    if not isinstance(data, dict) or data.get('schema') != 1:
+    if not isinstance(data, dict) or data.get('schema') != 1 or not isinstance(data.get('skills'), list):
         _refusal('invalid worker skill journal')
+    snapshot_root = _snapshot(home, task)
+    root = Path(task['worktree']).resolve()/Path(data.get('roots', [''])[0])
+    for record in data['skills']:
+        if not isinstance(record, dict) or _id(record.get('id'), 'journal skill') != record['id']:
+            _refusal('invalid worker skill journal record')
+        if Path(record.get('snapshot', '')).resolve() != (snapshot_root/record['id']).resolve():
+            _refusal('worker skill snapshot path escaped task data')
+        if Path(record.get('destination', '')).resolve() != (root/record['id']).resolve():
+            _refusal('worker skill destination escaped task worktree')
     return data
 
 
