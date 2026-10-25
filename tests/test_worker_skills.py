@@ -395,6 +395,39 @@ def test_retry_repairs_exclude_after_registry_write_failure():
         assert '/.omp/skills/agd-probe/\n' in exclude.read_text()
 
 
+def test_remove_retries_after_first_owned_directory_deletion():
+    from unittest.mock import patch
+    from agd_lib import worker_skills
+    from test_projects import run
+    with tempfile.TemporaryDirectory() as directory:
+        home, worktree = Path(directory)/'home', Path(directory)/'worktree'
+        worktree.mkdir()
+        run(['git', 'init', '-b', 'main', worktree])
+        add_skill(home, 'agd-one'); add_skill(home, 'agd-two')
+        task = {'id': 'remove-retry', 'worktree': str(worktree), 'harness': 'omp', 'lease_id': 'lease'}
+        selection = {'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-one', 'agd-two']}
+        worker_skills.prepare(home, task, selection)
+        common = (worktree/run(['git', 'rev-parse', '--git-common-dir'], cwd=worktree).stdout.strip()).resolve()
+        exclude = common/'info'/'exclude'; exclude.write_text(exclude.read_text() + 'user-entry\n')
+        import shutil
+        original = shutil.rmtree
+        calls = [0]
+        def interrupted(path):
+            original(path)
+            calls[0] += 1
+            if calls[0] == 1:
+                raise RuntimeError('injected remove interruption')
+        with patch('shutil.rmtree', interrupted):
+            try:
+                worker_skills.remove(home, task)
+            except RuntimeError:
+                pass
+        worker_skills.remove(home, task)
+        assert not (worktree/'.omp'/'skills'/'agd-one').exists()
+        assert not (worktree/'.omp'/'skills'/'agd-two').exists()
+        assert 'user-entry\n' in exclude.read_text()
+
+
 if __name__ == '__main__':
     test_verified_omp_skill_root_is_project_local()
     test_unverified_cursor_has_no_skill_provisioning_root()
@@ -413,3 +446,4 @@ if __name__ == '__main__':
     test_native_alias_and_symlinked_skill_parents_refuse_provisioning()
     test_pending_snapshot_retry_refuses_changed_catalog_source()
     test_retry_repairs_exclude_after_registry_write_failure()
+    test_remove_retries_after_first_owned_directory_deletion()
