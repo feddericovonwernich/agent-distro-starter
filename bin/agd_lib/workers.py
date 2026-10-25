@@ -52,9 +52,12 @@ def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=Fal
     if selected_backend not in ('tmux', 'herdr') or harness not in ('omp', 'cursor'):
         raise ValueError('unsupported backend or harness')
     selection = worker_skills.resolve(home, profile=profile, skill_mode=skill_mode, skills=skills)
+    manifest = None
     if selection['skills']:
-        raise store.DependencyError('worker skill provisioning is unavailable until bundles can be frozen')
+        manifest = worker_skills.prepare(home, dict(task, harness=harness), selection)
     task.update(harness=harness, backend=selected_backend, worker_skill_selection=selection)
+    if manifest is not None:
+        task['worker_skills'] = manifest
     harnesses.launch_argv(task, tasks.task_file(home, task_id).parent/'brief.md', unattended)
     module = backend(task)
     if selected_backend == 'tmux' and not shutil.which('tmux'):
@@ -92,6 +95,8 @@ def run_worker(home, task_id, incarnation):
     if not task.get('endpoint'):
         raise store.Refusal('endpoint identity was not published; retaining task')
     tasks.verify_workspace(home, task)
+    if task.get('worker_skills'):
+        worker_skills.verify(home, task)
     env = dict(os.environ, AGD_HOME=str(home), AGD_TASK_ID=task_id, AGD_INCARNATION=incarnation)
     env.pop('AGD_OWNER', None)
     import subprocess
