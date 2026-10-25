@@ -2,6 +2,13 @@ import shutil
 from pathlib import Path
 from . import store
 
+def worker_skill_roots(harness):
+    if harness == 'omp':
+        return ('.omp/skills',)
+    if harness == 'cursor':
+        raise store.DependencyError('Cursor native skill discovery is unverified; cannot provision skills')
+    raise ValueError('unsupported harness')
+
 
 def launch_argv(task, brief_path, unattended=False):
     code_root = Path(__file__).resolve().parents[2]
