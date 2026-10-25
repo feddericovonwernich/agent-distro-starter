@@ -327,6 +327,36 @@ def test_native_alias_and_symlinked_skill_parents_refuse_provisioning():
             return
         raise AssertionError('symlinked native skill parent was accepted')
 
+
+def test_pending_snapshot_retry_refuses_changed_catalog_source():
+    from agd_lib import worker_skills, store
+    from test_projects import run
+    with tempfile.TemporaryDirectory() as directory:
+        home, worktree = Path(directory)/'home', Path(directory)/'worktree'
+        worktree.mkdir()
+        run(['git', 'init', '-b', 'main', worktree])
+        skill = add_skill(home, 'agd-probe')
+        task = {'id': 'pending', 'worktree': str(worktree), 'harness': 'omp', 'lease_id': 'lease'}
+        os.environ['AGD_FAIL_AFTER_SNAPSHOT'] = '1'
+        try:
+            worker_skills.prepare(home, task, {
+                'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError('snapshot failure injection did not run')
+        finally:
+            os.environ.pop('AGD_FAIL_AFTER_SNAPSHOT')
+        worker_skills.prepare(home, task, {
+            'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+        (skill/'SKILL.md').write_text('changed\n')
+        try:
+            worker_skills.prepare(home, task, {
+                'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+        except store.Refusal:
+            return
+        raise AssertionError('changed source was accepted after pending snapshot')
+
 if __name__ == '__main__':
     test_verified_omp_skill_root_is_project_local()
     test_unverified_cursor_has_no_skill_provisioning_root()
@@ -343,3 +373,4 @@ if __name__ == '__main__':
     test_ensure_recovers_missing_artifacts_and_verify_refuses_foreign_or_tracked_content()
     test_verify_refuses_modified_frozen_snapshot()
     test_native_alias_and_symlinked_skill_parents_refuse_provisioning()
+    test_pending_snapshot_retry_refuses_changed_catalog_source()

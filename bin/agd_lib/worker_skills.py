@@ -281,6 +281,8 @@ def _manifest(home, task):
     for record in data['skills']:
         if not isinstance(record, dict) or _id(record.get('id'), 'journal skill') != record['id']:
             _refusal('invalid worker skill journal record')
+        if Path(record.get('source', '')).resolve() != _private_path(home, 'config', 'worker-skills', record['id']).resolve():
+            _refusal('worker skill source path escaped catalog')
         if Path(record.get('snapshot', '')).resolve() != (snapshot_root/record['id']).resolve():
             _refusal('worker skill snapshot path escaped task data')
         if Path(record.get('destination', '')).resolve() != (root/record['id']).resolve():
@@ -326,8 +328,10 @@ def prepare(home: Path, task: dict, selection: dict) -> dict:
         existing = _manifest(home, task)
         if existing.get('selection') != selection:
             _refusal('pending worker skill journal selects different skills')
+        for record in existing['skills']:
+            _check(record, Path(record['source']))
         ensure(home, task)
-        return existing
+        return _manifest(home, task)
     frozen = _snapshot(home, task)
     if frozen.exists() or frozen.is_symlink():
         _refusal('worker skill snapshot destination already exists')
@@ -352,14 +356,18 @@ def prepare(home: Path, task: dict, selection: dict) -> dict:
         if destination.exists() or destination.is_symlink():
             _refusal(f'worker skill destination exists: {destination}')
         frozen_skill = frozen/skill_id
-        _copy_tree(source, frozen_skill)
-        records.append({'id': skill_id, 'snapshot': str(frozen_skill),
-                        'destination': str(destination), 'files': _files(frozen_skill)})
+        records.append({'id': skill_id, 'source': str(source), 'snapshot': str(frozen_skill),
+                        'destination': str(destination), 'files': _files(source)})
     manifest = {'schema': 1, 'selection': selection, 'harness': task['harness'],
                 'roots': list(roots), 'skills': records, 'state': 'pending',
                 'excludes': [str(Path(record['destination']).relative_to(task['worktree']))
                              for record in records]}
     store.atomic_json(journal, manifest)
+    for index, record in enumerate(records):
+        _copy_tree(Path(record['source']), Path(record['snapshot']))
+        _check(record, Path(record['snapshot']))
+        if os.environ.get('AGD_FAIL_AFTER_SNAPSHOT') and index == 0:
+            raise RuntimeError('injected snapshot interruption')
     _exclude(home, task, manifest['excludes'], True)
     for record in records:
         _copy_tree(Path(record['snapshot']), Path(record['destination']))
