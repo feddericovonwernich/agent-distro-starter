@@ -441,6 +441,8 @@ def _exclude(home, task, paths, add):
         excludes = info/'exclude'
         if add:
             owners[key] = paths
+            data['managed'] = sorted(managed)
+            store.atomic_json(registry, data)
             text = excludes.read_text() if excludes.exists() else ''
             for path in paths:
                 line = f'/{path}/\n'
