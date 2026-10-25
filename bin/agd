@@ -40,6 +40,24 @@ def parser():
     task.add_parser('list')
     reconcile = task.add_parser('reconcile')
     reconcile.add_argument('id')
+    for action in ('ready', 'approve', 'land', 'cleanup'):
+        op = task.add_parser(action)
+        op.add_argument('id')
+        if action == 'ready':
+            op.add_argument('--report', required=True)
+        if action == 'approve':
+            op.add_argument('--action', required=True, choices=('local-merge', 'publish', 'discard', 'unattended'))
+            op.add_argument('--target', required=True)
+            op.add_argument('--instruction', required=True)
+        if action == 'land':
+            op.add_argument('--approval', required=True)
+        if action == 'cleanup':
+            op.add_argument('--discard', action='store_true')
+            op.add_argument('--approval')
+    publication = task.add_parser('publication-record')
+    publication.add_argument('id')
+    for option in ('approval', 'remote', 'branch', 'url', 'evidence'):
+        publication.add_argument('--'+option, required=True)
     return p
 
 
@@ -75,6 +93,17 @@ def main(args):
             return [tasks.read(home, f.parent.name) for f in sorted((home/'data'/'tasks').glob('*/task.json'))]
         if args.operation == 'reconcile':
             return tasks.reconcile_allocation(home, args.id)
+        if args.operation == 'ready':
+            return tasks.ready(home, args.id, args.report)
+        if args.operation == 'approve':
+            return tasks.approve(home, args.id, args.action, args.target, args.instruction)
+        if args.operation == 'land':
+            return tasks.land(home, args.id, args.approval)
+        if args.operation == 'cleanup':
+            return tasks.cleanup(home, args.id, args.discard, args.approval)
+        if args.operation == 'publication-record':
+            return tasks.publication_record(home, args.id, args.approval, args.remote,
+                                            args.branch, args.url, args.evidence)
     raise ValueError('unsupported command')
 
 

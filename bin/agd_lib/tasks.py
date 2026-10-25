@@ -1,7 +1,9 @@
+import hashlib
 import json
 import os
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 from . import projects, store
 
 
@@ -72,8 +74,7 @@ def reconcile_allocation(home, task_id):
         return task
     project = projects.read(home, task['project'])
     status = json.loads(store.run(['treehouse', 'status', '--json'], cwd=project['path']).stdout)
-    # The documented status format is checked against the installed binary in the integration test.
-    matches = [item for item in status['worktrees'] if item.get('lease_holder') == task['lease_holder']]
+    matches = [item for item in status if item.get('lease_holder') == task['lease_holder']]
     if len(matches) != 1:
         raise store.Refusal(f'lease allocation uncertain: {len(matches)} matching slots; inspect Treehouse')
     match = matches[0]
@@ -82,5 +83,175 @@ def reconcile_allocation(home, task_id):
         raise store.Refusal('recovered lease identity mismatch')
     with store.lock(home):
         task.update(phase='prepared', worktree=str(path), lease_id=match['lease_id'])
+        save(home, task)
+    return task
+
+
+def verify_workspace(home, task):
+    project = projects.read(home, task['project'])
+    work = Path(task['worktree'])
+    if work.is_symlink() or not work.is_dir() or work.resolve() == Path(project['path']):
+        raise store.Refusal('task workspace is absent or points at stable clone')
+    if store.git(work, 'rev-parse', '--path-format=absolute', '--git-common-dir') != project['common_dir']:
+        raise store.Refusal('task Git clone identity changed')
+    if store.git(work, 'branch', '--show-current') != task['branch']:
+        raise store.Refusal('task branch identity changed')
+    status = json.loads(store.run(['treehouse', 'status', '--json'], cwd=project['path']).stdout)
+    matches = [row for row in status if Path(row['path']).resolve() == work.resolve()]
+    if len(matches) != 1 or matches[0].get('lease_id') != task['lease_id'] or matches[0].get('lease_holder') != task['lease_holder']:
+        raise store.Refusal('task lease identity changed')
+    return work
+
+
+def ready(home, task_id, report):
+    task = read(home, task_id)
+    if task['phase'] != 'prepared':
+        raise store.Refusal('task is not prepared')
+    work = verify_workspace(home, task)
+    if not store.clean(work):
+        raise store.Refusal('task workspace has uncommitted or untracked changes')
+    head = store.git(work, 'rev-parse', 'HEAD')
+    if task['kind'] == 'ship' and (head == task['start'] or store.run(['git', 'merge-base', '--is-ancestor', task['start'], head], cwd=work, check=False).returncode):
+        raise store.Refusal('ship task needs committed changes from its base')
+    if task['kind'] == 'scout' and head != task['start']:
+        raise store.Refusal('scout contains unexpected commits')
+    text = Path(report).read_text()
+    if not text.strip():
+        raise store.Refusal('empty report')
+    with store.lock(home):
+        (task_file(home, task_id).parent/'report.md').write_text(text)
+        task.update(phase='ready', ready_head=head, report='report.md')
+        save(home, task)
+    return task
+
+
+def approve(home, task_id, action, target, instruction):
+    task = read(home, task_id)
+    if action not in ('local-merge', 'publish', 'discard', 'unattended'):
+        raise ValueError('unsupported approval')
+    text = Path(instruction).read_text().strip()
+    if not text:
+        raise store.Refusal('explicit instruction required')
+    if action == 'discard' and target != task_id:
+        raise store.Refusal('discard approval must target exact task')
+    work = verify_workspace(home, task)
+    evidence = dict(id=str(uuid.uuid4()), task=task_id, action=action, target=target,
+                    head=store.git(work, 'rev-parse', 'HEAD'), instruction=text)
+    if action == 'discard':
+        evidence['inventory'] = inventory(work)
+    store.atomic_json(task_file(home, task_id).parent/'approvals'/f'{evidence["id"]}.json', evidence)
+    return evidence
+
+
+def authorization(home, task, approval_id, action, target):
+    try:
+        approval_id = str(uuid.UUID(approval_id))
+        approval = json.loads((task_file(home, task['id']).parent/'approvals'/f'{approval_id}.json').read_text())
+    except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
+        raise store.Refusal('approval missing or invalid') from error
+    if approval['task'] != task['id'] or approval['action'] != action or approval['target'] != target:
+        raise store.Refusal('approval does not match operation and target')
+    work = verify_workspace(home, task)
+    if approval['head'] != store.git(work, 'rev-parse', 'HEAD'):
+        raise store.Refusal('approval bound to a different head')
+    if action == 'discard' and approval.get('inventory') != inventory(work):
+        raise store.Refusal('dirty path inventory changed since discard approval')
+    return approval
+
+
+def inventory(work):
+    digest = hashlib.sha256()
+    names = store.run(['git', 'ls-files', '-co', '--exclude-standard', '-z'], cwd=work).stdout
+    for name in sorted(set(names.split('\0')) - {''}):
+        path = work/name
+        digest.update(name.encode() + b'\0')
+        if path.is_symlink():
+            digest.update(os.readlink(path).encode())
+        elif path.is_file():
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def land(home, task_id, approval_id):
+    task = read(home, task_id)
+    project = projects.read(home, task['project'])
+    target = task['project'] + ':' + task['base']
+    with store.lock(home):
+        if task['phase'] not in ('ready', 'landed'):
+            raise store.Refusal('task is not ready to land')
+        authorization(home, task, approval_id, 'local-merge', target)
+        work = verify_workspace(home, task)
+        clone = Path(project['path'])
+        if not store.clean(work) or not store.clean(clone) or store.git(clone, 'branch', '--show-current') != task['base']:
+            raise store.Refusal('task or stable clone dirty/wrong branch')
+        head = store.git(work, 'rev-parse', 'HEAD')
+        if head != task['ready_head']:
+            raise store.Refusal('ready commit moved')
+        destination = store.git(clone, 'rev-parse', 'HEAD')
+        if store.run(['git', 'merge-base', '--is-ancestor', destination, head], cwd=clone, check=False).returncode:
+            raise store.Refusal('landing would not fast-forward')
+        if destination != head:
+            store.git(clone, 'merge', '--ff-only', head)
+        if store.git(clone, 'rev-parse', 'HEAD') != head:
+            raise store.Refusal('landing unconfirmed')
+        task.update(phase='landed', landed_head=head, landed_target=target)
+        save(home, task)
+    return task
+
+
+def cleanup(home, task_id, discard=False, approval_id=None):
+    task = read(home, task_id)
+    project = projects.read(home, task['project'])
+    with store.lock(home):
+        if task['phase'] == 'cleaned':
+            return task
+        work = verify_workspace(home, task)
+        if task.get('worker') and task.get('worker_alive') is not False:
+            raise store.Refusal('worker not proved stopped')
+        if discard:
+            if not approval_id:
+                raise store.Refusal('discard requires approval')
+            authorization(home, task, approval_id, 'discard', task['id'])
+        else:
+            if not store.clean(work):
+                raise store.Refusal('uncommitted or untracked task work')
+            if task['kind'] == 'scout':
+                if task['phase'] != 'ready' or store.git(work, 'rev-parse', 'HEAD') != task['start']:
+                    raise store.Refusal('scout report missing or work modified')
+            else:
+                if task['phase'] != 'landed' or store.git(work, 'rev-parse', 'HEAD') != task['ready_head']:
+                    raise store.Refusal('task work has not landed')
+                if store.run(['git', 'merge-base', '--is-ancestor', task['ready_head'], task['base']], cwd=project['path'], check=False).returncode:
+                    raise store.Refusal('landing ancestry unconfirmed')
+        argv = ['treehouse', 'return', task['worktree'], '--if-lease-id', task['lease_id'],
+                '--if-lease-holder', task['lease_holder']]
+        if discard:
+            argv.append('--force')
+        store.run(argv, cwd=project['path'], timeout=120)
+        task['phase'] = 'cleaned'
+        save(home, task)
+    return task
+
+
+def publication_record(home, task_id, approval_id, remote, branch, url, evidence_file):
+    task = read(home, task_id)
+    parsed = urlsplit(url)
+    if parsed.scheme not in ('https', 'http') or not parsed.hostname or parsed.username or parsed.password:
+        raise store.Refusal('review URL must be canonical HTTP(S) with no embedded credentials')
+    if task['phase'] != 'ready':
+        raise store.Refusal('only ready work can be published')
+    with store.lock(home):
+        approval = authorization(home, task, approval_id, 'publish', f'{remote}:{branch}')
+        work = verify_workspace(home, task)
+        if branch != task['branch'] or not store.clean(work) or store.git(work, 'rev-parse', 'HEAD') != task['ready_head']:
+            raise store.Refusal('published branch differs from ready head')
+        remote_head = store.git(work, 'ls-remote', '--heads', remote, f'refs/heads/{branch}')
+        if not remote_head or remote_head.split()[0] != task['ready_head']:
+            raise store.Refusal('published remote head not proven')
+        evidence = Path(evidence_file).read_text()
+        if not evidence.strip():
+            raise store.Refusal('forge output evidence required')
+        (task_file(home, task_id).parent/'publication.txt').write_text(evidence)
+        task['publication'] = dict(url=url, remote=remote, branch=branch, head=task['ready_head'], approval=approval['id'])
         save(home, task)
     return task

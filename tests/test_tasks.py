@@ -29,6 +29,18 @@ def test_distinct_leases_and_preserved_project():
         command(home, 'task', 'create', 'one', '--project', 'sample', '--brief', str(brief), expected=3)
         assert command(home, 'task', 'status', 'one')['lease_id'] == a['lease_id']
 
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'bin'))
+        from agd_lib import tasks
+        saved = tasks.read(home, 'two')
+        saved['phase'] = 'preparing'
+        saved.pop('worktree')
+        saved.pop('lease_id')
+        tasks.save(home, saved)
+        recovered = command(home, 'task', 'reconcile', 'two')
+        assert recovered['lease_id'] == b['lease_id']
+        assert recovered['worktree'] == b['worktree']
+
 
 if __name__ == '__main__':
     test_distinct_leases_and_preserved_project()
