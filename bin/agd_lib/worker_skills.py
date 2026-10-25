@@ -313,8 +313,11 @@ def prepare(home: Path, task: dict, selection: dict) -> dict:
         records.append({'id': skill_id, 'snapshot': str(frozen_skill),
                         'destination': str(destination), 'files': _files(frozen_skill)})
     manifest = {'schema': 1, 'selection': selection, 'harness': task['harness'],
-                'roots': list(roots), 'skills': records, 'state': 'pending'}
+                'roots': list(roots), 'skills': records, 'state': 'pending',
+                'excludes': [str(Path(record['destination']).relative_to(task['worktree']))
+                             for record in records]}
     store.atomic_json(journal, manifest)
+    _exclude(home, task, manifest['excludes'], True)
     for record in records:
         _copy_tree(Path(record['snapshot']), Path(record['destination']))
     manifest['state'] = 'complete'
@@ -359,3 +362,39 @@ def remove(home: Path, task: dict) -> None:
     verify(home, task)
     for record in _manifest(home, task)['skills']:
         shutil.rmtree(record['destination'])
+    _exclude(home, task, _manifest(home, task).get('excludes', []), False)
+
+
+def _exclude(home, task, paths, add):
+    import fcntl
+    common = Path(store.git(task['worktree'], 'rev-parse', '--path-format=absolute', '--git-common-dir'))
+    info = common/'info'
+    info.mkdir(exist_ok=True)
+    lock = info/'agd-worker-skills.lock'
+    registry = info/'agd-worker-skills.json'
+    key = f'{_private_path(home, "data", "home.json")}:{task["id"]}:{task.get("lease_id", "")}'
+    with lock.open('a+') as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        data = _json(registry) if registry.exists() else {}
+        owners = data.setdefault('owners', {})
+        managed = set(data.setdefault('managed', []))
+        excludes = info/'exclude'
+        if add:
+            owners[key] = paths
+            text = excludes.read_text() if excludes.exists() else ''
+            for path in paths:
+                line = f'/{path}/\n'
+                if line not in text:
+                    text += line
+                    managed.add(path)
+            excludes.write_text(text)
+        else:
+            owners.pop(key, None)
+            remaining = {path for values in owners.values() for path in values}
+            if excludes.exists():
+                excludes.write_text(''.join(
+                    line for line in excludes.read_text().splitlines(True)
+                    if not (line.strip('/\n') in managed - remaining)))
+            managed.intersection_update(remaining)
+        data['managed'] = sorted(managed)
+        store.atomic_json(registry, data)
