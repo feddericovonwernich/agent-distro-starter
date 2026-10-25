@@ -4,7 +4,7 @@ import shutil
 import time
 import uuid
 from pathlib import Path
-from . import harnesses, projects, store, tasks, tmux
+from . import harnesses, projects, store, tasks, tmux, worker_skills
 
 
 def backend(task):
@@ -38,7 +38,8 @@ def event(home, task_id, incarnation, kind, key, message):
     return observation
 
 
-def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=False, approval_id=None):
+def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=False, approval_id=None,
+           profile=None, skill_mode='profile', skills=()):
     task = tasks.read(home, task_id)
     if task['phase'] != 'prepared' or task['executor'] != 'central':
         raise store.Refusal('task already launched or not prepared')
@@ -50,7 +51,10 @@ def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=Fal
         tasks.authorization(home, task, approval_id or '', 'unattended', task_id)
     if selected_backend not in ('tmux', 'herdr') or harness not in ('omp', 'cursor'):
         raise ValueError('unsupported backend or harness')
-    task.update(harness=harness, backend=selected_backend)
+    selection = worker_skills.resolve(home, profile=profile, skill_mode=skill_mode, skills=skills)
+    if selection['skills']:
+        raise store.DependencyError('worker skill provisioning is unavailable until bundles can be frozen')
+    task.update(harness=harness, backend=selected_backend, worker_skill_selection=selection)
     harnesses.launch_argv(task, tasks.task_file(home, task_id).parent/'brief.md', unattended)
     module = backend(task)
     if selected_backend == 'tmux' and not shutil.which('tmux'):

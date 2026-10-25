@@ -78,6 +78,9 @@ def parser():
             op.add_argument('--harness', choices=('omp', 'cursor'), default='omp')
             op.add_argument('--backend', choices=('tmux', 'herdr'), default='tmux')
             op.add_argument('--unattended', action='store_true')
+            op.add_argument('--profile')
+            op.add_argument('--skill-mode', choices=('profile', 'curated'), default='profile')
+            op.add_argument('--skill', action='append', default=[])
             op.add_argument('--approval')
         if action in ('run', 'event'):
             op.add_argument('--incarnation', required=True)
@@ -189,7 +192,8 @@ def main(args):
         if args.operation == 'profiles':
             return worker_skills.profiles(home)
         if args.operation == 'launch':
-            return workers.launch(home, args.id, args.harness, args.backend, args.unattended, args.approval)
+            return workers.launch(home, args.id, args.harness, args.backend, args.unattended,
+                                  args.approval, args.profile, args.skill_mode, tuple(args.skill))
         if args.operation == 'run':
             return workers.run_worker(home, args.id, args.incarnation)
         if args.operation == 'event':

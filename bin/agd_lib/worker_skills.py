@@ -14,6 +14,27 @@ def _refusal(message):
     raise store.Refusal(f'worker skills: {message}')
 
 
+def _private_path(home, *parts):
+    path = Path(home)
+    try:
+        identity = os.lstat(path)
+    except OSError as error:
+        raise store.Refusal('worker skills: private home is unavailable') from error
+    if stat.S_ISLNK(identity.st_mode) or not stat.S_ISDIR(identity.st_mode):
+        _refusal('private home must be a real directory')
+    for part in parts:
+        path /= part
+        try:
+            identity = os.lstat(path)
+        except FileNotFoundError:
+            return path
+        except OSError as error:
+            raise store.Refusal(f'worker skills: cannot inspect {path}') from error
+        if stat.S_ISLNK(identity.st_mode):
+            _refusal(f'private-home path is symlinked: {path}')
+    return path
+
+
 def _json(path):
     def pairs(items):
         result = {}
@@ -110,7 +131,7 @@ def _bundle(path, skill_id):
 
 
 def catalog(home: Path) -> list[dict]:
-    root = Path(home)/'config'/'worker-skills'
+    root = _private_path(home, 'config', 'worker-skills')
     if not root.exists():
         return []
     if root.is_symlink() or not root.is_dir():
@@ -125,7 +146,7 @@ def catalog(home: Path) -> list[dict]:
 
 
 def profiles(home: Path) -> dict:
-    path = Path(home)/'config'/'workers.json'
+    path = _private_path(home, 'config', 'workers.json')
     if not path.exists():
         return {'default_profile': None, 'profiles': {}}
     data = _json(path)
@@ -158,7 +179,7 @@ def resolve(home: Path, *, profile: str | None = None, skill_mode: str = 'profil
         _refusal('individual skills require curated mode')
     if skill_mode == 'curated' and not skills:
         _refusal('curated mode requires at least one skill')
-    config_path = Path(home)/'config'/'workers.json'
+    config_path = _private_path(home, 'config', 'workers.json')
     if skill_mode == 'profile' and profile is None and not config_path.exists():
         return {'schema': 1, 'mode': 'none', 'profile': None, 'skills': []}
     available = {entry['id'] for entry in catalog(home)}

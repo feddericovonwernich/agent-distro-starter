@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -114,6 +115,50 @@ def test_worker_skill_and_profile_lists_are_deterministic_json():
             'profiles': {'implementer': {'skills': ['agd-zebra', 'agd-alpha']}}}
 
 
+def test_catalog_and_config_symlinks_cannot_escape_private_home():
+    from agd_lib import worker_skills, store
+    with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
+        home = Path(directory)
+        target = Path(outside)
+        os.symlink(target, home/'config')
+        for action in (lambda: worker_skills.catalog(home),
+                       lambda: worker_skills.resolve(home)):
+            try:
+                action()
+            except store.Refusal:
+                continue
+            raise AssertionError('config parent symlink escaped private home')
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory)
+        (home/'config').mkdir()
+        for name, action in (
+                ('workers.json', lambda: worker_skills.resolve(home)),
+                ('worker-skills', lambda: worker_skills.catalog(home))):
+            os.symlink(home/f'missing-{name}', home/'config'/name)
+            try:
+                action()
+            except store.Refusal:
+                (home/'config'/name).unlink()
+                continue
+            raise AssertionError(f'dangling {name} symlink was treated as absent')
+
+
+def test_launch_selection_flags_resolve_before_an_endpoint_starts():
+    from support import lab, command
+    from agd_lib import tasks
+    os.environ['PATH'] = '/tmp/agd-treehouse-v3.1.6:' + os.environ['PATH']
+    with lab() as (home, project):
+        brief = home/'brief.md'
+        brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'selection', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        result = command(home, 'worker', 'launch', 'selection', '--profile', 'missing',
+                         expected=3)
+        assert 'unknown profile' in result.stderr
+        assert tasks.read(home, 'selection')['phase'] == 'prepared'
+        assert tasks.read(home, 'selection')['lease_id'] == task['lease_id']
+
+
 if __name__ == '__main__':
     test_verified_omp_skill_root_is_project_local()
     test_unverified_cursor_has_no_skill_provisioning_root()
@@ -122,3 +167,5 @@ if __name__ == '__main__':
     test_invalid_worker_skill_configuration_refuses_instead_of_degrading()
     test_catalog_rejects_missing_or_malformed_bundles()
     test_worker_skill_and_profile_lists_are_deterministic_json()
+    test_catalog_and_config_symlinks_cannot_escape_private_home()
+    test_launch_selection_flags_resolve_before_an_endpoint_starts()
