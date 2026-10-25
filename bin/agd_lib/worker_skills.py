@@ -410,10 +410,19 @@ def verify(home: Path, task: dict) -> None:
 
 def remove(home: Path, task: dict) -> None:
     import shutil
-    verify(home, task)
-    for record in _manifest(home, task)['skills']:
-        shutil.rmtree(record['destination'])
-    _exclude(home, task, _manifest(home, task).get('excludes', []), False)
+    manifest = _manifest(home, task)
+    if manifest.get('state') != 'removing':
+        verify(home, task)
+        manifest['state'] = 'removing'
+        store.atomic_json(_journal(home, task), manifest)
+    for record in manifest['skills']:
+        destination = Path(record['destination'])
+        if destination.exists() or destination.is_symlink():
+            _check(record, destination)
+            shutil.rmtree(destination)
+    _exclude(home, task, manifest.get('excludes', []), False)
+    manifest['state'] = 'removed'
+    store.atomic_json(_journal(home, task), manifest)
 
 
 def _exclude(home, task, paths, add):
