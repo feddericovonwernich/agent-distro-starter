@@ -214,6 +214,89 @@ def test_prepare_freezes_and_materializes_a_skill_bundle():
         assert manifest['selection']['skills'] == ['agd-probe']
 
 
+def test_shared_common_git_exclusion_waits_for_last_owner():
+    from agd_lib import worker_skills
+    from test_projects import run
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        first, second = root/'first', root/'second'
+        first.mkdir()
+        run(['git', 'init', '-b', 'main', first])
+        run(['git', 'config', 'user.email', 'test@example.invalid'], cwd=first)
+        run(['git', 'config', 'user.name', 'Distro Test'], cwd=first)
+        (first/'value.txt').write_text('base\n')
+        run(['git', 'add', 'value.txt'], cwd=first)
+        run(['git', 'commit', '-m', 'initial'], cwd=first)
+        run(['git', 'worktree', 'add', second], cwd=first)
+        tasks = []
+        for number, worktree in enumerate((first, second), 1):
+            home = root/f'home-{number}'
+            add_skill(home, 'agd-probe')
+            task = {'id': f'task-{number}', 'worktree': str(worktree), 'harness': 'omp',
+                    'lease_id': f'lease-{number}'}
+            worker_skills.prepare(home, task, {
+                'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+            tasks.append((home, task))
+        common = (first/run(['git', 'rev-parse', '--git-common-dir'], cwd=first).stdout.strip()).resolve()
+        exclude = common/'info'/'exclude'
+        exclude.write_text(exclude.read_text() + 'keep-user-entry\n')
+        worker_skills.remove(*tasks[0])
+        assert '/.omp/skills/agd-probe/\n' in exclude.read_text()
+        worker_skills.remove(*tasks[1])
+        assert '/.omp/skills/agd-probe/\n' not in exclude.read_text()
+        assert 'keep-user-entry\n' in exclude.read_text()
+
+
+def test_ensure_recovers_missing_artifacts_and_verify_refuses_foreign_or_tracked_content():
+    from agd_lib import worker_skills, store
+    from test_projects import run
+    with tempfile.TemporaryDirectory() as directory:
+        home, worktree = Path(directory)/'home', Path(directory)/'worktree'
+        worktree.mkdir()
+        run(['git', 'init', '-b', 'main', worktree])
+        add_skill(home, 'agd-probe')
+        task = {'id': 'recovery', 'worktree': str(worktree), 'harness': 'omp', 'lease_id': 'lease'}
+        worker_skills.prepare(home, task, {
+            'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+        generated = worktree/'.omp'/'skills'/'agd-probe'
+        import shutil
+        shutil.rmtree(generated)
+        worker_skills.ensure(home, task)
+        (generated/'foreign.txt').write_text('foreign\n')
+        try:
+            worker_skills.verify(home, task)
+        except store.Refusal:
+            pass
+        else:
+            raise AssertionError('foreign artifact passed verification')
+        (generated/'foreign.txt').unlink()
+        run(['git', 'add', '-f', generated/'SKILL.md'], cwd=worktree)
+        try:
+            worker_skills.verify(home, task)
+        except store.Refusal:
+            return
+        raise AssertionError('staged worker skill passed verification')
+
+
+
+def test_verify_refuses_modified_frozen_snapshot():
+    from agd_lib import worker_skills, store
+    from test_projects import run
+    with tempfile.TemporaryDirectory() as directory:
+        home, worktree = Path(directory)/'home', Path(directory)/'worktree'
+        worktree.mkdir()
+        run(['git', 'init', '-b', 'main', worktree])
+        add_skill(home, 'agd-probe')
+        task = {'id': 'snapshot', 'worktree': str(worktree), 'harness': 'omp', 'lease_id': 'lease'}
+        worker_skills.prepare(home, task, {
+            'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+        (home/'data'/'tasks'/'snapshot'/'worker-skills'/'agd-probe'/'SKILL.md').write_text('altered\n')
+        try:
+            worker_skills.verify(home, task)
+        except store.Refusal:
+            return
+        raise AssertionError('modified snapshot passed verification')
+
 if __name__ == '__main__':
     test_verified_omp_skill_root_is_project_local()
     test_unverified_cursor_has_no_skill_provisioning_root()
@@ -226,3 +309,6 @@ if __name__ == '__main__':
     test_config_parent_must_be_a_real_directory()
     test_launch_selection_flags_resolve_before_an_endpoint_starts()
     test_prepare_freezes_and_materializes_a_skill_bundle()
+    test_shared_common_git_exclusion_waits_for_last_owner()
+    test_ensure_recovers_missing_artifacts_and_verify_refuses_foreign_or_tracked_content()
+    test_verify_refuses_modified_frozen_snapshot()
