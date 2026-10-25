@@ -39,3 +39,7 @@ For a private home elsewhere, set `AGD_HOME` to its absolute path before `bin/ag
 For the optional Herdr backend, run from a Herdr-managed pane and set `AGD_HERDR_SESSION` to a separately started, non-default named server before launching OMP; see [operations](docs/operations.md). Cursor workers still require account authentication and live transcript validation.
 
 `project remove app` only unregisters and preserves the clone. Clone deletion needs a project-scoped approval and refuses retained tasks, uncommitted work and unverifiable local refs. No command publishes or merges without a separate, exact-target approval.
+
+## Customize an instance
+
+Read the [customization skill](.agents/skills/customize/SKILL.md) when changing persona, workflows, tools, worker behavior or UI. It maps each request to its actual consumer and explains activation, approvals and update implications. `config/` is not a generic settings system, and tracked local customizations may require deliberate integration with upstream rather than a fast-forward update.
