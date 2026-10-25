@@ -284,6 +284,36 @@ def _manifest(home, task):
     return data
 
 
+def _native_names(root):
+    if root.parent.is_symlink():
+        _refusal(f'native skill parent is symlinked: {root.parent}')
+    if root.is_symlink():
+        _refusal(f'native skill root is symlinked: {root}')
+    if not root.exists():
+        return set()
+    names, stack = set(), [root]
+    while stack:
+        directory = stack.pop()
+        for item in directory.iterdir():
+            identity = os.lstat(item)
+            if stat.S_ISLNK(identity.st_mode):
+                _refusal(f'native skill root contains a symlink: {item}')
+            if stat.S_ISDIR(identity.st_mode):
+                stack.append(item)
+            elif item.name == 'SKILL.md' and stat.S_ISREG(identity.st_mode):
+                name = item.parent.name
+                lines = item.read_text().splitlines()
+                if lines and lines[0] == '---':
+                    for line in lines[1:]:
+                        if line == '---':
+                            break
+                        if line.startswith('name: '):
+                            name = line[6:]
+                            break
+                names.add(name)
+    return names
+
+
 def prepare(home: Path, task: dict, selection: dict) -> dict:
     if selection.get('schema') != 1 or not isinstance(selection.get('skills'), list):
         _refusal('invalid worker skill selection')
@@ -307,9 +337,9 @@ def prepare(home: Path, task: dict, selection: dict) -> dict:
             _refusal(f'missing catalog skill {skill_id}')
         ancestor = Path(task['worktree']).resolve()
         while True:
-            collision = ancestor/roots[0]/skill_id
-            if collision.exists() or collision.is_symlink():
-                _refusal(f'worker skill collides with native project discovery: {collision}')
+            native = ancestor/roots[0]
+            if skill_id in _native_names(native):
+                _refusal(f'worker skill collides with native project discovery: {native}')
             if ancestor.parent == ancestor:
                 break
             ancestor = ancestor.parent

@@ -297,6 +297,36 @@ def test_verify_refuses_modified_frozen_snapshot():
             return
         raise AssertionError('modified snapshot passed verification')
 
+
+def test_native_alias_and_symlinked_skill_parents_refuse_provisioning():
+    from agd_lib import worker_skills, store
+    from test_projects import run
+    with tempfile.TemporaryDirectory() as directory:
+        root, home, worktree = Path(directory), Path(directory)/'home', Path(directory)/'project'/'task'
+        worktree.mkdir(parents=True)
+        run(['git', 'init', '-b', 'main', worktree])
+        add_skill(home, 'agd-probe')
+        alias = root/'project'/'.omp'/'skills'/'other'
+        alias.mkdir(parents=True)
+        (alias/'SKILL.md').write_text('---\nname: agd-probe\ndescription: collision\n---\n')
+        task = {'id': 'alias', 'worktree': str(worktree), 'harness': 'omp', 'lease_id': 'lease'}
+        try:
+            worker_skills.prepare(home, task, {
+                'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+        except store.Refusal:
+            pass
+        else:
+            raise AssertionError('frontmatter alias collision was accepted')
+        shutil = __import__('shutil')
+        shutil.rmtree(root/'project'/'.omp')
+        os.symlink(root/'elsewhere', root/'project'/'.omp')
+        try:
+            worker_skills.prepare(home, task, {
+                'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+        except store.Refusal:
+            return
+        raise AssertionError('symlinked native skill parent was accepted')
+
 if __name__ == '__main__':
     test_verified_omp_skill_root_is_project_local()
     test_unverified_cursor_has_no_skill_provisioning_root()
@@ -312,3 +342,4 @@ if __name__ == '__main__':
     test_shared_common_git_exclusion_waits_for_last_owner()
     test_ensure_recovers_missing_artifacts_and_verify_refuses_foreign_or_tracked_content()
     test_verify_refuses_modified_frozen_snapshot()
+    test_native_alias_and_symlinked_skill_parents_refuse_provisioning()
