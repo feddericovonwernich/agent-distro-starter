@@ -270,10 +270,14 @@ def _manifest(home, task):
     if not path.is_file() or path.is_symlink():
         _refusal('worker skill journal is missing')
     data = _json(path)
-    if not isinstance(data, dict) or data.get('schema') != 1 or not isinstance(data.get('skills'), list):
+    from . import harnesses
+    if (not isinstance(data, dict) or data.get('schema') != 1 or
+            data.get('harness') != task.get('harness') or
+            data.get('roots') != list(harnesses.worker_skill_roots(task['harness'])) or
+            not isinstance(data.get('skills'), list)):
         _refusal('invalid worker skill journal')
     snapshot_root = _snapshot(home, task)
-    root = Path(task['worktree']).resolve()/Path(data.get('roots', [''])[0])
+    root = Path(task['worktree'])/data['roots'][0]
     for record in data['skills']:
         if not isinstance(record, dict) or _id(record.get('id'), 'journal skill') != record['id']:
             _refusal('invalid worker skill journal record')
