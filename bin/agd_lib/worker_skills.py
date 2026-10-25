@@ -278,14 +278,17 @@ def _manifest(home, task):
         _refusal('invalid worker skill journal')
     snapshot_root = _snapshot(home, task)
     root = Path(task['worktree'])/data['roots'][0]
+    for parent in (root.parent, root):
+        if parent.is_symlink():
+            _refusal(f'worker skill destination parent is symlinked: {parent}')
     for record in data['skills']:
         if not isinstance(record, dict) or _id(record.get('id'), 'journal skill') != record['id']:
             _refusal('invalid worker skill journal record')
-        if Path(record.get('source', '')).resolve() != _private_path(home, 'config', 'worker-skills', record['id']).resolve():
+        if Path(record.get('source', '')) != _private_path(home, 'config', 'worker-skills', record['id']):
             _refusal('worker skill source path escaped catalog')
-        if Path(record.get('snapshot', '')).resolve() != (snapshot_root/record['id']).resolve():
+        if Path(record.get('snapshot', '')) != snapshot_root/record['id']:
             _refusal('worker skill snapshot path escaped task data')
-        if Path(record.get('destination', '')).resolve() != (root/record['id']).resolve():
+        if Path(record.get('destination', '')) != root/record['id']:
             _refusal('worker skill destination escaped task worktree')
     return data
 
@@ -381,6 +384,8 @@ def _check(record, root):
 
 def ensure(home: Path, task: dict) -> None:
     manifest = _manifest(home, task)
+    if manifest.get('state') in ('removing', 'removed'):
+        _refusal('worker skill artifacts are being removed or removed')
     _exclude(home, task, manifest.get('excludes', []), True)
     for record in manifest['skills']:
         snapshot = Path(record['snapshot'])
