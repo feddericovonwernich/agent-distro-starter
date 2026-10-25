@@ -21,6 +21,10 @@ def read(home, task_id):
 def save(home, task):
     store.atomic_json(task_file(home, task['id']), task)
 
+def treehouse_args(task):
+    return ['treehouse', '--root', task['treehouse_root']] if task.get('treehouse_root') else ['treehouse']
+
+
 
 def create(home, task_id, project_id, brief, base=None, kind='ship'):
     store.validate_id(task_id)
@@ -42,6 +46,9 @@ def create(home, task_id, project_id, brief, base=None, kind='ship'):
         task = dict(schema=1, id=task_id, project=project_id, kind=kind, phase='preparing',
                     condition='normal', base=base, start=start, branch='agd/'+task_id,
                     lease_holder=holder, attempt=attempt, executor='central')
+        if os.environ.get('TREEHOUSE_ROOT'):
+            root = Path(os.environ['TREEHOUSE_ROOT'])
+            task['treehouse_root'] = str(root if root.is_absolute() else (clone/root).resolve())
         directory = task_file(home, task_id).parent
         directory.mkdir(parents=True, mode=0o700)
         (directory/'brief.md').write_text(brief_text)
@@ -50,7 +57,7 @@ def create(home, task_id, project_id, brief, base=None, kind='ship'):
     empty.write_text('')
     try:
         allocation = json.loads(store.run(
-            ['treehouse', 'get', '--lease', '--json', '--lease-holder', holder,
+            [*treehouse_args(task), 'get', '--lease', '--json', '--lease-holder', holder,
              '--base', base, '--branch', task['branch'], '--include-file', str(empty)],
             cwd=clone, timeout=120).stdout)
         path = Path(allocation['path']).resolve()
@@ -73,7 +80,7 @@ def reconcile_allocation(home, task_id):
     if task['phase'] != 'preparing':
         return task
     project = projects.read(home, task['project'])
-    status = json.loads(store.run(['treehouse', 'status', '--json'], cwd=project['path']).stdout)
+    status = json.loads(store.run([*treehouse_args(task), 'status', '--json'], cwd=project['path']).stdout)
     matches = [item for item in status if item.get('lease_holder') == task['lease_holder']]
     if len(matches) != 1:
         raise store.Refusal(f'lease allocation uncertain: {len(matches)} matching slots; inspect Treehouse')
@@ -96,7 +103,7 @@ def verify_workspace(home, task):
         raise store.Refusal('task Git clone identity changed')
     if store.git(work, 'branch', '--show-current') != task['branch']:
         raise store.Refusal('task branch identity changed')
-    status = json.loads(store.run(['treehouse', 'status', '--json'], cwd=project['path']).stdout)
+    status = json.loads(store.run([*treehouse_args(task), 'status', '--json'], cwd=project['path']).stdout)
     matches = [row for row in status if Path(row['path']).resolve() == work.resolve()]
     if len(matches) != 1 or matches[0].get('lease_id') != task['lease_id'] or matches[0].get('lease_holder') != task['lease_holder']:
         raise store.Refusal('task lease identity changed')
@@ -104,21 +111,24 @@ def verify_workspace(home, task):
 
 
 def ready(home, task_id, report):
-    task = read(home, task_id)
-    if task['phase'] != 'prepared':
-        raise store.Refusal('task is not prepared')
-    work = verify_workspace(home, task)
-    if not store.clean(work):
-        raise store.Refusal('task workspace has uncommitted or untracked changes')
-    head = store.git(work, 'rev-parse', 'HEAD')
-    if task['kind'] == 'ship' and (head == task['start'] or store.run(['git', 'merge-base', '--is-ancestor', task['start'], head], cwd=work, check=False).returncode):
-        raise store.Refusal('ship task needs committed changes from its base')
-    if task['kind'] == 'scout' and head != task['start']:
-        raise store.Refusal('scout contains unexpected commits')
     text = Path(report).read_text()
     if not text.strip():
         raise store.Refusal('empty report')
     with store.lock(home):
+        task = read(home, task_id)
+        if task['phase'] not in ('prepared', 'running'):
+            raise store.Refusal('task not prepared or running')
+        if os.environ.get('AGD_TASK_ID') and (os.environ['AGD_TASK_ID'] != task_id or
+                                              os.environ.get('AGD_INCARNATION') != task.get('incarnation')):
+            raise store.Refusal('worker incarnation cannot report this task')
+        work = verify_workspace(home, task)
+        if not store.clean(work):
+            raise store.Refusal('task workspace has uncommitted or untracked changes')
+        head = store.git(work, 'rev-parse', 'HEAD')
+        if task['kind'] == 'ship' and (head == task['start'] or store.run(['git', 'merge-base', '--is-ancestor', task['start'], head], cwd=work, check=False).returncode):
+            raise store.Refusal('ship task needs committed changes from its base')
+        if task['kind'] == 'scout' and head != task['start']:
+            raise store.Refusal('scout contains unexpected commits')
         (task_file(home, task_id).parent/'report.md').write_text(text)
         task.update(phase='ready', ready_head=head, report='report.md')
         save(home, task)
@@ -172,11 +182,21 @@ def inventory(work):
     return digest.hexdigest()
 
 
+def require_stopped_worker(home, task):
+    if task.get('executor') != 'worker':
+        return
+    from . import workers
+    if task.get('worker_alive') is not False or not task.get('endpoint') or workers.inspect(home, task['id'])['endpoint']['presence'] != 'missing':
+        raise store.Refusal('worker and owned endpoint not proved stopped')
+
+
 def land(home, task_id, approval_id):
     task = read(home, task_id)
     project = projects.read(home, task['project'])
     target = task['project'] + ':' + task['base']
     with store.lock(home):
+        task = read(home, task_id)
+        require_stopped_worker(home, task)
         if task['phase'] not in ('ready', 'landed'):
             raise store.Refusal('task is not ready to land')
         authorization(home, task, approval_id, 'local-merge', target)
@@ -203,11 +223,11 @@ def cleanup(home, task_id, discard=False, approval_id=None):
     task = read(home, task_id)
     project = projects.read(home, task['project'])
     with store.lock(home):
+        task = read(home, task_id)
         if task['phase'] == 'cleaned':
             return task
         work = verify_workspace(home, task)
-        if task.get('worker') and task.get('worker_alive') is not False:
-            raise store.Refusal('worker not proved stopped')
+        require_stopped_worker(home, task)
         if discard:
             if not approval_id:
                 raise store.Refusal('discard requires approval')
@@ -223,7 +243,7 @@ def cleanup(home, task_id, discard=False, approval_id=None):
                     raise store.Refusal('task work has not landed')
                 if store.run(['git', 'merge-base', '--is-ancestor', task['ready_head'], task['base']], cwd=project['path'], check=False).returncode:
                     raise store.Refusal('landing ancestry unconfirmed')
-        argv = ['treehouse', 'return', task['worktree'], '--if-lease-id', task['lease_id'],
+        argv = [*treehouse_args(task), 'return', task['worktree'], '--if-lease-id', task['lease_id'],
                 '--if-lease-holder', task['lease_holder']]
         if discard:
             argv.append('--force')
@@ -249,8 +269,8 @@ def publication_record(home, task_id, approval_id, remote, branch, url, evidence
         if not remote_head or remote_head.split()[0] != task['ready_head']:
             raise store.Refusal('published remote head not proven')
         evidence = Path(evidence_file).read_text()
-        if not evidence.strip():
-            raise store.Refusal('forge output evidence required')
+        if url not in evidence:
+            raise store.Refusal('review URL is not present in forge output evidence')
         (task_file(home, task_id).parent/'publication.txt').write_text(evidence)
         task['publication'] = dict(url=url, remote=remote, branch=branch, head=task['ready_head'], approval=approval['id'])
         save(home, task)

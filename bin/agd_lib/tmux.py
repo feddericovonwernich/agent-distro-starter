@@ -21,10 +21,14 @@ def create(home: Path, task_id: str, incarnation: str, cwd: Path, argv: list[str
         store.run([*cmd, 'new-session', '-d', '-s', session, '-n', 'anchor', '-c', str(home)], timeout=10)
     server_pid = store.run([*cmd, 'display-message', '-p', '#{pid}']).stdout.strip()
     token = str(uuid.uuid4())
+    receipt = home/'state'/'tasks'/task_id/'endpoint.json'
+    reservation = dict(prefix=cmd, session=session, server_pid=server_pid,
+                       token=token, task=task_id, incarnation=incarnation)
+    store.atomic_json(receipt, reservation)
     pane = store.run([*cmd, 'new-window', '-d', '-P', '-F', '#{pane_id}', '-t', session,
                       '-n', task_id, '-c', str(cwd), shlex.join(argv)]).stdout.strip()
-    endpoint = dict(prefix=cmd, session=session, server_pid=server_pid, pane=pane,
-                    token=token, task=task_id, incarnation=incarnation)
+    endpoint = dict(reservation, pane=pane)
+    store.atomic_json(receipt, endpoint)
     try:
         call(endpoint, 'set-option', '-p', '-t', pane, '@agd_owner', token)
     except Exception:
@@ -39,7 +43,10 @@ def owned(endpoint):
         raise store.Refusal('tmux server missing or replaced; endpoint identity unknown')
     token = call(endpoint, 'show-options', '-p', '-v', '-t', endpoint['pane'], '@agd_owner', check=False)
     if token.returncode:
-        return False
+        pane = call(endpoint, 'list-panes', '-F', '#{pane_id}', '-t', endpoint['pane'], check=False)
+        if pane.returncode:
+            return False
+        raise store.Refusal('pane exists without confirmed owner token')
     if token.stdout.strip() != endpoint['token']:
         raise store.Refusal('pane belongs to a different task/incarnation')
     return True

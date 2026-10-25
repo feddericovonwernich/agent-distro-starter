@@ -1,3 +1,4 @@
+import uuid
 import json
 import shutil
 from pathlib import Path
@@ -63,24 +64,58 @@ def refresh(home, project_id):
         store.git(clone, 'merge', '--ff-only', f'origin/{data["base"]}')
     return read(home, project_id)
 
+def approve(home, project_id, action, instruction):
+    if action != 'delete-clone':
+        raise ValueError('unsupported project approval')
+    text = Path(instruction).read_text().strip()
+    if not text:
+        raise store.Refusal('explicit clone deletion instruction required')
+    with store.lock(home):
+        data = read(home, project_id)
+        clone = Path(data['path'])
+        evidence = dict(id=str(uuid.uuid4()), action=action, project=project_id,
+                        path=data['path'], common_dir=data['common_dir'],
+                        head=store.git(clone, 'rev-parse', 'HEAD'), instruction=text)
+        store.atomic_json(home/'data'/'projects'/f'{project_id}.approval.json', evidence)
+    return evidence
+
+
 
 def remove(home, project_id, delete=False, approval=None):
     data = read(home, project_id)
     with store.lock(home):
         for task_file in (home/'data'/'tasks').glob('*/task.json'):
-            if json.loads(task_file.read_text()).get('project') == project_id:
+            task = json.loads(task_file.read_text())
+            if task.get('project') == project_id and task.get('phase') != 'cleaned':
                 raise store.Refusal('project has retained tasks')
         if delete:
             evidence = home/'data'/'projects'/f'{project_id}.approval.json'
-            if not approval or not evidence.exists() or json.loads(evidence.read_text()).get('id') != approval:
+            if not approval or not evidence.exists():
                 raise store.Refusal('clone deletion needs scoped approval')
+            grant = json.loads(evidence.read_text())
             clone = Path(data['path'])
+            if (grant.get('id') != approval or grant.get('action') != 'delete-clone' or
+                grant.get('project') != project_id or grant.get('path') != data['path'] or
+                grant.get('common_dir') != data['common_dir'] or
+                grant.get('head') != store.git(clone, 'rev-parse', 'HEAD')):
+                raise store.Refusal('clone deletion approval identity changed')
             if not store.clean(clone) or store.git(clone, 'branch', '--show-current') != data['base']:
                 raise store.Refusal('clone has unlanded or dirty work')
+            if store.git(clone, 'ls-files', '--others', '--ignored', '--exclude-standard'):
+                raise store.Refusal('clone contains ignored local files; preserve them before deletion')
             if store.git(clone, 'branch', '--no-merged', data['base']) or store.git(clone, 'rev-list', f'origin/{data["base"]}..{data["base"]}'):
                 raise store.Refusal('clone has unlanded local commits')
+            refs = store.git(clone, 'for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/tags').splitlines()
+            if refs != [f'refs/heads/{data["base"]}']:
+                raise store.Refusal('clone has other local refs')
+            for commit in store.git(clone, 'reflog', '--all', '--format=%H').splitlines():
+                if store.run(['git', 'merge-base', '--is-ancestor', commit, f'origin/{data["base"]}'],
+                             cwd=clone, check=False).returncode:
+                    raise store.Refusal('clone reflog retains unpublished commits')
             shutil.rmtree(clone)
         record(home, project_id).unlink()
+        if delete:
+            evidence.unlink()
     return dict(removed=project_id, clone_deleted=delete)
 
 

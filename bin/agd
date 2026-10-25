@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import argparse
+import shutil
+import subprocess
 import json
 import sys
 import uuid
 from pathlib import Path
-from agd_lib import projects, store, tasks
+from agd_lib import projects, store, tasks, workers, supervision
 
 
 def parser():
@@ -12,8 +14,11 @@ def parser():
     p.add_argument('--home')
     sub = p.add_subparsers(dest='command', required=True)
     sub.add_parser('init')
+    doctor = sub.add_parser('doctor')
+    doctor.add_argument('--harness', choices=('omp', 'cursor'), default='omp')
+    doctor.add_argument('--backend', choices=('tmux', 'herdr'), default='tmux')
     project = sub.add_parser('project').add_subparsers(dest='operation', required=True)
-    for action in ('add', 'register', 'inspect', 'refresh', 'remove', 'trust'):
+    for action in ('add', 'register', 'inspect', 'refresh', 'remove', 'trust', 'approve'):
         op = project.add_parser(action)
         op.add_argument('id')
         if action == 'add':
@@ -23,6 +28,9 @@ def parser():
             op.add_argument('--path', required=True)
             op.add_argument('--base', default='main')
         if action == 'trust':
+            op.add_argument('--instruction', required=True)
+        if action == 'approve':
+            op.add_argument('--action', required=True, choices=('delete-clone',))
             op.add_argument('--instruction', required=True)
         if action == 'remove':
             op.add_argument('--delete-clone', action='store_true')
@@ -58,17 +66,82 @@ def parser():
     publication.add_argument('id')
     for option in ('approval', 'remote', 'branch', 'url', 'evidence'):
         publication.add_argument('--'+option, required=True)
+    worker = sub.add_parser('worker').add_subparsers(dest='operation', required=True)
+    for action in ('launch', 'run', 'event', 'inspect', 'send', 'inbox', 'acknowledge', 'interrupt', 'stop', 'relaunch'):
+        op = worker.add_parser(action)
+        op.add_argument('id')
+        if action == 'launch':
+            op.add_argument('--harness', choices=('omp', 'cursor'), default='omp')
+            op.add_argument('--backend', choices=('tmux', 'herdr'), default='tmux')
+            op.add_argument('--unattended', action='store_true')
+            op.add_argument('--approval')
+        if action in ('run', 'event'):
+            op.add_argument('--incarnation', required=True)
+        if action == 'event':
+            op.add_argument('--kind', required=True)
+            op.add_argument('--key', required=True)
+            op.add_argument('--message', required=True)
+        if action == 'send':
+            op.add_argument('--file', required=True)
+        if action == 'acknowledge':
+            op.add_argument('message_id')
+    decision = sub.add_parser('decision').add_subparsers(dest='operation', required=True)
+    resolve = decision.add_parser('resolve')
+    resolve.add_argument('id')
+    resolve.add_argument('key')
+    resolve.add_argument('--answer', required=True)
+    session = sub.add_parser('session').add_subparsers(dest='operation', required=True)
+    start = session.add_parser('start')
+    start.add_argument('--owner-pid', type=int, required=True)
+    start.add_argument('--owner-start', required=True)
+    start.add_argument('--generation', required=True)
+    session.add_parser('status')
+    session.add_parser('reconcile')
+    events = sub.add_parser('events').add_subparsers(dest='operation', required=True)
+    events.add_parser('list')
+    ack = events.add_parser('acknowledge')
+    ack.add_argument('ids', nargs='+')
     return p
 
 
 def main(args):
     home = store.home(args.home)
+    mutation = (args.command == 'init' or
+                args.command == 'project' and args.operation not in ('list', 'inspect') or
+                args.command == 'task' and args.operation not in ('list', 'status') or
+                args.command == 'worker' and args.operation not in ('inspect', 'inbox') or
+                args.command == 'decision' or
+                args.command == 'session' and args.operation == 'reconcile' or
+                args.command == 'events' and args.operation == 'acknowledge')
+    if mutation:
+        worker_scoped = (args.command == 'worker' and args.operation in ('run', 'event', 'acknowledge') or
+                         args.command == 'task' and args.operation == 'ready')
+        store.require_owner(home, worker_scoped)
     if args.command == 'init':
         for name in ('config', 'projects', 'data/projects', 'data/tasks', 'state'):
             (home/name).mkdir(parents=True, exist_ok=True, mode=0o700)
         if not (home/'data'/'home.json').exists():
             store.atomic_json(home/'data'/'home.json', {'schema': 1, 'home_id': str(uuid.uuid4())})
         return {'home': str(home)}
+    if args.command == 'doctor':
+        names = ['git', 'treehouse', 'omp' if args.harness == 'omp' else 'cursor-agent',
+                 args.backend]
+        found = {}
+        for name in names:
+            binary = shutil.which(name)
+            if not binary:
+                found[name] = {'available': False, 'reason': f'install {name} independently'}
+                continue
+            version = subprocess.run([binary, '-V' if name == 'tmux' else '--version'],
+                                     stdin=subprocess.DEVNULL, capture_output=True,
+                                     text=True, timeout=10)
+            text = (version.stdout or version.stderr).strip()
+            compatible = version.returncode == 0 and (name != 'treehouse' or text == 'v3.1.6')
+            found[name] = {'available': compatible, 'version': text[:120],
+                           'path': binary, 'reason': '' if compatible else
+                           ('use pinned Treehouse v3.1.6' if name == 'treehouse' else 'version check failed')}
+        return {'dependencies': found, 'ready': all(row['available'] for row in found.values()),
+                'approval': 'Explicit project trust is required for Cursor; unattended workers need scoped approval.'}
     if args.command == 'project':
         if args.operation == 'list':
             return [projects.read(home, f.stem) for f in sorted((home/'data'/'projects').glob('*.json')) if not f.name.endswith('.approval.json')]
@@ -84,11 +157,13 @@ def main(args):
             return projects.remove(home, args.id, args.delete_clone, args.approval)
         if args.operation == 'trust':
             return projects.trust(home, args.id, args.instruction)
+        if args.operation == 'approve':
+            return projects.approve(home, args.id, args.action, args.instruction)
     if args.command == 'task':
         if args.operation == 'create':
             return tasks.create(home, args.id, args.project, args.brief, args.base, args.kind)
         if args.operation == 'status':
-            return tasks.read(home, args.id)
+            return dict(tasks.read(home, args.id), open_decisions=supervision.decisions(home, args.id))
         if args.operation == 'list':
             return [tasks.read(home, f.parent.name) for f in sorted((home/'data'/'tasks').glob('*/task.json'))]
         if args.operation == 'reconcile':
@@ -104,12 +179,49 @@ def main(args):
         if args.operation == 'publication-record':
             return tasks.publication_record(home, args.id, args.approval, args.remote,
                                             args.branch, args.url, args.evidence)
+    if args.command == 'worker':
+        if args.operation == 'launch':
+            return workers.launch(home, args.id, args.harness, args.backend, args.unattended, args.approval)
+        if args.operation == 'run':
+            return workers.run_worker(home, args.id, args.incarnation)
+        if args.operation == 'event':
+            return workers.event(home, args.id, args.incarnation, args.kind, args.key, args.message)
+        if args.operation == 'inspect':
+            return workers.inspect(home, args.id)
+        if args.operation == 'send':
+            return workers.send(home, args.id, args.file)
+        if args.operation == 'inbox':
+            return workers.inbox(home, args.id)
+        if args.operation == 'acknowledge':
+            return workers.acknowledge(home, args.id, args.message_id)
+        if args.operation == 'interrupt':
+            return workers.interrupt(home, args.id)
+        if args.operation == 'stop':
+            return workers.stop(home, args.id)
+        if args.operation == 'relaunch':
+            return workers.relaunch(home, args.id)
+    if args.command == 'decision':
+        return supervision.resolve(home, args.id, args.key, args.answer)
+    if args.command == 'session':
+        if args.operation == 'start':
+            return supervision.watch(home, args.owner_pid, args.owner_start, args.generation)
+        if args.operation == 'status':
+            return supervision.status(home)
+        if args.operation == 'reconcile':
+            return supervision.reconcile(home)
+    if args.command == 'events':
+        if args.operation == 'list':
+            return supervision.pending(home)
+        if args.operation == 'acknowledge':
+            return supervision.acknowledge(home, args.ids)
     raise ValueError('unsupported command')
 
 
 if __name__ == '__main__':
     try:
-        print(json.dumps(main(parser().parse_args())))
+        result = main(parser().parse_args())
+        if result is not None:
+            print(json.dumps(result))
     except (ValueError, store.Refusal, store.DependencyError) as error:
         print(str(error), file=sys.stderr)
         sys.exit(2 if isinstance(error, ValueError) else 4 if isinstance(error, store.DependencyError) else 3)

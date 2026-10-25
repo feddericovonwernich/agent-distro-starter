@@ -22,6 +22,16 @@ def test_ready_is_not_cleanup_authority():
         instruction = home/'approval.txt'
         instruction.write_text('Merge task change into sample main locally.\n')
         approval = command(home, 'task', 'approve', 'change', '--action', 'local-merge', '--target', 'sample:main', '--instruction', str(instruction))
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'bin'))
+        from agd_lib import tasks
+        active = tasks.read(home, 'change')
+        active.update(executor='worker', worker_alive=True, incarnation='live')
+        tasks.save(home, active)
+        command(home, 'task', 'land', 'change', '--approval', approval['id'], expected=3)
+        assert (project/'value.txt').read_text() == 'base\n'
+        active.update(executor='central')
+        tasks.save(home, active)
         command(home, 'task', 'land', 'change', '--approval', approval['id'])
         assert (project/'value.txt').read_text() == 'changed\n'
         command(home, 'task', 'cleanup', 'change')
@@ -94,6 +104,13 @@ def test_publication_record_requires_head_bound_approval():
                 '--remote', 'origin', '--branch', 'agd/review',
                 '--url', 'https://example.invalid/pull/1', '--evidence', str(evidence), expected=3)
         assert command(home, 'task', 'status', 'review')['phase'] == 'ready'
+        instruction = home/'publish-approval.md'; instruction.write_text('Publish review for this exact branch.\n')
+        approval = command(home, 'task', 'approve', 'review', '--action', 'publish',
+                           '--target', 'origin:agd/review', '--instruction', str(instruction))
+        command(home, 'task', 'publication-record', 'review', '--approval', approval['id'],
+                '--remote', 'origin', '--branch', 'agd/review',
+                '--url', 'https://example.invalid/pull/1', '--evidence', str(evidence), expected=3)
+        assert 'publication' not in command(home, 'task', 'status', 'review')
 
 if __name__ == '__main__':
     test_ready_is_not_cleanup_authority()

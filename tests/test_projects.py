@@ -50,6 +50,22 @@ def test_project_lifecycle():
         assert command(home, 'project', 'trust', 'sample', '--instruction', str(instruction))['trusted']
         command(home, 'project', 'add', '../escape', '--source', str(origin), expected=2)
         assert not (root/'escape').exists()
+        (project/'value.txt').write_text('base\n')
+        deletion = home/'delete-consent.txt'
+        deletion.write_text('Delete only this disposable sample clone.\n')
+        approval = command(home, 'project', 'approve', 'sample', '--action', 'delete-clone',
+                           '--instruction', str(deletion))
+        with (project/'.git'/'info'/'exclude').open('a') as stream:
+            stream.write('\nprivate-note.txt\n')
+        private = project/'private-note.txt'
+        private.write_text('keep this ignored material\n')
+        command(home, 'project', 'remove', 'sample', '--delete-clone',
+                '--approval', approval['id'], expected=3)
+        assert private.read_text() == 'keep this ignored material\n'
+        private.unlink()
+        assert command(home, 'project', 'remove', 'sample', '--delete-clone',
+                       '--approval', approval['id'])['clone_deleted']
+        assert not project.exists()
 
 
 if __name__ == '__main__':

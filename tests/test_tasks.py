@@ -42,5 +42,36 @@ def test_distinct_leases_and_preserved_project():
         assert recovered['worktree'] == b['worktree']
 
 
+def test_lease_survives_missing_environment_override():
+    from support import lab
+    from test_projects import CLI
+    with lab() as (home, project):
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        command(home, 'task', 'create', 'standalone', '--project', 'sample',
+                '--brief', str(brief), '--kind', 'scout')
+        report = home/'report.md'; report.write_text('Read value.txt: base. Checked read.\n')
+        env = dict(os.environ)
+        env.pop('TREEHOUSE_ROOT', None)
+        result = run([CLI, '--home', home, 'task', 'ready', 'standalone', '--report', report],
+                     env=env)
+        assert __import__('json').loads(result.stdout)['phase'] == 'ready'
+
+
+def test_cleaned_history_does_not_block_unregister():
+    from support import lab
+    with lab() as (home, project):
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        command(home, 'task', 'create', 'past', '--project', 'sample',
+                '--brief', str(brief), '--kind', 'scout')
+        report = home/'report.md'; report.write_text('value.txt contains base.\n')
+        command(home, 'task', 'ready', 'past', '--report', str(report))
+        command(home, 'task', 'cleanup', 'past')
+        command(home, 'project', 'remove', 'sample')
+        assert project.is_dir()
+        assert command(home, 'task', 'status', 'past')['phase'] == 'cleaned'
+
+
 if __name__ == '__main__':
     test_distinct_leases_and_preserved_project()
+    test_lease_survives_missing_environment_override()
+    test_cleaned_history_does_not_block_unregister()

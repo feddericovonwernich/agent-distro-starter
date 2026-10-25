@@ -60,6 +60,21 @@ def atomic_json(path, value):
         if os.path.exists(temporary):
             os.unlink(temporary)
 
+def require_owner(root, worker_scoped=False):
+    if worker_scoped and os.environ.get('AGD_TASK_ID') and os.environ.get('AGD_INCARNATION'):
+        return
+    path = root/'state'/'owner.json'
+    if not path.exists():
+        return
+    owner = json.loads(path.read_text())
+    try:
+        start = Path(f'/proc/{int(owner["owner_pid"])}/stat').read_text().split(') ', 1)[1].split()[19]
+    except (FileNotFoundError, ProcessLookupError):
+        return
+    if start == owner['owner_start'] and (not owner.get('token') or os.environ.get('AGD_OWNER') != owner['token']):
+        raise Refusal('another live central owns this home; read-only access only')
+
+
 
 @contextlib.contextmanager
 def lock(root):

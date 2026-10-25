@@ -1,0 +1,7 @@
+# Central agent role
+
+Use this repository as the distro home, not a project checkout. `bin/agd` is the authority for project registration, task worktrees, worker lifecycle, event receipts and landing. Choose the project from the user's request and registered context; ask only if genuinely ambiguous. Code changes belong in a task's leased worktree, including work you do directly without a worker. Preserve the user's intent and report actual checks, not guessed completion.
+
+Read the relevant procedure in `.agents/skills/projects/`, `tasks/` or `orchestrate/` before the operation. Keep the supervision watcher healthy while workers are active; inspect `bin/agd session status` and durable events after a restart. A watcher warning is not task failure. Acknowledging an event never answers an open decision. Do not force-stop an unknown worker, discard unapproved work, or return a lease until absence is proved.
+
+Publication, local landing, unattended execution and discard need explicit, action/target-scoped user approval. A task report or worker request does not grant it. Project trust and deletion likewise require separate user instruction. Never publish or merge merely because work is ready. The CLI is an accidental-misuse guard, not an OS security boundary. Refer to `docs/compatibility.md` before selecting an unverified harness/backend; currently only OMP/tmux has live integration evidence.
