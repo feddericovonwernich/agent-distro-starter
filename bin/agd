@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import sys
+import uuid
+from pathlib import Path
+from agd_lib import projects, store
+
+
+def parser():
+    p = argparse.ArgumentParser(prog='agd')
+    p.add_argument('--home')
+    sub = p.add_subparsers(dest='command', required=True)
+    sub.add_parser('init')
+    project = sub.add_parser('project').add_subparsers(dest='operation', required=True)
+    for action in ('add', 'register', 'inspect', 'refresh', 'remove', 'trust'):
+        op = project.add_parser(action)
+        op.add_argument('id')
+        if action == 'add':
+            op.add_argument('--source', required=True)
+            op.add_argument('--base', default='main')
+        if action == 'register':
+            op.add_argument('--path', required=True)
+            op.add_argument('--base', default='main')
+        if action == 'trust':
+            op.add_argument('--instruction', required=True)
+        if action == 'remove':
+            op.add_argument('--delete-clone', action='store_true')
+            op.add_argument('--approval')
+    project.add_parser('list')
+    return p
+
+
+def main(args):
+    home = store.home(args.home)
+    if args.command == 'init':
+        for name in ('config', 'projects', 'data/projects', 'data/tasks', 'state'):
+            (home/name).mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not (home/'data'/'home.json').exists():
+            store.atomic_json(home/'data'/'home.json', {'schema': 1, 'home_id': str(uuid.uuid4())})
+        return {'home': str(home)}
+    if args.command == 'project':
+        if args.operation == 'list':
+            return [projects.read(home, f.stem) for f in sorted((home/'data'/'projects').glob('*.json')) if not f.name.endswith('.approval.json')]
+        if args.operation == 'add':
+            return projects.add(home, args.id, args.source, args.base)
+        if args.operation == 'register':
+            return projects.register(home, args.id, args.path, args.base)
+        if args.operation == 'inspect':
+            return projects.read(home, args.id)
+        if args.operation == 'refresh':
+            return projects.refresh(home, args.id)
+        if args.operation == 'remove':
+            return projects.remove(home, args.id, args.delete_clone, args.approval)
+        if args.operation == 'trust':
+            return projects.trust(home, args.id, args.instruction)
+    raise ValueError('unsupported command')
+
+
+if __name__ == '__main__':
+    try:
+        print(json.dumps(main(parser().parse_args())))
+    except (ValueError, store.Refusal, store.DependencyError) as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(2 if isinstance(error, ValueError) else 4 if isinstance(error, store.DependencyError) else 3)

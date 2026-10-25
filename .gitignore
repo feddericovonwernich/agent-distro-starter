@@ -1,1 +1,8 @@
 /.worktrees/
+/config/
+/projects/
+/data/
+/state/
+/.env
+__pycache__/
+*.pyc
