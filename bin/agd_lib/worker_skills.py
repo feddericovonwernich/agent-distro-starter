@@ -296,6 +296,14 @@ def prepare(home: Path, task: dict, selection: dict) -> dict:
     for skill_id in selection['skills']:
         if skill_id not in available:
             _refusal(f'missing catalog skill {skill_id}')
+        ancestor = Path(task['worktree']).resolve()
+        while True:
+            collision = ancestor/roots[0]/skill_id
+            if collision.exists() or collision.is_symlink():
+                _refusal(f'worker skill collides with native project discovery: {collision}')
+            if ancestor.parent == ancestor:
+                break
+            ancestor = ancestor.parent
         source = _private_path(home, 'config', 'worker-skills', skill_id)
         destination = root/skill_id
         if destination.exists() or destination.is_symlink():
