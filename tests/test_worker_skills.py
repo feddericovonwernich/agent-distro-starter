@@ -428,6 +428,30 @@ def test_remove_retries_after_first_owned_directory_deletion():
         assert 'user-entry\n' in exclude.read_text()
 
 
+def test_tampered_journal_cannot_touch_sibling_paths():
+    from agd_lib import worker_skills, store
+    from test_projects import run
+    with tempfile.TemporaryDirectory() as directory:
+        home, worktree = Path(directory)/'home', Path(directory)/'worktree'
+        worktree.mkdir(); run(['git', 'init', '-b', 'main', worktree])
+        add_skill(home, 'agd-probe')
+        task = {'id': 'tampered', 'worktree': str(worktree), 'harness': 'omp', 'lease_id': 'lease'}
+        worker_skills.prepare(home, task, {
+            'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+        sentinel = Path(directory)/'sentinel'; sentinel.mkdir(); (sentinel/'keep').write_text('keep')
+        journal = home/'data'/'tasks'/'tampered'/'worker-skills.json'
+        data = json.loads(journal.read_text())
+        data['skills'][0]['destination'] = str(sentinel)
+        journal.write_text(json.dumps(data))
+        for action in (lambda: worker_skills.ensure(home, task), lambda: worker_skills.remove(home, task)):
+            try:
+                action()
+            except store.Refusal:
+                continue
+            raise AssertionError('tampered journal was accepted')
+        assert (sentinel/'keep').read_text() == 'keep'
+
+
 if __name__ == '__main__':
     test_verified_omp_skill_root_is_project_local()
     test_unverified_cursor_has_no_skill_provisioning_root()
@@ -447,3 +471,4 @@ if __name__ == '__main__':
     test_pending_snapshot_retry_refuses_changed_catalog_source()
     test_retry_repairs_exclude_after_registry_write_failure()
     test_remove_retries_after_first_owned_directory_deletion()
+    test_tampered_journal_cannot_touch_sibling_paths()
