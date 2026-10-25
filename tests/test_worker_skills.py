@@ -337,16 +337,22 @@ def test_pending_snapshot_retry_refuses_changed_catalog_source():
         run(['git', 'init', '-b', 'main', worktree])
         skill = add_skill(home, 'agd-probe')
         task = {'id': 'pending', 'worktree': str(worktree), 'harness': 'omp', 'lease_id': 'lease'}
-        os.environ['AGD_FAIL_AFTER_SNAPSHOT'] = '1'
+        original = worker_skills._copy_tree
+        def interrupted(source, destination):
+            original(source, destination)
+            if destination.name == 'agd-probe':
+                raise RuntimeError('injected snapshot interruption')
+        worker_skills._copy_tree = interrupted
         try:
-            worker_skills.prepare(home, task, {
-                'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError('snapshot failure injection did not run')
+            try:
+                worker_skills.prepare(home, task, {
+                    'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError('snapshot failure injection did not run')
         finally:
-            os.environ.pop('AGD_FAIL_AFTER_SNAPSHOT')
+            worker_skills._copy_tree = original
         worker_skills.prepare(home, task, {
             'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
         (skill/'SKILL.md').write_text('changed\n')

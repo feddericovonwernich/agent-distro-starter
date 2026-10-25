@@ -366,8 +366,6 @@ def prepare(home: Path, task: dict, selection: dict) -> dict:
     for index, record in enumerate(records):
         _copy_tree(Path(record['source']), Path(record['snapshot']))
         _check(record, Path(record['snapshot']))
-        if os.environ.get('AGD_FAIL_AFTER_SNAPSHOT') and index == 0:
-            raise RuntimeError('injected snapshot interruption')
     _exclude(home, task, manifest['excludes'], True)
     for record in records:
         _copy_tree(Path(record['snapshot']), Path(record['destination']))
