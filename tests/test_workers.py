@@ -60,11 +60,15 @@ def test_relaunch_refuses_unknown_prior_process():
 
 
 def test_unavailable_backend_does_not_strand_lease():
+    from test_projects import CLI, run
     with lab() as (home, project):
         brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
         task = command(home, 'task', 'create', 'notstarted', '--project', 'sample',
                        '--brief', str(brief), '--kind', 'scout')
-        command(home, 'worker', 'launch', 'notstarted', '--backend', 'herdr', expected=4)
+        env = dict(os.environ)
+        env.pop('AGD_HERDR_SESSION', None)
+        run([CLI, '--home', home, 'worker', 'launch', 'notstarted', '--backend', 'herdr'],
+            env=env, expected=4)
         assert tasks.read(home, 'notstarted')['phase'] == 'prepared'
         assert tasks.read(home, 'notstarted')['lease_id'] == task['lease_id']
 

@@ -55,6 +55,8 @@ def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=Fal
     module = backend(task)
     if selected_backend == 'tmux' and not shutil.which('tmux'):
         raise store.DependencyError('tmux is not installed')
+    if selected_backend == 'herdr':
+        module.prepare(home)
     incarnation = str(uuid.uuid4())
     task.update(executor='worker', incarnation=incarnation, phase='running', worker_alive=None,
                 unattended=unattended)
@@ -230,6 +232,8 @@ def relaunch(home, task_id):
         raise store.Refusal('prior owned endpoint not proved absent')
     work = tasks.verify_workspace(home, task)
     harnesses.launch_argv(task, tasks.task_file(home, task_id).parent/'brief.md', task['unattended'])
+    if task['backend'] == 'herdr':
+        backend(task).prepare(home)
     incarnation = str(uuid.uuid4())
     task['prior_endpoint'] = task.pop('endpoint')
     task.update(incarnation=incarnation, worker_alive=None, condition='normal')

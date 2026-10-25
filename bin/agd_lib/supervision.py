@@ -94,15 +94,24 @@ def reconcile(home):
     with store.lock(home):
         for path in sorted((home/'data'/'tasks').glob('*/task.json')):
             task = tasks.read(home, path.parent.name)
-            if task.get('executor') == 'worker' and task['phase'] == 'running' and not task.get('endpoint') and task.get('backend') == 'tmux':
+            if (task.get('executor') == 'worker' and task['phase'] == 'running'
+                and not task.get('endpoint') and task.get('backend') in ('tmux', 'herdr')):
                 receipt = home/'state'/'tasks'/task['id']/'endpoint.json'
                 if receipt.exists():
                     recorded = json.loads(receipt.read_text())
+                    valid = (recorded.get('prefix') == tmux.prefix(home) if task['backend'] == 'tmux'
+                             else recorded.get('home') == str(home))
                     if (recorded.get('task') == task['id'] and recorded.get('incarnation') == task.get('incarnation')
-                        and recorded.get('prefix') == tmux.prefix(home) and recorded.get('pane')):
+                        and valid and recorded.get('pane')):
                         try:
-                            presence = tmux.inspect(recorded)['presence']
-                        except (store.Refusal, store.DependencyError):
+                            state = workers.backend(task).inspect(recorded)
+                            presence = state['presence']
+                            if task['backend'] == 'herdr' and presence == 'present':
+                                command = recorded.get('command')
+                                processes = state['process']['foreground_processes']
+                                if not command or not any(row.get('argv', [])[-len(command):] == command for row in processes):
+                                    presence = 'unknown'
+                        except (store.Refusal, store.DependencyError, KeyError, TypeError):
                             presence = 'unknown'
                         if presence == 'present':
                             task['endpoint'] = recorded

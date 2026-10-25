@@ -16,4 +16,6 @@ OMP automatically loads `.omp/extensions/agd-primary.ts` from this checkout. The
 
 For a private home elsewhere, set `AGD_HOME` to its absolute path before `bin/agd init` and `omp`. Keep the pinned Treehouse binary first on `PATH` for both the central process and workers. See [operations](docs/operations.md) for approvals, recovery and commands and [compatibility](docs/compatibility.md) for tested versus deferred combinations.
 
+For the optional Herdr backend, run from a Herdr-managed pane and set `AGD_HERDR_SESSION` to a separately started, non-default named server before launching OMP; see [operations](docs/operations.md). Cursor workers still require account authentication and live transcript validation.
+
 `project remove app` only unregisters and preserves the clone. Clone deletion needs a project-scoped approval and refuses retained tasks, uncommitted work and unverifiable local refs. No command publishes or merges without a separate, exact-target approval.
