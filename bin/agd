@@ -4,7 +4,7 @@ import json
 import sys
 import uuid
 from pathlib import Path
-from agd_lib import projects, store
+from agd_lib import projects, store, tasks
 
 
 def parser():
@@ -28,6 +28,18 @@ def parser():
             op.add_argument('--delete-clone', action='store_true')
             op.add_argument('--approval')
     project.add_parser('list')
+    task = sub.add_parser('task').add_subparsers(dest='operation', required=True)
+    create = task.add_parser('create')
+    create.add_argument('id')
+    create.add_argument('--project', required=True)
+    create.add_argument('--brief', required=True)
+    create.add_argument('--base')
+    create.add_argument('--kind', choices=('ship', 'scout'), default='ship')
+    status = task.add_parser('status')
+    status.add_argument('id')
+    task.add_parser('list')
+    reconcile = task.add_parser('reconcile')
+    reconcile.add_argument('id')
     return p
 
 
@@ -54,6 +66,15 @@ def main(args):
             return projects.remove(home, args.id, args.delete_clone, args.approval)
         if args.operation == 'trust':
             return projects.trust(home, args.id, args.instruction)
+    if args.command == 'task':
+        if args.operation == 'create':
+            return tasks.create(home, args.id, args.project, args.brief, args.base, args.kind)
+        if args.operation == 'status':
+            return tasks.read(home, args.id)
+        if args.operation == 'list':
+            return [tasks.read(home, f.parent.name) for f in sorted((home/'data'/'tasks').glob('*/task.json'))]
+        if args.operation == 'reconcile':
+            return tasks.reconcile_allocation(home, args.id)
     raise ValueError('unsupported command')
 
 

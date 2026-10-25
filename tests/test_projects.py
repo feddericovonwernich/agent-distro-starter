@@ -16,7 +16,7 @@ def run(args, cwd=None, env=None, expected=0):
 
 
 def command(home, *args, expected=0):
-    env = dict(os.environ, AGD_HOME=str(home))
+    env = dict(os.environ, AGD_HOME=str(home), TREEHOUSE_ROOT=str(home.parent/'pool'))
     result = run([CLI, '--home', home, *args], env=env, expected=expected)
     return json.loads(result.stdout) if expected == 0 else result
 
