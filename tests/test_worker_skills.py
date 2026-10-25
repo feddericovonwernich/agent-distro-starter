@@ -452,6 +452,22 @@ def test_tampered_journal_cannot_touch_sibling_paths():
         assert (sentinel/'keep').read_text() == 'keep'
 
 
+
+def test_preexisting_identical_exclude_line_is_not_removed():
+    from agd_lib import worker_skills
+    from test_projects import run
+    with tempfile.TemporaryDirectory() as directory:
+        home, worktree = Path(directory)/'home', Path(directory)/'worktree'
+        worktree.mkdir(); run(['git', 'init', '-b', 'main', worktree])
+        common = (worktree/run(['git', 'rev-parse', '--git-common-dir'], cwd=worktree).stdout.strip()).resolve()
+        exclude = common/'info'/'exclude'; original = '/.omp/skills/agd-probe/\nuser\n'; exclude.write_text(original)
+        add_skill(home, 'agd-probe')
+        task = {'id': 'user-exclude', 'worktree': str(worktree), 'harness': 'omp', 'lease_id': 'lease'}
+        selection = {'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']}
+        worker_skills.prepare(home, task, selection)
+        worker_skills.remove(home, task)
+        assert exclude.read_text() == original
+
 if __name__ == '__main__':
     test_verified_omp_skill_root_is_project_local()
     test_unverified_cursor_has_no_skill_provisioning_root()
@@ -472,3 +488,4 @@ if __name__ == '__main__':
     test_retry_repairs_exclude_after_registry_write_failure()
     test_remove_retries_after_first_owned_directory_deletion()
     test_tampered_journal_cannot_touch_sibling_paths()
+    test_preexisting_identical_exclude_line_is_not_removed()
