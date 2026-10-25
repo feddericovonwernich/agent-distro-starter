@@ -486,6 +486,23 @@ def test_ensure_refuses_post_prepare_native_parent_symlink():
             return
         raise AssertionError('post-prepare symlink replacement was accepted')
 
+
+def test_ensure_refuses_removed_skill_set():
+    from agd_lib import worker_skills, store
+    from test_projects import run
+    with tempfile.TemporaryDirectory() as directory:
+        home, worktree = Path(directory)/'home', Path(directory)/'worktree'
+        worktree.mkdir(); run(['git', 'init', '-b', 'main', worktree])
+        add_skill(home, 'agd-probe')
+        task = {'id': 'removed', 'worktree': str(worktree), 'harness': 'omp', 'lease_id': 'lease'}
+        worker_skills.prepare(home, task, {'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+        worker_skills.remove(home, task)
+        try:
+            worker_skills.ensure(home, task)
+        except store.Refusal:
+            return
+        raise AssertionError('removed skill set was resurrected')
+
 if __name__ == '__main__':
     test_verified_omp_skill_root_is_project_local()
     test_unverified_cursor_has_no_skill_provisioning_root()
@@ -508,3 +525,4 @@ if __name__ == '__main__':
     test_tampered_journal_cannot_touch_sibling_paths()
     test_preexisting_identical_exclude_line_is_not_removed()
     test_ensure_refuses_post_prepare_native_parent_symlink()
+    test_ensure_refuses_removed_skill_set()
