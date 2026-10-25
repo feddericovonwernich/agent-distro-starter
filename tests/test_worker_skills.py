@@ -197,6 +197,10 @@ def test_prepare_freezes_and_materializes_a_skill_bundle():
         manifest = worker_skills.prepare(home, task, {
             'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
         generated = worktree/'.omp'/'skills'/'agd-probe'/'references'/'token.txt'
+        common = (worktree/run(['git', 'rev-parse', '--git-common-dir'], cwd=worktree).stdout.strip()).resolve()
+        exclude = common/'info'/'exclude'
+        assert '/.omp/skills/agd-probe/\n' in exclude.read_text()
+        exclude.write_text(exclude.read_text() + 'user-note\n')
         assert generated.read_text() == 'frozen token\n'
         assert generated.stat().st_mode & 0o111
         resource.write_text('changed source\n')
@@ -205,6 +209,8 @@ def test_prepare_freezes_and_materializes_a_skill_bundle():
         worker_skills.verify(home, task)
         worker_skills.remove(home, task)
         assert not generated.exists()
+        assert 'user-note\n' in exclude.read_text()
+        assert '/.omp/skills/agd-probe/\n' not in exclude.read_text()
         assert manifest['selection']['skills'] == ['agd-probe']
 
 
