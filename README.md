@@ -2,9 +2,29 @@
 
 An OMP central session manages registered project clones, isolated Treehouse task worktrees, and supervised OMP workers. `projects/`, `config/`, `data/`, and `state/` belong to the local operator and are ignored by Git.
 
-## Start
+## Install a named local instance
 
-Install Git, OMP, tmux and **Treehouse v3.1.6** independently. Check the selected tools with `bin/agd doctor`; the globally installed Treehouse v2.3.0 is incompatible. From this checkout:
+On Linux, install Bash, curl, Git, Python 3.12+, OMP, tmux and Treehouse **v3.1.6** independently. Review the [installer](install.sh) before running downloaded code. From the parent directory where you want the instance:
+
+```sh
+bash -c 'installer=$(curl -fsSL https://raw.githubusercontent.com/feddericovonwernich/agent-distro-starter/main/install.sh) && bash -c "$installer"'
+```
+
+Enter a name starting with a lowercase letter, followed by lowercase letters, digits or hyphens (up to 48 characters). The installer refuses existing paths, clones into `./NAME` with its template Git origin intact, and initializes ignored private state in that clone. It does not install dependencies, authenticate Cursor or configure projects.
+
+```sh
+cd ./NAME
+unset AGD_HOME  # use the clone's private home unless intentionally configured otherwise
+bin/agd doctor
+bin/agd project add app --source /path/to/repository.git --base main
+omp
+```
+
+`doctor` checks executable versions, not account authentication. OMP/tmux and OMP/Herdr have been exercised on Linux; Cursor workers still need authentication and live validation.
+
+## Manual setup from a source checkout
+
+Install Git, Python 3.12+, OMP, tmux and **Treehouse v3.1.6** independently. Check the selected tools with `bin/agd doctor`; older Treehouse releases are incompatible. From this checkout:
 
 ```sh
 bin/agd init
