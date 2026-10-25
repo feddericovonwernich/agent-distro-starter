@@ -559,6 +559,29 @@ def test_cli_curated_selection_freezes_before_backend_failure():
         assert (home/'data'/'tasks'/'curated'/'worker-skills.json').is_file()
         assert (Path(task['worktree'])/'.omp'/'skills'/'agd-probe'/'SKILL.md').is_file()
 
+
+def test_cli_default_profile_and_cursor_nonempty_refusal_preserve_task():
+    from support import lab, command
+    from agd_lib import tasks
+    with lab() as (home, project):
+        os.environ['PATH'] = '/tmp/agd-treehouse-v3.1.6:' + os.environ['PATH']
+        add_skill(home, 'agd-probe')
+        write_profiles(home, {'default_profile': 'implementer',
+                              'profiles': {'implementer': {'skills': ['agd-probe']}}})
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'profile', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        command(home, 'worker', 'launch', 'profile', '--backend', 'herdr', expected=4)
+        assert tasks.read(home, 'profile')['phase'] == 'prepared'
+        assert (home/'data'/'tasks'/'profile'/'worker-skills.json').is_file()
+        instruction = home/'trust.md'; instruction.write_text('Trust this disposable project.\n')
+        command(home, 'project', 'trust', 'sample', '--instruction', str(instruction))
+        task = command(home, 'task', 'create', 'cursor', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        command(home, 'worker', 'launch', 'cursor', '--harness', 'cursor',
+                '--skill-mode', 'curated', '--skill', 'agd-probe', expected=4)
+        assert tasks.read(home, 'cursor')['phase'] == 'prepared'
+
 if __name__ == '__main__':
     test_verified_omp_skill_root_is_project_local()
     test_unverified_cursor_has_no_skill_provisioning_root()
@@ -585,3 +608,4 @@ if __name__ == '__main__':
     test_retry_after_post_exclude_write_failure_releases_only_owned_line()
     test_prompt_names_assigned_skill_paths()
     test_cli_curated_selection_freezes_before_backend_failure()
+    test_cli_default_profile_and_cursor_nonempty_refusal_preserve_task()
