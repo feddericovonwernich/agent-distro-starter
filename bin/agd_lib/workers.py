@@ -240,6 +240,9 @@ def relaunch(home, task_id):
     if inspect(home, task_id)['endpoint']['presence'] != 'missing':
         raise store.Refusal('prior owned endpoint not proved absent')
     work = tasks.verify_workspace(home, task)
+    if task.get('worker_skills'):
+        worker_skills.ensure(home, task)
+        worker_skills.verify(home, task)
     harnesses.launch_argv(task, tasks.task_file(home, task_id).parent/'brief.md', task['unattended'])
     if task['backend'] == 'herdr':
         backend(task).prepare(home)
