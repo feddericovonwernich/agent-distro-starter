@@ -381,6 +381,7 @@ def _check(record, root):
 
 def ensure(home: Path, task: dict) -> None:
     manifest = _manifest(home, task)
+    _exclude(home, task, manifest.get('excludes', []), True)
     for record in manifest['skills']:
         snapshot = Path(record['snapshot'])
         _check(record, snapshot)

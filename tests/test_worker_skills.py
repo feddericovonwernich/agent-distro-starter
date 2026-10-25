@@ -363,6 +363,38 @@ def test_pending_snapshot_retry_refuses_changed_catalog_source():
             return
         raise AssertionError('changed source was accepted after pending snapshot')
 
+
+def test_retry_repairs_exclude_after_registry_write_failure():
+    from unittest.mock import patch
+    from agd_lib import worker_skills, store
+    from test_projects import run
+    with tempfile.TemporaryDirectory() as directory:
+        home, worktree = Path(directory)/'home', Path(directory)/'worktree'
+        worktree.mkdir()
+        run(['git', 'init', '-b', 'main', worktree])
+        add_skill(home, 'agd-probe')
+        common = (worktree/run(['git', 'rev-parse', '--git-common-dir'], cwd=worktree).stdout.strip()).resolve()
+        exclude = common/'info'/'exclude'; exclude.write_text('user-entry\n')
+        task = {'id': 'exclude-retry', 'worktree': str(worktree), 'harness': 'omp', 'lease_id': 'lease'}
+        original = store.atomic_json
+        def interrupted(path, value):
+            original(path, value)
+            if Path(path).name == 'agd-worker-skills.json':
+                raise RuntimeError('injected registry interruption')
+        with patch.object(store, 'atomic_json', interrupted):
+            try:
+                worker_skills.prepare(home, task, {
+                    'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError('registry fault was not injected')
+        worker_skills.prepare(home, task, {
+            'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+        assert 'user-entry\n' in exclude.read_text()
+        assert '/.omp/skills/agd-probe/\n' in exclude.read_text()
+
+
 if __name__ == '__main__':
     test_verified_omp_skill_root_is_project_local()
     test_unverified_cursor_has_no_skill_provisioning_root()
@@ -380,3 +412,4 @@ if __name__ == '__main__':
     test_verify_refuses_modified_frozen_snapshot()
     test_native_alias_and_symlinked_skill_parents_refuse_provisioning()
     test_pending_snapshot_retry_refuses_changed_catalog_source()
+    test_retry_repairs_exclude_after_registry_write_failure()
