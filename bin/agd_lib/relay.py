@@ -256,24 +256,39 @@ def _install_review_definition(root):
             shutil.copyfile(origin, destination)
 
 
-def _configure_connector(root, repository):
+def _require_read_token():
     if not os.environ.get('AGD_RELAY_GITHUB_READ_TOKEN'):
         raise store.Refusal('Relay requires AGD_RELAY_GITHUB_READ_TOKEN with Checks, Pull requests, and Metadata read')
+
+
+def _configure_connector(root, repository):
+    _require_read_token()
     path = root/'.relay'/'connectors'/'github.json'
     config = {'connector': 'github', 'tokenEnv': 'AGD_RELAY_GITHUB_READ_TOKEN',
               'repositories': [{'name': repository, 'mode': 'generic-check-runs'}], 'triggers': []}
     if os.path.lexists(path):
         _lstat(path, 'file')
-        if json.loads(path.read_text()) != config:
+        try:
+            prior = json.loads(path.read_text())
+        except json.JSONDecodeError as error:
+            raise store.Refusal('Relay GitHub connector configuration is invalid') from error
+        generated = (isinstance(prior, dict) and prior.get('connector') == 'github' and
+                     prior.get('tokenEnv') == 'GITHUB_TOKEN' and
+                     prior.get('repositories') == [{'name': repository, 'mode': 'configured-tools'}] and
+                     isinstance(prior.get('triggers'), list) and len(prior['triggers']) == 3 and
+                     isinstance(prior.get('aggregate'), dict))
+        if prior != config and not generated:
             raise store.Refusal('Relay GitHub connector configuration was modified')
+        if prior != config:
+            store.atomic_json(path, config)
     else:
         store.atomic_json(path, config)
-
 
 def ensure_project_service(home, project_id, repository, run=store.run):
     project_id = store.validate_id(project_id)
     if not isinstance(repository, str) or repository.count('/') != 1 or not all(repository.split('/')):
         raise store.Refusal('Relay project repository must be OWNER/REPOSITORY')
+    _require_read_token()
     runtime = ensure_runtime(home)
     with store.lock(home):
         root = _service_root(home, project_id)

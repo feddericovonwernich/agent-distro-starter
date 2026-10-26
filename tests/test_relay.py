@@ -109,7 +109,8 @@ def test_project_service_is_private_and_idempotent(tmp_path, monkeypatch):
     monkeypatch.setenv('AGD_RELAY_GITHUB_READ_TOKEN', 'test-read-token')
 
     def init(argv, cwd, **_kwargs):
-        (cwd/'.relay').mkdir()
+        (cwd/'.relay'/'connectors').mkdir(parents=True)
+        (cwd/'.relay'/'connectors'/'github.json').write_text('{"connector":"github","tokenEnv":"GITHUB_TOKEN","repositories":[{"name":"owner/repo","mode":"configured-tools"}],"triggers":[{}, {}, {}],"aggregate":{}}')
     first = relay.ensure_project_service(home, 'sample', 'owner/repo', run=init)
     second = relay.ensure_project_service(home, 'sample', 'owner/repo', run=init)
 
@@ -117,7 +118,23 @@ def test_project_service_is_private_and_idempotent(tmp_path, monkeypatch):
     assert first['runtime'] == str(runtime)
     assert first['repository'] == 'owner/repo'
     assert first['root'] == str(home/'state'/'relay'/'projects'/'sample')
+    connector = __import__('json').loads((home/'state'/'relay'/'projects'/'sample'/'.relay'/'connectors'/'github.json').read_text())
+    assert connector == {'connector': 'github', 'tokenEnv': 'AGD_RELAY_GITHUB_READ_TOKEN',
+                         'repositories': [{'name': 'owner/repo', 'mode': 'generic-check-runs'}], 'triggers': []}
     assert not (home/'relay').exists()
+
+
+def test_project_service_requires_token_before_runtime_or_state(tmp_path, monkeypatch):
+    called = False
+    def runtime(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return tmp_path/'runtime'
+    monkeypatch.setattr(relay, 'ensure_runtime', runtime)
+    from agd_lib import store
+    with pytest.raises(store.Refusal, match='AGD_RELAY_GITHUB_READ_TOKEN'):
+        relay.ensure_project_service(tmp_path/'home', 'sample', 'owner/repo')
+    assert not called and not (tmp_path/'home').exists()
 
 
 def test_project_service_rejects_symlinked_state_root(tmp_path, monkeypatch):
