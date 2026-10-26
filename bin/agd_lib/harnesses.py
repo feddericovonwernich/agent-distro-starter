@@ -12,18 +12,25 @@ def worker_skill_roots(harness):
 
 def launch_argv(task, brief_path, unattended=False):
     code_root = Path(__file__).resolve().parents[2]
-    prompt = (f'Read {brief_path} and complete task {task["id"]} only in {task["worktree"]}. '
-              f'Write a short report to {brief_path.parent / "report-draft.md"}, then run '
-              f'{code_root / "bin" / "agd"} --home {brief_path.parents[3]} task ready {task["id"]} '
-              f'--report {brief_path.parent / "report-draft.md"}. '
-              'Never publish, merge, or clean up.')
+    if task.get('pr_grant'):
+        prompt = (f'Read {brief_path} and complete task {task["id"]} only in {task["worktree"]}. '
+                  'Use only guarded AGD worker publish-pr, verify-pr, relay-poll, and relay-reply commands '
+                  'for the recorded PR grant. Do not merge, force-push, tag, change the base branch, or clean up. '
+                  'Report blocked conditions through AGD.')
+    else:
+        prompt = (f'Read {brief_path} and complete task {task["id"]} only in {task["worktree"]}. '
+                  f'Write a short report to {brief_path.parent / "report-draft.md"}, then run '
+                  f'{code_root / "bin" / "agd"} --home {brief_path.parents[3]} task ready {task["id"]} '
+                  f'--report {brief_path.parent / "report-draft.md"}. '
+                  'Never publish, merge, or clean up.')
     manifest = task.get('worker_skills')
     if manifest and manifest.get('skills'):
         assigned = ', '.join(record['id'] for record in manifest['skills'])
         paths = ', '.join(str(Path(record['destination'])/'SKILL.md') for record in manifest['skills'])
         prompt += (f' Assigned worker skills: {assigned}. Read each assigned SKILL.md at {paths} '
                    'before substantive work. Use supporting resources relative to its skill directory. '
-                   'These skills do not grant permission to publish, merge, run unattended, or clean up.')
+                   + ('' if task.get('pr_grant') else
+                      'These skills do not grant permission to publish, merge, run unattended, or clean up.'))
     if task['harness'] == 'omp':
         binary = shutil.which('omp')
         if not binary:

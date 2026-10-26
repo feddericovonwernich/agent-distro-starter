@@ -123,3 +123,20 @@ def test_publish_refuses_closed_recorded_pr_before_creating(monkeypatch):
             pr.publish(home, task['id'], 'worker-inc', grant['id'], 'Title', 'Body', github_client=provider)
 
         assert not provider.created
+
+
+def test_reconcile_reports_clean_unpublished_state_without_remote_branch(monkeypatch):
+    with lab() as (home, _):
+        brief = home / 'brief.md'; brief.write_text('Change value.txt.\n')
+        task = command(home, 'task', 'create', 'unpublished-pr', '--project', 'sample', '--brief', str(brief))
+        run(['git', 'commit', '--allow-empty', '-m', 'candidate'], cwd=task['worktree'])
+        instruction = home / 'instruction.txt'
+        instruction.write_text('Authorize unpublished-pr to publish origin:agd/unpublished-pr.\n')
+        grant = tasks.grant_pr_publish(home, task['id'], 'origin:agd/unpublished-pr', instruction)
+        task.update(phase='running', executor='worker', incarnation='worker-inc')
+        tasks.save(home, task)
+        monkeypatch.setenv('AGD_TASK_ID', task['id'])
+        monkeypatch.setenv('AGD_INCARNATION', 'worker-inc')
+
+        assert pr.reconcile(home, task['id'], 'worker-inc', grant['id'], github_client=FakeGitHub()) is None
+        assert tasks.read_pr_receipt(home, task['id']) is None

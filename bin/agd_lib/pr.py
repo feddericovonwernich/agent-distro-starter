@@ -36,10 +36,14 @@ def reconcile(home, task_id, incarnation, grant_id, github_client=None):
         work = tasks.verify_workspace(home, task)
         head = store.git(work, 'rev-parse', 'HEAD')
         remote = store.git(work, 'ls-remote', '--heads', grant['remote'], f'refs/heads/{task["branch"]}')
-        if not remote or remote.split()[0] != head:
+        receipt = tasks.read_pr_receipt(home, task_id)
+        if not remote:
+            if receipt is None:
+                return None
+            raise store.Refusal('recorded PR remote head cannot be reconciled')
+        if remote.split()[0] != head:
             raise store.Refusal('recorded PR remote head cannot be reconciled')
         remote_head = remote.split()[0]
-        receipt = tasks.read_pr_receipt(home, task_id)
         if receipt is not None:
             if (receipt.get('grant_id') != grant['id'] or receipt.get('remote') != grant['remote'] or
                     receipt.get('repository') != repository or receipt.get('branch') != task['branch'] or

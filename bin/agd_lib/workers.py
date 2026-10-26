@@ -56,7 +56,7 @@ def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=Fal
         if profile is not None or skill_mode != 'profile' or skills:
             raise store.Refusal('PR grant launch controls worker skills')
         profile, skill_mode, skills = None, 'curated', ('agd-scoped-pr-relay',)
-    preflight = dict(task, harness=harness, backend=selected_backend)
+    preflight = dict(task, harness=harness, backend=selected_backend, pr_grant=pr_grant)
     harnesses.launch_argv(preflight, tasks.task_file(home, task_id).parent/'brief.md', unattended)
     module = backend(preflight)
     if selected_backend == 'tmux' and not shutil.which('tmux'):
@@ -73,6 +73,7 @@ def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=Fal
         if pr_grant:
             tasks._authorize_pr_publish_locked(home, current, pr_grant)
             profile, skill_mode, skills = None, 'curated', ('agd-scoped-pr-relay',)
+            current['pr_grant'] = pr_grant
         manifest = None
         if selection['skills']:
             manifest = worker_skills.prepare(home, dict(current, harness=harness), selection)
@@ -267,6 +268,8 @@ def relaunch(home, task_id):
         current = tasks.read(home, task_id)
         if current.get('incarnation') != task['prior_endpoint']['incarnation'] or current.get('worker_alive') is not False:
             raise store.Refusal('prior worker changed during relaunch; no endpoint created')
+        if current.get('pr_grant'):
+            tasks._authorize_pr_publish_locked(home, current, current['pr_grant'])
         tasks.save(home, task)
     endpoint = backend(task).create(home, task_id, incarnation, work,
                                     ['env', f'AGD_TASK_ID={task_id}', f'AGD_INCARNATION={incarnation}',
