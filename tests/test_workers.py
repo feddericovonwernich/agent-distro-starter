@@ -164,6 +164,36 @@ def test_proved_absent_unpublished_start_returns_to_prepared():
         assert recovered['lease_id'] == task['lease_id']
         assert Path(task['worktree']).is_dir()
 
+
+def test_relaunch_restores_frozen_skill_after_catalog_changes():
+    from unittest.mock import patch
+    from agd_lib import worker_skills, workers
+    from test_worker_skills import add_skill
+    from test_projects import run
+    import shutil
+    os.environ['PATH'] = '/tmp/agd-treehouse-v3.1.6:' + os.environ['PATH']
+    with lab() as (home, project):
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'frozen', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        add_skill(home, 'agd-probe')
+        selection = {'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']}
+        manifest = worker_skills.prepare(home, dict(task, harness='omp'), selection)
+        task.update(executor='worker', incarnation='old', harness='omp', backend='tmux',
+                    phase='running', worker_alive=False, endpoint={'old': True, 'incarnation': 'old'}, unattended=False,
+                    worker_skills=manifest)
+        tasks.save(home, task)
+        shutil.rmtree(home/'config'/'worker-skills'/'agd-probe')
+        shutil.rmtree(Path(task['worktree'])/'.omp'/'skills'/'agd-probe')
+        class FakeBackend:
+            def create(self, *args):
+                return {'new': True}
+        with patch.object(workers, 'inspect', return_value={'endpoint': {'presence': 'missing'}}), \
+             patch.object(workers, 'backend', return_value=FakeBackend()):
+            result = workers.relaunch(home, 'frozen')
+        assert result['endpoint'] == {'new': True}
+        assert (Path(task['worktree'])/'.omp'/'skills'/'agd-probe'/'SKILL.md').is_file()
+
 if __name__ == '__main__':
     test_old_worker_cannot_change_current_task()
     test_current_scout_worker_can_report_ready()
@@ -174,3 +204,4 @@ if __name__ == '__main__':
     test_crashed_runner_recovered_only_after_process_and_pane_absent()
     test_reconcile_adopts_exact_owned_endpoint_after_publication_gap()
     test_proved_absent_unpublished_start_returns_to_prepared()
+    test_relaunch_restores_frozen_skill_after_catalog_changes()
