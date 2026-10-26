@@ -54,7 +54,7 @@ def parser():
         if action == 'ready':
             op.add_argument('--report', required=True)
         if action == 'approve':
-            op.add_argument('--action', required=True, choices=('local-merge', 'publish', 'discard', 'unattended'))
+            op.add_argument('--action', required=True, choices=('local-merge', 'publish', 'pr-publish', 'discard', 'unattended'))
             op.add_argument('--target', required=True)
             op.add_argument('--instruction', required=True)
         if action == 'land':
@@ -195,7 +195,9 @@ def main(args):
         if args.operation == 'ready':
             return tasks.ready(home, args.id, args.report)
         if args.operation == 'approve':
-            return tasks.approve(home, args.id, args.action, args.target, args.instruction)
+            return (tasks.grant_pr_publish(home, args.id, args.target, args.instruction)
+                    if args.action == 'pr-publish' else
+                    tasks.approve(home, args.id, args.action, args.target, args.instruction))
         if args.operation == 'land':
             return tasks.land(home, args.id, args.approval)
         if args.operation == 'cleanup':

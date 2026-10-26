@@ -2,6 +2,8 @@ import os
 import tempfile
 from pathlib import Path
 from test_projects import run, command
+import pytest
+
 
 
 def test_distinct_leases_and_preserved_project():
@@ -104,6 +106,53 @@ def test_cleanup_retry_after_return_marks_confirmed_absent_lease_cleaned():
             raise AssertionError('wrong cleanup retry authorization was accepted')
         assert tasks.read(home, 'returning')['cleanup_phase'] == 'returning'
         assert tasks.cleanup(home, 'returning')['phase'] == 'cleaned'
+
+def test_pr_publish_grant_binds_target_and_descendant_history():
+    from support import lab
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'bin'))
+    from agd_lib import store, tasks
+
+    with lab() as (home, _):
+        brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
+        task = command(home, 'task', 'create', 'prgrant', '--project', 'sample', '--brief', str(brief))
+        run(['git', 'commit', '--allow-empty', '-m', 'candidate'], cwd=task['worktree'])
+        instruction = home/'instruction.txt'; instruction.write_text('Publish only this task branch.\n')
+        grant = tasks.grant_pr_publish(home, 'prgrant', 'origin:agd/prgrant', instruction)
+        assert tasks.authorize_pr_publish(home, tasks.read(home, 'prgrant'), grant['id'])['id'] == grant['id']
+        run(['git', 'commit', '--allow-empty', '-m', 'repair'], cwd=task['worktree'])
+        assert tasks.authorize_pr_publish(home, tasks.read(home, 'prgrant'), grant['id'])['grant_head'] != task['start']
+        run(['git', 'reset', '--hard', task['start']], cwd=task['worktree'])
+        with pytest.raises(store.Refusal, match='descendant'):
+            tasks.authorize_pr_publish(home, tasks.read(home, 'prgrant'), grant['id'])
+        with pytest.raises(store.Refusal, match='target'):
+            tasks.grant_pr_publish(home, 'prgrant', 'origin:other', instruction)
+
+
+def test_pr_receipt_does_not_transition_task_phase():
+    from support import lab
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'bin'))
+    from agd_lib import tasks
+
+    with lab() as (home, _):
+        brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
+        command(home, 'task', 'create', 'receipt', '--project', 'sample', '--brief', str(brief))
+        before = tasks.read(home, 'receipt')['phase']
+        tasks.write_pr_receipt(home, 'receipt', {'schema': 1, 'grant_id': 'grant', 'blocked_reason': 'auth'})
+        assert tasks.read(home, 'receipt')['phase'] == before
+
+
+def test_task_approve_pr_publish_records_exact_target():
+    from support import lab
+
+    with lab() as (home, _):
+        brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
+        task = command(home, 'task', 'create', 'cli-grant', '--project', 'sample', '--brief', str(brief))
+        instruction = home/'instruction.txt'; instruction.write_text('Publish only this task branch.\n')
+        grant = command(home, 'task', 'approve', task['id'], '--action', 'pr-publish',
+                        '--target', 'origin:agd/cli-grant', '--instruction', str(instruction))
+        assert grant['target'] == 'origin:agd/cli-grant'
 
 
 if __name__ == '__main__':
