@@ -119,6 +119,24 @@ def test_find_open_pr_returns_only_exact_head_and_base():
     assert [pr['number'] for pr in prs] == [7]
 
 
+@pytest.mark.parametrize(('connection', 'message'), [
+    ({'pageInfo': {'hasNextPage': True}, 'nodes': []}, 'incomplete'),
+    ({'pageInfo': {'hasNextPage': False}, 'nodes': [{
+        'id': 'P_7', 'number': 7, 'url': 'https://example.test/owner/repo/pull/7',
+        'state': 'OPEN', 'headRefName': 'agd/task', 'headRefOid': 'abc', 'baseRefName': 'main',
+        'headRepository': {'nameWithOwner': 'fork/repo'},
+        'commits': {'nodes': [{'commit': {'statusCheckRollup': {
+            'contexts': {'pageInfo': {'hasNextPage': False}, 'nodes': []}}}}]}}]}, 'repository'),
+])
+def test_find_open_pr_refuses_incomplete_or_cross_repository_connection(connection, message):
+    def gh(argv, **_):
+        return type('Result', (), {'stdout': json.dumps(
+            {'data': {'repository': {'pullRequests': connection}}})})()
+
+    with pytest.raises(store.Refusal, match=message):
+        github.find_open_pr('owner/repo', 'agd/task', 'main', run=gh)
+
+
 def test_normalize_policy_combines_classic_requirements_and_empty_rules():
     policy = github.normalize_policy(
         {'required_status_checks': {'contexts': ['ci']},
