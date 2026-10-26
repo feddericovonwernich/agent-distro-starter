@@ -47,7 +47,7 @@ def test_verify_and_ready_requires_current_final_github_evidence(monkeypatch):
         pr.publish(home, task['id'], 'worker-inc', grant['id'], 'Title', 'Body', github_client=provider)
         provider.prs[7].update(mergedAt=None, mergeStateStatus='CLEAN', checks={}, reviewDecision=None)
         provider.effective_policy = lambda repository, base, run=None: {'checks': (), 'approvals': 0}
-        report = home/'report.md'; report.write_text('Verified.\n')
+        report = tasks.task_file(home, task['id']).parent/'report-draft.md'; report.write_text('Verified.\n')
 
         ready = pr.verify_and_ready(home, task['id'], 'worker-inc', grant['id'], report,
                                     github_client=provider)
@@ -88,7 +88,7 @@ def test_verify_and_ready_rejects_remote_change_before_ready(monkeypatch):
             return {'checks': (), 'approvals': 0}
 
         provider.effective_policy = change_remote
-        report = home/'report.md'; report.write_text('Verified.\n')
+        report = tasks.task_file(home, task['id']).parent/'report-draft.md'; report.write_text('Verified.\n')
         with pytest.raises(tasks.store.Refusal, match='changed before ready'):
             pr.verify_and_ready(home, task['id'], 'worker-inc', grant['id'], report,
                                 github_client=provider)

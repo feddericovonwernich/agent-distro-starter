@@ -72,7 +72,7 @@ def parser():
     profiles = worker.add_parser('profiles').add_subparsers(dest='profile_operation', required=True)
     profiles.add_parser('list')
     for action in ('launch', 'run', 'event', 'inspect', 'send', 'inbox', 'acknowledge', 'interrupt', 'stop', 'relaunch',
-                   'publish-pr'):
+                   'publish-pr', 'verify-pr'):
         op = worker.add_parser(action)
         op.add_argument('id')
         if action == 'launch':
@@ -99,6 +99,10 @@ def parser():
             op.add_argument('--grant', required=True)
             op.add_argument('--title', required=True)
             op.add_argument('--body', required=True)
+        if action == 'verify-pr':
+            op.add_argument('--incarnation', required=True)
+            op.add_argument('--grant', required=True)
+            op.add_argument('--report', required=True)
     decision = sub.add_parser('decision').add_subparsers(dest='operation', required=True)
     resolve = decision.add_parser('resolve')
     resolve.add_argument('id')
@@ -128,7 +132,7 @@ def main(args):
                 args.command == 'session' and args.operation == 'reconcile' or
                 args.command == 'events' and args.operation == 'acknowledge')
     if mutation:
-        worker_scoped = (args.command == 'worker' and args.operation in ('run', 'event', 'acknowledge', 'publish-pr') or
+        worker_scoped = (args.command == 'worker' and args.operation in ('run', 'event', 'acknowledge', 'publish-pr', 'verify-pr') or
                          args.command == 'task' and args.operation == 'ready')
         store.require_owner(home, worker_scoped)
     if args.command == 'init':
@@ -223,6 +227,8 @@ def main(args):
         if args.operation == 'publish-pr':
             return pr.publish(home, args.id, args.incarnation, args.grant,
                               Path(args.title).read_text(), Path(args.body).read_text())
+        if args.operation == 'verify-pr':
+            return pr.verify_and_ready(home, args.id, args.incarnation, args.grant, Path(args.report))
         if args.operation == 'run':
             return workers.run_worker(home, args.id, args.incarnation)
         if args.operation == 'event':
