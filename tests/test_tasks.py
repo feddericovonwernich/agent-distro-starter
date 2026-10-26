@@ -150,6 +150,24 @@ def test_pr_publish_grant_requires_instruction_to_name_task_and_target():
             tasks.grant_pr_publish(home, 'instruction-grant', 'origin:agd/instruction-grant', instruction)
 
 
+
+
+def test_ready_refuses_pr_granted_task_without_final_verification():
+    from support import lab
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'bin'))
+    from agd_lib import store, tasks
+
+    with lab() as (home, _):
+        brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
+        task = command(home, 'task', 'create', 'ready-pr', '--project', 'sample', '--brief', str(brief))
+        run(['git', 'commit', '--allow-empty', '-m', 'candidate'], cwd=task['worktree'])
+        instruction = home/'instruction.txt'
+        instruction.write_text('Authorize ready-pr to publish origin:agd/ready-pr.\n')
+        tasks.grant_pr_publish(home, task['id'], 'origin:agd/ready-pr', instruction)
+        report = home/'report.md'; report.write_text('Verified.\n')
+        with pytest.raises(store.Refusal, match='PR verification'):
+            tasks.ready(home, task['id'], report)
 def test_pr_receipt_does_not_transition_task_phase():
     from support import lab
     import sys

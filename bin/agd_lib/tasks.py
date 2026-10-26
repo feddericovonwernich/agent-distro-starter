@@ -124,6 +124,19 @@ def verify_worker_skills(home, task):
             raise store.Refusal('worker skill artifact appears in task history')
 
 
+
+def _pr_publish_granted(home, task):
+    for path in (task_file(home, task['id']).parent/'approvals').glob('*.json'):
+        try:
+            approval = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            continue
+        if approval.get('action') == 'pr-publish' and approval.get('task') == task['id']:
+            return True
+    return False
+
+
+
 def ready(home, task_id, report):
     text = Path(report).read_text()
     if not text.strip():
@@ -140,6 +153,12 @@ def ready(home, task_id, report):
         if not store.clean(work):
             raise store.Refusal('task workspace has uncommitted or untracked changes')
         head = store.git(work, 'rev-parse', 'HEAD')
+        if _pr_publish_granted(home, task):
+            receipt = read_pr_receipt(home, task_id)
+            verification = receipt.get('verification') if receipt else None
+            if (not isinstance(verification, dict) or verification.get('head') != head or
+                    verification.get('remote_head') != head or verification.get('pr_head') != head):
+                raise store.Refusal('PR verification is missing or superseded')
         if task['kind'] == 'ship' and (head == task['start'] or store.run(['git', 'merge-base', '--is-ancestor', task['start'], head], cwd=work, check=False).returncode):
             raise store.Refusal('ship task needs committed changes from its base')
         if task['kind'] == 'scout' and head != task['start']:
