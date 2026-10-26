@@ -137,6 +137,17 @@ def test_project_service_requires_token_before_runtime_or_state(tmp_path, monkey
     assert not called and not (tmp_path/'home').exists()
 
 
+
+def test_project_service_preserves_unrecorded_relay_state(tmp_path, monkeypatch):
+    home = tmp_path/'home'
+    root = home/'state'/'relay'/'projects'/'sample'/'.relay'/'connectors'
+    root.mkdir(parents=True)
+    (root/'github.json').write_text('{"connector":"github","tokenEnv":"GITHUB_TOKEN","repositories":[{"name":"owner/repo","mode":"configured-tools"}],"triggers":[{}, {}, {}],"aggregate":{}}')
+    monkeypatch.setenv('AGD_RELAY_GITHUB_READ_TOKEN', 'test-read-token')
+    monkeypatch.setattr(relay, 'ensure_runtime', lambda *_args, **_kwargs: tmp_path/'runtime')
+    with pytest.raises(store.Refusal, match='without a service record'):
+        relay.ensure_project_service(home, 'sample', 'owner/repo')
+
 def test_project_service_rejects_symlinked_state_root(tmp_path, monkeypatch):
     import os
     home = tmp_path/'home'
