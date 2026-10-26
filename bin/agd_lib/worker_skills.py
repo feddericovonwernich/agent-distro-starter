@@ -8,6 +8,19 @@ from . import store
 
 _CONFIG_KEYS = {'default_profile', 'profiles'}
 _PROFILE_KEYS = {'skills'}
+DEFAULT_PROFILE = 'default'
+DEFAULT_SKILLS = (
+    'agd-ponytail',
+    'agd-ponytail-audit',
+    'agd-ponytail-debt',
+    'agd-ponytail-gain',
+    'agd-ponytail-help',
+    'agd-ponytail-review',
+    'agd-superpowers-systematic-debugging',
+    'agd-superpowers-test-driven-development',
+    'agd-superpowers-verification-before-completion',
+)
+
 
 
 def _refusal(message):
@@ -263,6 +276,60 @@ def _copy_tree(source, destination):
                 shutil.copy2(item, target)
             else:
                 _refusal(f'worker skill source contains an unsafe entry: {item}')
+
+def _create_json(path, value):
+    import tempfile
+    path = Path(path)
+    fd, temporary = tempfile.mkstemp(prefix='.write-', dir=path.parent)
+    published = False
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            json.dump(value, stream, sort_keys=True)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return False
+        published = True
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    if published:
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    return published
+
+def seed_defaults(home: Path) -> bool:
+    source_root = Path(__file__).resolve().parents[2]/'bundled'/'worker-skills'
+    try:
+        source_identity = os.lstat(source_root)
+    except OSError as error:
+        raise store.Refusal('worker skills: bundled worker skills are unavailable') from error
+    if stat.S_ISLNK(source_identity.st_mode) or not stat.S_ISDIR(source_identity.st_mode):
+        _refusal('bundled worker skills must be a real directory')
+    config = _private_path(home, 'config')
+    catalog_root = config/'worker-skills'
+    config_path = config/'workers.json'
+    if catalog_root.exists() or catalog_root.is_symlink() or config_path.exists() or config_path.is_symlink():
+        return False
+    for skill_id in DEFAULT_SKILLS:
+        _bundle(source_root/skill_id, skill_id)
+    try:
+        catalog_root.mkdir()
+    except FileExistsError:
+        return False
+    for skill_id in DEFAULT_SKILLS:
+        _copy_tree(source_root/skill_id, catalog_root/skill_id)
+    if not _create_json(config_path, {
+            'default_profile': DEFAULT_PROFILE,
+            'profiles': {DEFAULT_PROFILE: {'skills': list(DEFAULT_SKILLS)}}}):
+        return False
+    return True
 
 
 def _manifest(home, task):

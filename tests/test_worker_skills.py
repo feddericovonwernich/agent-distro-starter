@@ -102,7 +102,6 @@ def test_worker_skill_and_profile_lists_are_deterministic_json():
     from test_projects import command
     with tempfile.TemporaryDirectory() as directory:
         home = Path(directory)
-        command(home, 'init')
         add_skill(home, 'agd-zebra', 'Zebra instructions.')
         add_skill(home, 'agd-alpha', 'Alpha instructions.')
         write_profiles(home, {'default_profile': 'implementer', 'profiles': {
@@ -761,6 +760,81 @@ def test_cleanup_retry_after_artifact_removal_before_return():
         assert not (Path(task['worktree'])/'.omp'/'skills'/'agd-probe').exists()
         assert tasks.cleanup(home, 'cleanup-skill')['phase'] == 'cleaned'
 
+DEFAULT_WORKER_SKILLS = [
+    'agd-ponytail',
+    'agd-ponytail-audit',
+    'agd-ponytail-debt',
+    'agd-ponytail-gain',
+    'agd-ponytail-help',
+    'agd-ponytail-review',
+    'agd-superpowers-systematic-debugging',
+    'agd-superpowers-test-driven-development',
+    'agd-superpowers-verification-before-completion',
+]
+
+
+def test_init_seeds_default_worker_profile_from_bundled_catalog():
+    from agd_lib import worker_skills
+    from test_projects import command
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory)
+        command(home, 'init')
+        expected = {
+            'schema': 1, 'mode': 'profile', 'profile': 'default',
+            'skills': DEFAULT_WORKER_SKILLS}
+        assert worker_skills.resolve(home) == expected
+        assert command(home, 'worker', 'profiles', 'list') == {
+            'default_profile': 'default',
+            'profiles': {'default': {'skills': DEFAULT_WORKER_SKILLS}}}
+        assert [row['id'] for row in command(home, 'worker', 'skills', 'list')] == DEFAULT_WORKER_SKILLS
+
+
+def test_init_seeds_checkout_home_with_tracked_files():
+    import shutil
+    from agd_lib import worker_skills
+    from test_projects import ROOT, run
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory)/'clone'
+        run(['git', 'clone', '--no-local', ROOT, home])
+        shutil.copy2(ROOT/'bin'/'agd', home/'bin'/'agd')
+        shutil.copy2(ROOT/'bin'/'agd_lib'/'worker_skills.py', home/'bin'/'agd_lib'/'worker_skills.py')
+        shutil.copytree(ROOT/'bundled', home/'bundled', dirs_exist_ok=True)
+        env = dict(os.environ, TREEHOUSE_ROOT=str(home.parent/'pool'))
+        env.pop('AGD_HOME', None)
+        run([home/'bin'/'agd', 'init'], cwd=home, env=env)
+        assert worker_skills.resolve(home)['skills'] == DEFAULT_WORKER_SKILLS
+
+
+def test_init_preserves_preexisting_private_worker_configuration():
+    from test_projects import command
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory)
+        skill = add_skill(home, 'agd-existing')
+        (skill/'SKILL.md').write_text(
+            '---\nname: agd-existing\ndescription: Existing instructions.\n---\nKeep.\n')
+        config = {'default_profile': 'existing', 'profiles': {'existing': {'skills': ['agd-existing']}}}
+        write_profiles(home, config)
+        before = (home/'config'/'workers.json').read_bytes()
+        command(home, 'init')
+        command(home, 'init')
+        assert (home/'config'/'workers.json').read_bytes() == before
+        assert (skill/'SKILL.md').read_text().endswith('Keep.\n')
+        assert not (home/'config'/'worker-skills'/'agd-ponytail').exists()
+
+
+def test_init_preserves_nonempty_uninitialized_home():
+    from test_projects import command
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory)/'home'
+        home.mkdir()
+        sentinel = home/'sentinel'
+        sentinel.write_text('preserve me\n')
+        command(home, 'init')
+        assert sentinel.read_text() == 'preserve me\n'
+        assert not (home/'config'/'workers.json').exists()
+        assert not (home/'config'/'worker-skills').exists()
+
+
 if __name__ == '__main__':
     test_verified_omp_skill_root_is_project_local()
     test_unverified_cursor_has_no_skill_provisioning_root()
@@ -794,3 +868,7 @@ if __name__ == '__main__':
     test_unsafe_git_exclusion_metadata_refuses_before_prepare_mutates()
     test_cleanup_retry_after_pre_remove_failure_releases_owned_artifacts()
     test_returned_lease_requires_completed_skill_removal_journal()
+    test_init_seeds_default_worker_profile_from_bundled_catalog()
+    test_init_seeds_checkout_home_with_tracked_files()
+    test_init_preserves_preexisting_private_worker_configuration()
+    test_init_preserves_nonempty_uninitialized_home()
