@@ -349,8 +349,13 @@ def start_project_service(home, project_id, repository, popen=subprocess.Popen, 
         if isinstance(server, dict) and isinstance(server.get('pid'), int) and isinstance(server.get('start'), str):
             if not supervision.gone(server['pid'], server['start']):
                 return current
-        server_process = popen([str(runtime/'bin'/'relay'), 'start', '--project-root', str(root), '--port', '0'],
-                               cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            server_process = popen([str(runtime/'bin'/'relay'), 'start', '--project-root', str(root), '--port', '0'],
+                                   cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as error:
+            raise store.DependencyError('Relay server could not start') from error
+        current.update(server={**_process_record(server_process), 'status': 'starting'}, health='starting')
+        store.atomic_json(_service_file(home, project_id), current)
     runtime_file = root/'.relay'/'runtime.json'
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
