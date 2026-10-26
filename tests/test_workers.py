@@ -194,6 +194,32 @@ def test_relaunch_restores_frozen_skill_after_catalog_changes():
         assert result['endpoint'] == {'new': True}
         assert (Path(task['worktree'])/'.omp'/'skills'/'agd-probe'/'SKILL.md').is_file()
 
+
+def test_concurrent_skill_launch_has_one_winner_without_orphans():
+    from concurrent.futures import ThreadPoolExecutor
+    from unittest.mock import patch
+    from agd_lib import workers
+    from test_worker_skills import add_skill
+    os.environ['PATH'] = '/tmp/agd-treehouse-v3.1.6:' + os.environ['PATH']
+    with lab() as (home, project):
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        command(home, 'task', 'create', 'race', '--project', 'sample', '--brief', str(brief), '--kind', 'scout')
+        add_skill(home, 'agd-probe')
+        class Fake:
+            def create(self, *args): return {'incarnation': args[2]}
+        def attempt():
+            try:
+                return workers.launch(home, 'race', profile=None, skill_mode='curated', skills=('agd-probe',))
+            except Exception as error:
+                return error
+        with patch.object(workers.harnesses, 'launch_argv', return_value=['true']), \
+             patch.object(workers, 'backend', return_value=Fake()), \
+             patch.object(workers.shutil, 'which', return_value='/bin/true'):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(lambda _: attempt(), range(2)))
+        assert sum(isinstance(row, dict) for row in results) == 1
+        assert sum(isinstance(row, Exception) for row in results) == 1
+
 if __name__ == '__main__':
     test_old_worker_cannot_change_current_task()
     test_current_scout_worker_can_report_ready()
@@ -205,3 +231,4 @@ if __name__ == '__main__':
     test_reconcile_adopts_exact_owned_endpoint_after_publication_gap()
     test_proved_absent_unpublished_start_returns_to_prepared()
     test_relaunch_restores_frozen_skill_after_catalog_changes()
+    test_concurrent_skill_launch_has_one_winner_without_orphans()
