@@ -155,15 +155,20 @@ def pr_receipt_file(home, task_id):
 
 
 def validate_pr_receipt(receipt):
-    if not isinstance(receipt, dict) or receipt.get('schema') != 1 or not isinstance(receipt.get('grant_id'), str):
+    if (not isinstance(receipt, dict) or receipt.get('schema') != 1 or
+            not isinstance(receipt.get('grant_id'), str) or not receipt['grant_id']):
         raise store.Refusal('PR receipt is invalid')
-    if receipt.get('blocked_reason'):
+    if 'blocked_reason' in receipt:
+        if not isinstance(receipt['blocked_reason'], str) or not receipt['blocked_reason']:
+            raise store.Refusal('PR receipt is invalid')
         return receipt
     required = ('remote', 'repository', 'branch', 'base', 'local_head', 'remote_head', 'pr')
     if any(not isinstance(receipt.get(key), str) or not receipt[key] for key in required[:-1]):
         raise store.Refusal('PR receipt is invalid')
     pull_request = receipt['pr']
-    if not isinstance(pull_request, dict) or not isinstance(pull_request.get('number'), int) or pull_request['number'] < 1:
+    if (not isinstance(pull_request, dict) or not isinstance(pull_request.get('number'), int) or
+            pull_request['number'] < 1 or not isinstance(pull_request.get('url'), str) or
+            not pull_request['url'] or not isinstance(pull_request.get('id'), str) or not pull_request['id']):
         raise store.Refusal('PR receipt is invalid')
     return receipt
 

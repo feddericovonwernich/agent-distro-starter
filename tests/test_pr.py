@@ -23,7 +23,7 @@ class FakeGitHub:
 
     def create_pr(self, repository, head, base, title, body):
         self.created.append((repository, head, base))
-        pr = {'number': 7, 'url': 'https://example.test/owner/repo/pull/7',
+        pr = {'id': 'P_7', 'number': 7, 'url': 'https://example.test/owner/repo/pull/7',
               'repository': repository, 'headRefName': head, 'headRefOid': self.created_head,
               'baseRefName': base, 'state': 'OPEN'}
         self.prs[7] = pr
@@ -86,8 +86,10 @@ def test_reconcile_refuses_closed_recorded_pr_without_creating(monkeypatch):
         run(['git', 'push', 'origin', f'HEAD:refs/heads/{task["branch"]}'], cwd=task['worktree'])
         tasks.write_pr_receipt(home, task['id'], {'schema': 1, 'grant_id': grant['id'], 'remote': 'origin',
             'repository': grant['remote_url'], 'branch': task['branch'], 'base': task['base'],
-            'local_head': head, 'remote_head': head, 'pr': {'number': 9}})
-        provider = FakeGitHub([{'number': 9, 'repository': grant['remote_url'], 'headRefName': task['branch'],
+            'local_head': head, 'remote_head': head,
+            'pr': {'id': 'P_9', 'number': 9, 'url': 'https://example.test/owner/repo/pull/9'}})
+        provider = FakeGitHub([{'id': 'P_9', 'number': 9, 'url': 'https://example.test/owner/repo/pull/9',
+            'repository': grant['remote_url'], 'headRefName': task['branch'],
             'headRefOid': head, 'baseRefName': task['base'], 'state': 'CLOSED'}])
 
         with pytest.raises(tasks.store.Refusal, match='recorded PR'):
