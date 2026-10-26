@@ -348,7 +348,9 @@ def start_project_service(home, project_id, repository, popen=subprocess.Popen, 
         server = current.get('server')
         if isinstance(server, dict) and isinstance(server.get('pid'), int) and isinstance(server.get('start'), str):
             if not supervision.gone(server['pid'], server['start']):
-                return current
+                if current.get('health') == 'healthy':
+                    return current
+                raise store.Refusal('Relay server startup is pending')
         try:
             server_process = popen([str(runtime/'bin'/'relay'), 'start', '--project-root', str(root), '--port', '0'],
                                    cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
