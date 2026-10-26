@@ -16,6 +16,26 @@ For tmux, `worker launch NAME --harness omp --backend tmux` starts a live worker
 
 Optional private-home configuration at `config/workers.json` defines a `default_profile` and flat `profiles`, whose `skills` arrays refer to bundles in `config/worker-skills/ID/`. A bundle has a regular `SKILL.md` with simple `---` frontmatter containing its exact lowercase `agd-` ID and a nonempty one-line description; its resources may be regular files or directories only. `worker skills list` and `worker profiles list` return deterministic JSON. Launch with the implicit default, `--profile NAME`, or `--skill-mode curated --skill ID`; curated selection needs at least one skill and cannot be combined with a profile. Without configuration, an implicit launch records no provisioned skills; a requested unknown profile or curated skill is refused rather than silently falling back. Profiles and curated choices are exact sets, not exclusive native visibility: other user/project skills may remain discoverable. Selected bundles are frozen before launch, rechecked on relaunch/readiness/delivery, and task-owned ignored artifacts are removed only during cleanup.
 
+Both paths are relative to the effective private home (`AGD_HOME` when set), not the tracked distro checkout. A minimal catalog is:
+
+```json
+{"default_profile":"implementer","profiles":{"implementer":{"skills":["agd-review"]}}}
+```
+
+Save that as `config/workers.json`, then create `config/worker-skills/agd-review/SKILL.md`:
+
+```markdown
+---
+name: agd-review
+description: Review changes carefully.
+---
+Read references/checklist.txt before reviewing.
+```
+
+`config/worker-skills/agd-review/references/checklist.txt` is a regular relative resource. Bundles are instructions, not permissions to publish, merge, run unattended, or clean up.
+
+Provisioning refuses an existing destination, native-name alias or ancestor collision, symlinked parent, tracked path, or unsafe bundle entry. It freezes complete regular-file copies with hashes and modes; relaunch verifies/restores that snapshot and never re-resolves the mutable catalog. Exact generated paths are shared-Git-common-directory `info/exclude` entries with locked ownership: sibling worktrees and user lines are preserved, and a managed entry is released only after its last owner. Cleanup retains snapshots/journals, retries uncertain return state, and a discard retry must reuse its exact recorded approval.
+
 For Herdr, run the operator/central CLI inside a Herdr-managed pane (`HERDR_ENV=1`). Start a **separate named, non-default** server, for example `herdr --session agd-distro-lab server` in its own terminal, and set `AGD_HERDR_SESSION=agd-distro-lab` plus the pinned Treehouse v3.1.6 path in `PATH` before starting the central OMP process. Then select `worker launch NAME --harness omp --backend herdr`. The adapter creates a home-owned workspace and one unfocused tab per worker; all reads and controls use that recorded server, workspace, tab, pane, terminal and socket identity. It never uses the focused/default session. Keep the named server alive until every retained task that used it has been cleaned: even a stopped worker's endpoint must remain verifiably absent before releasing its lease. An unavailable or replaced server is **unknown**, not proof a worker is gone.
 
 The central extension starts one watcher per session and re-arms it once after unexpected exit. `session status`, `session reconcile`, `events list` and `events acknowledge EVENT_ID` inspect and handle durable wakes. Acknowledging a wake does **not** answer a decision: use `task status NAME` to inspect `open_decisions`, obtain the requested answer, and `decision resolve NAME KEY --answer FILE` to persist and enqueue it. Event receipt survives acknowledgement separately. A competing central must not take over while the first owner is alive. Worker phase `ready` can still mean its process is alive; stop it before cleanup.
