@@ -1,5 +1,7 @@
 """Read-only GitHub human-review producer for the central Relay service."""
 import hashlib
+import os
+import subprocess
 import json
 import re
 from pathlib import Path
@@ -87,6 +89,30 @@ class GitHubReader:
         if not isinstance(page, dict):
             raise ReviewFeedbackError(f'GitHub {kind} pagination is unavailable')
         return {'items': items, 'next': page.get('endCursor') if page.get('hasNextPage') else None}
+
+
+def central_github_reader(repository, pull_request, environ=None):
+    """Create the human-review reader from the dedicated central-only token.
+
+    Token permissions are a deployment contract: fine-grained repository access
+    limited to Checks, Pull requests, and Metadata read.
+    """
+    token = (os.environ if environ is None else environ).get('AGD_RELAY_GITHUB_READ_TOKEN')
+    if not isinstance(token, str) or not token:
+        raise ReviewFeedbackError('Relay requires AGD_RELAY_GITHUB_READ_TOKEN with repository read permissions')
+
+    def run(argv, cwd=None, timeout=30, check=True):
+        environment = {'PATH': os.environ.get('PATH', ''), 'GH_TOKEN': token}
+        try:
+            result = subprocess.run([str(value) for value in argv], cwd=cwd, stdin=subprocess.DEVNULL,
+                                    capture_output=True, text=True, timeout=timeout, env=environment)
+        except FileNotFoundError as error:
+            raise store.DependencyError(f'missing executable: {argv[0]}') from error
+        if check and result.returncode:
+            raise ReviewFeedbackError('dedicated GitHub review credential was refused')
+        return result
+
+    return GitHubReader(repository, pull_request, run=run)
 
 
 class LoopbackRelay:
