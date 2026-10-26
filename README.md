@@ -38,4 +38,8 @@ For a private home elsewhere, set `AGD_HOME` to its absolute path before `bin/ag
 
 For the optional Herdr backend, run from a Herdr-managed pane and set `AGD_HERDR_SESSION` to a separately started, non-default named server before launching OMP; see [operations](docs/operations.md). Cursor workers still require account authentication and live transcript validation.
 
+## Optional worker skills
+
+An operator may create private `config/workers.json` profiles and native bundles in `config/worker-skills/agd-ID/`. `worker skills list` and `worker profiles list` inspect the catalog. Launch with the configured default, `--profile NAME`, or the orchestrator-selected `--skill-mode curated --skill agd-ID`; profiles and curated skills cannot be combined. Selected bundles are frozen per task, so relaunch does not adopt catalog edits. Provisioned files are task-owned ignored artifacts and are checked before readiness/delivery and removed only during safe cleanup. OMP 18.3.2 project discovery and relative resources are verified; Cursor nonempty provisioning refuses until authenticated live discovery evidence exists.
+
 `project remove app` only unregisters and preserves the clone. Clone deletion needs a project-scoped approval and refuses retained tasks, uncommitted work and unverifiable local refs. No command publishes or merges without a separate, exact-target approval.
