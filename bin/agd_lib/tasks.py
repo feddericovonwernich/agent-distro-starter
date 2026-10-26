@@ -114,6 +114,12 @@ def verify_worker_skills(home, task):
     if task.get('worker_skills'):
         from . import worker_skills
         worker_skills.verify(home, task)
+        paths = [str(Path(record['destination']).relative_to(task['worktree']))
+                 for record in task['worker_skills']['skills']]
+        history = store.run(['git', 'log', '--format=', f'{task["start"]}..HEAD', '--', *paths],
+                            cwd=task['worktree']).stdout
+        if history.strip():
+            raise store.Refusal('worker skill artifact appears in task history')
 
 
 def ready(home, task_id, report):
