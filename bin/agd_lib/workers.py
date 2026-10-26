@@ -59,6 +59,8 @@ def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=Fal
     selection = worker_skills.resolve(home, profile=profile, skill_mode=skill_mode, skills=skills)
     if selection['skills']:
         harnesses.worker_skill_roots(harness)
+    if selected_backend == 'herdr':
+        module.available()
     with store.lock(home):
         current = tasks.read(home, task_id)
         if current['phase'] != 'prepared' or current['executor'] != 'central':
