@@ -1,6 +1,7 @@
 import os
 import re
 import stat
+import time
 from pathlib import Path
 
 
@@ -113,6 +114,7 @@ def publish(home, task_id, incarnation, grant_id, title, body, run=store.run, gi
             except store.Refusal as error:
                 raise store.Refusal('recorded PR cannot be reconciled') from error
             receipt.pop('verification', None)
+            receipt.pop('blocked_reason', None)
             receipt.update(local_head=head, remote_head=observed_remote_head, pr=pull_request)
             tasks._write_pr_receipt_locked(home, task_id, receipt)
             return receipt
@@ -147,13 +149,17 @@ def _verification_report(home, task_id, report_path):
     return text
 
 
-def _block_verification_locked(home, task_id, receipt, reason):
-    if receipt is not None:
+def _block_verification_locked(home, task_id, task, receipt, reason, terminal=False):
+    reason = reason[:400]
+    if terminal and receipt is not None:
         receipt.pop('verification', None)
-        receipt['blocked_reason'] = f'PR verification blocked: {reason[:400]}'
+        receipt['blocked_reason'] = f'PR verification blocked: {reason}'
         tasks._write_pr_receipt_locked(home, task_id, receipt)
-    store.atomic_json(tasks.task_file(home, task_id).parent/'verification-blocked.json',
-                      {'reason': reason[:400]})
+    folder = tasks.task_file(home, task_id).parent
+    store.atomic_json(folder/'verification-blocked.json', {'reason': reason})
+    store.atomic_json(folder/'observations'/'verification-blocked.json',
+                      {'id': 'verification-blocked', 'task': task_id, 'incarnation': task['incarnation'],
+                       'kind': 'blocked', 'key': 'verification', 'message': reason, 'observed_at': time.time()})
 
 
 def verify_and_ready(home, task_id, incarnation, grant_id, report_path, github_client=None, run=store.run):
@@ -189,6 +195,7 @@ def verify_and_ready(home, task_id, incarnation, grant_id, report_path, github_c
                                         receipt['pr']['number'])
             if not remote or remote.split()[0] != head:
                 raise store.Refusal('PR verification changed before ready')
+            policy = github_client.effective_policy(repository, task['base'], run=run)
             github.finalize(current, policy, head, repository, task['branch'], task['base'])
             receipt.update(local_head=head, remote_head=head, pr=current,
                            verification={'grant_id': grant['id'], 'remote': grant['remote'],
@@ -196,8 +203,13 @@ def verify_and_ready(home, task_id, incarnation, grant_id, report_path, github_c
                                          'head': head, 'remote_head': head, 'pr_head': current['headRefOid'],
                                          'pr_number': current['number'], 'pr_id': current['id'],
                                          'final': evidence})
+            receipt.pop('blocked_reason', None)
+            blocked = tasks.task_file(home, task_id).parent/'verification-blocked.json'
+            if blocked.exists():
+                blocked.unlink()
             tasks._write_pr_receipt_locked(home, task_id, receipt, allow_final=True)
             return tasks._ready_locked(home, task_id, text)
-        except store.Refusal as error:
-            _block_verification_locked(home, task_id, locals().get('receipt'), str(error))
+        except (store.Refusal, store.DependencyError) as error:
+            _block_verification_locked(home, task_id, task, locals().get('receipt'), str(error),
+                                       isinstance(error, store.DependencyError))
             raise
