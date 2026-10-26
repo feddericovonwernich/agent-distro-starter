@@ -323,9 +323,32 @@ def _native_names(root):
     return names
 
 
+def _exclude_info(task):
+    common = Path(store.git(task['worktree'], 'rev-parse', '--path-format=absolute', '--git-common-dir'))
+    for path, label in ((common, 'Git common directory'), (common/'info', 'Git info directory')):
+        try:
+            identity = os.lstat(path)
+        except OSError as error:
+            raise store.Refusal(f'worker skills: cannot inspect {label}') from error
+        if stat.S_ISLNK(identity.st_mode) or not stat.S_ISDIR(identity.st_mode):
+            _refusal(f'{label} must be a real directory')
+    info = common/'info'
+    for path in (info/'exclude', info/'agd-worker-skills.lock', info/'agd-worker-skills.json'):
+        try:
+            identity = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise store.Refusal(f'worker skills: cannot inspect Git metadata {path.name}') from error
+        if stat.S_ISLNK(identity.st_mode) or not stat.S_ISREG(identity.st_mode):
+            _refusal(f'Git metadata must be a regular file: {path.name}')
+    return info
+
+
 def prepare(home: Path, task: dict, selection: dict) -> dict:
     if selection.get('schema') != 1 or not isinstance(selection.get('skills'), list):
         _refusal('invalid worker skill selection')
+    _exclude_info(task)
     journal = _journal(home, task)
     if journal.exists():
         existing = _manifest(home, task)
@@ -433,11 +456,7 @@ def remove(home: Path, task: dict) -> None:
 
 def _exclude(home, task, paths, add):
     import fcntl
-    common = Path(store.git(task['worktree'], 'rev-parse', '--path-format=absolute', '--git-common-dir'))
-    info = common/'info'
-    if info.is_symlink():
-        _refusal('common Git info directory is symlinked')
-    info.mkdir(exist_ok=True)
+    info = _exclude_info(task)
     lock = info/'agd-worker-skills.lock'
     registry = info/'agd-worker-skills.json'
     excludes = info/'exclude'

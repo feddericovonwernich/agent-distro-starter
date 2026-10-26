@@ -633,6 +633,70 @@ def test_staged_and_historic_generated_skills_refuse_ready():
         command(home, 'task', 'ready', 'history', '--report', str(report), expected=3)
 
 
+def test_unsafe_git_exclusion_metadata_refuses_before_prepare_mutates():
+    from agd_lib import worker_skills, store
+    from test_projects import run
+    with tempfile.TemporaryDirectory() as directory:
+        root, home, worktree = Path(directory), Path(directory)/'home', Path(directory)/'worktree'
+        worktree.mkdir(); run(['git', 'init', '-b', 'main', worktree])
+        add_skill(home, 'agd-probe')
+        common = Path(run(['git', 'rev-parse', '--git-common-dir'], cwd=worktree).stdout.strip())
+        if not common.is_absolute():
+            common = worktree/common
+        common = common.resolve()
+        info = common/'info'
+        task = {'id': 'unsafe-exclude', 'worktree': str(worktree), 'harness': 'omp', 'lease_id': 'lease'}
+        selection = {'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']}
+        for name in ('exclude', 'agd-worker-skills.json'):
+            sentinel = root/f'{name}.sentinel'; sentinel.write_text('outside\n')
+            path = info/name
+            path.unlink(missing_ok=True)
+            os.symlink(sentinel, path)
+            try:
+                worker_skills.prepare(home, task, selection)
+            except store.Refusal:
+                pass
+            else:
+                raise AssertionError(f'symlinked {name} was accepted')
+            assert sentinel.read_text() == 'outside\n'
+            assert not (home/'data'/'tasks'/task['id']/'worker-skills.json').exists()
+            assert not (worktree/'.omp').exists()
+            path.unlink()
+
+
+def test_cleanup_records_return_intent_before_artifact_removal():
+    from unittest.mock import patch
+    from support import lab, command
+    from agd_lib import tasks, worker_skills
+    os.environ['PATH'] = '/tmp/agd-treehouse-v3.1.6:' + os.environ['PATH']
+    with lab() as (home, project):
+        add_skill(home, 'agd-probe')
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'remove-window', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        task['harness'] = 'omp'
+        task['worker_skills'] = worker_skills.prepare(home, task, {
+            'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+        tasks.save(home, task)
+        report = home/'report.md'; report.write_text('base inspected\n')
+        command(home, 'task', 'ready', 'remove-window', '--report', str(report))
+        original = worker_skills.remove
+        def interrupted(root, saved):
+            original(root, saved)
+            raise RuntimeError('injected post-remove failure')
+        with patch.object(worker_skills, 'remove', interrupted):
+            try:
+                tasks.cleanup(home, 'remove-window')
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError('post-remove fault was not injected')
+        assert tasks.read(home, 'remove-window')['cleanup_phase'] == 'returning'
+        assert not (Path(task['worktree'])/'.omp'/'skills'/'agd-probe').exists()
+        assert (home/'data'/'tasks'/'remove-window'/'worker-skills'/'agd-probe'/'SKILL.md').exists()
+        assert tasks.cleanup(home, 'remove-window')['phase'] == 'cleaned'
+
+
 def test_cleanup_retry_after_artifact_removal_before_return():
     from unittest.mock import patch
     from support import lab, command
@@ -693,3 +757,5 @@ if __name__ == '__main__':
     test_unchanged_generated_skill_allows_ready_but_modification_refuses()
     test_staged_and_historic_generated_skills_refuse_ready()
     test_cleanup_retry_after_artifact_removal_before_return()
+    test_unsafe_git_exclusion_metadata_refuses_before_prepare_mutates()
+    test_cleanup_records_return_intent_before_artifact_removal()
