@@ -110,6 +110,18 @@ def verify_workspace(home, task):
     return work
 
 
+def verify_worker_skills(home, task):
+    if task.get('worker_skills'):
+        from . import worker_skills
+        worker_skills.verify(home, task)
+        paths = [str(Path(record['destination']).relative_to(task['worktree']))
+                 for record in task['worker_skills']['skills']]
+        history = store.run(['git', 'rev-list', '--max-count=1', f'{task["start"]}..HEAD', '--', *paths],
+                            cwd=task['worktree']).stdout
+        if history.strip():
+            raise store.Refusal('worker skill artifact appears in task history')
+
+
 def ready(home, task_id, report):
     text = Path(report).read_text()
     if not text.strip():
@@ -122,6 +134,7 @@ def ready(home, task_id, report):
                                               os.environ.get('AGD_INCARNATION') != task.get('incarnation')):
             raise store.Refusal('worker incarnation cannot report this task')
         work = verify_workspace(home, task)
+        verify_worker_skills(home, task)
         if not store.clean(work):
             raise store.Refusal('task workspace has uncommitted or untracked changes')
         head = store.git(work, 'rev-parse', 'HEAD')
@@ -201,6 +214,7 @@ def land(home, task_id, approval_id):
             raise store.Refusal('task is not ready to land')
         authorization(home, task, approval_id, 'local-merge', target)
         work = verify_workspace(home, task)
+        verify_worker_skills(home, task)
         clone = Path(project['path'])
         if not store.clean(work) or not store.clean(clone) or store.git(clone, 'branch', '--show-current') != task['base']:
             raise store.Refusal('task or stable clone dirty/wrong branch')
@@ -226,7 +240,24 @@ def cleanup(home, task_id, discard=False, approval_id=None):
         task = read(home, task_id)
         if task['phase'] == 'cleaned':
             return task
+        if task.get('cleanup_phase') in ('removing', 'returning'):
+            if task.get('cleanup_discard') != discard or task.get('cleanup_approval') != approval_id:
+                raise store.Refusal('cleanup retry must use its recorded authorization')
+        if task.get('cleanup_phase') == 'returning':
+            status = json.loads(store.run([*treehouse_args(task), 'status', '--json'],
+                                          cwd=project['path']).stdout)
+            if not any(row.get('lease_id') == task['lease_id'] and row.get('lease_holder') == task['lease_holder']
+                       for row in status):
+                if task.get('worker_skills'):
+                    from . import worker_skills
+                    if not worker_skills.removed(home, task):
+                        raise store.Refusal('worker skill removal is incomplete')
+                task['phase'] = 'cleaned'
+                save(home, task)
+                return task
         work = verify_workspace(home, task)
+        if task.get('cleanup_phase') not in ('removing', 'returning'):
+            verify_worker_skills(home, task)
         require_stopped_worker(home, task)
         if discard:
             if not approval_id:
@@ -243,6 +274,11 @@ def cleanup(home, task_id, discard=False, approval_id=None):
                     raise store.Refusal('task work has not landed')
                 if store.run(['git', 'merge-base', '--is-ancestor', task['ready_head'], task['base']], cwd=project['path'], check=False).returncode:
                     raise store.Refusal('landing ancestry unconfirmed')
+        task.update(cleanup_phase='returning', cleanup_discard=discard, cleanup_approval=approval_id)
+        save(home, task)
+        if task.get('worker_skills'):
+            from . import worker_skills
+            worker_skills.remove(home, task)
         argv = [*treehouse_args(task), 'return', task['worktree'], '--if-lease-id', task['lease_id'],
                 '--if-lease-holder', task['lease_holder']]
         if discard:
@@ -263,6 +299,7 @@ def publication_record(home, task_id, approval_id, remote, branch, url, evidence
     with store.lock(home):
         approval = authorization(home, task, approval_id, 'publish', f'{remote}:{branch}')
         work = verify_workspace(home, task)
+        verify_worker_skills(home, task)
         if branch != task['branch'] or not store.clean(work) or store.git(work, 'rev-parse', 'HEAD') != task['ready_head']:
             raise store.Refusal('published branch differs from ready head')
         remote_head = store.git(work, 'ls-remote', '--heads', remote, f'refs/heads/{branch}')

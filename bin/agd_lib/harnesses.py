@@ -2,6 +2,13 @@ import shutil
 from pathlib import Path
 from . import store
 
+def worker_skill_roots(harness):
+    if harness == 'omp':
+        return ('.omp/skills',)
+    if harness == 'cursor':
+        raise store.DependencyError('Cursor native skill discovery is unverified; cannot provision skills')
+    raise ValueError('unsupported harness')
+
 
 def launch_argv(task, brief_path, unattended=False):
     code_root = Path(__file__).resolve().parents[2]
@@ -10,6 +17,13 @@ def launch_argv(task, brief_path, unattended=False):
               f'{code_root / "bin" / "agd"} --home {brief_path.parents[3]} task ready {task["id"]} '
               f'--report {brief_path.parent / "report-draft.md"}. '
               'Never publish, merge, or clean up.')
+    manifest = task.get('worker_skills')
+    if manifest and manifest.get('skills'):
+        assigned = ', '.join(record['id'] for record in manifest['skills'])
+        paths = ', '.join(str(Path(record['destination'])/'SKILL.md') for record in manifest['skills'])
+        prompt += (f' Assigned worker skills: {assigned}. Read each assigned SKILL.md at {paths} '
+                   'before substantive work. Use supporting resources relative to its skill directory. '
+                   'These skills do not grant permission to publish, merge, run unattended, or clean up.')
     if task['harness'] == 'omp':
         binary = shutil.which('omp')
         if not binary:

@@ -6,7 +6,7 @@ import json
 import sys
 import uuid
 from pathlib import Path
-from agd_lib import projects, store, tasks, workers, supervision
+from agd_lib import projects, store, tasks, workers, supervision, worker_skills
 
 
 def parser():
@@ -67,6 +67,10 @@ def parser():
     for option in ('approval', 'remote', 'branch', 'url', 'evidence'):
         publication.add_argument('--'+option, required=True)
     worker = sub.add_parser('worker').add_subparsers(dest='operation', required=True)
+    skills = worker.add_parser('skills').add_subparsers(dest='skill_operation', required=True)
+    skills.add_parser('list')
+    profiles = worker.add_parser('profiles').add_subparsers(dest='profile_operation', required=True)
+    profiles.add_parser('list')
     for action in ('launch', 'run', 'event', 'inspect', 'send', 'inbox', 'acknowledge', 'interrupt', 'stop', 'relaunch'):
         op = worker.add_parser(action)
         op.add_argument('id')
@@ -74,6 +78,9 @@ def parser():
             op.add_argument('--harness', choices=('omp', 'cursor'), default='omp')
             op.add_argument('--backend', choices=('tmux', 'herdr'), default='tmux')
             op.add_argument('--unattended', action='store_true')
+            op.add_argument('--profile')
+            op.add_argument('--skill-mode', choices=('profile', 'curated'), default='profile')
+            op.add_argument('--skill', action='append', default=[])
             op.add_argument('--approval')
         if action in ('run', 'event'):
             op.add_argument('--incarnation', required=True)
@@ -109,7 +116,7 @@ def main(args):
     mutation = (args.command == 'init' or
                 args.command == 'project' and args.operation not in ('list', 'inspect') or
                 args.command == 'task' and args.operation not in ('list', 'status') or
-                args.command == 'worker' and args.operation not in ('inspect', 'inbox') or
+                args.command == 'worker' and args.operation not in ('inspect', 'inbox', 'skills', 'profiles') or
                 args.command == 'decision' or
                 args.command == 'session' and args.operation == 'reconcile' or
                 args.command == 'events' and args.operation == 'acknowledge')
@@ -180,8 +187,13 @@ def main(args):
             return tasks.publication_record(home, args.id, args.approval, args.remote,
                                             args.branch, args.url, args.evidence)
     if args.command == 'worker':
+        if args.operation == 'skills':
+            return worker_skills.catalog(home)
+        if args.operation == 'profiles':
+            return worker_skills.profiles(home)
         if args.operation == 'launch':
-            return workers.launch(home, args.id, args.harness, args.backend, args.unattended, args.approval)
+            return workers.launch(home, args.id, args.harness, args.backend, args.unattended,
+                                  args.approval, args.profile, args.skill_mode, tuple(args.skill))
         if args.operation == 'run':
             return workers.run_worker(home, args.id, args.incarnation)
         if args.operation == 'event':

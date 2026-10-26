@@ -4,7 +4,7 @@ import shutil
 import time
 import uuid
 from pathlib import Path
-from . import harnesses, projects, store, tasks, tmux
+from . import harnesses, projects, store, tasks, tmux, worker_skills
 
 
 def backend(task):
@@ -38,7 +38,8 @@ def event(home, task_id, incarnation, kind, key, message):
     return observation
 
 
-def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=False, approval_id=None):
+def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=False, approval_id=None,
+           profile=None, skill_mode='profile', skills=()):
     task = tasks.read(home, task_id)
     if task['phase'] != 'prepared' or task['executor'] != 'central':
         raise store.Refusal('task already launched or not prepared')
@@ -50,20 +51,33 @@ def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=Fal
         tasks.authorization(home, task, approval_id or '', 'unattended', task_id)
     if selected_backend not in ('tmux', 'herdr') or harness not in ('omp', 'cursor'):
         raise ValueError('unsupported backend or harness')
-    task.update(harness=harness, backend=selected_backend)
-    harnesses.launch_argv(task, tasks.task_file(home, task_id).parent/'brief.md', unattended)
-    module = backend(task)
+    preflight = dict(task, harness=harness, backend=selected_backend)
+    harnesses.launch_argv(preflight, tasks.task_file(home, task_id).parent/'brief.md', unattended)
+    module = backend(preflight)
     if selected_backend == 'tmux' and not shutil.which('tmux'):
         raise store.DependencyError('tmux is not installed')
+    selection = worker_skills.resolve(home, profile=profile, skill_mode=skill_mode, skills=skills)
+    if selection['skills']:
+        harnesses.worker_skill_roots(harness)
     if selected_backend == 'herdr':
-        module.prepare(home)
-    incarnation = str(uuid.uuid4())
-    task.update(executor='worker', incarnation=incarnation, phase='running', worker_alive=None,
-                unattended=unattended)
+        module.available()
     with store.lock(home):
         current = tasks.read(home, task_id)
         if current['phase'] != 'prepared' or current['executor'] != 'central':
             raise store.Refusal('task launch raced another owner; no endpoint created')
+        selection = worker_skills.resolve(home, profile=profile, skill_mode=skill_mode, skills=skills)
+        manifest = None
+        if selection['skills']:
+            manifest = worker_skills.prepare(home, dict(current, harness=harness), selection)
+        if selected_backend == 'herdr':
+            module.prepare(home)
+        task = current
+        task.update(harness=harness, backend=selected_backend, worker_skill_selection=selection)
+        if manifest is not None:
+            task['worker_skills'] = manifest
+        incarnation = str(uuid.uuid4())
+        task.update(executor='worker', incarnation=incarnation, phase='running', worker_alive=None,
+                    unattended=unattended)
         tasks.save(home, task)
     endpoint = module.create(home, task_id, incarnation, work,
                              ['env', f'AGD_TASK_ID={task_id}', f'AGD_INCARNATION={incarnation}',
@@ -88,6 +102,8 @@ def run_worker(home, task_id, incarnation):
     if not task.get('endpoint'):
         raise store.Refusal('endpoint identity was not published; retaining task')
     tasks.verify_workspace(home, task)
+    if task.get('worker_skills'):
+        worker_skills.verify(home, task)
     env = dict(os.environ, AGD_HOME=str(home), AGD_TASK_ID=task_id, AGD_INCARNATION=incarnation)
     env.pop('AGD_OWNER', None)
     import subprocess
@@ -231,6 +247,9 @@ def relaunch(home, task_id):
     if inspect(home, task_id)['endpoint']['presence'] != 'missing':
         raise store.Refusal('prior owned endpoint not proved absent')
     work = tasks.verify_workspace(home, task)
+    if task.get('worker_skills'):
+        worker_skills.ensure(home, task)
+        worker_skills.verify(home, task)
     harnesses.launch_argv(task, tasks.task_file(home, task_id).parent/'brief.md', task['unattended'])
     if task['backend'] == 'herdr':
         backend(task).prepare(home)

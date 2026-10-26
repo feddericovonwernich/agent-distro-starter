@@ -71,7 +71,43 @@ def test_cleaned_history_does_not_block_unregister():
         assert command(home, 'task', 'status', 'past')['phase'] == 'cleaned'
 
 
+def test_cleanup_retry_after_return_marks_confirmed_absent_lease_cleaned():
+    from unittest.mock import patch
+    from support import lab
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'bin'))
+    from agd_lib import tasks
+    os.environ['PATH'] = '/tmp/agd-treehouse-v3.1.6:' + os.environ['PATH']
+    with lab() as (home, project):
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        command(home, 'task', 'create', 'returning', '--project', 'sample',
+                '--brief', str(brief), '--kind', 'scout')
+        report = home/'report.md'; report.write_text('base inspected\n')
+        command(home, 'task', 'ready', 'returning', '--report', str(report))
+        original = tasks.save
+        def interrupted(root, task):
+            if task.get('phase') == 'cleaned':
+                raise RuntimeError('injected post-return failure')
+            original(root, task)
+        with patch.object(tasks, 'save', interrupted):
+            try:
+                tasks.cleanup(home, 'returning')
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError('post-return fault not injected')
+        try:
+            tasks.cleanup(home, 'returning', discard=True)
+        except tasks.store.Refusal:
+            pass
+        else:
+            raise AssertionError('wrong cleanup retry authorization was accepted')
+        assert tasks.read(home, 'returning')['cleanup_phase'] == 'returning'
+        assert tasks.cleanup(home, 'returning')['phase'] == 'cleaned'
+
+
 if __name__ == '__main__':
     test_distinct_leases_and_preserved_project()
     test_lease_survives_missing_environment_override()
     test_cleaned_history_does_not_block_unregister()
+    test_cleanup_retry_after_return_marks_confirmed_absent_lease_cleaned()
