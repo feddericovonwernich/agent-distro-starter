@@ -415,6 +415,8 @@ def verify(home: Path, task: dict) -> None:
 def remove(home: Path, task: dict) -> None:
     import shutil
     manifest = _manifest(home, task)
+    if manifest.get('state') == 'removed':
+        return
     if manifest.get('state') != 'removing':
         verify(home, task)
         manifest['state'] = 'removing'
@@ -433,16 +435,23 @@ def _exclude(home, task, paths, add):
     import fcntl
     common = Path(store.git(task['worktree'], 'rev-parse', '--path-format=absolute', '--git-common-dir'))
     info = common/'info'
+    if info.is_symlink():
+        _refusal('common Git info directory is symlinked')
     info.mkdir(exist_ok=True)
     lock = info/'agd-worker-skills.lock'
     registry = info/'agd-worker-skills.json'
+    excludes = info/'exclude'
     key = f'{_private_path(home, "data", "home.json")}:{task["id"]}:{task.get("lease_id", "")}'
+    for metadata in (lock, registry, excludes):
+        if metadata.exists() or metadata.is_symlink():
+            identity = os.lstat(metadata)
+            if stat.S_ISLNK(identity.st_mode) or not stat.S_ISREG(identity.st_mode):
+                _refusal(f'common Git metadata is unsafe: {metadata}')
     with lock.open('a+') as stream:
         fcntl.flock(stream, fcntl.LOCK_EX)
         data = _json(registry) if registry.exists() else {}
         owners = data.setdefault('owners', {})
         managed = set(data.setdefault('managed', []))
-        excludes = info/'exclude'
         if add:
             text = excludes.read_text() if excludes.exists() else ''
             inserted = {path for path in paths if f'/{path}/\n' not in text}

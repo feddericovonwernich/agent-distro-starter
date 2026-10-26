@@ -240,7 +240,7 @@ def cleanup(home, task_id, discard=False, approval_id=None):
         task = read(home, task_id)
         if task['phase'] == 'cleaned':
             return task
-        if task.get('cleanup_phase') == 'returning':
+        if task.get('cleanup_phase') in ('removing', 'returning'):
             if task.get('cleanup_discard') != discard or task.get('cleanup_approval') != approval_id:
                 raise store.Refusal('cleanup retry must use its recorded authorization')
         if task.get('cleanup_phase') == 'returning':
@@ -252,7 +252,7 @@ def cleanup(home, task_id, discard=False, approval_id=None):
                 save(home, task)
                 return task
         work = verify_workspace(home, task)
-        if task.get('cleanup_phase') != 'returning':
+        if task.get('cleanup_phase') not in ('removing', 'returning'):
             verify_worker_skills(home, task)
         require_stopped_worker(home, task)
         if discard:
@@ -270,10 +270,12 @@ def cleanup(home, task_id, discard=False, approval_id=None):
                     raise store.Refusal('task work has not landed')
                 if store.run(['git', 'merge-base', '--is-ancestor', task['ready_head'], task['base']], cwd=project['path'], check=False).returncode:
                     raise store.Refusal('landing ancestry unconfirmed')
-        if task.get('worker_skills') and task.get('cleanup_phase') != 'returning':
+        task.update(cleanup_phase='removing', cleanup_discard=discard, cleanup_approval=approval_id)
+        save(home, task)
+        if task.get('worker_skills'):
             from . import worker_skills
             worker_skills.remove(home, task)
-        task.update(cleanup_phase='returning', cleanup_discard=discard, cleanup_approval=approval_id)
+        task['cleanup_phase'] = 'returning'
         save(home, task)
         argv = [*treehouse_args(task), 'return', task['worktree'], '--if-lease-id', task['lease_id'],
                 '--if-lease-holder', task['lease_holder']]
