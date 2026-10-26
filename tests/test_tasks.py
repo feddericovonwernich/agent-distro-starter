@@ -96,6 +96,13 @@ def test_cleanup_retry_after_return_marks_confirmed_absent_lease_cleaned():
                 pass
             else:
                 raise AssertionError('post-return fault not injected')
+        try:
+            tasks.cleanup(home, 'returning', discard=True)
+        except tasks.store.Refusal:
+            pass
+        else:
+            raise AssertionError('wrong cleanup retry authorization was accepted')
+        assert tasks.read(home, 'returning')['cleanup_phase'] == 'returning'
         assert tasks.cleanup(home, 'returning')['phase'] == 'cleaned'
 
 
