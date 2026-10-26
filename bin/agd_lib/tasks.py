@@ -240,8 +240,17 @@ def cleanup(home, task_id, discard=False, approval_id=None):
         task = read(home, task_id)
         if task['phase'] == 'cleaned':
             return task
+        if task.get('cleanup_phase') == 'returning':
+            status = json.loads(store.run([*treehouse_args(task), 'status', '--json'],
+                                          cwd=project['path']).stdout)
+            if not any(row.get('lease_id') == task['lease_id'] and row.get('lease_holder') == task['lease_holder']
+                       for row in status):
+                task['phase'] = 'cleaned'
+                save(home, task)
+                return task
         work = verify_workspace(home, task)
-        verify_worker_skills(home, task)
+        if task.get('cleanup_phase') != 'returning':
+            verify_worker_skills(home, task)
         require_stopped_worker(home, task)
         if discard:
             if not approval_id:
@@ -261,6 +270,8 @@ def cleanup(home, task_id, discard=False, approval_id=None):
         if task.get('worker_skills'):
             from . import worker_skills
             worker_skills.remove(home, task)
+        task['cleanup_phase'] = 'returning'
+        save(home, task)
         argv = [*treehouse_args(task), 'return', task['worktree'], '--if-lease-id', task['lease_id'],
                 '--if-lease-holder', task['lease_holder']]
         if discard:
