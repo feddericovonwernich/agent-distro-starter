@@ -22,6 +22,28 @@ query($owner: String!, $name: String!, $number: Int!) {
 '''
 
 
+SEARCH_QUERY = '''
+query($owner: String!, $name: String!, $head: String!, $base: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(first: 100, states: OPEN, headRefName: $head, baseRefName: $base) {
+      pageInfo { hasNextPage }
+      nodes {
+        id number url state mergedAt headRefName headRefOid baseRefName mergeStateStatus reviewDecision
+        headRepository { nameWithOwner }
+        commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) {
+          pageInfo { hasNextPage }
+          nodes {
+            ... on CheckRun { name status conclusion }
+            ... on StatusContext { context state }
+          }
+        } } } } } }
+      }
+    }
+  }
+}
+'''
+
+
 def split_repository(repository):
     try:
         owner, name = repository.split('/', 1)
@@ -61,10 +83,11 @@ def get_pr(repository, number, run=store.run):
 
 def find_open_pr(repository, head, base, run=store.run):
     owner, name = split_repository(repository)
-    query = PR_QUERY.replace('$number: Int!', '$head: String!, $base: String!').replace(
-        'pullRequest(number: $number)', 'pullRequests(first: 100, states: OPEN, headRefName: $head, baseRefName: $base)')
-    data = graphql(query, {'owner': owner, 'name': name, 'head': head, 'base': base}, run)
-    nodes = data['repository'].get('pullRequests', {}).get('nodes')
+    data = graphql(SEARCH_QUERY, {'owner': owner, 'name': name, 'head': head, 'base': base}, run)
+    search = data['repository'].get('pullRequests', {})
+    if search.get('pageInfo', {}).get('hasNextPage'):
+        raise store.Refusal('GitHub PR search is incomplete')
+    nodes = search.get('nodes')
     if not isinstance(nodes, list):
         raise store.Refusal('GitHub PR search is incomplete')
     found = []
@@ -73,6 +96,8 @@ def find_open_pr(repository, head, base, run=store.run):
             continue
         if node.get('headRefName') != head or node.get('baseRefName') != base:
             continue
+        if node.get('headRepository', {}).get('nameWithOwner') != repository:
+            raise store.Refusal('GitHub PR head repository does not match task')
         try:
             rollup = node['commits']['nodes'][-1]['commit']['statusCheckRollup']
             if rollup['contexts']['pageInfo']['hasNextPage']:

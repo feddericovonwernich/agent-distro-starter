@@ -107,6 +107,7 @@ def test_find_open_pr_returns_only_exact_head_and_base():
             return {'id': f'P_{number}', 'number': number,
                     'url': f'https://example.test/owner/repo/pull/{number}', 'state': 'OPEN',
                     'mergedAt': None, 'headRefName': head, 'headRefOid': 'abc', 'baseRefName': 'main',
+                    'headRepository': {'nameWithOwner': 'owner/repo'},
                     'mergeStateStatus': 'CLEAN', 'reviewDecision': None,
                     'commits': {'nodes': [{'commit': {'statusCheckRollup': {
                         'contexts': {'pageInfo': {'hasNextPage': False}, 'nodes': []}}}}]}}
