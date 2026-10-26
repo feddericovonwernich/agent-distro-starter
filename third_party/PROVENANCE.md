@@ -17,7 +17,7 @@ Archive SHA-256: `1c2ef0722ef66993270a03fa5c73f389b52582a77930c290d1b54d3ad119d7
 
 The five canonical Open Relay skill trees are copied verbatim under `.agents/skills/`. No upstream Open Relay skill is shipped as a worker bundle: the raw upstream worker instructions are not compatible with AGD's guarded worker model or `agd-` bundle namespace. Workers will receive a separate AGD-owned `agd-scoped-pr-relay` adapter when that capability is implemented.
 
-The upstream Apache-2.0 `LICENSE` applies to the copied central skill files above; its SHA-256 is recorded on line 15. The central files have these SHA-256 values:
+The tracked `third_party/OPEN_RELAY_LICENSE` contains the upstream Apache-2.0 license text applicable to the copied central skill files; its SHA-256 is `736cb7537e55ce92c53ebab962988e66e38dbf050f620abd65cbb85de524ab4e`. The central files have these SHA-256 values:
 
 | Skill | `SKILL.md` SHA-256 |
 | --- | --- |
