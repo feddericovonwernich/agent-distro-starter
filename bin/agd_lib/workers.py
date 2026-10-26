@@ -39,7 +39,7 @@ def event(home, task_id, incarnation, kind, key, message):
 
 
 def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=False, approval_id=None,
-           profile=None, skill_mode='profile', skills=()):
+           profile=None, skill_mode='profile', skills=(), pr_grant=None):
     task = tasks.read(home, task_id)
     if task['phase'] != 'prepared' or task['executor'] != 'central':
         raise store.Refusal('task already launched or not prepared')
@@ -51,6 +51,11 @@ def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=Fal
         tasks.authorization(home, task, approval_id or '', 'unattended', task_id)
     if selected_backend not in ('tmux', 'herdr') or harness not in ('omp', 'cursor'):
         raise ValueError('unsupported backend or harness')
+    if pr_grant:
+        tasks.authorize_pr_publish(home, task, pr_grant)
+        if profile is not None or skill_mode != 'profile' or skills:
+            raise store.Refusal('PR grant launch controls worker skills')
+        profile, skill_mode, skills = None, 'curated', ('agd-scoped-pr-relay',)
     preflight = dict(task, harness=harness, backend=selected_backend)
     harnesses.launch_argv(preflight, tasks.task_file(home, task_id).parent/'brief.md', unattended)
     module = backend(preflight)
@@ -65,7 +70,9 @@ def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=Fal
         current = tasks.read(home, task_id)
         if current['phase'] != 'prepared' or current['executor'] != 'central':
             raise store.Refusal('task launch raced another owner; no endpoint created')
-        selection = worker_skills.resolve(home, profile=profile, skill_mode=skill_mode, skills=skills)
+        if pr_grant:
+            tasks._authorize_pr_publish_locked(home, current, pr_grant)
+            profile, skill_mode, skills = None, 'curated', ('agd-scoped-pr-relay',)
         manifest = None
         if selection['skills']:
             manifest = worker_skills.prepare(home, dict(current, harness=harness), selection)
