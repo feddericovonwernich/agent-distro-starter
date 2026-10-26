@@ -1,4 +1,5 @@
 import json
+import re
 
 from . import store
 
@@ -85,6 +86,21 @@ def find_open_pr(repository, head, base, run=store.run):
                   if isinstance(item, dict) and item.get('name', item.get('context'))}
         found.append(dict(node, repository=repository, checks=checks))
     return found
+
+
+def create_pr(repository, head, base, title, body, run=store.run):
+    owner, name = split_repository(repository)
+    if not all(isinstance(value, str) and value for value in (head, base, title, body)):
+        raise store.Refusal('GitHub PR creation fields are invalid')
+    result = run(['gh', 'pr', 'create', '--repo', f'{owner}/{name}', '--head', head, '--base', base,
+                  '--title', title, '--body', body, '--no-maintainer-edit'])
+    match = re.fullmatch(r'\s*https://github\.com/[^/\s]+/[^/\s]+/pull/([1-9][0-9]*)\s*', result.stdout)
+    if not match:
+        raise store.Refusal('GitHub PR creation response is ambiguous')
+    pr = get_pr(repository, int(match.group(1)), run)
+    if pr['headRefName'] != head or pr['baseRefName'] != base:
+        raise store.Refusal('GitHub created PR identity does not match task')
+    return pr
 
 
 def graphql(query, variables, run=store.run):
