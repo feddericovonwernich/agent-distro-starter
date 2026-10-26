@@ -11,6 +11,56 @@ def github_repository(remote_url):
     return f'{match.group(1)}/{match.group(2)}'
 
 
+def _check_current_pr(provider, repository, branch, base, head, number):
+    candidate = provider.get_pr(repository, number)
+    if (candidate.get('repository') != repository or candidate.get('state') != 'OPEN' or
+            candidate.get('headRefName') != branch or candidate.get('baseRefName') != base or
+            candidate.get('headRefOid') != head):
+        raise store.Refusal('PR identity or current head does not match publication')
+    return candidate
+
+
+def reconcile(home, task_id, incarnation, grant_id, github_client=None):
+    default_github = github_client is None
+    if default_github:
+        from . import github as github_client
+    with store.lock(home):
+        task = tasks.read(home, task_id)
+        if (task.get('phase') != 'running' or task.get('executor') != 'worker' or
+                not isinstance(task.get('incarnation'), str) or not task['incarnation'] or
+                task['incarnation'] != incarnation or os.environ.get('AGD_TASK_ID') != task_id or
+                os.environ.get('AGD_INCARNATION') != incarnation):
+            raise store.Refusal('publication requires the current worker')
+        grant = tasks._authorize_pr_publish_locked(home, task, grant_id)
+        repository = github_repository(grant['remote_url']) if default_github else grant['remote_url']
+        head = store.git(tasks.verify_workspace(home, task), 'rev-parse', 'HEAD')
+        receipt = tasks.read_pr_receipt(home, task_id)
+        if receipt is not None:
+            if (receipt.get('grant_id') != grant['id'] or receipt.get('repository') != repository or
+                    receipt.get('branch') != task['branch'] or receipt.get('base') != task['base']):
+                raise store.Refusal('recorded PR does not match publication')
+            try:
+                current = _check_current_pr(github_client, repository, task['branch'], task['base'], head,
+                                            receipt['pr']['number'])
+            except store.Refusal as error:
+                raise store.Refusal('recorded PR cannot be reconciled') from error
+            receipt.update(local_head=head, remote_head=head, pr=current)
+            tasks._write_pr_receipt_locked(home, task_id, receipt)
+            return receipt
+        candidates = github_client.find_open_pr(repository, task['branch'], task['base'])
+        if len(candidates) > 1:
+            raise store.Refusal('multiple matching open pull requests')
+        current = (_check_current_pr(github_client, repository, task['branch'], task['base'], head,
+                                     candidates[0]['number']) if candidates else
+                   _check_current_pr(github_client, repository, task['branch'], task['base'], head,
+                                     github_client.create_pr(repository, task['branch'], task['base'], '', '')['number']))
+        receipt = {'schema': 1, 'grant_id': grant['id'], 'remote': grant['remote'],
+                   'repository': repository, 'branch': task['branch'], 'base': task['base'],
+                   'local_head': head, 'remote_head': head, 'pr': current}
+        tasks._write_pr_receipt_locked(home, task_id, receipt)
+        return receipt
+
+
 def publish(home, task_id, incarnation, grant_id, title, body, run=store.run, github_client=None):
     default_github = github_client is None
     if default_github:
