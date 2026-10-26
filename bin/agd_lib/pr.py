@@ -159,7 +159,8 @@ def _block_verification_locked(home, task_id, task, receipt, reason, terminal=Fa
     store.atomic_json(folder/'verification-blocked.json', {'reason': reason})
     store.atomic_json(folder/'observations'/'verification-blocked.json',
                       {'id': 'verification-blocked', 'task': task_id, 'incarnation': task['incarnation'],
-                       'kind': 'blocked', 'key': 'verification', 'message': reason, 'observed_at': time.time()})
+                       'kind': 'blocked' if terminal else 'busy', 'key': 'verification', 'message': reason,
+                       'observed_at': time.time()})
 
 
 def verify_and_ready(home, task_id, incarnation, grant_id, report_path, github_client=None, run=store.run):
@@ -204,12 +205,16 @@ def verify_and_ready(home, task_id, incarnation, grant_id, report_path, github_c
                                          'pr_number': current['number'], 'pr_id': current['id'],
                                          'final': evidence})
             receipt.pop('blocked_reason', None)
-            blocked = tasks.task_file(home, task_id).parent/'verification-blocked.json'
-            if blocked.exists():
-                blocked.unlink()
+            folder = tasks.task_file(home, task_id).parent
+            for path in (folder/'verification-blocked.json', folder/'observations'/'verification-blocked.json'):
+                if path.exists():
+                    path.unlink()
             tasks._write_pr_receipt_locked(home, task_id, receipt, allow_final=True)
             return tasks._ready_locked(home, task_id, text)
         except (store.Refusal, store.DependencyError) as error:
-            _block_verification_locked(home, task_id, task, locals().get('receipt'), str(error),
-                                       isinstance(error, store.DependencyError))
+            reason = str(error)
+            waiting = ('merge state is not CLEAN', 'required checks are not green',
+                       'required reviews are not APPROVED')
+            _block_verification_locked(home, task_id, task, locals().get('receipt'), reason,
+                                       isinstance(error, store.DependencyError) or not any(item in reason for item in waiting))
             raise

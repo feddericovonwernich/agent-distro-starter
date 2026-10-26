@@ -57,6 +57,34 @@ def test_verify_and_ready_requires_current_final_github_evidence(monkeypatch):
         assert receipt['verification']['head'] == head
 
 
+def test_verify_and_ready_refreshes_policy_before_ready(monkeypatch):
+    with lab() as (home, _):
+        brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
+        task = command(home, 'task', 'create', 'policy-race', '--project', 'sample', '--brief', str(brief))
+        run(['git', 'commit', '--allow-empty', '-m', 'candidate'], cwd=task['worktree'])
+        instruction = home/'instruction.txt'
+        instruction.write_text('Authorize policy-race to publish origin:agd/policy-race.\n')
+        grant = tasks.grant_pr_publish(home, task['id'], 'origin:agd/policy-race', instruction)
+        task.update(phase='running', executor='worker', incarnation='worker-inc'); tasks.save(home, task)
+        monkeypatch.setenv('AGD_TASK_ID', task['id']); monkeypatch.setenv('AGD_INCARNATION', 'worker-inc')
+        head = run(['git', 'rev-parse', 'HEAD'], cwd=task['worktree']).stdout.strip()
+        provider = FakeGitHub(created_head=head)
+        pr.publish(home, task['id'], 'worker-inc', grant['id'], 'Title', 'Body', github_client=provider)
+        provider.prs[7].update(mergedAt=None, mergeStateStatus='CLEAN', checks={}, reviewDecision=None)
+        policies = iter(({'checks': (), 'approvals': 0}, {'checks': (), 'approvals': 1}))
+        provider.effective_policy = lambda *_args, **_kwargs: next(policies)
+        report = tasks.task_file(home, task['id']).parent/'report-draft.md'; report.write_text('Verified.\n')
+        with pytest.raises(tasks.store.Refusal, match='reviews are not APPROVED'):
+            pr.verify_and_ready(home, task['id'], 'worker-inc', grant['id'], report, github_client=provider)
+        assert tasks.read(home, task['id'])['phase'] == 'running'
+        observation = __import__('json').loads((tasks.task_file(home, task['id']).parent/'observations'/'verification-blocked.json').read_text())
+        assert observation['kind'] == 'busy'
+        provider.prs[7]['reviewDecision'] = 'APPROVED'
+        provider.effective_policy = lambda *_args, **_kwargs: {'checks': (), 'approvals': 1}
+        assert pr.verify_and_ready(home, task['id'], 'worker-inc', grant['id'], report, github_client=provider)['phase'] == 'ready'
+        assert not (tasks.task_file(home, task['id']).parent/'observations'/'verification-blocked.json').exists()
+
+
 
 def test_verify_and_ready_rejects_remote_change_before_ready(monkeypatch):
     with lab() as (home, _):
