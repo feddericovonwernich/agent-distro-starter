@@ -33,30 +33,36 @@ def reconcile(home, task_id, incarnation, grant_id, github_client=None):
             raise store.Refusal('publication requires the current worker')
         grant = tasks._authorize_pr_publish_locked(home, task, grant_id)
         repository = github_repository(grant['remote_url']) if default_github else grant['remote_url']
-        head = store.git(tasks.verify_workspace(home, task), 'rev-parse', 'HEAD')
+        work = tasks.verify_workspace(home, task)
+        head = store.git(work, 'rev-parse', 'HEAD')
+        remote = store.git(work, 'ls-remote', '--heads', grant['remote'], f'refs/heads/{task["branch"]}')
+        if not remote or remote.split()[0] != head:
+            raise store.Refusal('recorded PR remote head cannot be reconciled')
+        remote_head = remote.split()[0]
         receipt = tasks.read_pr_receipt(home, task_id)
         if receipt is not None:
-            if (receipt.get('grant_id') != grant['id'] or receipt.get('repository') != repository or
-                    receipt.get('branch') != task['branch'] or receipt.get('base') != task['base']):
+            if (receipt.get('grant_id') != grant['id'] or receipt.get('remote') != grant['remote'] or
+                    receipt.get('repository') != repository or receipt.get('branch') != task['branch'] or
+                    receipt.get('base') != task['base'] or receipt.get('remote_head') != remote_head):
                 raise store.Refusal('recorded PR does not match publication')
             try:
                 current = _check_current_pr(github_client, repository, task['branch'], task['base'], head,
                                             receipt['pr']['number'])
             except store.Refusal as error:
                 raise store.Refusal('recorded PR cannot be reconciled') from error
-            receipt.update(local_head=head, remote_head=head, pr=current)
+            receipt.update(local_head=head, remote_head=remote_head, pr=current)
             tasks._write_pr_receipt_locked(home, task_id, receipt)
             return receipt
         candidates = github_client.find_open_pr(repository, task['branch'], task['base'])
         if len(candidates) > 1:
             raise store.Refusal('multiple matching open pull requests')
-        current = (_check_current_pr(github_client, repository, task['branch'], task['base'], head,
-                                     candidates[0]['number']) if candidates else
-                   _check_current_pr(github_client, repository, task['branch'], task['base'], head,
-                                     github_client.create_pr(repository, task['branch'], task['base'], '', '')['number']))
+        if not candidates:
+            return None
+        current = _check_current_pr(github_client, repository, task['branch'], task['base'], head,
+                                    candidates[0]['number'])
         receipt = {'schema': 1, 'grant_id': grant['id'], 'remote': grant['remote'],
                    'repository': repository, 'branch': task['branch'], 'base': task['base'],
-                   'local_head': head, 'remote_head': head, 'pr': current}
+                   'local_head': head, 'remote_head': remote_head, 'pr': current}
         tasks._write_pr_receipt_locked(home, task_id, receipt)
         return receipt
 
@@ -91,7 +97,8 @@ def publish(home, task_id, incarnation, grant_id, title, body, run=store.run, gi
             raise store.Refusal('multiple matching open pull requests')
         pull_request = (_check_current_pr(github_client, repository, task['branch'], task['base'], head,
                                            matches[0]['number']) if matches else
-                        github_client.create_pr(repository, task['branch'], task['base'], title, body))
+                        _check_current_pr(github_client, repository, task['branch'], task['base'], head,
+                                          github_client.create_pr(repository, task['branch'], task['base'], title, body)['number']))
         receipt = {'schema': 1, 'grant_id': grant['id'], 'remote': grant['remote'],
                    'repository': repository, 'branch': task['branch'], 'base': task['base'],
                    'local_head': head, 'remote_head': head, 'pr': pull_request}

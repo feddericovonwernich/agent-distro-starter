@@ -10,8 +10,9 @@ from test_projects import command, run
 
 
 class FakeGitHub:
-    def __init__(self, prs=()):
+    def __init__(self, prs=(), created_head=None):
         self.created = []
+        self.created_head = created_head
         self.prs = {pr['number']: pr for pr in prs}
 
     def find_open_pr(self, repository, head, base):
@@ -23,7 +24,7 @@ class FakeGitHub:
     def create_pr(self, repository, head, base, title, body):
         self.created.append((repository, head, base))
         pr = {'number': 7, 'url': 'https://example.test/owner/repo/pull/7',
-              'repository': repository, 'headRefName': head, 'headRefOid': 'abc',
+              'repository': repository, 'headRefName': head, 'headRefOid': self.created_head,
               'baseRefName': base, 'state': 'OPEN'}
         self.prs[7] = pr
         return pr
@@ -41,7 +42,7 @@ def test_publish_validates_grant_and_writes_receipt_under_one_lock(monkeypatch):
         tasks.save(home, task)
         monkeypatch.setenv('AGD_TASK_ID', task['id'])
         monkeypatch.setenv('AGD_INCARNATION', 'worker-inc')
-        provider = FakeGitHub()
+        provider = FakeGitHub(created_head=run(['git', 'rev-parse', 'HEAD'], cwd=task['worktree']).stdout.strip())
 
         receipt = pr.publish(home, task['id'], 'worker-inc', grant['id'], 'Title', 'Body',
                              github_client=provider)
@@ -82,6 +83,7 @@ def test_reconcile_refuses_closed_recorded_pr_without_creating(monkeypatch):
         monkeypatch.setenv('AGD_TASK_ID', task['id'])
         monkeypatch.setenv('AGD_INCARNATION', 'worker-inc')
         head = run(['git', 'rev-parse', 'HEAD'], cwd=task['worktree']).stdout.strip()
+        run(['git', 'push', 'origin', f'HEAD:refs/heads/{task["branch"]}'], cwd=task['worktree'])
         tasks.write_pr_receipt(home, task['id'], {'schema': 1, 'grant_id': grant['id'], 'remote': 'origin',
             'repository': grant['remote_url'], 'branch': task['branch'], 'base': task['base'],
             'local_head': head, 'remote_head': head, 'pr': {'number': 9}})
