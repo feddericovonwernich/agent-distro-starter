@@ -92,6 +92,21 @@ def publish(home, task_id, incarnation, grant_id, title, body, run=store.run, gi
         remote_head = store.git(work, 'ls-remote', '--heads', grant['remote'], f'refs/heads/{task["branch"]}')
         if not remote_head or remote_head.split()[0] != head:
             raise store.Refusal('remote branch head was not confirmed')
+        observed_remote_head = remote_head.split()[0]
+        receipt = tasks.read_pr_receipt(home, task_id)
+        if receipt is not None:
+            if (receipt.get('grant_id') != grant['id'] or receipt.get('remote') != grant['remote'] or
+                    receipt.get('repository') != repository or receipt.get('branch') != task['branch'] or
+                    receipt.get('base') != task['base']):
+                raise store.Refusal('recorded PR does not match publication')
+            try:
+                pull_request = _check_current_pr(github_client, repository, task['branch'], task['base'], head,
+                                                  receipt['pr']['number'])
+            except store.Refusal as error:
+                raise store.Refusal('recorded PR cannot be reconciled') from error
+            receipt.update(local_head=head, remote_head=observed_remote_head, pr=pull_request)
+            tasks._write_pr_receipt_locked(home, task_id, receipt)
+            return receipt
         matches = github_client.find_open_pr(repository, task['branch'], task['base'])
         if len(matches) > 1:
             raise store.Refusal('multiple matching open pull requests')
@@ -101,6 +116,6 @@ def publish(home, task_id, incarnation, grant_id, title, body, run=store.run, gi
                                           github_client.create_pr(repository, task['branch'], task['base'], title, body)['number']))
         receipt = {'schema': 1, 'grant_id': grant['id'], 'remote': grant['remote'],
                    'repository': repository, 'branch': task['branch'], 'base': task['base'],
-                   'local_head': head, 'remote_head': head, 'pr': pull_request}
+                   'local_head': head, 'remote_head': observed_remote_head, 'pr': pull_request}
         tasks._write_pr_receipt_locked(home, task_id, receipt)
         return receipt

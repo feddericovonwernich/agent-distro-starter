@@ -91,29 +91,35 @@ def test_reconcile_refuses_closed_recorded_pr_without_creating(monkeypatch):
         provider = FakeGitHub([{'id': 'P_9', 'number': 9, 'url': 'https://example.test/owner/repo/pull/9',
             'repository': grant['remote_url'], 'headRefName': task['branch'],
             'headRefOid': head, 'baseRefName': task['base'], 'state': 'CLOSED'}])
-
         with pytest.raises(tasks.store.Refusal, match='recorded PR'):
             pr.reconcile(home, task['id'], 'worker-inc', grant['id'], github_client=provider)
 
         assert not provider.created
 
 
-def test_publish_refuses_stale_open_pr_head(monkeypatch):
+
+def test_publish_refuses_closed_recorded_pr_before_creating(monkeypatch):
     with lab() as (home, _):
         brief = home / 'brief.md'; brief.write_text('Change value.txt.\n')
-        task = command(home, 'task', 'create', 'stale-pr', '--project', 'sample', '--brief', str(brief))
+        task = command(home, 'task', 'create', 'closed-publish', '--project', 'sample', '--brief', str(brief))
         run(['git', 'commit', '--allow-empty', '-m', 'candidate'], cwd=task['worktree'])
         instruction = home / 'instruction.txt'
-        instruction.write_text('Authorize stale-pr to publish origin:agd/stale-pr.\n')
-        grant = tasks.grant_pr_publish(home, task['id'], 'origin:agd/stale-pr', instruction)
+        instruction.write_text('Authorize closed-publish to publish origin:agd/closed-publish.\n')
+        grant = tasks.grant_pr_publish(home, task['id'], 'origin:agd/closed-publish', instruction)
         task.update(phase='running', executor='worker', incarnation='worker-inc')
         tasks.save(home, task)
         monkeypatch.setenv('AGD_TASK_ID', task['id'])
         monkeypatch.setenv('AGD_INCARNATION', 'worker-inc')
-        provider = FakeGitHub([{'number': 8, 'repository': grant['remote_url'], 'headRefName': task['branch'],
-            'headRefOid': 'stale', 'baseRefName': task['base'], 'state': 'OPEN'}])
+        head = run(['git', 'rev-parse', 'HEAD'], cwd=task['worktree']).stdout.strip()
+        tasks.write_pr_receipt(home, task['id'], {'schema': 1, 'grant_id': grant['id'], 'remote': 'origin',
+            'repository': grant['remote_url'], 'branch': task['branch'], 'base': task['base'],
+            'local_head': head, 'remote_head': head,
+            'pr': {'id': 'P_9', 'number': 9, 'url': 'https://example.test/owner/repo/pull/9'}})
+        provider = FakeGitHub([{'id': 'P_9', 'number': 9, 'url': 'https://example.test/owner/repo/pull/9',
+            'repository': grant['remote_url'], 'headRefName': task['branch'], 'headRefOid': head,
+            'baseRefName': task['base'], 'state': 'CLOSED'}], created_head=head)
 
-        with pytest.raises(tasks.store.Refusal, match='current head'):
+        with pytest.raises(tasks.store.Refusal, match='recorded PR'):
             pr.publish(home, task['id'], 'worker-inc', grant['id'], 'Title', 'Body', github_client=provider)
 
-        assert not tasks.read_pr_receipt(home, task['id'])
+        assert not provider.created
