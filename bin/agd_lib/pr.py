@@ -89,7 +89,9 @@ def publish(home, task_id, incarnation, grant_id, title, body, run=store.run, gi
         matches = github_client.find_open_pr(repository, task['branch'], task['base'])
         if len(matches) > 1:
             raise store.Refusal('multiple matching open pull requests')
-        pull_request = matches[0] if matches else github_client.create_pr(repository, task['branch'], task['base'], title, body)
+        pull_request = (_check_current_pr(github_client, repository, task['branch'], task['base'], head,
+                                           matches[0]['number']) if matches else
+                        github_client.create_pr(repository, task['branch'], task['base'], title, body))
         receipt = {'schema': 1, 'grant_id': grant['id'], 'remote': grant['remote'],
                    'repository': repository, 'branch': task['branch'], 'base': task['base'],
                    'local_head': head, 'remote_head': head, 'pr': pull_request}
