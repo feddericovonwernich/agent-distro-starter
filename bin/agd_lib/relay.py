@@ -367,11 +367,20 @@ def start_project_service(home, project_id, repository, popen=subprocess.Popen, 
             except json.JSONDecodeError:
                 pass
         if server_process.poll() is not None:
-            raise store.Refusal('Relay server exited before publishing runtime identity')
+            reason = 'Relay server exited before publishing runtime identity'
+            break
         time.sleep(.05)
     else:
+        reason = 'Relay server did not publish runtime identity'
         server_process.terminate()
-        raise store.Refusal('Relay server did not publish runtime identity')
+    if 'reason' in locals():
+        with store.lock(home):
+            current = json.loads(_service_file(home, project_id).read_text())
+            if current.get('server', {}).get('pid') == server_process.pid:
+                current['health'] = 'unhealthy'
+                current['blocked_reason'] = reason
+                store.atomic_json(_service_file(home, project_id), current)
+        raise store.Refusal(reason)
     with store.lock(home):
         current = json.loads(_service_file(home, project_id).read_text())
         current.update(server=_process_record(server_process), health='healthy')
