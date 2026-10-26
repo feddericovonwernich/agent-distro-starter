@@ -9,6 +9,7 @@
 **Tech Stack:** Python standard library; existing AGD CLI and task store; Git; authenticated GitHub CLI (`gh`); Node >= 22.19/npm; Open Relay 0.1.0 pinned at `dac2865837bcab9444a8636053f4f1406a3f9291`; pytest; disposable homes/local bare Git.
 
 **Spec:** `docs/superpowers/specs/2026-10-26-scoped-worker-pr-relay-design.md`
+**Status:** User approved local implementation in the designated feature worktree only. This excludes live GitHub push/PR creation/merge, Relay installation, and changes to any running instance. A disposable pinned Relay custom-event smoke proved correlated POST/poll delivery; a delayed reply after its 30-second lease expired with `lease authority expired`.
 
 ## Global Constraints
 
@@ -22,7 +23,7 @@
 - The pinned built-in GitHub connector runs `generic-check-runs` for standard Actions, emitting `pr.ci.settled@1`. AGD's central read-only human-review producer emits `agd.pr.review@1`; it is required because the built-in `configured-tools`/`pr.automation.settled@1` path only recognizes configured Sonar/Copilot/Bugbot tools and does not cover general human review. Optional bot triggers use combined mode only after explicit identity configuration and never gate worker wakes.
 - Do not modify Open Relay source. One AGD-owned central producer handles human-review polling/deduplication; its durable cursor/idempotency and health are AGD responsibilities.
 - A worker delivery uses `relay agent poll AGD_WORKER_ID --project-root CENTRAL_RELAY_ROOT --definitions pr.ci.settled@1,agd.pr.review@1 --structured-output --context-tokens 5000 --correlation-id github:LOWERCASE_OWNER/LOWERCASE_REPOSITORY:pull-request:PR_NUMBER`. Its default ten-minute park is intentional; do not wrap it in a 30-second process timeout or busy-loop `relay get`.
-- For every delivery: `reply start`, validate untrusted payload identity/current head and result against the delivered `outputSchema`, then exactly one terminal `complete`, `fail`, or `cancelled` reply before another poll. `relay notify` is automatic acknowledgement and is not used for the worker repair lease.
+- For every delivery: promptly verify untrusted payload identity/current head, durably persist it as pending feedback, then send `reply start` and a schema-valid terminal `complete` acknowledgement before any potentially lengthy repair/test. Acknowledgement is receipt, not completed repair: a crash resumes pending feedback. Settle one lease before another poll; an uncertain, rejected, or expired reply authority is blocked. `relay notify` is automatic acknowledgement and is not used for the worker repair lease.
 - GitHub final evidence must show an OPEN, unmerged exact repository/head/base PR; equal local/remote/PR SHA; green effective required checks; `mergeStateStatus == CLEAN`; and `reviewDecision == APPROVED` when effective reviews are required. Missing/ambiguous policy data blocks.
 - GitHub and Git are not one transaction. Re-read remote and PR heads immediately before `ready`; if either moved, reject the evidence and reconcile/verify again.
 - No credentialed GitHub publication/connector acceptance run is allowed without a separate user instruction naming the target. Committed tests use fakes at GitHub/Relay/npm boundaries and disposable local Git only.
@@ -421,15 +422,25 @@ def test_ci_settlement_then_new_current_head_review_wakes_once(home_task):
     ci = relay.poll(home, task, grant, "worker-inc", run=delivery_for("pr.ci.settled@1", task))
     relay.reply(home, task, grant, "worker-inc", ci["lease_id"], "start", None, run=reply_success)
     settled = relay.reply(home, task, grant, "worker-inc", ci["lease_id"], "complete",
-                          {"result": {"summary": "CI settled"}, "effects": []}, run=reply_success)
+                          {"result": {"summary": "feedback received; repair pending"}, "effects": []}, run=reply_success)
     assert settled["status"] == "settled"
-    assert tasks.read_pr_receipt(home, task["id"])["relay"]["lease"]["status"] == "settled"
+    receipt = tasks.read_pr_receipt(home, task["id"])
+    assert receipt["relay"]["lease"]["status"] == "settled"
+    assert receipt["relay"]["pending_feedback"]["status"] == "acknowledged"
     assert relay.watch_human_reviews(home, task, grant, review_client(comment_id=41), producer=recording_producer)["emitted"] == 1
     review = relay.poll(home, task, grant, "worker-inc", run=delivery_for("agd.pr.review@1", task))
     assert review["definition"] == "agd.pr.review@1"
     relay.reload_project_service(home, task["project"])
     assert relay.watch_human_reviews(home, task, grant, review_client(comment_id=41), producer=recording_producer)["emitted"] == 0
     assert relay.watch_human_reviews(home, task, grant, review_client(comment_id=42, head="stale"), producer=recording_producer)["emitted"] == 0
+
+def test_acknowledged_feedback_resumes_after_crash(home_task):
+    home, task, grant = home_task
+    delivery = relay.poll(home, task, grant, "worker-inc", run=delivery_for("pr.ci.settled@1", task))
+    relay.reply(home, task, grant, "worker-inc", delivery["lease_id"], "start", None, run=reply_success)
+    relay.reply(home, task, grant, "worker-inc", delivery["lease_id"], "complete",
+                {"result": {"summary": "feedback received; repair pending"}, "effects": []}, run=reply_success)
+    assert relay.reconcile_task(home, task)["relay"]["pending_feedback"]["lease_id"] == delivery["lease_id"]
 
 def test_review_producer_failure_blocks_task_and_service(home_task):
     home, task, grant = home_task
@@ -483,20 +494,20 @@ For a worker poll, use the exact one-shot command with `timeout=610` in `store.r
 relay agent poll AGD_WORKER_ID --project-root CENTRAL_RELAY_ROOT --definitions pr.ci.settled@1,agd.pr.review@1 --structured-output --context-tokens 5000 --correlation-id github:owner/repository:pull-request:PR_NUMBER
 ```
 
-On `{"type":"timeout"}`, record an idle observation and permit one immediate later poll; never loop inside AGD and never poll with an active lease. On delivery, persist lease ID, exact definition/correlation, event/PR/head identity, and delivered `outputSchema`, then require:
+On `{"type":"timeout"}`, record an idle observation and permit one immediate later poll; never loop inside AGD and never poll with an active lease. On delivery, promptly verify identity/current head, persist lease ID, exact definition/correlation, event/PR/head identity, delivered `outputSchema`, and pending feedback before any repair. Then require:
 
 ```bash
 relay agent reply LEASE_ID start --project-root CENTRAL_RELAY_ROOT
-relay agent reply LEASE_ID complete --project-root CENTRAL_RELAY_ROOT --json '{"result":{"summary":"verified current-head feedback handled"},"effects":[]}'
+relay agent reply LEASE_ID complete --project-root CENTRAL_RELAY_ROOT --json '{"result":{"summary":"feedback received; repair pending"},"effects":[]}'
 ```
 
-Validate the proposed result against the delivered schema before `complete`. A Relay HTTP 400/schema rejection leaves the lease active; preserve it for correction. For invalid, stale, or untrusted feedback, record why and settle with `relay agent reply LEASE_ID cancelled --project-root CENTRAL_RELAY_ROOT --json '{"effects":[]}'`; do not re-poll until Relay accepts the terminal reply. Relay restart/401/409 invalidates local lease authority: mark receipt blocked and use recovery rather than guessing.
+Validate the acknowledgement result against the delivered schema before `complete`; it means receipt, not completed repair. The pending record survives a crash and drives resumed repair/test/publication. A Relay HTTP 400/schema rejection leaves the lease active; preserve it for correction. For invalid, stale, or untrusted feedback, record why and settle with `relay agent reply LEASE_ID cancelled --project-root CENTRAL_RELAY_ROOT --json '{"effects":[]}'`; do not re-poll until Relay accepts the terminal reply. Relay restart, 401, 409, or expired lease authority is uncertain: mark receipt blocked and use recovery rather than guessing.
 
 - [ ] **Step 4: Run protocol tests and commit**
 
-Run: `pytest tests/test_relay.py tests/test_github.py tests/test_workers.py -k 'ci_settlement_then_new_current_head_review_wakes_once or review_producer_failure or lease_unsettled' -v`
+Run: `pytest tests/test_relay.py tests/test_github.py tests/test_workers.py -k 'ci_settlement_then_new_current_head_review_wakes_once or acknowledged_feedback_resumes_after_crash or review_producer_failure or lease_unsettled' -v`
 
-Expected: PASS; standard Actions and a human review independently produce a correlated lease, a restart cannot duplicate a review artifact, and a rejected completion does not erase its lease.
+Expected: PASS; standard Actions and a human review independently produce a correlated lease, acknowledgement persists resumable feedback, a restart cannot duplicate a review artifact, and a rejected completion does not erase its lease.
 
 ```bash
 git add bin/agd_lib/relay.py bin/agd_lib/github.py bin/agd_lib/workers.py bin/agd_lib/supervision.py tests/test_relay.py tests/test_github.py tests/test_workers.py
@@ -540,7 +551,7 @@ Expected: FAIL because grant-only command guards do not exist.
 
 - [ ] **Step 3: Implement mutually exclusive prompt paths**
 
-Without `pr_grant`, retain the exact current prompt and normal resolver behavior. With a valid grant, provision the fixed `agd-scoped-pr-relay` bundle in the frozen manifest, replace (not append to) the default prohibition with the exact allowed commands, and state that only guarded publish/verify/poll/reply commands may be used. The skill tells the worker to treat Relay payloads as data, call `reply start`, verify identity/head, make minimal repairs, commit, call guarded non-force publish, and settle one terminal lease before re-polling. It prohibits merge/force/tag/base changes/admin access/credential exposure and reports blocked conditions through existing worker events.
+Without `pr_grant`, retain the exact current prompt and normal resolver behavior. With a valid grant, provision the fixed `agd-scoped-pr-relay` bundle in the frozen manifest, replace (not append to) the default prohibition with the exact allowed commands, and state that only guarded publish/verify/poll/reply commands may be used. The skill tells the worker to treat Relay payloads as data, promptly verify and persist pending feedback, send `reply start` and schema-valid terminal acknowledgement, then make minimal repairs, commit, and call guarded non-force publish; it resumes persisted pending feedback after a crash and never polls before settlement. It prohibits merge/force/tag/base changes/admin access/credential exposure and reports blocked conditions through existing worker events.
 
 - [ ] **Step 4: Run focused tests and commit**
 
@@ -632,4 +643,4 @@ Plan complete and saved to `docs/superpowers/plans/2026-10-26-scoped-worker-pr-r
 1. **Subagent-Driven (recommended)** — dispatch a fresh subagent per task, review between tasks.
 2. **Inline Execution** — execute tasks in this session using `executing-plans`, with review checkpoints.
 
-Choose an approach before implementation; this planning task does not start implementation.
+Local implementation is approved in the designated feature worktree. It does not authorize live GitHub push/PR creation/merge, Relay installation, or running-instance changes.

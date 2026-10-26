@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-The user approved this architecture for implementation planning. It adds an explicitly authorized, worker-driven pull-request lifecycle backed by Open Relay feedback. It does **not** authorize implementation, Relay installation, network access, a push, a pull request, a merge, a restart, or changes to any running installation.
+The user approved local implementation in the designated feature worktree. This does **not** authorize a live GitHub push, PR creation, merge, Relay installation, or change to any running instance. A disposable pinned Relay custom-event smoke proved correlated POST/poll delivery; its delayed 30-second lease reply expired with `lease authority expired`.
 
 The feature applies only to a `ship` task with an orchestrator-recorded PR publication grant from a user instruction that names that exact task and `<remote>:<assigned-branch>` target. This is a new task action, distinct from the existing `publish` approval: existing `publish` remains bound to one ready `HEAD` and therefore cannot authorize an iterative repair loop. The existing worker type remains in use; a PR-capable worker is not a new trust class. Normal task launches and their default skills remain unchanged.
 
@@ -46,7 +46,7 @@ The current `publication_record` is intentionally a post-`ready` record. This de
 
 The launch prompt remains prohibitive by default. Only a task with the recorded PR grant receives an AGD-owned concise skill that names the permitted lifecycle and directs the worker to the guarded AGD operations. It explicitly says that the skill is neither authority nor an OS sandbox, that no merge/force/tag is allowed, and that unavailable or ambiguous conditions must be reported as blocked.
 
-The skill is selected in curated mode only after the grant is present; it is not part of `DEFAULT_SKILLS`, a default profile, or ordinary task selection. It is frozen and materialized using the existing worker-skill catalog and per-task snapshot mechanism. The worker must poll Relay feedback, make the smallest justified repair in its assigned worktree, commit it, then invoke the guarded non-force publication operation again. It stays active until final GitHub verification succeeds or it emits an actionable durable blocked/decision event. It must settle each Relay lease/reply exactly once through Relay's supported semantics before moving on; failed settlement is retried or blocks, never silently discarded.
+The skill is selected in curated mode only after the grant is present; it is not part of `DEFAULT_SKILLS`, a default profile, or ordinary task selection. It is frozen and materialized using the existing worker-skill catalog and per-task snapshot mechanism. On delivery, the worker promptly verifies identity, durably records pending feedback, and sends `start` plus a schema-valid `complete` acknowledgement before any potentially lengthy repair or test. That acknowledgement means receipt, not completed repair: a crash afterwards resumes the persisted pending feedback. The worker then makes the smallest justified repair in its assigned worktree, commits it, and invokes the guarded non-force publication operation again. It stays active until final GitHub verification succeeds or it emits an actionable durable blocked/decision event. It settles each lease before another poll; an uncertain or expired reply authority is durable `blocked`, never silently discarded.
 
 The worker polls both the standard-CI `pr.ci.settled@1` and AGD-owned human-feedback `agd.pr.review@1` definitions using its task's exact lowercase `github:<owner/repository>:pull-request:<number>` correlation ID. `pr.automation.settled@1` is not a required wake: the pinned default `configured-tools` aggregate waits for all configured Sonar/Copilot/Bugbot recognizers and can never settle for a standard Actions-only repository. The worker's Relay client commands use only:
 
@@ -113,8 +113,9 @@ sequenceDiagram
     loop Feedback and repair
         W->>R: poll with project-root and PR correlation
         R-->>W: leased review/check feedback
-        W->>R: reply/settle lease
-        W->>W: Repair, commit
+        W->>W: Verify and persist pending feedback
+        W->>R: start + schema-valid complete acknowledgement
+        W->>W: Repair, commit; resume pending work after crash
         W->>A: Guarded publish-pr
         A->>G: Non-force push and reconcile PR
     end
