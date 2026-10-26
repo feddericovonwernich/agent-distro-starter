@@ -75,7 +75,8 @@ def test_get_pr_queries_repository_number_and_normalizes_contexts():
         return type('Result', (), {'stdout': '''{"data":{"repository":{"pullRequest":{
             "id":"P_1","number":7,"url":"https://example.test/owner/repo/pull/7",
             "state":"OPEN","mergedAt":null,"headRefName":"agd/task","headRefOid":"abc",
-            "baseRefName":"main","mergeStateStatus":"CLEAN","reviewDecision":null,
+            "baseRefName":"main","headRepository":{"nameWithOwner":"owner/repo"},
+            "mergeStateStatus":"CLEAN","reviewDecision":null,
             "commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{
                 "pageInfo":{"hasNextPage":false},"nodes":[
                 {"name":"ci","status":"COMPLETED","conclusion":"SUCCESS"},
@@ -93,7 +94,8 @@ def test_get_pr_refuses_truncated_check_contexts():
     def gh(argv, **_):
         return type('Result', (), {'stdout': '''{"data":{"repository":{"pullRequest":{
           "id":"P_1","number":7,"url":"https://example.test/pr/7","state":"OPEN","mergedAt":null,
-          "headRefName":"agd/task","headRefOid":"abc","baseRefName":"main","mergeStateStatus":"CLEAN",
+          "headRefName":"agd/task","headRefOid":"abc","baseRefName":"main",
+          "headRepository":{"nameWithOwner":"owner/repo"},"mergeStateStatus":"CLEAN",
           "reviewDecision":null,"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{
           "pageInfo":{"hasNextPage":true},"nodes":[]}}}}]}}}}}'''})()
 

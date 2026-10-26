@@ -9,6 +9,7 @@ query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       id number url state mergedAt headRefName headRefOid baseRefName mergeStateStatus reviewDecision
+      headRepository { nameWithOwner }
       commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) {
         pageInfo { hasNextPage }
         nodes {
@@ -61,6 +62,8 @@ def get_pr(repository, number, run=store.run):
     node = graphql(PR_QUERY, {'owner': owner, 'name': name, 'number': number}, run)['repository'].get('pullRequest')
     if not isinstance(node, dict):
         raise store.Refusal('GitHub PR is missing')
+    if node.get('headRepository', {}).get('nameWithOwner') != repository:
+        raise store.Refusal('GitHub PR head repository does not match task')
     try:
         rollup = node['commits']['nodes'][-1]['commit']['statusCheckRollup']
         if rollup['contexts']['pageInfo']['hasNextPage']:
