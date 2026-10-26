@@ -556,8 +556,8 @@ def test_cli_curated_selection_freezes_before_backend_failure():
         command(home, 'worker', 'launch', 'curated', '--backend', 'herdr',
                 '--skill-mode', 'curated', '--skill', 'agd-probe', expected=4)
         assert tasks.read(home, 'curated')['phase'] == 'prepared'
-        assert (home/'data'/'tasks'/'curated'/'worker-skills.json').is_file()
-        assert (Path(task['worktree'])/'.omp'/'skills'/'agd-probe'/'SKILL.md').is_file()
+        assert not (home/'data'/'tasks'/'curated'/'worker-skills.json').exists()
+        assert not (Path(task['worktree'])/'.omp').exists()
 
 
 def test_cli_default_profile_and_cursor_nonempty_refusal_preserve_task():
@@ -573,7 +573,7 @@ def test_cli_default_profile_and_cursor_nonempty_refusal_preserve_task():
                        '--brief', str(brief), '--kind', 'scout')
         command(home, 'worker', 'launch', 'profile', '--backend', 'herdr', expected=4)
         assert tasks.read(home, 'profile')['phase'] == 'prepared'
-        assert (home/'data'/'tasks'/'profile'/'worker-skills.json').is_file()
+        assert not (home/'data'/'tasks'/'profile'/'worker-skills.json').exists()
         instruction = home/'trust.md'; instruction.write_text('Trust this disposable project.\n')
         command(home, 'project', 'trust', 'sample', '--instruction', str(instruction))
         task = command(home, 'task', 'create', 'cursor', '--project', 'sample',

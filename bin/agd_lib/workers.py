@@ -51,26 +51,28 @@ def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=Fal
         tasks.authorization(home, task, approval_id or '', 'unattended', task_id)
     if selected_backend not in ('tmux', 'herdr') or harness not in ('omp', 'cursor'):
         raise ValueError('unsupported backend or harness')
-    selection = worker_skills.resolve(home, profile=profile, skill_mode=skill_mode, skills=skills)
-    manifest = None
-    if selection['skills']:
-        manifest = worker_skills.prepare(home, dict(task, harness=harness), selection)
-    task.update(harness=harness, backend=selected_backend, worker_skill_selection=selection)
-    if manifest is not None:
-        task['worker_skills'] = manifest
-    harnesses.launch_argv(task, tasks.task_file(home, task_id).parent/'brief.md', unattended)
-    module = backend(task)
+    preflight = dict(task, harness=harness, backend=selected_backend)
+    harnesses.launch_argv(preflight, tasks.task_file(home, task_id).parent/'brief.md', unattended)
+    module = backend(preflight)
     if selected_backend == 'tmux' and not shutil.which('tmux'):
         raise store.DependencyError('tmux is not installed')
     if selected_backend == 'herdr':
         module.prepare(home)
-    incarnation = str(uuid.uuid4())
-    task.update(executor='worker', incarnation=incarnation, phase='running', worker_alive=None,
-                unattended=unattended)
     with store.lock(home):
         current = tasks.read(home, task_id)
         if current['phase'] != 'prepared' or current['executor'] != 'central':
             raise store.Refusal('task launch raced another owner; no endpoint created')
+        selection = worker_skills.resolve(home, profile=profile, skill_mode=skill_mode, skills=skills)
+        manifest = None
+        if selection['skills']:
+            manifest = worker_skills.prepare(home, dict(current, harness=harness), selection)
+        task = current
+        task.update(harness=harness, backend=selected_backend, worker_skill_selection=selection)
+        if manifest is not None:
+            task['worker_skills'] = manifest
+        incarnation = str(uuid.uuid4())
+        task.update(executor='worker', incarnation=incarnation, phase='running', worker_alive=None,
+                    unattended=unattended)
         tasks.save(home, task)
     endpoint = module.create(home, task_id, incarnation, work,
                              ['env', f'AGD_TASK_ID={task_id}', f'AGD_INCARNATION={incarnation}',
