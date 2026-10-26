@@ -195,3 +195,18 @@ def test_restart_detects_an_edited_old_artifact(tmp_path):
     github.pages['review_comments'] = [[artifact('comment-1', 'review_comment', github.head, body='edited')]]
     assert review_feedback.watch_human_reviews(tmp_path, 'sample', 'owner/repo', 7, github, relay)['emitted'] == 1
     assert len(relay.keys) == 2
+
+
+def test_loopback_disables_environment_proxy(monkeypatch):
+    from urllib.request import ProxyHandler
+    monkeypatch.setenv('HTTP_PROXY', 'http://attacker.invalid:8080')
+    captured = []
+    class Response:
+        status = 201
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+    class Opener:
+        def open(self, *_args, **_kwargs): return Response()
+    with patch('agd_lib.review_feedback.build_opener', side_effect=lambda *handlers: captured.extend(handlers) or Opener()):
+        assert review_feedback.LoopbackRelay('http://127.0.0.1:4312', 'secret')({'type': 'agd.pr.review'}) == 201
+    assert any(isinstance(handler, ProxyHandler) and handler.proxies == {} for handler in captured)

@@ -4,7 +4,7 @@ import json
 import re
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 from urllib.parse import urlsplit
 
 from . import store
@@ -102,7 +102,7 @@ class LoopbackRelay:
         request = Request(self.endpoint, data=json.dumps(payload, separators=(',', ':')).encode(), method='POST',
                           headers={'Authorization': f'Bearer {self.producer_token}', 'Content-Type': 'application/json'})
         try:
-            with build_opener(_NoRedirect()).open(request, timeout=15) as response:
+            with build_opener(ProxyHandler({}), _NoRedirect()).open(request, timeout=15) as response:
                 return response.status
         except HTTPError as error:
             if 300 <= error.code < 400:
