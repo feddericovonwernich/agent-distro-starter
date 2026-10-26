@@ -343,6 +343,7 @@ def start_project_service(home, project_id, repository, popen=subprocess.Popen, 
     record = ensure_project_service(home, project_id, repository)
     root, runtime = Path(record['root']), Path(record['runtime'])
     from . import supervision
+    waiting = None
     with store.lock(home):
         current = json.loads(_service_file(home, project_id).read_text())
         server = current.get('server')
@@ -350,14 +351,25 @@ def start_project_service(home, project_id, repository, popen=subprocess.Popen, 
             if not supervision.gone(server['pid'], server['start']):
                 if current.get('health') == 'healthy':
                     return current
-                raise store.Refusal('Relay server startup is pending')
-        try:
-            server_process = popen([str(runtime/'bin'/'relay'), 'start', '--project-root', str(root), '--port', '0'],
-                                   cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except OSError as error:
-            raise store.DependencyError('Relay server could not start') from error
-        current.update(server={**_process_record(server_process), 'status': 'starting'}, health='starting')
-        store.atomic_json(_service_file(home, project_id), current)
+                waiting = (server['pid'], server['start'])
+        if waiting is None:
+            try:
+                server_process = popen([str(runtime/'bin'/'relay'), 'start', '--project-root', str(root), '--port', '0'],
+                                       cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError as error:
+                raise store.DependencyError('Relay server could not start') from error
+            current.update(server={**_process_record(server_process), 'status': 'starting'}, health='starting')
+            store.atomic_json(_service_file(home, project_id), current)
+    if waiting is not None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if supervision.gone(*waiting):
+                raise store.Refusal('Relay server exited during startup')
+            current = json.loads(_service_file(home, project_id).read_text())
+            if current.get('health') == 'healthy' and current.get('server', {}).get('pid') == waiting[0]:
+                return current
+            time.sleep(.05)
+        raise store.Refusal('Relay server startup timed out')
     runtime_file = root/'.relay'/'runtime.json'
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
