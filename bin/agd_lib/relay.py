@@ -5,6 +5,8 @@ import json
 import os
 import shutil
 import stat
+import subprocess
+import time
 import uuid
 from pathlib import Path
 
@@ -321,6 +323,7 @@ def ensure_project_service(home, project_id, repository, run=store.run):
         relay_state = root/'.relay'
         if os.path.lexists(relay_state):
             raise store.Refusal('Relay project state exists without a service record; preserving it')
+        # ponytail: global home lock during one-time init; use per-project locks if concurrent project provisioning matters.
         run([str(runtime/'bin'/'relay'), 'init', '--github', repository], cwd=root, timeout=30)
         _lstat(relay_state, 'dir')
         _install_review_definition(root)
@@ -329,3 +332,43 @@ def ensure_project_service(home, project_id, repository, run=store.run):
                   'runtime': str(runtime), 'root': str(root), 'health': 'starting'}
         store.atomic_json(path, record)
         return record
+
+
+def _process_record(process):
+    from . import supervision
+    return {'pid': process.pid, 'start': supervision.process_start(process.pid)}
+
+
+def start_project_service(home, project_id, repository, popen=subprocess.Popen, timeout=5):
+    record = ensure_project_service(home, project_id, repository)
+    root, runtime = Path(record['root']), Path(record['runtime'])
+    from . import supervision
+    with store.lock(home):
+        current = json.loads(_service_file(home, project_id).read_text())
+        server = current.get('server')
+        if isinstance(server, dict) and isinstance(server.get('pid'), int) and isinstance(server.get('start'), str):
+            if not supervision.gone(server['pid'], server['start']):
+                return current
+        server_process = popen([str(runtime/'bin'/'relay'), 'start', '--project-root', str(root), '--port', '0'],
+                               cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    runtime_file = root/'.relay'/'runtime.json'
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if runtime_file.is_file() and not runtime_file.is_symlink():
+            try:
+                runtime_state = json.loads(runtime_file.read_text())
+                if runtime_state.get('pid') == server_process.pid and isinstance(runtime_state.get('port'), int):
+                    break
+            except json.JSONDecodeError:
+                pass
+        if server_process.poll() is not None:
+            raise store.Refusal('Relay server exited before publishing runtime identity')
+        time.sleep(.05)
+    else:
+        server_process.terminate()
+        raise store.Refusal('Relay server did not publish runtime identity')
+    with store.lock(home):
+        current = json.loads(_service_file(home, project_id).read_text())
+        current.update(server=_process_record(server_process), health='healthy')
+        store.atomic_json(_service_file(home, project_id), current)
+        return current
