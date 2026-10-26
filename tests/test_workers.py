@@ -207,7 +207,7 @@ def test_granted_launch_uses_frozen_private_scoped_skill_and_prompt():
         instruction.write_text('Task granted may publish origin:agd/granted for task granted.\n')
         grant = tasks.grant_pr_publish(home, 'granted', 'origin:agd/granted', instruction)
         class FakeBackend:
-            def create(self, *_args): return {'created': True}
+            def create(self, *_args): return {'created': True, 'incarnation': _args[2]}
         with patch.object(workers.harnesses, 'launch_argv', return_value=['true']), \
              patch.object(workers, 'backend', return_value=FakeBackend()), \
              patch.object(workers.shutil, 'which', return_value='/bin/true'):
@@ -222,6 +222,14 @@ def test_granted_launch_uses_frozen_private_scoped_skill_and_prompt():
         text = argv[-1]
         assert grant['id'] in text and '--incarnation $AGD_INCARNATION' in text
         assert f'worker verify-pr granted' in text and str(home) in text
+        current = tasks.read(home, 'granted')
+        current['worker_alive'] = False
+        tasks.save(home, current)
+        with patch.object(workers, 'inspect', return_value={'endpoint': {'presence': 'missing'}}), \
+             patch.object(workers, 'backend', return_value=FakeBackend()):
+            relaunched = workers.relaunch(home, 'granted')
+        assert relaunched['incarnation'] != launched['incarnation']
+        assert (Path(manifest['skills'][0]['snapshot'])/'SKILL.md').is_file()
 def test_concurrent_skill_launch_has_one_winner_without_orphans():
     from concurrent.futures import ThreadPoolExecutor
     from unittest.mock import patch
