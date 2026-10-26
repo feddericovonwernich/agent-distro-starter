@@ -237,7 +237,7 @@ def _service_file(home, project_id):
     return _service_root(home, project_id)/'service.json'
 
 
-def ensure_project_service(home, project_id, repository):
+def ensure_project_service(home, project_id, repository, run=store.run):
     project_id = store.validate_id(project_id)
     if not isinstance(repository, str) or repository.count('/') != 1 or not all(repository.split('/')):
         raise store.Refusal('Relay project repository must be OWNER/REPOSITORY')
@@ -257,6 +257,12 @@ def ensure_project_service(home, project_id, repository):
                     record.get('health') not in ('starting', 'healthy')):
                 raise store.Refusal('Relay project service identity changed')
             return record
+        relay_state = root/'.relay'
+        if os.path.lexists(relay_state):
+            _lstat(relay_state, 'dir')
+        else:
+            run([str(runtime/'bin'/'relay'), 'init', '--github', repository], cwd=root, timeout=30)
+            _lstat(relay_state, 'dir')
         record = {'schema': 1, 'project': project_id, 'repository': repository,
                   'runtime': str(runtime), 'root': str(root), 'health': 'starting'}
         store.atomic_json(path, record)

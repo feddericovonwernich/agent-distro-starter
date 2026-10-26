@@ -107,8 +107,10 @@ def test_project_service_is_private_and_idempotent(tmp_path, monkeypatch):
     runtime.mkdir()
     monkeypatch.setattr(relay, 'ensure_runtime', lambda *_args, **_kwargs: runtime)
 
-    first = relay.ensure_project_service(home, 'sample', 'owner/repo')
-    second = relay.ensure_project_service(home, 'sample', 'owner/repo')
+    def init(argv, cwd, **_kwargs):
+        (cwd/'.relay').mkdir()
+    first = relay.ensure_project_service(home, 'sample', 'owner/repo', run=init)
+    second = relay.ensure_project_service(home, 'sample', 'owner/repo', run=init)
 
     assert first == second
     assert first['runtime'] == str(runtime)
