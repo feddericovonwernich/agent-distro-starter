@@ -88,6 +88,42 @@ def find_open_pr(repository, head, base, run=store.run):
     return found
 
 
+def normalize_policy(classic, rules):
+    if classic is not None and not isinstance(classic, dict):
+        raise store.Refusal('GitHub policy evidence is unrecognized')
+    if not isinstance(rules, dict) or not isinstance(rules.get('rules'), list):
+        raise store.Refusal('GitHub policy evidence is incomplete')
+    if rules['rules']:
+        raise store.Refusal('GitHub policy evidence is unrecognized')
+    classic = classic or {}
+    checks = classic.get('required_status_checks', {}).get('contexts', [])
+    approvals = classic.get('required_pull_request_reviews', {}).get('required_approving_review_count', 0)
+    if (not isinstance(checks, list) or not all(isinstance(check, str) and check for check in checks) or
+            not isinstance(approvals, int) or approvals < 0):
+        raise store.Refusal('GitHub policy evidence is unrecognized')
+    return {'checks': tuple(checks), 'approvals': approvals}
+
+
+
+def _api_json(path, run, optional=False):
+    result = run(['gh', 'api', '--method', 'GET', path], check=False)
+    if result.returncode:
+        if optional and '404' in (result.stderr or result.stdout):
+            return None
+        raise store.Refusal('GitHub policy request failed')
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise store.Refusal('GitHub policy response is invalid') from error
+
+
+def effective_policy(repository, base, run=store.run):
+    owner, name = split_repository(repository)
+    path = f'repos/{owner}/{name}/branches/{base}'
+    classic = _api_json(f'{path}/protection', run, optional=True)
+    rules = _api_json(f'repos/{owner}/{name}/rules/branches/{base}', run)
+    return normalize_policy(classic, rules)
+
 def create_pr(repository, head, base, title, body, run=store.run):
     owner, name = split_repository(repository)
     if not all(isinstance(value, str) and value for value in (head, base, title, body)):

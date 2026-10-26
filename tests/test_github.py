@@ -116,3 +116,17 @@ def test_find_open_pr_returns_only_exact_head_and_base():
     prs = github.find_open_pr('owner/repo', 'agd/task', 'main', run=gh)
 
     assert [pr['number'] for pr in prs] == [7]
+
+
+def test_normalize_policy_combines_classic_requirements_and_empty_rules():
+    policy = github.normalize_policy(
+        {'required_status_checks': {'contexts': ['ci']},
+         'required_pull_request_reviews': {'required_approving_review_count': 2}},
+        {'rules': []})
+
+    assert policy == {'checks': ('ci',), 'approvals': 2}
+
+
+def test_normalize_policy_refuses_unrecognized_effective_rules():
+    with pytest.raises(store.Refusal, match='policy'):
+        github.normalize_policy(None, {'rules': [{'type': 'unknown'}]})
