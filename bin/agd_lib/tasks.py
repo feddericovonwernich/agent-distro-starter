@@ -154,6 +154,22 @@ def pr_receipt_file(home, task_id):
     return task_file(home, task_id).parent/'pr.json'
 
 
+def validate_pr_receipt(receipt):
+    if not isinstance(receipt, dict) or receipt.get('schema') != 1 or not isinstance(receipt.get('grant_id'), str):
+        raise store.Refusal('PR receipt is invalid')
+    if receipt.get('blocked_reason'):
+        return receipt
+    required = ('remote', 'repository', 'branch', 'base', 'local_head', 'remote_head', 'pr')
+    if any(not isinstance(receipt.get(key), str) or not receipt[key] for key in required[:-1]):
+        raise store.Refusal('PR receipt is invalid')
+    pull_request = receipt['pr']
+    if not isinstance(pull_request, dict) or not isinstance(pull_request.get('number'), int) or pull_request['number'] < 1:
+        raise store.Refusal('PR receipt is invalid')
+    return receipt
+
+
+
+
 def read_pr_receipt(home, task_id):
     path = pr_receipt_file(home, task_id)
     if not path.exists():
@@ -161,12 +177,13 @@ def read_pr_receipt(home, task_id):
     if path.is_symlink() or not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode):
         raise store.Refusal('PR receipt is unsafe')
     try:
-        return json.loads(path.read_text())
+        return validate_pr_receipt(json.loads(path.read_text()))
     except json.JSONDecodeError as error:
         raise store.Refusal('PR receipt is invalid') from error
 
 
 def _write_pr_receipt_locked(home, task_id, receipt):
+    validate_pr_receipt(receipt)
     read(home, task_id)
     path = pr_receipt_file(home, task_id)
     if path.exists() and (path.is_symlink() or not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode)):
