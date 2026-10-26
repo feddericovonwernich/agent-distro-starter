@@ -238,21 +238,28 @@ def _service_file(home, project_id):
 
 
 def _install_review_definition(root):
+    relay_root = root/'.relay'
+    _lstat(relay_root, 'dir')
     source = Path(__file__).resolve().parents[2]/'bundled'/'relay'
     for relative in ('events/agd-pr-review.v1.json', 'schemas/agd-pr-review-input.json',
                      'schemas/agd-pr-review-output.json', 'handlers/agd-pr-review.md'):
-        origin, destination = source/relative, root/'.relay'/relative
+        origin, destination = source/relative, relay_root/relative
         if not origin.is_file() or origin.is_symlink():
             raise store.Refusal('bundled Relay review definition is unavailable')
+        parent = relay_root
+        for part in Path(relative).parent.parts:
+            parent /= part
+            if os.path.lexists(parent):
+                _lstat(parent, 'dir')
         if os.path.lexists(destination):
             _lstat(destination, 'file')
             if destination.read_bytes() != origin.read_bytes():
                 raise store.Refusal('Relay review definition was modified')
         else:
-            if os.path.lexists(destination.parent):
-                _lstat(destination.parent, 'dir')
-            else:
+            try:
                 destination.parent.mkdir(parents=True, mode=0o700)
+            except FileExistsError:
+                _lstat(destination.parent, 'dir')
             shutil.copyfile(origin, destination)
 
 
@@ -263,7 +270,11 @@ def _require_read_token():
 
 def _configure_connector(root, repository, fresh_init=False):
     _require_read_token()
-    path = root/'.relay'/'connectors'/'github.json'
+    relay_root = root/'.relay'
+    _lstat(relay_root, 'dir')
+    connectors = relay_root/'connectors'
+    _lstat(connectors, 'dir')
+    path = connectors/'github.json'
     config = {'connector': 'github', 'tokenEnv': 'AGD_RELAY_GITHUB_READ_TOKEN',
               'repositories': [{'name': repository, 'mode': 'generic-check-runs'}], 'triggers': []}
     if not os.path.lexists(path):
