@@ -65,10 +65,14 @@ def get_pr(repository, number, run=store.run):
     if node.get('headRepository', {}).get('nameWithOwner') != repository:
         raise store.Refusal('GitHub PR head repository does not match task')
     try:
-        rollup = node['commits']['nodes'][-1]['commit']['statusCheckRollup']
-        if rollup['contexts']['pageInfo']['hasNextPage']:
-            raise store.Refusal('GitHub PR check evidence is incomplete')
-        contexts = rollup['contexts']['nodes']
+        commit = node['commits']['nodes'][-1]['commit']
+        rollup = commit['statusCheckRollup']
+        if rollup is None:
+            contexts = []
+        else:
+            if rollup['contexts']['pageInfo']['hasNextPage']:
+                raise store.Refusal('GitHub PR check evidence is incomplete')
+            contexts = rollup['contexts']['nodes']
     except store.Refusal:
         raise
     except (KeyError, IndexError, TypeError):
