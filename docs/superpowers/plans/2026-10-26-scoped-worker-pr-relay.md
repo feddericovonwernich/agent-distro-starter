@@ -17,7 +17,7 @@
 - `pr-publish` is a new action, distinct from HEAD-bound `publish`, and is restricted to one ship task, `REMOTE:TASK_BRANCH`, and descendants of its recorded grant head.
 - Never force-push, merge, tag, alter the base branch, run `sudo`, alter user-global npm/global skills, or include tokens/server/admin configuration in worker instructions.
 - Private installation only: `npm install --global --prefix "$AGD_HOME/state/relay-stage-$UUID" --ignore-scripts --no-audit --no-fund https://github.com/feddericovonwernich/open-relay/archive/dac2865837bcab9444a8636053f4f1406a3f9291.tar.gz`.
-- Relay compatibility comes from package metadata (`open-relay` 0.1.0 plus committed `dist/src/cli.js`) and Node >= 22.19; never call Relay `--help`, `--version`, or `version`.
+- Relay compatibility comes from package metadata (`open-relay` 0.1.0 plus committed `dist/src/cli.js`) and Node >= 22.19. `relay --help` or `relay help` MAY provide a non-mutating usage smoke; neither is version/provenance evidence. Never use unsupported `relay --version` or `relay version` for detection.
 - The package declares `ajv: ^8.17.1`; its transitive npm resolution is not lock-pinned and must be documented as a supply-chain limitation.
 - A worker delivery uses `relay agent poll AGD_WORKER_ID --project-root CENTRAL_RELAY_ROOT --definitions pr.automation.settled@1 --structured-output --context-tokens 5000 --correlation-id github:LOWERCASE_OWNER/LOWERCASE_REPOSITORY:pull-request:PR_NUMBER`. Its default ten-minute park is intentional; do not wrap it in a 30-second process timeout or busy-loop `relay get`.
 - For every delivery: `reply start`, validate untrusted payload identity/current head and result against the delivered `outputSchema`, then exactly one terminal `complete`, `fail`, or `cancelled` reply before another poll. `relay notify` is automatic acknowledgement and is not used for the worker repair lease.
@@ -77,25 +77,13 @@ published_exact_receipt(task: dict, grant: dict) -> dict
 
 `create_ship_commit` writes a brief, calls existing `command(home, "task", "create", ...)`, changes `value.txt`, and commits with the local test Git identity. `write_report` creates a nonempty report. `make_relay_runtime` and `fake_npm_success` create only a validated fake private staging tree and return `subprocess.CompletedProcess`. The Git helpers create local bare-remote divergence and read its SHA. The Relay helpers return one schema-bearing `pr.automation.settled@1` delivery or a completion rejection while retaining the receipt. `FakeGitHub` returns only supplied provider payloads and records actual create calls; it never reproduces AGD receipt logic.
 
-- [ ] **Step 2: Run the helper-import smoke test**
-
-```python
-def test_pr_support_creates_a_committed_ship_task():
-    with lab() as (home, _):
-        task = create_ship_commit(home, "support")
-        assert Path(task["worktree"]).joinpath("value.txt").read_text() == "changed\n"
-```
-
-Run: `pytest tests/test_pr.py::test_pr_support_creates_a_committed_ship_task -v`
-
-Expected: PASS after the helper is complete; it exercises a disposable committed task rather than source wording or mocked forwarding.
-
-- [ ] **Step 3: Commit**
+- [ ] **Step 2: Commit the reusable disposable support**
 
 ```bash
-git add tests/pr_support.py tests/test_pr.py
+git add tests/pr_support.py
 git commit -m "test: add disposable PR workflow support"
 ```
+
 ### Task 1: Vendor the known Relay skill set and provenance
 
 **Files:**
@@ -269,7 +257,7 @@ git commit -m "feat: add scoped PR publication grants"
 graphql(query: str, variables: dict, run=store.run) -> dict
 find_open_pr(repository: str, head: str, base: str, run=store.run) -> list[dict]
 create_pr(repository: str, head: str, base: str, title: str, body: str, run=store.run) -> dict
-finalize(pr: dict, protection: dict, rules: dict, expected_sha: str) -> dict
+finalize(pr: dict, classic_protection: dict | None, rules: dict, expected_sha: str) -> dict
 ```
 
 `graphql` calls `gh api graphql --method POST -f query=QUERY -f owner=OWNER -f name=REPOSITORY`; all variables are string raw fields. Credential/no-`gh`/nonzero/invalid JSON/GraphQL errors become `DependencyError` or `Refusal` with no token output.
@@ -277,7 +265,7 @@ finalize(pr: dict, protection: dict, rules: dict, expected_sha: str) -> dict
 - [ ] **Step 1: Write failing policy truth-table tests**
 
 ```python
-@pytest.mark.parametrize("pr, protection, rules, message", [
+@pytest.mark.parametrize("pr, classic_protection, rules, message", [
     (pr_payload(state="CLOSED"), required_policy(), empty_rules(), "open"),
     (pr_payload(head="other"), required_policy(), empty_rules(), "head"),
     (pr_payload(checks={"ci": "PENDING"}), required_policy(checks=["ci"]), empty_rules(), "checks"),
@@ -285,13 +273,13 @@ finalize(pr: dict, protection: dict, rules: dict, expected_sha: str) -> dict
     (pr_payload(review="CHANGES_REQUESTED"), required_policy(reviews=1), empty_rules(), "APPROVED"),
     (pr_payload(review=None), required_policy(reviews=1), empty_rules(), "APPROVED"),
 ])
-def test_finalize_rejects_nonfinal_or_missing_required_evidence(pr, protection, rules, message):
+def test_finalize_rejects_nonfinal_or_missing_required_evidence(pr, classic_protection, rules, message):
     with pytest.raises(store.Refusal, match=message):
-        github.finalize(pr, protection, rules, expected_sha="abc")
+        github.finalize(pr, classic_protection, rules, expected_sha="abc")
 
 
-def test_finalize_allows_null_review_only_when_no_review_is_required():
-    result = github.finalize(pr_payload(review=None), required_policy(reviews=0), empty_rules(), expected_sha="abc")
+def test_finalize_accepts_unprotected_branch_when_rules_report_no_requirements():
+    result = github.finalize(pr_payload(review=None), None, empty_rules(), expected_sha="abc")
     assert result["head_sha"] == "abc"
 ```
 
@@ -320,7 +308,7 @@ query($owner: String!, $name: String!, $number: Int!) {
 }
 ```
 
-Read branch protection with `gh api --method GET repos/OWNER/REPOSITORY/branches/BASE/protection` and effective branch rules with `gh api --method GET repos/OWNER/REPOSITORY/rules/branches/BASE`. Normalize both responses into required check names and required approval count. If either endpoint is unavailable, inaccessible, unrecognized, or disagrees with the graph evidence, block rather than infer a policy. This is intentionally conservative for GitHub ruleset/merge-queue cases.
+Read classic branch protection with `gh api --method GET repos/OWNER/REPOSITORY/branches/BASE/protection` and effective branch rules with `gh api --method GET repos/OWNER/REPOSITORY/rules/branches/BASE`. A 404 from classic protection means no classic protection and supplies zero classic requirements; it is not a failure when the rules endpoint is accessible and reports no requirements. Normalize accessible classic/rules responses into required check names and approval count, rejecting only an unavailable/unrecognized rules response, conflicting requirements, or incomplete policy data. `mergeStateStatus == CLEAN` remains mandatory and is the conservative final signal for merge-queue/ruleset cases.
 
 Create only after a matching-PR search returns none, with:
 
@@ -332,7 +320,7 @@ The explicit `--head`, `--base`, `--title`, and `--body` prevent interactive sel
 
 - [ ] **Step 4: Implement and test final evidence behavior**
 
-Normalize only a same-repository, OPEN, unmerged PR with exact head/base and equal `headRefOid`. Check all required names from policy against completed-success CheckRun/StatusContext states; require `mergeStateStatus == CLEAN`; require `APPROVED` only when policy requires approvals; fail closed on absent check contexts, null policy, missing review decision, or unrecognized rules. Run: `pytest tests/test_github.py -v` — expected PASS.
+Normalize only a same-repository, OPEN, unmerged PR with exact head/base and equal `headRefOid`. Check all required names from accessible policy against completed-success CheckRun/StatusContext states; require `mergeStateStatus == CLEAN`; require `APPROVED` only when policy requires approvals; fail closed on absent check contexts, missing review decision when approvals are required, unavailable rules data, or unrecognized policy fields. Run: `pytest tests/test_github.py -v` — expected PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -599,7 +587,7 @@ git commit -m "feat: gate ready on verified Relay PR workflow"
 
 - **Spec coverage:** Tasks 1–2 cover pinned Relay skills/provenance and private provisioning. Tasks 3, 5, and 8 cover exact authority, recovery, final-ready/head-race, and durable blocks. Task 4 provides GitHub final authority and credentials failures. Tasks 6–7 provide a single central read-only Relay connector, actual poll/reply lease settlement, same-worker scope, and the corrected non-conflicting prompt. Task 8 covers docs and disposable smoke.
 - **No permanent incidental tests:** no test asserts documentation/provenance wording, copied-file presence, raw command forwarding, or mock echo. Tests exercise observable authority, lease, PR identity, head race, and final-ready behavior. Provenance integrity uses a throwaway check.
-- **Known external boundary:** GitHub branch-protection/rules endpoint access and output vary by repository plan/ruleset. The implementation fails closed on unavailable or unrecognized effective-policy data; no completion claim is valid without an explicitly approved credentialed target acceptance run. The pinned Relay commands/definitions/output schema in Task 6 are sourced from its pinned `src/cli.ts`, `src/agent-session.ts`, and `src/init.ts`, not guessed.
+- **Known external boundary:** GitHub rules endpoint access and output vary by repository plan/ruleset. A classic-protection 404 is explicitly the unprotected case only when accessible rules report no requirements; unavailable or unrecognized rules remain blocked. No completion claim is valid without an explicitly approved credentialed target acceptance run. The pinned Relay commands/definitions/output schema in Task 6 are sourced from its pinned `src/cli.ts`, `src/agent-session.ts`, and `src/init.ts`, not guessed.
 
 ## Execution handoff
 
