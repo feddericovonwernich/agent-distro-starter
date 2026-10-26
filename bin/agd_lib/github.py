@@ -5,7 +5,7 @@ from . import store
 
 def graphql(query, variables, run=store.run):
     argv = ['gh', 'api', 'graphql', '--method', 'POST', '-f', f'query={query}']
-    argv.extend(flag for key, value in variables.items() for flag in ('-f', f'{key}={value}'))
+    argv.extend(flag for key, value in variables.items() for flag in ('-F', f'{key}={value}'))
     try:
         result = run(argv)
     except store.DependencyError:
@@ -21,9 +21,12 @@ def graphql(query, variables, run=store.run):
     return payload['data']
 
 
-def finalize(pr, policy, expected_sha):
+def finalize(pr, policy, expected_sha, repository, branch, base):
     if pr.get('state') != 'OPEN' or pr.get('mergedAt') is not None:
         raise store.Refusal('PR is not open and unmerged')
+    if (pr.get('repository') != repository or pr.get('headRefName') != branch or
+            pr.get('baseRefName') != base):
+        raise store.Refusal('PR identity does not match task')
     if pr.get('headRefOid') != expected_sha:
         raise store.Refusal('PR head does not match expected head')
     if pr.get('mergeStateStatus') != 'CLEAN':
@@ -38,7 +41,10 @@ def finalize(pr, policy, expected_sha):
         raise store.Refusal('PR check evidence is incomplete')
     for name in required_checks:
         check = checks.get(name)
-        if not isinstance(check, dict) or check.get('status') != 'COMPLETED' or check.get('conclusion') != 'SUCCESS':
+        green_run = (isinstance(check, dict) and check.get('status') == 'COMPLETED' and
+                     check.get('conclusion') in ('SUCCESS', 'NEUTRAL', 'SKIPPED'))
+        green_status = isinstance(check, dict) and check.get('state') == 'SUCCESS'
+        if not (green_run or green_status):
             raise store.Refusal('PR required checks are not green')
     if approvals and pr.get('reviewDecision') != 'APPROVED':
         raise store.Refusal('PR required reviews are not APPROVED')

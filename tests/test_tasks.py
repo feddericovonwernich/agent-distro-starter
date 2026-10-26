@@ -117,7 +117,7 @@ def test_pr_publish_grant_binds_target_and_descendant_history():
         brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
         task = command(home, 'task', 'create', 'prgrant', '--project', 'sample', '--brief', str(brief))
         run(['git', 'commit', '--allow-empty', '-m', 'candidate'], cwd=task['worktree'])
-        instruction = home/'instruction.txt'; instruction.write_text('Publish only this task branch.\n')
+        instruction = home/'instruction.txt'; instruction.write_text('Authorize prgrant to publish origin:agd/prgrant.\n')
         grant = tasks.grant_pr_publish(home, 'prgrant', 'origin:agd/prgrant', instruction)
         assert tasks.authorize_pr_publish(home, tasks.read(home, 'prgrant'), grant['id'])['id'] == grant['id']
         run(['git', 'commit', '--allow-empty', '-m', 'repair'], cwd=task['worktree'])
@@ -127,6 +127,24 @@ def test_pr_publish_grant_binds_target_and_descendant_history():
             tasks.authorize_pr_publish(home, tasks.read(home, 'prgrant'), grant['id'])
         with pytest.raises(store.Refusal, match='target'):
             tasks.grant_pr_publish(home, 'prgrant', 'origin:other', instruction)
+
+
+def test_pr_publish_grant_requires_instruction_to_name_task_and_target():
+    from support import lab
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'bin'))
+    from agd_lib import store, tasks
+
+    with lab() as (home, _):
+        brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
+        command(home, 'task', 'create', 'instruction-grant', '--project', 'sample', '--brief', str(brief))
+        instruction = home/'instruction.txt'
+        instruction.write_text('Authorize publication.\n')
+        with pytest.raises(store.Refusal, match='identify exact task and target'):
+            tasks.grant_pr_publish(home, 'instruction-grant', 'origin:agd/instruction-grant', instruction)
+        instruction.write_text('Authorize instruction-grant to publish origin:agd/instruction-grant.\n')
+        assert tasks.grant_pr_publish(home, 'instruction-grant', 'origin:agd/instruction-grant',
+                                      instruction)['target'] == 'origin:agd/instruction-grant'
 
 
 def test_pr_receipt_does_not_transition_task_phase():
@@ -149,7 +167,7 @@ def test_task_approve_pr_publish_records_exact_target():
     with lab() as (home, _):
         brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
         task = command(home, 'task', 'create', 'cli-grant', '--project', 'sample', '--brief', str(brief))
-        instruction = home/'instruction.txt'; instruction.write_text('Publish only this task branch.\n')
+        instruction = home/'instruction.txt'; instruction.write_text('Authorize cli-grant to publish origin:agd/cli-grant.\n')
         grant = command(home, 'task', 'approve', task['id'], '--action', 'pr-publish',
                         '--target', 'origin:agd/cli-grant', '--instruction', str(instruction))
         assert grant['target'] == 'origin:agd/cli-grant'

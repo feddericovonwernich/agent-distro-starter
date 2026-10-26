@@ -1,6 +1,6 @@
 import hashlib
 import stat
-
+import re
 import json
 import os
 import uuid
@@ -167,60 +167,65 @@ def read_pr_receipt(home, task_id):
 
 
 def write_pr_receipt(home, task_id, receipt):
-    read(home, task_id)
-    path = pr_receipt_file(home, task_id)
-    if path.exists() and (path.is_symlink() or not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode)):
-        raise store.Refusal('PR receipt is unsafe')
     with store.lock(home):
+        read(home, task_id)
+        path = pr_receipt_file(home, task_id)
+        if path.exists() and (path.is_symlink() or not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode)):
+            raise store.Refusal('PR receipt is unsafe')
         store.atomic_json(path, receipt)
 
 
 def grant_pr_publish(home, task_id, target, instruction):
-    task = read(home, task_id)
-    if task['kind'] != 'ship':
-        raise store.Refusal('PR publication requires a ship task')
-    try:
-        remote, branch = target.split(':', 1)
-    except ValueError as error:
-        raise store.Refusal('PR publication target must be REMOTE:BRANCH') from error
-    if not remote or branch != task['branch']:
-        raise store.Refusal('PR publication target must match the assigned task branch')
-    text = Path(instruction).read_text()
-    if not text.strip():
-        raise store.Refusal('explicit instruction required')
-    work = verify_workspace(home, task)
-    if not store.clean(work):
-        raise store.Refusal('task workspace has uncommitted or untracked changes')
-    remote_url = store.git(work, 'remote', 'get-url', remote, check=False)
-    if not remote_url:
-        raise store.Refusal('PR publication remote is unavailable')
-    grant = dict(id=str(uuid.uuid4()), task=task_id, action='pr-publish', target=target,
-                 instruction=text, grant_head=store.git(work, 'rev-parse', 'HEAD'),
-                 branch=task['branch'], base=task['base'], remote=remote, remote_url=remote_url)
     with store.lock(home):
+        task = read(home, task_id)
+        if task['kind'] != 'ship':
+            raise store.Refusal('PR publication requires a ship task')
+        try:
+            remote, branch = target.split(':', 1)
+        except ValueError as error:
+            raise store.Refusal('PR publication target must be REMOTE:BRANCH') from error
+        if not remote or branch != task['branch']:
+            raise store.Refusal('PR publication target must match the assigned task branch')
+        text = Path(instruction).read_text()
+        if not text.strip():
+            raise store.Refusal('explicit instruction required')
+        if not all(re.search(rf'(?<![A-Za-z0-9-]){re.escape(value)}(?![A-Za-z0-9-])', text)
+                   for value in (task_id, target)):
+            raise store.Refusal('instruction must identify exact task and target')
+        work = verify_workspace(home, task)
+        if not store.clean(work):
+            raise store.Refusal('task workspace has uncommitted or untracked changes')
+        remote_url = store.git(work, 'remote', 'get-url', remote, check=False)
+        if not remote_url:
+            raise store.Refusal('PR publication remote is unavailable')
+        grant = dict(id=str(uuid.uuid4()), task=task_id, action='pr-publish', target=target,
+                     instruction=text, grant_head=store.git(work, 'rev-parse', 'HEAD'),
+                     branch=task['branch'], base=task['base'], remote=remote, remote_url=remote_url)
         store.atomic_json(task_file(home, task_id).parent/'approvals'/f'{grant["id"]}.json', grant)
-    return grant
+        return grant
 
 
 def authorize_pr_publish(home, task, grant_id):
-    try:
-        grant_id = str(uuid.UUID(grant_id))
-        grant = json.loads((task_file(home, task['id']).parent/'approvals'/f'{grant_id}.json').read_text())
-    except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
-        raise store.Refusal('PR publication grant missing or invalid') from error
-    if (grant.get('task') != task['id'] or grant.get('action') != 'pr-publish' or
-            grant.get('branch') != task['branch'] or grant.get('base') != task['base'] or
-            grant.get('target') != f'{grant.get("remote")}:{task["branch"]}'):
-        raise store.Refusal('PR publication grant does not match task target')
-    work = verify_workspace(home, task)
-    if not store.clean(work):
-        raise store.Refusal('task workspace has uncommitted or untracked changes')
-    if store.git(work, 'remote', 'get-url', grant['remote'], check=False) != grant.get('remote_url'):
-        raise store.Refusal('PR publication remote changed')
-    if store.run(['git', 'merge-base', '--is-ancestor', grant['grant_head'], 'HEAD'],
-                 cwd=work, check=False).returncode:
-        raise store.Refusal('PR publication head is not a descendant of grant head')
-    return grant
+    with store.lock(home):
+        task = read(home, task['id'])
+        try:
+            grant_id = str(uuid.UUID(grant_id))
+            grant = json.loads((task_file(home, task['id']).parent/'approvals'/f'{grant_id}.json').read_text())
+        except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
+            raise store.Refusal('PR publication grant missing or invalid') from error
+        if (grant.get('task') != task['id'] or grant.get('action') != 'pr-publish' or
+                grant.get('branch') != task['branch'] or grant.get('base') != task['base'] or
+                grant.get('target') != f'{grant.get("remote")}:{task["branch"]}'):
+            raise store.Refusal('PR publication grant does not match task target')
+        work = verify_workspace(home, task)
+        if not store.clean(work):
+            raise store.Refusal('task workspace has uncommitted or untracked changes')
+        if store.git(work, 'remote', 'get-url', grant['remote'], check=False) != grant.get('remote_url'):
+            raise store.Refusal('PR publication remote changed')
+        if store.run(['git', 'merge-base', '--is-ancestor', grant['grant_head'], 'HEAD'],
+                     cwd=work, check=False).returncode:
+            raise store.Refusal('PR publication head is not a descendant of grant head')
+        return grant
 
 
 def approve(home, task_id, action, target, instruction):
