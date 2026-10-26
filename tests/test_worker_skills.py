@@ -632,6 +632,37 @@ def test_staged_and_historic_generated_skills_refuse_ready():
         report = home/'report.md'; report.write_text('changed value\n')
         command(home, 'task', 'ready', 'history', '--report', str(report), expected=3)
 
+
+def test_cleanup_retry_after_artifact_removal_before_return():
+    from unittest.mock import patch
+    from support import lab, command
+    from agd_lib import tasks, worker_skills
+    from test_projects import run
+    os.environ['PATH'] = '/tmp/agd-treehouse-v3.1.6:' + os.environ['PATH']
+    with lab() as (home, project):
+        add_skill(home, 'agd-probe')
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'cleanup-skill', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        task['harness'] = 'omp'
+        task['worker_skills'] = worker_skills.prepare(home, task, {'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+        tasks.save(home, task)
+        report = home/'report.md'; report.write_text('base inspected\n')
+        command(home, 'task', 'ready', 'cleanup-skill', '--report', str(report))
+        original = tasks.store.run
+        def interrupted(argv, **kwargs):
+            if 'return' in argv:
+                raise tasks.store.Refusal('injected return failure')
+            return original(argv, **kwargs)
+        with patch.object(tasks.store, 'run', interrupted):
+            try:
+                tasks.cleanup(home, 'cleanup-skill')
+            except tasks.store.Refusal:
+                pass
+        assert tasks.read(home, 'cleanup-skill')['cleanup_phase'] == 'returning'
+        assert not (Path(task['worktree'])/'.omp'/'skills'/'agd-probe').exists()
+        assert tasks.cleanup(home, 'cleanup-skill')['phase'] == 'cleaned'
+
 if __name__ == '__main__':
     test_verified_omp_skill_root_is_project_local()
     test_unverified_cursor_has_no_skill_provisioning_root()
@@ -661,3 +692,4 @@ if __name__ == '__main__':
     test_cli_default_profile_and_cursor_nonempty_refusal_preserve_task()
     test_unchanged_generated_skill_allows_ready_but_modification_refuses()
     test_staged_and_historic_generated_skills_refuse_ready()
+    test_cleanup_retry_after_artifact_removal_before_return()
