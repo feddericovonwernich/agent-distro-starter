@@ -582,6 +582,27 @@ def test_cli_default_profile_and_cursor_nonempty_refusal_preserve_task():
                 '--skill-mode', 'curated', '--skill', 'agd-probe', expected=4)
         assert tasks.read(home, 'cursor')['phase'] == 'prepared'
 
+
+def test_unchanged_generated_skill_allows_ready_but_modification_refuses():
+    from support import lab, command
+    from agd_lib import tasks, worker_skills
+    with lab() as (home, project):
+        os.environ['PATH'] = '/tmp/agd-treehouse-v3.1.6:' + os.environ['PATH']
+        add_skill(home, 'agd-probe')
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'guarded', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        task['harness'] = 'omp'
+        manifest = worker_skills.prepare(home, task, {
+            'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+        task['worker_skills'] = manifest; tasks.save(home, task)
+        report = home/'report.md'; report.write_text('value.txt contains base.\n')
+        assert command(home, 'task', 'ready', 'guarded', '--report', str(report))['phase'] == 'ready'
+        generated = Path(task['worktree'])/'.omp'/'skills'/'agd-probe'/'SKILL.md'
+        generated.write_text('changed\n')
+        command(home, 'task', 'ready', 'guarded', '--report', str(report), expected=3)
+        assert tasks.read(home, 'guarded')['lease_id'] == task['lease_id']
+
 if __name__ == '__main__':
     test_verified_omp_skill_root_is_project_local()
     test_unverified_cursor_has_no_skill_provisioning_root()
@@ -609,3 +630,4 @@ if __name__ == '__main__':
     test_prompt_names_assigned_skill_paths()
     test_cli_curated_selection_freezes_before_backend_failure()
     test_cli_default_profile_and_cursor_nonempty_refusal_preserve_task()
+    test_unchanged_generated_skill_allows_ready_but_modification_refuses()
