@@ -91,17 +91,40 @@ def find_open_pr(repository, head, base, run=store.run):
 def normalize_policy(classic, rules):
     if classic is not None and not isinstance(classic, dict):
         raise store.Refusal('GitHub policy evidence is unrecognized')
-    if not isinstance(rules, dict) or not isinstance(rules.get('rules'), list):
+    if isinstance(rules, dict):
+        pages = [rules.get('rules')]
+    elif isinstance(rules, list):
+        pages = rules
+    else:
+        pages = []
+    if not pages or any(not isinstance(page, list) for page in pages):
         raise store.Refusal('GitHub policy evidence is incomplete')
-    if rules['rules']:
-        raise store.Refusal('GitHub policy evidence is unrecognized')
     classic = classic or {}
-    checks = classic.get('required_status_checks', {}).get('contexts', [])
+    checks = set(classic.get('required_status_checks', {}).get('contexts', []))
     approvals = classic.get('required_pull_request_reviews', {}).get('required_approving_review_count', 0)
-    if (not isinstance(checks, list) or not all(isinstance(check, str) and check for check in checks) or
+    if (not all(isinstance(check, str) and check for check in checks) or
             not isinstance(approvals, int) or approvals < 0):
         raise store.Refusal('GitHub policy evidence is unrecognized')
-    return {'checks': tuple(checks), 'approvals': approvals}
+    for rule in (rule for page in pages for rule in page):
+        if not isinstance(rule, dict) or not isinstance(rule.get('parameters'), dict):
+            raise store.Refusal('GitHub policy evidence is unrecognized')
+        parameters = rule['parameters']
+        if rule.get('type') == 'required_status_checks':
+            required = parameters.get('required_status_checks')
+            if not isinstance(required, list):
+                raise store.Refusal('GitHub policy evidence is unrecognized')
+            for check in required:
+                if not isinstance(check, dict) or not isinstance(check.get('context'), str) or not check['context']:
+                    raise store.Refusal('GitHub policy evidence is unrecognized')
+                checks.add(check['context'])
+        elif rule.get('type') == 'pull_request':
+            count = parameters.get('required_approving_review_count', 0)
+            if not isinstance(count, int) or count < 0:
+                raise store.Refusal('GitHub policy evidence is unrecognized')
+            approvals = max(approvals, count)
+        else:
+            raise store.Refusal('GitHub policy evidence is unrecognized')
+    return {'checks': tuple(sorted(checks)), 'approvals': approvals}
 
 
 
@@ -117,11 +140,27 @@ def _api_json(path, run, optional=False):
         raise store.Refusal('GitHub policy response is invalid') from error
 
 
+
+def _rules_pages(path, run):
+    result = run(['gh', 'api', '--method', 'GET', '--paginate', '--slurp', f'{path}?per_page=100'],
+                 check=False)
+    if result.returncode:
+        raise store.Refusal('GitHub policy request failed')
+    try:
+        pages = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise store.Refusal('GitHub policy response is invalid') from error
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        raise store.Refusal('GitHub policy response is incomplete')
+    return pages
+
+
+
 def effective_policy(repository, base, run=store.run):
     owner, name = split_repository(repository)
     path = f'repos/{owner}/{name}/branches/{base}'
     classic = _api_json(f'{path}/protection', run, optional=True)
-    rules = _api_json(f'repos/{owner}/{name}/rules/branches/{base}', run)
+    rules = _rules_pages(f'repos/{owner}/{name}/rules/branches/{base}', run)
     return normalize_policy(classic, rules)
 
 def create_pr(repository, head, base, title, body, run=store.run):

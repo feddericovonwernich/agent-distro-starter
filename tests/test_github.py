@@ -130,3 +130,14 @@ def test_normalize_policy_combines_classic_requirements_and_empty_rules():
 def test_normalize_policy_refuses_unrecognized_effective_rules():
     with pytest.raises(store.Refusal, match='policy'):
         github.normalize_policy(None, {'rules': [{'type': 'unknown'}]})
+
+
+def test_normalize_policy_unions_known_paginated_rules():
+    policy = github.normalize_policy(
+        {'required_status_checks': {'contexts': ['classic']},
+         'required_pull_request_reviews': {'required_approving_review_count': 1}},
+        [[{'type': 'required_status_checks', 'parameters': {'required_status_checks': [
+                {'context': 'ci'}, {'context': 'lint', 'integration_id': 42}]}},
+          {'type': 'pull_request', 'parameters': {'required_approving_review_count': 2}}],
+         [{'type': 'pull_request', 'parameters': {'required_approving_review_count': 3}}]])
+    assert policy == {'checks': ('ci', 'classic', 'lint'), 'approvals': 3}
