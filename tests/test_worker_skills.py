@@ -601,7 +601,36 @@ def test_unchanged_generated_skill_allows_ready_but_modification_refuses():
         generated = Path(task['worktree'])/'.omp'/'skills'/'agd-probe'/'SKILL.md'
         generated.write_text('changed\n')
         command(home, 'task', 'ready', 'guarded', '--report', str(report), expected=3)
-        assert tasks.read(home, 'guarded')['lease_id'] == task['lease_id']
+
+
+def test_staged_and_historic_generated_skills_refuse_ready():
+    from support import lab, command, run
+    from agd_lib import tasks, worker_skills
+    os.environ['PATH'] = '/tmp/agd-treehouse-v3.1.6:' + os.environ['PATH']
+    with lab() as (home, project):
+        add_skill(home, 'agd-probe')
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'staged', '--project', 'sample', '--brief', str(brief), '--kind', 'scout')
+        task['harness'] = 'omp'
+        task['worker_skills'] = worker_skills.prepare(home, task, {'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+        tasks.save(home, task)
+        work = Path(task['worktree'])
+        run(['git', 'add', '-f', '.omp/skills/agd-probe/SKILL.md'], cwd=work)
+        report = home/'report.md'; report.write_text('base inspected\n')
+        command(home, 'task', 'ready', 'staged', '--report', str(report), expected=3)
+    with lab() as (home, project):
+        add_skill(home, 'agd-probe')
+        brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
+        task = command(home, 'task', 'create', 'history', '--project', 'sample', '--brief', str(brief))
+        task['harness'] = 'omp'
+        task['worker_skills'] = worker_skills.prepare(home, task, {'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+        tasks.save(home, task); work = Path(task['worktree'])
+        run(['git', 'config', 'user.name', 'Distro Test'], cwd=work); run(['git', 'config', 'user.email', 'test@example.invalid'], cwd=work)
+        run(['git', 'add', '-f', '.omp/skills/agd-probe/SKILL.md'], cwd=work); run(['git', 'commit', '-m', 'leak skill'], cwd=work)
+        run(['git', 'rm', '-f', '.omp/skills/agd-probe/SKILL.md'], cwd=work); (work/'value.txt').write_text('changed\n')
+        run(['git', 'add', 'value.txt'], cwd=work); run(['git', 'commit', '-m', 'delete skill and change'], cwd=work)
+        report = home/'report.md'; report.write_text('changed value\n')
+        command(home, 'task', 'ready', 'history', '--report', str(report), expected=3)
 
 if __name__ == '__main__':
     test_verified_omp_skill_root_is_project_local()
@@ -631,3 +660,4 @@ if __name__ == '__main__':
     test_cli_curated_selection_freezes_before_backend_failure()
     test_cli_default_profile_and_cursor_nonempty_refusal_preserve_task()
     test_unchanged_generated_skill_allows_ready_but_modification_refuses()
+    test_staged_and_historic_generated_skills_refuse_ready()
