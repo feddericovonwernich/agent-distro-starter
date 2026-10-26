@@ -4,7 +4,7 @@ import json
 import re
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 from urllib.parse import urlsplit
 
 from . import store
@@ -17,6 +17,11 @@ class ReviewFeedbackError(store.Refusal):
 _KINDS = ('reviews', 'review_comments', 'review_threads')
 _KIND_NAMES = dict(reviews='review', review_comments='review_comment', review_threads='review_thread')
 _REPOSITORY = re.compile(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z')
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, newurl):
+        return None
 
 
 class GitHubReader:
@@ -88,17 +93,20 @@ class LoopbackRelay:
     """Authenticated producer POST boundary. Token stays in central process memory."""
     def __init__(self, endpoint, producer_token):
         parsed = urlsplit(endpoint)
-        if parsed.scheme != 'http' or parsed.hostname not in ('127.0.0.1', '::1') or not producer_token:
-            raise ValueError('Relay endpoint must be loopback with a producer token')
+        if (parsed.scheme != 'http' or parsed.hostname not in ('127.0.0.1', '::1') or
+                parsed.path not in ('', '/') or parsed.query or parsed.fragment or not producer_token):
+            raise ValueError('Relay endpoint must be a bare loopback origin with a producer token')
         self.endpoint, self.producer_token = endpoint.rstrip('/') + '/v1/events', producer_token
 
     def __call__(self, payload):
         request = Request(self.endpoint, data=json.dumps(payload, separators=(',', ':')).encode(), method='POST',
                           headers={'Authorization': f'Bearer {self.producer_token}', 'Content-Type': 'application/json'})
         try:
-            with urlopen(request, timeout=15) as response:
+            with build_opener(_NoRedirect()).open(request, timeout=15) as response:
                 return response.status
         except HTTPError as error:
+            if 300 <= error.code < 400:
+                raise ReviewFeedbackError('Relay producer redirected request')
             return error.code
         except (URLError, OSError) as error:
             raise ReviewFeedbackError('Relay producer is unavailable') from error
@@ -121,8 +129,33 @@ def _path(home, project_id, pull_request):
 
 
 def _default(repository, pull_request):
-    return {'repository': repository, 'pull_request': pull_request, 'healthy': True, 'artifacts': {},
-            'idempotency_keys': [], 'cursor': {}, 'head_digest': None, 'review_decision': None, 'observed': False}
+    return {'version': 1, 'repository': repository, 'pull_request': pull_request, 'healthy': True,
+            'blocked_reason': None, 'head_sha': None, 'artifacts': {}, 'idempotency_keys': [],
+            'cursor': {}, 'head_digest': None, 'review_decision': None, 'observed': False}
+
+
+def _valid_digest(value):
+    return isinstance(value, str) and bool(re.fullmatch(r'[0-9a-f]{64}', value))
+
+
+def _validate_state(state, repository, pull_request):
+    if not isinstance(state, dict) or state.get('version') != 1 or state.get('repository') != repository or state.get('pull_request') != pull_request or not isinstance(state.get('healthy'), bool) or not isinstance(state.get('observed'), bool) or not isinstance(state.get('blocked_reason'), (str, type(None))) or not isinstance(state.get('head_sha'), (str, type(None))) or not isinstance(state.get('head_digest'), (str, type(None))) or not isinstance(state.get('review_decision'), (str, type(None))) or not isinstance(state.get('artifacts'), dict) or not isinstance(state.get('idempotency_keys'), list) or not isinstance(state.get('cursor'), dict):
+        raise ReviewFeedbackError('review feedback state is malformed')
+    if (state['head_sha'] is not None and not _string(state['head_sha'], 'stored head', 128)) or (state['head_digest'] is not None and not _valid_digest(state['head_digest'])) or any(not isinstance(key, str) or not _valid_digest(value) for key, value in state['artifacts'].items()) or len(state['idempotency_keys']) > 1000 or any(not isinstance(key, str) or not key for key in state['idempotency_keys']):
+        raise ReviewFeedbackError('review feedback state is malformed')
+    if state['observed']:
+        cursor = state['cursor']
+        sources = cursor.get('sources') if isinstance(cursor, dict) else None
+        if cursor.get('version') != 1 or cursor.get('head_sha') != state['head_sha'] or not isinstance(sources, dict) or set(sources) != set(_KINDS):
+            raise ReviewFeedbackError('review feedback state is malformed')
+        for source in sources.values():
+            if not isinstance(source, dict) or not _valid_digest(source.get('completed_snapshot_digest')) or not isinstance(source.get('high_water_id'), str):
+                raise ReviewFeedbackError('review feedback state is malformed')
+
+
+def _save(home, project_id, pull_request, state):
+    _validate_state(state, state['repository'], pull_request)
+    store.atomic_json(_path(home, project_id, pull_request), state)
 
 
 def read_service(home, project_id, repository, pull_request):
@@ -137,8 +170,7 @@ def read_service(home, project_id, repository, pull_request):
         state = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as error:
         raise ReviewFeedbackError('review feedback state is unavailable') from error
-    if not isinstance(state, dict) or state.get('repository') != repository or state.get('pull_request') != pull_request or not isinstance(state.get('artifacts'), dict) or not isinstance(state.get('idempotency_keys'), list):
-        raise ReviewFeedbackError('review feedback state is malformed')
+    _validate_state(state, repository, pull_request)
     return state
 
 
@@ -178,6 +210,7 @@ def _read_pages(github, kind):
         if not isinstance(rows, list):
             raise ReviewFeedbackError(f'GitHub {kind} is unavailable')
         items.extend(rows)
+        # ponytail: cap snapshots at 100; add durable chunked pagination when review throughput requires it.
         if len(items) > 100:
             raise ReviewFeedbackError('GitHub review evidence exceeds bounded limit')
         cursor = page.get('next')
@@ -212,16 +245,18 @@ def _mark_unhealthy(home, project_id, repository, pull_request, reason):
     with store.lock(Path(home)):
         state = read_service(home, project_id, repository, pull_request)
         state['healthy'], state['blocked_reason'] = False, reason[:500]
-        store.atomic_json(_path(home, project_id, pull_request), state)
+        _save(home, project_id, pull_request, state)
 
 
 def watch_human_reviews(home, project_id, repository, pull_request, github, relay):
     """Emit changed evidence; any exception is an explicit task-blocking failure."""
     try:
         head, decision = _metadata(github)
-        artifacts, cursor = [], {}
+        artifacts, sources = [], {}
         for kind in _KINDS:
-            rows, cursor[kind] = _read_pages(github, kind)
+            rows, _ = _read_pages(github, kind)
+            sources[kind] = {'completed_snapshot_digest': _digest(rows),
+                             'high_water_id': max((str(row.get('id', '')) for row in rows if isinstance(row, dict)), default='')}
             artifacts.extend(item for row in rows if (item := _artifact(row, kind, head)) is not None)
         end_head, end_decision = _metadata(github)
         if (end_head, end_decision) != (head, decision):
@@ -244,8 +279,8 @@ def watch_human_reviews(home, project_id, repository, pull_request, github, rela
                     raise ReviewFeedbackError('Relay producer rejected review feedback')
                 emitted += 1
                 keys.append(key)
-            state.update({'healthy': True, 'blocked_reason': None, 'head_sha': head, 'head_digest': _digest({'head': head, 'decision': decision, 'artifacts': artifacts}), 'review_decision': decision, 'observed': True, 'cursor': cursor, 'artifacts': {f"{item['kind']}:{item['id']}": _digest(item) for item in artifacts}, 'idempotency_keys': (state.get('idempotency_keys', []) + keys)[-1000:]})
-            store.atomic_json(_path(home, project_id, pull_request), state)
+            state.update({'healthy': True, 'blocked_reason': None, 'head_sha': head, 'head_digest': _digest({'head': head, 'decision': decision, 'artifacts': artifacts}), 'review_decision': decision, 'observed': True, 'cursor': {'version': 1, 'head_sha': head, 'sources': sources}, 'artifacts': {f"{item['kind']}:{item['id']}": _digest(item) for item in artifacts}, 'idempotency_keys': (state.get('idempotency_keys', []) + keys)[-1000:]})
+            _save(home, project_id, pull_request, state)
             return {'emitted': emitted, 'head_sha': head, 'healthy': True}
     except ReviewFeedbackError as error:
         _mark_unhealthy(home, project_id, repository, pull_request, str(error))

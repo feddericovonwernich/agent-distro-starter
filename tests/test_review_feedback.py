@@ -139,8 +139,12 @@ def test_authenticated_gh_and_loopback_boundaries_use_central_credentials_only()
         status = 201
         def __enter__(self): return self
         def __exit__(self, *_): return False
-    with patch('agd_lib.review_feedback.urlopen', side_effect=lambda request, timeout: seen.append(request) or Response()):
-        assert review_feedback.LoopbackRelay('http://127.0.0.1:4312', 'secret')( {'type': 'agd.pr.review'}) == 201
+    class Opener:
+        def open(self, request, timeout):
+            seen.append(request)
+            return Response()
+    with patch('agd_lib.review_feedback.build_opener', return_value=Opener()):
+        assert review_feedback.LoopbackRelay('http://127.0.0.1:4312', 'secret')({'type': 'agd.pr.review'}) == 201
     assert seen[0].full_url == 'http://127.0.0.1:4312/v1/events'
     assert seen[0].get_header('Authorization') == 'Bearer secret'
 
@@ -157,3 +161,37 @@ def test_malformed_or_symlinked_state_fails_closed(tmp_path):
     state.symlink_to(target)
     with pytest.raises(review_feedback.ReviewFeedbackError, match='path is unsafe'):
         review_feedback.read_service(tmp_path, 'sample', 'owner/repo', 7)
+
+
+def test_snapshot_cursor_is_durable_per_source_and_head(tmp_path):
+    github, relay = GitHub(), Relay()
+    github.pages['reviews'] = [[artifact('review-1', 'review', github.head, 'APPROVED')]]
+    review_feedback.watch_human_reviews(tmp_path, 'sample', 'owner/repo', 7, github, relay)
+    cursor = review_feedback.read_service(tmp_path, 'sample', 'owner/repo', 7)['cursor']
+    assert cursor['version'] == 1
+    assert cursor['head_sha'] == github.head
+    assert cursor['sources']['reviews']['completed_snapshot_digest']
+    assert cursor['sources']['reviews']['high_water_id'] == 'review-1'
+
+
+def test_loopback_rejects_redirect_without_following_or_exposing_token():
+    from urllib.error import HTTPError
+    from unittest.mock import Mock
+    opener = Mock()
+    opener.open.side_effect = HTTPError('http://attacker.invalid/', 302, 'Found', {}, None)
+    with patch('agd_lib.review_feedback.build_opener', return_value=opener, create=True) as factory:
+        with pytest.raises(review_feedback.ReviewFeedbackError) as error:
+            review_feedback.LoopbackRelay('http://127.0.0.1:4312/', 'secret')({'type': 'agd.pr.review'})
+    assert factory.called
+    assert opener.open.call_count == 1
+    assert 'secret' not in str(error.value)
+
+
+def test_restart_detects_an_edited_old_artifact(tmp_path):
+    github, relay = GitHub(), Relay()
+    github.pages['review_comments'] = [[artifact('comment-1', 'review_comment', github.head, body='first')]]
+    review_feedback.watch_human_reviews(tmp_path, 'sample', 'owner/repo', 7, github, relay)
+    assert review_feedback.watch_human_reviews(tmp_path, 'sample', 'owner/repo', 7, github, relay)['emitted'] == 0
+    github.pages['review_comments'] = [[artifact('comment-1', 'review_comment', github.head, body='edited')]]
+    assert review_feedback.watch_human_reviews(tmp_path, 'sample', 'owner/repo', 7, github, relay)['emitted'] == 1
+    assert len(relay.keys) == 2
