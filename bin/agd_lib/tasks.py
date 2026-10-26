@@ -241,6 +241,9 @@ def cleanup(home, task_id, discard=False, approval_id=None):
         if task['phase'] == 'cleaned':
             return task
         if task.get('cleanup_phase') == 'returning':
+            if task.get('cleanup_discard') != discard or task.get('cleanup_approval') != approval_id:
+                raise store.Refusal('cleanup retry must use its recorded authorization')
+        if task.get('cleanup_phase') == 'returning':
             status = json.loads(store.run([*treehouse_args(task), 'status', '--json'],
                                           cwd=project['path']).stdout)
             if not any(row.get('lease_id') == task['lease_id'] and row.get('lease_holder') == task['lease_holder']
@@ -248,9 +251,6 @@ def cleanup(home, task_id, discard=False, approval_id=None):
                 task['phase'] = 'cleaned'
                 save(home, task)
                 return task
-        if task.get('cleanup_phase') == 'returning':
-            if task.get('cleanup_discard') != discard or task.get('cleanup_approval') != approval_id:
-                raise store.Refusal('cleanup retry must use its recorded authorization')
         work = verify_workspace(home, task)
         if task.get('cleanup_phase') != 'returning':
             verify_worker_skills(home, task)
