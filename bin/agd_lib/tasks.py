@@ -193,9 +193,11 @@ def grant_pr_publish(home, task_id, target, instruction):
         text = Path(instruction).read_text()
         if not text.strip():
             raise store.Refusal('explicit instruction required')
-        if not all(re.search(rf'(?<![A-Za-z0-9-]){re.escape(value)}(?![A-Za-z0-9-])', text)
-                   for value in (task_id, target)):
+        if not re.search(rf'(?<![A-Za-z0-9-]){re.escape(target)}(?![A-Za-z0-9-])', text):
             raise store.Refusal('instruction must identify exact task and target')
+        task_without_target = re.sub(rf'(?<![A-Za-z0-9-]){re.escape(target)}(?![A-Za-z0-9-])', '', text)
+        if not re.search(rf'(?<![A-Za-z0-9-]){re.escape(task_id)}(?![A-Za-z0-9-])', task_without_target):
+            raise store.Refusal('instruction must independently name exact task')
         work = verify_workspace(home, task)
         if not store.clean(work):
             raise store.Refusal('task workspace has uncommitted or untracked changes')

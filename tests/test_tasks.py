@@ -145,6 +145,9 @@ def test_pr_publish_grant_requires_instruction_to_name_task_and_target():
         instruction.write_text('Authorize instruction-grant to publish origin:agd/instruction-grant.\n')
         assert tasks.grant_pr_publish(home, 'instruction-grant', 'origin:agd/instruction-grant',
                                       instruction)['target'] == 'origin:agd/instruction-grant'
+        instruction.write_text('Authorize origin:agd/instruction-grant.\n')
+        with pytest.raises(store.Refusal, match='independently name exact task'):
+            tasks.grant_pr_publish(home, 'instruction-grant', 'origin:agd/instruction-grant', instruction)
 
 
 def test_pr_receipt_does_not_transition_task_phase():

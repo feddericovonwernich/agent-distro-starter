@@ -1,3 +1,4 @@
+import pytest
 import sys
 from pathlib import Path
 
@@ -9,15 +10,19 @@ from test_projects import command, run
 
 
 class FakeGitHub:
+    def __init__(self):
+        self.created = []
+
     def find_open_pr(self, repository, head, base):
         return []
 
     def create_pr(self, repository, head, base, title, body):
+        self.created.append((repository, head, base))
         return {'number': 7, 'url': 'https://example.test/owner/repo/pull/7',
                 'repository': repository, 'headRefName': head, 'baseRefName': base}
 
 
-def test_publish_validates_grant_and_writes_receipt_under_one_lock():
+def test_publish_validates_grant_and_writes_receipt_under_one_lock(monkeypatch):
     with lab() as (home, _):
         brief = home / 'brief.md'; brief.write_text('Change value.txt.\n')
         task = command(home, 'task', 'create', 'publish-lock', '--project', 'sample', '--brief', str(brief))
@@ -25,8 +30,33 @@ def test_publish_validates_grant_and_writes_receipt_under_one_lock():
         instruction = home / 'instruction.txt'
         instruction.write_text('Authorize publish-lock to publish origin:agd/publish-lock.\n')
         grant = tasks.grant_pr_publish(home, task['id'], 'origin:agd/publish-lock', instruction)
+        task.update(phase='running', executor='worker', incarnation='worker-inc')
+        tasks.save(home, task)
+        monkeypatch.setenv('AGD_TASK_ID', task['id'])
+        monkeypatch.setenv('AGD_INCARNATION', 'worker-inc')
+        provider = FakeGitHub()
 
-        receipt = pr.publish(home, task['id'], None, grant['id'], 'Title', 'Body', github_client=FakeGitHub())
+        receipt = pr.publish(home, task['id'], 'worker-inc', grant['id'], 'Title', 'Body',
+                             github_client=provider)
 
         assert receipt['grant_id'] == grant['id']
         assert tasks.read_pr_receipt(home, task['id'])['pr']['number'] == 7
+        assert provider.created
+
+
+def test_prepared_task_cannot_publish_or_touch_remote():
+    with lab() as (home, _):
+        brief = home / 'brief.md'; brief.write_text('Change value.txt.\n')
+        task = command(home, 'task', 'create', 'prepared-publish', '--project', 'sample', '--brief', str(brief))
+        run(['git', 'commit', '--allow-empty', '-m', 'candidate'], cwd=task['worktree'])
+        instruction = home / 'instruction.txt'
+        instruction.write_text('Authorize prepared-publish to publish origin:agd/prepared-publish.\n')
+        grant = tasks.grant_pr_publish(home, task['id'], 'origin:agd/prepared-publish', instruction)
+        provider = FakeGitHub()
+
+        with pytest.raises(tasks.store.Refusal, match='current worker'):
+            pr.publish(home, task['id'], None, grant['id'], 'Title', 'Body', github_client=provider)
+
+        assert not run(['git', 'ls-remote', '--heads', 'origin', 'refs/heads/agd/prepared-publish'],
+                       cwd=task['worktree']).stdout.strip()
+        assert not provider.created

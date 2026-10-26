@@ -1,14 +1,29 @@
+import os
+import re
+
 from . import store, tasks
 
 
+def github_repository(remote_url):
+    match = re.fullmatch(r'(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?', remote_url)
+    if not match:
+        raise store.Refusal('PR publication remote must be a canonical GitHub repository')
+    return f'{match.group(1)}/{match.group(2)}'
+
+
 def publish(home, task_id, incarnation, grant_id, title, body, run=store.run, github_client=None):
-    if github_client is None:
+    default_github = github_client is None
+    if default_github:
         from . import github as github_client
     with store.lock(home):
         task = tasks.read(home, task_id)
-        if task.get('incarnation') != incarnation:
-            raise store.Refusal('obsolete runner')
+        if (task.get('phase') != 'running' or task.get('executor') != 'worker' or
+                not isinstance(task.get('incarnation'), str) or not task['incarnation'] or
+                task['incarnation'] != incarnation or os.environ.get('AGD_TASK_ID') != task_id or
+                os.environ.get('AGD_INCARNATION') != incarnation):
+            raise store.Refusal('publication requires the current worker')
         grant = tasks._authorize_pr_publish_locked(home, task, grant_id)
+        repository = github_repository(grant['remote_url']) if default_github else grant['remote_url']
         work = tasks.verify_workspace(home, task)
         head = store.git(work, 'rev-parse', 'HEAD')
         remote_head = store.git(work, 'ls-remote', '--heads', grant['remote'], f'refs/heads/{task["branch"]}')
@@ -17,11 +32,10 @@ def publish(home, task_id, incarnation, grant_id, title, body, run=store.run, gi
             run(['git', 'fetch', grant['remote'], task['branch']], cwd=work)
             if run(['git', 'merge-base', '--is-ancestor', remote_sha, head], cwd=work, check=False).returncode:
                 raise store.Refusal('remote branch cannot fast-forward')
-        run(['git', 'push', grant['remote'], f'HEAD:refs/heads/{task["branch"]}'], cwd=work)
+        run(['git', 'push', '--no-force', grant['remote'], f'HEAD:refs/heads/{task["branch"]}'], cwd=work)
         remote_head = store.git(work, 'ls-remote', '--heads', grant['remote'], f'refs/heads/{task["branch"]}')
         if not remote_head or remote_head.split()[0] != head:
             raise store.Refusal('remote branch head was not confirmed')
-        repository = grant['remote_url']
         matches = github_client.find_open_pr(repository, task['branch'], task['base'])
         if len(matches) > 1:
             raise store.Refusal('multiple matching open pull requests')
