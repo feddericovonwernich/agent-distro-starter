@@ -6,7 +6,7 @@ import json
 import sys
 import uuid
 from pathlib import Path
-from agd_lib import projects, store, tasks, workers, supervision, worker_skills
+from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr
 
 
 def parser():
@@ -71,7 +71,8 @@ def parser():
     skills.add_parser('list')
     profiles = worker.add_parser('profiles').add_subparsers(dest='profile_operation', required=True)
     profiles.add_parser('list')
-    for action in ('launch', 'run', 'event', 'inspect', 'send', 'inbox', 'acknowledge', 'interrupt', 'stop', 'relaunch'):
+    for action in ('launch', 'run', 'event', 'inspect', 'send', 'inbox', 'acknowledge', 'interrupt', 'stop', 'relaunch',
+                   'publish-pr'):
         op = worker.add_parser(action)
         op.add_argument('id')
         if action == 'launch':
@@ -93,6 +94,11 @@ def parser():
             op.add_argument('--file', required=True)
         if action == 'acknowledge':
             op.add_argument('message_id')
+        if action == 'publish-pr':
+            op.add_argument('--incarnation', required=True)
+            op.add_argument('--grant', required=True)
+            op.add_argument('--title', required=True)
+            op.add_argument('--body', required=True)
     decision = sub.add_parser('decision').add_subparsers(dest='operation', required=True)
     resolve = decision.add_parser('resolve')
     resolve.add_argument('id')
@@ -122,7 +128,7 @@ def main(args):
                 args.command == 'session' and args.operation == 'reconcile' or
                 args.command == 'events' and args.operation == 'acknowledge')
     if mutation:
-        worker_scoped = (args.command == 'worker' and args.operation in ('run', 'event', 'acknowledge') or
+        worker_scoped = (args.command == 'worker' and args.operation in ('run', 'event', 'acknowledge', 'publish-pr') or
                          args.command == 'task' and args.operation == 'ready')
         store.require_owner(home, worker_scoped)
     if args.command == 'init':
@@ -214,6 +220,9 @@ def main(args):
         if args.operation == 'launch':
             return workers.launch(home, args.id, args.harness, args.backend, args.unattended,
                                   args.approval, args.profile, args.skill_mode, tuple(args.skill), args.pr_grant)
+        if args.operation == 'publish-pr':
+            return pr.publish(home, args.id, args.incarnation, args.grant,
+                              Path(args.title).read_text(), Path(args.body).read_text())
         if args.operation == 'run':
             return workers.run_worker(home, args.id, args.incarnation)
         if args.operation == 'event':
