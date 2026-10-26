@@ -435,6 +435,10 @@ def verify(home: Path, task: dict) -> None:
             _refusal(f'worker skill artifact is tracked: {record["id"]}')
 
 
+def removed(home: Path, task: dict) -> bool:
+    return _manifest(home, task).get('state') == 'removed'
+
+
 def remove(home: Path, task: dict) -> None:
     import shutil
     manifest = _manifest(home, task)

@@ -664,7 +664,7 @@ def test_unsafe_git_exclusion_metadata_refuses_before_prepare_mutates():
             path.unlink()
 
 
-def test_cleanup_records_return_intent_before_artifact_removal():
+def test_cleanup_retry_after_pre_remove_failure_releases_owned_artifacts():
     from unittest.mock import patch
     from support import lab, command
     from agd_lib import tasks, worker_skills
@@ -680,21 +680,55 @@ def test_cleanup_records_return_intent_before_artifact_removal():
         tasks.save(home, task)
         report = home/'report.md'; report.write_text('base inspected\n')
         command(home, 'task', 'ready', 'remove-window', '--report', str(report))
-        original = worker_skills.remove
         def interrupted(root, saved):
-            original(root, saved)
-            raise RuntimeError('injected post-remove failure')
+            raise RuntimeError('injected pre-remove failure')
         with patch.object(worker_skills, 'remove', interrupted):
             try:
                 tasks.cleanup(home, 'remove-window')
             except RuntimeError:
                 pass
             else:
-                raise AssertionError('post-remove fault was not injected')
+                raise AssertionError('pre-remove fault was not injected')
         assert tasks.read(home, 'remove-window')['cleanup_phase'] == 'returning'
-        assert not (Path(task['worktree'])/'.omp'/'skills'/'agd-probe').exists()
-        assert (home/'data'/'tasks'/'remove-window'/'worker-skills'/'agd-probe'/'SKILL.md').exists()
+        generated = Path(task['worktree'])/'.omp'/'skills'/'agd-probe'
+        assert generated.is_dir()
+        common = Path(tasks.store.git(task['worktree'], 'rev-parse', '--path-format=absolute', '--git-common-dir'))
+        assert '/.omp/skills/agd-probe/\n' in (common/'info'/'exclude').read_text()
         assert tasks.cleanup(home, 'remove-window')['phase'] == 'cleaned'
+        assert not generated.exists()
+        assert '/.omp/skills/agd-probe/\n' not in (common/'info'/'exclude').read_text()
+
+
+def test_returned_lease_requires_completed_skill_removal_journal():
+    from unittest.mock import patch
+    from types import SimpleNamespace
+    from support import lab, command
+    from agd_lib import tasks, worker_skills, store
+    os.environ['PATH'] = '/tmp/agd-treehouse-v3.1.6:' + os.environ['PATH']
+    with lab() as (home, project):
+        add_skill(home, 'agd-probe')
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'returned-window', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        task['harness'] = 'omp'
+        task['worker_skills'] = worker_skills.prepare(home, task, {
+            'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+        task.update(phase='ready', cleanup_phase='returning', cleanup_discard=False, cleanup_approval=None)
+        tasks.save(home, task)
+        original = tasks.store.run
+        def absent(argv, **kwargs):
+            if 'status' in argv:
+                return SimpleNamespace(stdout='[]')
+            return original(argv, **kwargs)
+        with patch.object(tasks.store, 'run', absent):
+            try:
+                tasks.cleanup(home, 'returned-window')
+            except store.Refusal:
+                pass
+            else:
+                raise AssertionError('returned lease accepted without removed skill journal')
+        assert (Path(task['worktree'])/'.omp'/'skills'/'agd-probe').is_dir()
+        assert tasks.read(home, 'returned-window')['phase'] == 'ready'
 
 
 def test_cleanup_retry_after_artifact_removal_before_return():
@@ -758,4 +792,5 @@ if __name__ == '__main__':
     test_staged_and_historic_generated_skills_refuse_ready()
     test_cleanup_retry_after_artifact_removal_before_return()
     test_unsafe_git_exclusion_metadata_refuses_before_prepare_mutates()
-    test_cleanup_records_return_intent_before_artifact_removal()
+    test_cleanup_retry_after_pre_remove_failure_releases_owned_artifacts()
+    test_returned_lease_requires_completed_skill_removal_journal()

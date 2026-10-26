@@ -248,6 +248,10 @@ def cleanup(home, task_id, discard=False, approval_id=None):
                                           cwd=project['path']).stdout)
             if not any(row.get('lease_id') == task['lease_id'] and row.get('lease_holder') == task['lease_holder']
                        for row in status):
+                if task.get('worker_skills'):
+                    from . import worker_skills
+                    if not worker_skills.removed(home, task):
+                        raise store.Refusal('worker skill removal is incomplete')
                 task['phase'] = 'cleaned'
                 save(home, task)
                 return task
