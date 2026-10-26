@@ -216,3 +216,31 @@ def ensure_runtime(home: Path, run=store.run, which=shutil.which) -> Path:
         _validate(stage, node_version, private=True, marker=True)
         os.replace(stage, root)
         return root
+
+
+def _service_file(home, project_id):
+    return Path(home) / 'state' / 'relay' / 'projects' / f'{store.validate_id(project_id)}.json'
+
+
+def ensure_project_service(home, project_id, repository):
+    if not isinstance(repository, str) or repository.count('/') != 1 or not all(repository.split('/')):
+        raise store.Refusal('Relay project repository must be OWNER/REPOSITORY')
+    runtime = ensure_runtime(home)
+    path = _service_file(home, project_id)
+    with store.lock(home):
+        if path.exists():
+            if path.is_symlink() or not path.is_file():
+                raise store.Refusal('Relay project service record is unsafe')
+            try:
+                record = json.loads(path.read_text())
+            except json.JSONDecodeError as error:
+                raise store.Refusal('Relay project service record is invalid') from error
+            if record.get('repository') != repository or record.get('runtime') != str(runtime):
+                raise store.Refusal('Relay project service identity changed')
+            return record
+        root = runtime_root(home) / 'projects' / project_id
+        root.mkdir(parents=True, mode=0o700)
+        record = {'schema': 1, 'project': project_id, 'repository': repository,
+                  'runtime': str(runtime), 'root': str(root), 'health': 'starting'}
+        store.atomic_json(path, record)
+        return record

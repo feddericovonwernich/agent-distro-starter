@@ -99,3 +99,17 @@ def test_lock_tolerates_concurrent_state_directory_creation(tmp_path, monkeypatc
     with relay._lock(home) as locked:
         assert locked == state
     assert (state / 'relay-install.lock').is_file()
+
+
+def test_project_service_is_private_and_idempotent(tmp_path, monkeypatch):
+    home = tmp_path / 'home'
+    runtime = tmp_path / 'runtime'
+    runtime.mkdir()
+    monkeypatch.setattr(relay, 'ensure_runtime', lambda *_args, **_kwargs: runtime)
+
+    first = relay.ensure_project_service(home, 'sample', 'owner/repo')
+    second = relay.ensure_project_service(home, 'sample', 'owner/repo')
+
+    assert first == second
+    assert first['runtime'] == str(runtime)
+    assert first['repository'] == 'owner/repo'
