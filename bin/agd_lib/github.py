@@ -8,9 +8,12 @@ query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       id number url state mergedAt headRefName headRefOid baseRefName mergeStateStatus reviewDecision
-      commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
-        ... on CheckRun { name status conclusion }
-        ... on StatusContext { context state }
+      commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) {
+        pageInfo { hasNextPage }
+        nodes {
+          ... on CheckRun { name status conclusion }
+          ... on StatusContext { context state }
+        }
       } } } } } }
     }
   }
@@ -36,7 +39,12 @@ def get_pr(repository, number, run=store.run):
     if not isinstance(node, dict):
         raise store.Refusal('GitHub PR is missing')
     try:
-        contexts = node['commits']['nodes'][-1]['commit']['statusCheckRollup']['contexts']['nodes']
+        rollup = node['commits']['nodes'][-1]['commit']['statusCheckRollup']
+        if rollup['contexts']['pageInfo']['hasNextPage']:
+            raise store.Refusal('GitHub PR check evidence is incomplete')
+        contexts = rollup['contexts']['nodes']
+    except store.Refusal:
+        raise
     except (KeyError, IndexError, TypeError):
         raise store.Refusal('GitHub PR check evidence is incomplete')
     checks = {}
@@ -48,6 +56,35 @@ def get_pr(repository, number, run=store.run):
             raise store.Refusal('GitHub PR check evidence is incomplete')
         checks[key] = context
     return dict(node, repository=repository, checks=checks)
+
+
+def find_open_pr(repository, head, base, run=store.run):
+    owner, name = split_repository(repository)
+    query = PR_QUERY.replace('$number: Int!', '$head: String!, $base: String!').replace(
+        'pullRequest(number: $number)', 'pullRequests(first: 100, states: OPEN, headRefName: $head, baseRefName: $base)')
+    data = graphql(query, {'owner': owner, 'name': name, 'head': head, 'base': base}, run)
+    nodes = data['repository'].get('pullRequests', {}).get('nodes')
+    if not isinstance(nodes, list):
+        raise store.Refusal('GitHub PR search is incomplete')
+    found = []
+    for node in nodes:
+        if not isinstance(node, dict) or node.get('state') != 'OPEN':
+            continue
+        if node.get('headRefName') != head or node.get('baseRefName') != base:
+            continue
+        try:
+            rollup = node['commits']['nodes'][-1]['commit']['statusCheckRollup']
+            if rollup['contexts']['pageInfo']['hasNextPage']:
+                raise store.Refusal('GitHub PR check evidence is incomplete')
+            contexts = rollup['contexts']['nodes']
+        except store.Refusal:
+            raise
+        except (KeyError, IndexError, TypeError):
+            raise store.Refusal('GitHub PR check evidence is incomplete')
+        checks = {item.get('name', item.get('context')): item for item in contexts
+                  if isinstance(item, dict) and item.get('name', item.get('context'))}
+        found.append(dict(node, repository=repository, checks=checks))
+    return found
 
 
 def graphql(query, variables, run=store.run):

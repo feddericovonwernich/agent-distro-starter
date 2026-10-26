@@ -166,13 +166,17 @@ def read_pr_receipt(home, task_id):
         raise store.Refusal('PR receipt is invalid') from error
 
 
+def _write_pr_receipt_locked(home, task_id, receipt):
+    read(home, task_id)
+    path = pr_receipt_file(home, task_id)
+    if path.exists() and (path.is_symlink() or not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode)):
+        raise store.Refusal('PR receipt is unsafe')
+    store.atomic_json(path, receipt)
+
+
 def write_pr_receipt(home, task_id, receipt):
     with store.lock(home):
-        read(home, task_id)
-        path = pr_receipt_file(home, task_id)
-        if path.exists() and (path.is_symlink() or not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode)):
-            raise store.Refusal('PR receipt is unsafe')
-        store.atomic_json(path, receipt)
+        _write_pr_receipt_locked(home, task_id, receipt)
 
 
 def grant_pr_publish(home, task_id, target, instruction):
@@ -205,27 +209,31 @@ def grant_pr_publish(home, task_id, target, instruction):
         return grant
 
 
+def _authorize_pr_publish_locked(home, task, grant_id):
+    task = read(home, task['id'])
+    try:
+        grant_id = str(uuid.UUID(grant_id))
+        grant = json.loads((task_file(home, task['id']).parent/'approvals'/f'{grant_id}.json').read_text())
+    except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
+        raise store.Refusal('PR publication grant missing or invalid') from error
+    if (grant.get('task') != task['id'] or grant.get('action') != 'pr-publish' or
+            grant.get('branch') != task['branch'] or grant.get('base') != task['base'] or
+            grant.get('target') != f'{grant.get("remote")}:{task["branch"]}'):
+        raise store.Refusal('PR publication grant does not match task target')
+    work = verify_workspace(home, task)
+    if not store.clean(work):
+        raise store.Refusal('task workspace has uncommitted or untracked changes')
+    if store.git(work, 'remote', 'get-url', grant['remote'], check=False) != grant.get('remote_url'):
+        raise store.Refusal('PR publication remote changed')
+    if store.run(['git', 'merge-base', '--is-ancestor', grant['grant_head'], 'HEAD'],
+                 cwd=work, check=False).returncode:
+        raise store.Refusal('PR publication head is not a descendant of grant head')
+    return grant
+
+
 def authorize_pr_publish(home, task, grant_id):
     with store.lock(home):
-        task = read(home, task['id'])
-        try:
-            grant_id = str(uuid.UUID(grant_id))
-            grant = json.loads((task_file(home, task['id']).parent/'approvals'/f'{grant_id}.json').read_text())
-        except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
-            raise store.Refusal('PR publication grant missing or invalid') from error
-        if (grant.get('task') != task['id'] or grant.get('action') != 'pr-publish' or
-                grant.get('branch') != task['branch'] or grant.get('base') != task['base'] or
-                grant.get('target') != f'{grant.get("remote")}:{task["branch"]}'):
-            raise store.Refusal('PR publication grant does not match task target')
-        work = verify_workspace(home, task)
-        if not store.clean(work):
-            raise store.Refusal('task workspace has uncommitted or untracked changes')
-        if store.git(work, 'remote', 'get-url', grant['remote'], check=False) != grant.get('remote_url'):
-            raise store.Refusal('PR publication remote changed')
-        if store.run(['git', 'merge-base', '--is-ancestor', grant['grant_head'], 'HEAD'],
-                     cwd=work, check=False).returncode:
-            raise store.Refusal('PR publication head is not a descendant of grant head')
-        return grant
+        return _authorize_pr_publish_locked(home, task, grant_id)
 
 
 def approve(home, task_id, action, target, instruction):
