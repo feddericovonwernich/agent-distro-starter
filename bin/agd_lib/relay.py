@@ -218,28 +218,45 @@ def ensure_runtime(home: Path, run=store.run, which=shutil.which) -> Path:
         return root
 
 
+def _service_root(home, project_id):
+    project_id = store.validate_id(project_id)
+    root = Path(home)
+    if not os.path.lexists(root):
+        root.mkdir(parents=True, mode=0o700)
+    _lstat(root, 'dir')
+    for part in ('state', 'relay', 'projects', project_id):
+        root /= part
+        if os.path.lexists(root):
+            _lstat(root, 'dir')
+        else:
+            root.mkdir(mode=0o700)
+    return root
+
+
 def _service_file(home, project_id):
-    return Path(home) / 'state' / 'relay' / 'projects' / f'{store.validate_id(project_id)}.json'
+    return _service_root(home, project_id)/'service.json'
 
 
 def ensure_project_service(home, project_id, repository):
+    project_id = store.validate_id(project_id)
     if not isinstance(repository, str) or repository.count('/') != 1 or not all(repository.split('/')):
         raise store.Refusal('Relay project repository must be OWNER/REPOSITORY')
     runtime = ensure_runtime(home)
-    path = _service_file(home, project_id)
     with store.lock(home):
-        if path.exists():
-            if path.is_symlink() or not path.is_file():
-                raise store.Refusal('Relay project service record is unsafe')
+        root = _service_root(home, project_id)
+        path = root/'service.json'
+        if os.path.lexists(path):
+            _lstat(path, 'file')
             try:
                 record = json.loads(path.read_text())
             except json.JSONDecodeError as error:
                 raise store.Refusal('Relay project service record is invalid') from error
-            if record.get('repository') != repository or record.get('runtime') != str(runtime):
+            if (not isinstance(record, dict) or record.get('schema') != 1 or
+                    record.get('project') != project_id or record.get('repository') != repository or
+                    record.get('runtime') != str(runtime) or record.get('root') != str(root) or
+                    record.get('health') not in ('starting', 'healthy')):
                 raise store.Refusal('Relay project service identity changed')
             return record
-        root = runtime_root(home) / 'projects' / project_id
-        root.mkdir(parents=True, mode=0o700)
         record = {'schema': 1, 'project': project_id, 'repository': repository,
                   'runtime': str(runtime), 'root': str(root), 'health': 'starting'}
         store.atomic_json(path, record)

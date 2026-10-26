@@ -13,10 +13,19 @@ def worker_skill_roots(harness):
 def launch_argv(task, brief_path, unattended=False):
     code_root = Path(__file__).resolve().parents[2]
     if task.get('pr_grant'):
+        agd = f'{code_root / "bin" / "agd"} --home {brief_path.parents[3]}'
+        grant = task['pr_grant']
         prompt = (f'Read {brief_path} and complete task {task["id"]} only in {task["worktree"]}. '
-                  'Use only guarded AGD worker publish-pr, verify-pr, relay-poll, and relay-reply commands '
-                  'for the recorded PR grant. Do not merge, force-push, tag, change the base branch, or clean up. '
-                  'Report blocked conditions through AGD.')
+                  f'Your PR grant is {grant}. Use this AGD command prefix: {agd}. '
+                  f'Publish only with: {agd} worker publish-pr {task["id"]} --incarnation $AGD_INCARNATION '
+                  f'--grant {grant} --title {brief_path.parent / "pr-title.txt"} --body {brief_path.parent / "pr-body.md"}. '
+                  f'Write the final report to {brief_path.parent / "report-draft.md"}, then verify only with: '
+                  f'{agd} worker verify-pr {task["id"]} --incarnation $AGD_INCARNATION --grant {grant} '
+                  f'--report {brief_path.parent / "report-draft.md"}. '
+                  f'Poll with: {agd} worker relay-poll {task["id"]} --incarnation $AGD_INCARNATION --grant {grant}. '
+                  f'Reply only with: {agd} worker relay-reply {task["id"]} --incarnation $AGD_INCARNATION '
+                  f'--grant {grant} --lease LEASE --action start|complete|cancelled --payload FILE. '
+                  'Do not merge, force-push, tag, change the base branch, or clean up. Report blocked conditions through AGD.')
     else:
         prompt = (f'Read {brief_path} and complete task {task["id"]} only in {task["worktree"]}. '
                   f'Write a short report to {brief_path.parent / "report-draft.md"}, then run '

@@ -332,6 +332,13 @@ def seed_defaults(home: Path) -> bool:
     return True
 
 
+def scoped_pr_source():
+    source = Path(__file__).resolve().parents[2]/'bundled'/'worker-skills'/'agd-scoped-pr-relay'
+    if source.is_symlink() or not source.is_dir():
+        _refusal('bundled scoped PR worker skill is unavailable')
+    return source
+
+
 def _manifest(home, task):
     path = _journal(home, task)
     if not path.is_file() or path.is_symlink():
@@ -351,7 +358,10 @@ def _manifest(home, task):
     for record in data['skills']:
         if not isinstance(record, dict) or _id(record.get('id'), 'journal skill') != record['id']:
             _refusal('invalid worker skill journal record')
-        if Path(record.get('source', '')) != _private_path(home, 'config', 'worker-skills', record['id']):
+        source = Path(record.get('source', ''))
+        scoped = record['id'] == 'agd-scoped-pr-relay' and task.get('pr_grant')
+        expected = Path(__file__).resolve().parents[2]/'bundled'/'worker-skills'/record['id'] if scoped else _private_path(home, 'config', 'worker-skills', record['id'])
+        if source != expected:
             _refusal('worker skill source path escaped catalog')
         if Path(record.get('snapshot', '')) != snapshot_root/record['id']:
             _refusal('worker skill snapshot path escaped task data')
@@ -412,7 +422,7 @@ def _exclude_info(task):
     return info
 
 
-def prepare(home: Path, task: dict, selection: dict) -> dict:
+def prepare(home: Path, task: dict, selection: dict, sources=None) -> dict:
     if selection.get('schema') != 1 or not isinstance(selection.get('skills'), list):
         _refusal('invalid worker skill selection')
     _exclude_info(task)
@@ -432,7 +442,8 @@ def prepare(home: Path, task: dict, selection: dict) -> dict:
     roots = harnesses.worker_skill_roots(task['harness'])
     root = Path(task['worktree'])/roots[0]
     records = []
-    available = {row['id'] for row in catalog(home)}
+    sources = sources or {}
+    available = {row['id'] for row in catalog(home)} | set(sources)
     for skill_id in selection['skills']:
         if skill_id not in available:
             _refusal(f'missing catalog skill {skill_id}')
@@ -444,7 +455,7 @@ def prepare(home: Path, task: dict, selection: dict) -> dict:
             if ancestor.parent == ancestor:
                 break
             ancestor = ancestor.parent
-        source = _private_path(home, 'config', 'worker-skills', skill_id)
+        source = Path(sources.get(skill_id) or _private_path(home, 'config', 'worker-skills', skill_id))
         destination = root/skill_id
         if destination.exists() or destination.is_symlink():
             _refusal(f'worker skill destination exists: {destination}')

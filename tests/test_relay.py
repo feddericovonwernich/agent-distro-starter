@@ -113,3 +113,20 @@ def test_project_service_is_private_and_idempotent(tmp_path, monkeypatch):
     assert first == second
     assert first['runtime'] == str(runtime)
     assert first['repository'] == 'owner/repo'
+    assert first['root'] == str(home/'state'/'relay'/'projects'/'sample')
+    assert not (home/'relay').exists()
+
+
+def test_project_service_rejects_symlinked_state_root(tmp_path, monkeypatch):
+    import os
+    home = tmp_path/'home'
+    outside = tmp_path/'outside'; outside.mkdir()
+    parent = home/'state'/'relay'/'projects'; parent.mkdir(parents=True)
+    os.symlink(outside, parent/'sample')
+    monkeypatch.setattr(relay, 'ensure_runtime', lambda *_args, **_kwargs: tmp_path/'system-relay')
+    from agd_lib import store
+    try:
+        relay.ensure_project_service(home, 'sample', 'owner/repo')
+    except store.Refusal:
+        return
+    raise AssertionError('symlinked project state was accepted')

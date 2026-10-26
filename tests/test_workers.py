@@ -195,6 +195,33 @@ def test_relaunch_restores_frozen_skill_after_catalog_changes():
         assert (Path(task['worktree'])/'.omp'/'skills'/'agd-probe'/'SKILL.md').is_file()
 
 
+
+
+def test_granted_launch_uses_frozen_private_scoped_skill_and_prompt():
+    from unittest.mock import patch
+    from agd_lib import workers
+    with lab() as (home, project):
+        brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
+        task = command(home, 'task', 'create', 'granted', '--project', 'sample', '--brief', str(brief), '--kind', 'ship')
+        instruction = home/'grant.md'
+        instruction.write_text('Task granted may publish origin:agd/granted for task granted.\n')
+        grant = tasks.grant_pr_publish(home, 'granted', 'origin:agd/granted', instruction)
+        class FakeBackend:
+            def create(self, *_args): return {'created': True}
+        with patch.object(workers.harnesses, 'launch_argv', return_value=['true']), \
+             patch.object(workers, 'backend', return_value=FakeBackend()), \
+             patch.object(workers.shutil, 'which', return_value='/bin/true'):
+            launched = workers.launch(home, 'granted', pr_grant=grant['id'])
+        manifest = launched['worker_skills']
+        assert manifest['skills'][0]['id'] == 'agd-scoped-pr-relay'
+        assert not (home/'config'/'worker-skills'/'agd-scoped-pr-relay').exists()
+        assert (Path(manifest['skills'][0]['snapshot'])/'SKILL.md').is_file()
+        scoped = dict(launched, worker_skills=manifest, pr_grant=grant['id'])
+        scoped['incarnation'] = 'worker-incarnation'
+        argv = __import__('agd_lib.harnesses', fromlist=['launch_argv']).launch_argv(scoped, brief)
+        text = argv[-1]
+        assert grant['id'] in text and '--incarnation $AGD_INCARNATION' in text
+        assert f'worker verify-pr granted' in text and str(home) in text
 def test_concurrent_skill_launch_has_one_winner_without_orphans():
     from concurrent.futures import ThreadPoolExecutor
     from unittest.mock import patch

@@ -61,7 +61,9 @@ def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=Fal
     module = backend(preflight)
     if selected_backend == 'tmux' and not shutil.which('tmux'):
         raise store.DependencyError('tmux is not installed')
-    selection = worker_skills.resolve(home, profile=profile, skill_mode=skill_mode, skills=skills)
+    selection = ({'schema': 1, 'mode': 'curated', 'profile': None,
+                  'skills': ['agd-scoped-pr-relay']} if pr_grant else
+                 worker_skills.resolve(home, profile=profile, skill_mode=skill_mode, skills=skills))
     if selection['skills']:
         harnesses.worker_skill_roots(harness)
     if selected_backend == 'herdr':
@@ -72,11 +74,14 @@ def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=Fal
             raise store.Refusal('task launch raced another owner; no endpoint created')
         if pr_grant:
             tasks._authorize_pr_publish_locked(home, current, pr_grant)
-            profile, skill_mode, skills = None, 'curated', ('agd-scoped-pr-relay',)
+            selection = {'schema': 1, 'mode': 'curated', 'profile': None,
+                         'skills': ['agd-scoped-pr-relay']}
             current['pr_grant'] = pr_grant
         manifest = None
         if selection['skills']:
-            manifest = worker_skills.prepare(home, dict(current, harness=harness), selection)
+            manifest = worker_skills.prepare(
+                home, dict(current, harness=harness), selection,
+                {'agd-scoped-pr-relay': worker_skills.scoped_pr_source()} if pr_grant else None)
         if selected_backend == 'herdr':
             module.prepare(home)
         task = current
