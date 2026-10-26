@@ -41,8 +41,7 @@
 | `bin/agd_lib/workers.py`, `bin/agd_lib/harnesses.py`, `bin/agd_lib/worker_skills.py` | Grant-only worker capability, conditional prompt replacement, and frozen scoped skill. |
 | `bundled/worker-skills/agd-scoped-pr-relay/` | AGD-owned worker instructions, never a default skill. |
 | `.agents/skills/{using-open-relay,setting-up-open-relay,waiting-for-open-relay-events,automating-github-prs-with-open-relay,recovering-open-relay}/` | Pinned canonical Relay central skills. |
-| `bundled/worker-skills/` | Worker bundles needed from those five upstream skill trees, copied with their licenses. |
-| `third_party/PROVENANCE.md` | Pinned source, Apache-2.0, copied file hashes, and `ajv` resolution caveat. |
+| `third_party/OPEN_RELAY_LICENSE`, `third_party/PROVENANCE.md` | Tracked Apache-2.0 license, pin, central-skill hashes, and `ajv` resolution caveat. |
 | `tests/test_relay.py`, `tests/test_github.py`, `tests/test_pr.py` | Behavior tests for runtime safety, protocol settlement, GitHub policy, and PR boundaries. |
 | `tests/test_tasks.py`, `tests/test_workers.py`, `tests/test_worker_skills.py` | Grant/ready/launch regressions. |
 | `CHANGELOG.md`, `docs/operations.md`, `.agents/skills/customize/SKILL.md`, `README.md` | Operating/security/scope contract. |
@@ -97,7 +96,7 @@ git commit -m "test: add disposable PR workflow support"
 
 **Files:**
 - Create: `.agents/skills/using-open-relay/`, `.agents/skills/setting-up-open-relay/`, `.agents/skills/waiting-for-open-relay-events/`, `.agents/skills/automating-github-prs-with-open-relay/`, `.agents/skills/recovering-open-relay/`
-- Create: matching approved worker bundles under `bundled/worker-skills/`, preserving upstream directory names/resources/LICENSEs
+- Create: `third_party/OPEN_RELAY_LICENSE`
 - Modify: `third_party/PROVENANCE.md`
 
 **Interfaces:**
@@ -111,13 +110,13 @@ tar -tzf /tmp/open-relay-dac2865.tar.gz | sed -n '/\/skills\//p'
 ```
 
 
-- [ ] **Step 2: Copy only the five named canonical skill trees**
+- [ ] **Step 2: Copy only the five named canonical central skill trees**
 
-Copy their `SKILL.md`, referenced local resources, and Apache-2.0 license files without running package lifecycle scripts or modifying user skills. Keep upstream bodies verbatim; the only AGD-authored skill is Task 5's concise scoped worker bundle.
+Copy their `SKILL.md` and referenced local resources without running package lifecycle scripts or modifying user skills. Keep upstream bodies verbatim. Ship one tracked Apache-2.0 license at `third_party/OPEN_RELAY_LICENSE`; ship no upstream worker bundle because worker catalog IDs require `agd-` and upstream `commit and push` conflicts with guarded publication. Task 7 supplies the sole AGD-authored grant-only worker bundle.
 
 - [ ] **Step 3: Record provenance and run a throwaway integrity check**
 
-Record source URL, SHA, package version, Apache-2.0, every copied file SHA-256, and the `ajv: ^8.17.1` transitive-resolution limitation. Run once, without committing a wording/copy test:
+Record source URL, SHA, package version, Apache-2.0 license path, every copied central-skill file SHA-256, and the `ajv: ^8.17.1` transitive-resolution limitation. Run once, without committing a wording/copy test:
 
 ```bash
 sha256sum .agents/skills/{using-open-relay,setting-up-open-relay,waiting-for-open-relay-events,automating-github-prs-with-open-relay,recovering-open-relay}/SKILL.md
@@ -128,7 +127,7 @@ Compare those five hashes with the provenance entries.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add .agents/skills bundled/worker-skills third_party/PROVENANCE.md
+git add .agents/skills third_party/OPEN_RELAY_LICENSE third_party/PROVENANCE.md
 git commit -m "feat: vendor pinned Open Relay skills"
 ```
 
