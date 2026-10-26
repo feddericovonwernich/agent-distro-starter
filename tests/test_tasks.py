@@ -168,6 +168,35 @@ def test_ready_refuses_pr_granted_task_without_final_verification():
         report = home/'report.md'; report.write_text('Verified.\n')
         with pytest.raises(store.Refusal, match='PR verification'):
             tasks.ready(home, task['id'], report)
+
+
+def test_ready_refuses_manually_written_final_claim_without_github_evidence():
+    from support import lab
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'bin'))
+    from agd_lib import store, tasks
+
+    with lab() as (home, _):
+        brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
+        task = command(home, 'task', 'create', 'forged-final', '--project', 'sample', '--brief', str(brief))
+        run(['git', 'commit', '--allow-empty', '-m', 'candidate'], cwd=task['worktree'])
+        instruction = home/'instruction.txt'
+        instruction.write_text('Authorize forged-final to publish origin:agd/forged-final.\n')
+        grant = tasks.grant_pr_publish(home, task['id'], 'origin:agd/forged-final', instruction)
+        head = run(['git', 'rev-parse', 'HEAD'], cwd=task['worktree']).stdout.strip()
+        with pytest.raises(store.Refusal, match='final verification is private'):
+            tasks.write_pr_receipt(home, task['id'], {
+                'schema': 1, 'grant_id': grant['id'], 'remote': 'origin', 'repository': grant['remote_url'],
+                'branch': task['branch'], 'base': task['base'], 'local_head': head, 'remote_head': head,
+                'pr': {'id': 'P_1', 'number': 1, 'url': 'https://example.test/owner/repo/pull/1'},
+                'verification': {'grant_id': grant['id'], 'remote': 'origin',
+                                 'repository': grant['remote_url'], 'branch': task['branch'], 'base': task['base'],
+                                 'head': head, 'remote_head': head, 'pr_head': head,
+                                 'pr_number': 1, 'pr_id': 'P_1',
+                                 'final': {'head_sha': head, 'pr': {'headRefOid': head}}}})
+        report = home/'report.md'; report.write_text('Verified.\n')
+        with pytest.raises(store.Refusal, match='PR verification'):
+            tasks.ready(home, task['id'], report)
 def test_pr_receipt_does_not_transition_task_phase():
     from support import lab
     import sys

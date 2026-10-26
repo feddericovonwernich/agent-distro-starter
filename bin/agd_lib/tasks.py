@@ -137,36 +137,52 @@ def _pr_publish_granted(home, task):
 
 
 
+def _ready_locked(home, task_id, text):
+    task = read(home, task_id)
+    if task['phase'] not in ('prepared', 'running'):
+        raise store.Refusal('task not prepared or running')
+    if os.environ.get('AGD_TASK_ID') and (os.environ['AGD_TASK_ID'] != task_id or
+                                          os.environ.get('AGD_INCARNATION') != task.get('incarnation')):
+        raise store.Refusal('worker incarnation cannot report this task')
+    work = verify_workspace(home, task)
+    verify_worker_skills(home, task)
+    if not store.clean(work):
+        raise store.Refusal('task workspace has uncommitted or untracked changes')
+    head = store.git(work, 'rev-parse', 'HEAD')
+    if task['kind'] == 'ship' and _pr_publish_granted(home, task):
+        receipt = read_pr_receipt(home, task_id)
+        verification = receipt.get('verification') if receipt else None
+        final = verification.get('final') if isinstance(verification, dict) else None
+        if (not isinstance(verification, dict) or not isinstance(final, dict) or
+                final.get('head_sha') != head or not isinstance(final.get('pr'), dict) or
+                final['pr'].get('headRefOid') != head or
+                receipt.get('grant_id') != verification.get('grant_id') or
+                receipt.get('remote') != verification.get('remote') or
+                receipt.get('repository') != verification.get('repository') or
+                receipt.get('branch') != verification.get('branch') or
+                receipt.get('base') != verification.get('base') or
+                receipt.get('pr', {}).get('number') != verification.get('pr_number') or
+                receipt.get('pr', {}).get('id') != verification.get('pr_id') or
+                verification.get('head') != head or verification.get('remote_head') != head or
+                verification.get('pr_head') != head):
+            raise store.Refusal('PR verification is missing or superseded')
+        _authorize_pr_publish_locked(home, task, receipt['grant_id'])
+    if task['kind'] == 'ship' and (head == task['start'] or store.run(['git', 'merge-base', '--is-ancestor', task['start'], head], cwd=work, check=False).returncode):
+        raise store.Refusal('ship task needs committed changes from its base')
+    if task['kind'] == 'scout' and head != task['start']:
+        raise store.Refusal('scout contains unexpected commits')
+    (task_file(home, task_id).parent/'report.md').write_text(text)
+    task.update(phase='ready', ready_head=head, report='report.md')
+    save(home, task)
+    return task
+
+
 def ready(home, task_id, report):
     text = Path(report).read_text()
     if not text.strip():
         raise store.Refusal('empty report')
     with store.lock(home):
-        task = read(home, task_id)
-        if task['phase'] not in ('prepared', 'running'):
-            raise store.Refusal('task not prepared or running')
-        if os.environ.get('AGD_TASK_ID') and (os.environ['AGD_TASK_ID'] != task_id or
-                                              os.environ.get('AGD_INCARNATION') != task.get('incarnation')):
-            raise store.Refusal('worker incarnation cannot report this task')
-        work = verify_workspace(home, task)
-        verify_worker_skills(home, task)
-        if not store.clean(work):
-            raise store.Refusal('task workspace has uncommitted or untracked changes')
-        head = store.git(work, 'rev-parse', 'HEAD')
-        if _pr_publish_granted(home, task):
-            receipt = read_pr_receipt(home, task_id)
-            verification = receipt.get('verification') if receipt else None
-            if (not isinstance(verification, dict) or verification.get('head') != head or
-                    verification.get('remote_head') != head or verification.get('pr_head') != head):
-                raise store.Refusal('PR verification is missing or superseded')
-        if task['kind'] == 'ship' and (head == task['start'] or store.run(['git', 'merge-base', '--is-ancestor', task['start'], head], cwd=work, check=False).returncode):
-            raise store.Refusal('ship task needs committed changes from its base')
-        if task['kind'] == 'scout' and head != task['start']:
-            raise store.Refusal('scout contains unexpected commits')
-        (task_file(home, task_id).parent/'report.md').write_text(text)
-        task.update(phase='ready', ready_head=head, report='report.md')
-        save(home, task)
-    return task
+        return _ready_locked(home, task_id, text)
 
 
 def pr_receipt_file(home, task_id):
@@ -189,6 +205,18 @@ def validate_pr_receipt(receipt):
             pull_request['number'] < 1 or not isinstance(pull_request.get('url'), str) or
             not pull_request['url'] or not isinstance(pull_request.get('id'), str) or not pull_request['id']):
         raise store.Refusal('PR receipt is invalid')
+    verification = receipt.get('verification')
+    if verification is not None:
+        required_verification = ('grant_id', 'remote', 'repository', 'branch', 'base', 'head',
+                                 'remote_head', 'pr_head', 'pr_id', 'pr_number')
+        final = verification.get('final') if isinstance(verification, dict) else None
+        if (not isinstance(verification, dict) or
+                any(not isinstance(verification.get(key), str) or not verification[key]
+                    for key in required_verification[:-1]) or
+                not isinstance(verification.get('pr_number'), int) or verification['pr_number'] < 1 or
+                not isinstance(final, dict) or not isinstance(final.get('head_sha'), str) or
+                not final['head_sha'] or not isinstance(final.get('pr'), dict)):
+            raise store.Refusal('PR receipt is invalid')
     return receipt
 
 
@@ -206,8 +234,10 @@ def read_pr_receipt(home, task_id):
         raise store.Refusal('PR receipt is invalid') from error
 
 
-def _write_pr_receipt_locked(home, task_id, receipt):
+def _write_pr_receipt_locked(home, task_id, receipt, allow_final=False):
     validate_pr_receipt(receipt)
+    if receipt.get('verification') is not None and not allow_final:
+        raise store.Refusal('PR final verification is private')
     read(home, task_id)
     path = pr_receipt_file(home, task_id)
     if path.exists() and (path.is_symlink() or not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode)):
