@@ -41,7 +41,10 @@ def _private_path(home, *parts, create=False):
     if not os.path.lexists(path):
         if not create:
             return path.joinpath(*parts)
-        path.mkdir(parents=True, mode=0o700)
+        try:
+            path.mkdir(parents=True, mode=0o700)
+        except FileExistsError:
+            pass
     _lstat(path, 'dir')
     for index, part in enumerate(parts):
         path /= part
@@ -168,7 +171,10 @@ def find_compatible_system() -> Path | None:
 def _lock(home):
     state = _private_path(home, 'state', create=True)
     if not state.exists():
-        state.mkdir(mode=0o700)
+        try:
+            state.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
     _lstat(state, 'dir')
     lock = state / 'relay-install.lock'
     if os.path.lexists(lock):

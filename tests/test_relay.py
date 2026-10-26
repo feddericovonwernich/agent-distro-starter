@@ -82,3 +82,20 @@ def test_symlinked_private_runtime_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(relay, '_node_version', lambda run: '22.19.0')
     with pytest.raises(store.Refusal, match='symlink'):
         relay.ensure_runtime(home, which=lambda name: None, run=fake_npm_success(home))
+
+def test_lock_tolerates_concurrent_state_directory_creation(tmp_path, monkeypatch):
+    home = tmp_path / 'home'
+    home.mkdir()
+    state = home / 'state'
+    original_mkdir = Path.mkdir
+
+    def mkdir_raced(path, *args, **kwargs):
+        if path == state:
+            original_mkdir(path, *args, **kwargs)
+            raise FileExistsError(path)
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'mkdir', mkdir_raced)
+    with relay._lock(home) as locked:
+        assert locked == state
+    assert (state / 'relay-install.lock').is_file()
