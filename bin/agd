@@ -125,10 +125,27 @@ def main(args):
                          args.command == 'task' and args.operation == 'ready')
         store.require_owner(home, worker_scoped)
     if args.command == 'init':
-        for name in ('config', 'projects', 'data/projects', 'data/tasks', 'state'):
-            (home/name).mkdir(parents=True, exist_ok=True, mode=0o700)
-        if not (home/'data'/'home.json').exists():
-            store.atomic_json(home/'data'/'home.json', {'schema': 1, 'home_id': str(uuid.uuid4())})
+        if home == Path(__file__).resolve().parents[1]:
+            fresh = not any((home/name).exists() or (home/name).is_symlink()
+                            for name in ('config', 'projects', 'data', 'state'))
+        else:
+            fresh = not home.exists() or not any(home.iterdir())
+        checkout_home = home == Path(__file__).resolve().parents[1]
+        with store.lock(home):
+            lock_only = all(path.name == 'mutation.lock' for path in (home/'state').iterdir())
+            if checkout_home:
+                still_fresh = fresh and lock_only and not any(
+                    (home/name).exists() or (home/name).is_symlink()
+                    for name in ('config', 'projects', 'data'))
+            else:
+                still_fresh = fresh and lock_only and all(
+                    path.name == 'state' for path in home.iterdir())
+            for name in ('config', 'projects', 'data/projects', 'data/tasks', 'state'):
+                (home/name).mkdir(parents=True, exist_ok=True, mode=0o700)
+            if not (home/'data'/'home.json').exists():
+                store.atomic_json(home/'data'/'home.json', {'schema': 1, 'home_id': str(uuid.uuid4())})
+            if still_fresh:
+                worker_skills.seed_defaults(home)
         return {'home': str(home)}
     if args.command == 'doctor':
         names = ['git', 'treehouse', 'omp' if args.harness == 'omp' else 'cursor-agent',
