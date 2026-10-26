@@ -256,6 +256,20 @@ def _install_review_definition(root):
             shutil.copyfile(origin, destination)
 
 
+def _configure_connector(root, repository):
+    if not os.environ.get('AGD_RELAY_GITHUB_READ_TOKEN'):
+        raise store.Refusal('Relay requires AGD_RELAY_GITHUB_READ_TOKEN with Checks, Pull requests, and Metadata read')
+    path = root/'.relay'/'connectors'/'github.json'
+    config = {'connector': 'github', 'tokenEnv': 'AGD_RELAY_GITHUB_READ_TOKEN',
+              'repositories': [{'name': repository, 'mode': 'generic-check-runs'}], 'triggers': []}
+    if os.path.lexists(path):
+        _lstat(path, 'file')
+        if json.loads(path.read_text()) != config:
+            raise store.Refusal('Relay GitHub connector configuration was modified')
+    else:
+        store.atomic_json(path, config)
+
+
 def ensure_project_service(home, project_id, repository, run=store.run):
     project_id = store.validate_id(project_id)
     if not isinstance(repository, str) or repository.count('/') != 1 or not all(repository.split('/')):
@@ -276,6 +290,7 @@ def ensure_project_service(home, project_id, repository, run=store.run):
                     record.get('health') not in ('starting', 'healthy')):
                 raise store.Refusal('Relay project service identity changed')
             _install_review_definition(root)
+            _configure_connector(root, repository)
             return record
         relay_state = root/'.relay'
         if os.path.lexists(relay_state):
@@ -284,6 +299,7 @@ def ensure_project_service(home, project_id, repository, run=store.run):
             run([str(runtime/'bin'/'relay'), 'init', '--github', repository], cwd=root, timeout=30)
             _lstat(relay_state, 'dir')
         _install_review_definition(root)
+        _configure_connector(root, repository)
         record = {'schema': 1, 'project': project_id, 'repository': repository,
                   'runtime': str(runtime), 'root': str(root), 'health': 'starting'}
         store.atomic_json(path, record)

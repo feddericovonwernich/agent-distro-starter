@@ -106,6 +106,7 @@ def test_project_service_is_private_and_idempotent(tmp_path, monkeypatch):
     runtime = tmp_path / 'runtime'
     runtime.mkdir()
     monkeypatch.setattr(relay, 'ensure_runtime', lambda *_args, **_kwargs: runtime)
+    monkeypatch.setenv('AGD_RELAY_GITHUB_READ_TOKEN', 'test-read-token')
 
     def init(argv, cwd, **_kwargs):
         (cwd/'.relay').mkdir()
