@@ -1,6 +1,8 @@
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -16,7 +18,7 @@ class GitHub:
 
     def __call__(self, kind, cursor=None):
         if kind == 'pull_request':
-            return {'headSha': self.head, 'reviewDecision': self.decision}
+            return {'headSha': self.head, 'reviewDecision': self.decision, 'state': 'OPEN'}
         pages = self.pages[kind]
         index = int(cursor or 0)
         return {'items': pages[index], 'next': str(index + 1) if index + 1 < len(pages) else None}
@@ -26,17 +28,23 @@ class Relay:
     def __init__(self, status=201):
         self.status = status
         self.requests = []
+        self.keys = set()
 
     def __call__(self, request):
         self.requests.append(request)
-        return self.status
+        if self.status != 201:
+            return self.status
+        if request['idempotencyKey'] in self.keys:
+            return 200
+        self.keys.add(request['idempotencyKey'])
+        return 201
 
 
 def artifact(identifier, kind, head, state=None, body=None):
     return {'id': identifier, 'headSha': head, 'state': state, 'body': body}
 
 
-def test_current_head_changes_emit_once_with_exact_correlation(tmp_path):
+def test_current_head_changes_emit_distinct_relay_events_with_exact_correlation(tmp_path):
     github, relay = GitHub(), Relay()
     github.pages['review_comments'] = [[artifact('comment-1', 'review_comment', github.head, body='fix this')]]
     github.pages['reviews'] = [[artifact('review-1', 'review', github.head, 'CHANGES_REQUESTED')]]
@@ -45,14 +53,15 @@ def test_current_head_changes_emit_once_with_exact_correlation(tmp_path):
     first = review_feedback.watch_human_reviews(tmp_path, 'sample', 'owner/repo', 7, github, relay)
     assert first['emitted'] == 3
     assert {r['correlationId'] for r in relay.requests} == {'github:owner/repo:pull-request:7'}
-    assert {r['idempotencyKey'] for r in relay.requests} == {
-        f'owner/repo/7/{github.head}/comment-1', f'owner/repo/7/{github.head}/review-1',
-        f'owner/repo/7/{github.head}/thread-1'}
+    assert all(r['idempotencyKey'].startswith(f'owner/repo/7/{github.head}/') for r in relay.requests)
+    assert len(relay.keys) == 3
 
     github.pages['reviews'] = [[artifact('review-1', 'review', github.head, 'DISMISSED')]]
     second = review_feedback.watch_human_reviews(tmp_path, 'sample', 'owner/repo', 7, github, relay)
     assert second['emitted'] == 1
     assert relay.requests[-1]['payload']['artifacts'][0]['state'] == 'DISMISSED'
+    assert len(relay.keys) == 4
+    assert relay.requests[-1]['idempotencyKey'] != relay.requests[1]['idempotencyKey']
 
 
 def test_restart_deduplicates_and_new_head_replays_current_evidence(tmp_path):
@@ -64,7 +73,23 @@ def test_restart_deduplicates_and_new_head_replays_current_evidence(tmp_path):
     github.head = 'b' * 40
     github.pages['reviews'] = [[artifact('review-1', 'review', github.head, 'APPROVED')]]
     assert review_feedback.watch_human_reviews(tmp_path, 'sample', 'owner/repo', 7, github, relay)['emitted'] == 1
-    assert relay.requests[-1]['idempotencyKey'] == f'owner/repo/7/{github.head}/review-1'
+    assert relay.requests[-1]['idempotencyKey'].startswith(f'owner/repo/7/{github.head}/review/review-1/')
+
+
+def test_head_changing_during_read_fails_closed(tmp_path):
+    github, relay = GitHub(), Relay()
+    github.pages['reviews'] = [[artifact('review-1', 'review', github.head, 'APPROVED')]]
+    calls = 0
+    def changing_head(kind, cursor=None):
+        nonlocal calls
+        response = github(kind, cursor)
+        if kind == 'pull_request':
+            calls += 1
+            if calls == 2:
+                github.head = 'b' * 40
+        return github(kind, cursor)
+    with pytest.raises(review_feedback.ReviewFeedbackError, match='head changed'):
+        review_feedback.watch_human_reviews(tmp_path, 'sample', 'owner/repo', 7, changing_head, relay)
 
 
 def test_producer_failure_marks_service_unhealthy_and_does_not_advance_cursor(tmp_path):
@@ -82,7 +107,7 @@ def test_invalid_json_or_pagination_fails_closed(tmp_path):
     github.pages['reviews'] = [[artifact('review-1', 'review', github.head)], [artifact('review-2', 'review', github.head)]]
     def repeated_cursor(kind, cursor=None):
         if kind == 'pull_request':
-            return json.dumps({'headSha': github.head, 'reviewDecision': None})
+            return json.dumps({'headSha': github.head, 'reviewDecision': None, 'state': 'OPEN'})
         if kind == 'reviews':
             return json.dumps({'items': github.pages['reviews'][0], 'next': '0'})
         return json.dumps({'items': [], 'next': None})
@@ -92,3 +117,43 @@ def test_invalid_json_or_pagination_fails_closed(tmp_path):
     with pytest.raises(review_feedback.ReviewFeedbackError, match='JSON'):
         review_feedback.watch_human_reviews(tmp_path, 'sample', 'owner/repo', 7,
                                             lambda *_: '{bad', relay)
+
+
+def test_authenticated_gh_and_loopback_boundaries_use_central_credentials_only():
+    commands = []
+    responses = [
+        {'data': {'repository': {'pullRequest': {'state': 'OPEN', 'headRefOid': 'a' * 40, 'reviewDecision': None}}}},
+        [{'id': 3, 'commit_id': 'a' * 40, 'body': 'review text'}],
+    ]
+    def run(argv, **kwargs):
+        commands.append(argv)
+        return SimpleNamespace(stdout=json.dumps(responses.pop(0)))
+    github = review_feedback.GitHubReader('owner/repo', 7, run=run)
+    assert github('pull_request')['state'] == 'OPEN'
+    assert github('review_comments')['items'][0]['id'] == '3'
+    assert commands[0][:3] == ['gh', 'api', 'graphql']
+    assert commands[1][2] == 'repos/owner/repo/pulls/7/comments?per_page=100&page=1'
+
+    seen = []
+    class Response:
+        status = 201
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+    with patch('agd_lib.review_feedback.urlopen', side_effect=lambda request, timeout: seen.append(request) or Response()):
+        assert review_feedback.LoopbackRelay('http://127.0.0.1:4312', 'secret')( {'type': 'agd.pr.review'}) == 201
+    assert seen[0].full_url == 'http://127.0.0.1:4312/v1/events'
+    assert seen[0].get_header('Authorization') == 'Bearer secret'
+
+
+def test_malformed_or_symlinked_state_fails_closed(tmp_path):
+    state = tmp_path / 'data' / 'relay' / 'review-feedback' / 'sample' / '7.json'
+    state.parent.mkdir(parents=True)
+    state.write_text('{not json')
+    with pytest.raises(review_feedback.ReviewFeedbackError, match='state is unavailable'):
+        review_feedback.read_service(tmp_path, 'sample', 'owner/repo', 7)
+    state.unlink()
+    target = tmp_path / 'state.json'
+    target.write_text('{}')
+    state.symlink_to(target)
+    with pytest.raises(review_feedback.ReviewFeedbackError, match='path is unsafe'):
+        review_feedback.read_service(tmp_path, 'sample', 'owner/repo', 7)
