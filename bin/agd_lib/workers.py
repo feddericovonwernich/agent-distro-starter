@@ -56,8 +56,9 @@ def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=Fal
     module = backend(preflight)
     if selected_backend == 'tmux' and not shutil.which('tmux'):
         raise store.DependencyError('tmux is not installed')
-    if selected_backend == 'herdr':
-        module.prepare(home)
+    selection = worker_skills.resolve(home, profile=profile, skill_mode=skill_mode, skills=skills)
+    if selection['skills']:
+        harnesses.worker_skill_roots(harness)
     with store.lock(home):
         current = tasks.read(home, task_id)
         if current['phase'] != 'prepared' or current['executor'] != 'central':
@@ -66,6 +67,8 @@ def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=Fal
         manifest = None
         if selection['skills']:
             manifest = worker_skills.prepare(home, dict(current, harness=harness), selection)
+        if selected_backend == 'herdr':
+            module.prepare(home)
         task = current
         task.update(harness=harness, backend=selected_backend, worker_skill_selection=selection)
         if manifest is not None:
