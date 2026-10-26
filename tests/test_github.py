@@ -67,3 +67,21 @@ def test_graphql_uses_typed_variables_for_pr_number():
 
     data = github.graphql('query', {'owner': 'owner', 'number': 7}, run=gh)
     assert data == {'repository': {'pullRequest': None}}
+
+
+def test_get_pr_queries_repository_number_and_normalizes_contexts():
+    def gh(argv, **_):
+        return type('Result', (), {'stdout': '''{"data":{"repository":{"pullRequest":{
+            "id":"P_1","number":7,"url":"https://example.test/owner/repo/pull/7",
+            "state":"OPEN","mergedAt":null,"headRefName":"agd/task","headRefOid":"abc",
+            "baseRefName":"main","mergeStateStatus":"CLEAN","reviewDecision":null,
+            "commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[
+                {"name":"ci","status":"COMPLETED","conclusion":"SUCCESS"},
+                {"context":"legacy","state":"SUCCESS"}]}}}}]}}}}}'''})()
+
+    pr = github.get_pr('owner/repo', 7, run=gh)
+
+    assert pr['repository'] == 'owner/repo'
+    assert pr['number'] == 7
+    assert pr['checks']['ci']['conclusion'] == 'SUCCESS'
+    assert pr['checks']['legacy']['state'] == 'SUCCESS'

@@ -3,6 +3,53 @@ import json
 from . import store
 
 
+PR_QUERY = '''
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      id number url state mergedAt headRefName headRefOid baseRefName mergeStateStatus reviewDecision
+      commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
+        ... on CheckRun { name status conclusion }
+        ... on StatusContext { context state }
+      } } } } } }
+    }
+  }
+}
+'''
+
+
+def split_repository(repository):
+    try:
+        owner, name = repository.split('/', 1)
+    except ValueError as error:
+        raise store.Refusal('GitHub repository must be OWNER/REPOSITORY') from error
+    if not owner or not name or '/' in name:
+        raise store.Refusal('GitHub repository must be OWNER/REPOSITORY')
+    return owner, name
+
+
+def get_pr(repository, number, run=store.run):
+    owner, name = split_repository(repository)
+    if not isinstance(number, int) or number < 1:
+        raise store.Refusal('GitHub PR number is invalid')
+    node = graphql(PR_QUERY, {'owner': owner, 'name': name, 'number': number}, run)['repository'].get('pullRequest')
+    if not isinstance(node, dict):
+        raise store.Refusal('GitHub PR is missing')
+    try:
+        contexts = node['commits']['nodes'][-1]['commit']['statusCheckRollup']['contexts']['nodes']
+    except (KeyError, IndexError, TypeError):
+        raise store.Refusal('GitHub PR check evidence is incomplete')
+    checks = {}
+    for context in contexts:
+        if not isinstance(context, dict):
+            raise store.Refusal('GitHub PR check evidence is incomplete')
+        key = context.get('name', context.get('context'))
+        if not isinstance(key, str) or not key:
+            raise store.Refusal('GitHub PR check evidence is incomplete')
+        checks[key] = context
+    return dict(node, repository=repository, checks=checks)
+
+
 def graphql(query, variables, run=store.run):
     argv = ['gh', 'api', 'graphql', '--method', 'POST', '-f', f'query={query}']
     argv.extend(flag for key, value in variables.items() for flag in ('-F', f'{key}={value}'))
