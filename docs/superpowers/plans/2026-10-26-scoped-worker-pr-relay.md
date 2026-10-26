@@ -19,7 +19,9 @@
 - Private installation only: `npm install --global --prefix "$AGD_HOME/state/relay-stage-$UUID" --ignore-scripts --no-audit --no-fund https://github.com/feddericovonwernich/open-relay/archive/dac2865837bcab9444a8636053f4f1406a3f9291.tar.gz`.
 - Relay compatibility comes from package metadata (`open-relay` 0.1.0 plus committed `dist/src/cli.js`) and Node >= 22.19. `relay --help` or `relay help` MAY provide a non-mutating usage smoke; neither is version/provenance evidence. Never use unsupported `relay --version` or `relay version` for detection.
 - The package declares `ajv: ^8.17.1`; its transitive npm resolution is not lock-pinned and must be documented as a supply-chain limitation.
-- A worker delivery uses `relay agent poll AGD_WORKER_ID --project-root CENTRAL_RELAY_ROOT --definitions pr.automation.settled@1 --structured-output --context-tokens 5000 --correlation-id github:LOWERCASE_OWNER/LOWERCASE_REPOSITORY:pull-request:PR_NUMBER`. Its default ten-minute park is intentional; do not wrap it in a 30-second process timeout or busy-loop `relay get`.
+- The pinned built-in GitHub connector runs `generic-check-runs` for standard Actions, emitting `pr.ci.settled@1`. AGD's central read-only human-review producer emits `agd.pr.review@1`; it is required because the built-in `configured-tools`/`pr.automation.settled@1` path only recognizes configured Sonar/Copilot/Bugbot tools and does not cover general human review. Optional bot triggers use combined mode only after explicit identity configuration and never gate worker wakes.
+- Do not modify Open Relay source. One AGD-owned central producer handles human-review polling/deduplication; its durable cursor/idempotency and health are AGD responsibilities.
+- A worker delivery uses `relay agent poll AGD_WORKER_ID --project-root CENTRAL_RELAY_ROOT --definitions pr.ci.settled@1,agd.pr.review@1 --structured-output --context-tokens 5000 --correlation-id github:LOWERCASE_OWNER/LOWERCASE_REPOSITORY:pull-request:PR_NUMBER`. Its default ten-minute park is intentional; do not wrap it in a 30-second process timeout or busy-loop `relay get`.
 - For every delivery: `reply start`, validate untrusted payload identity/current head and result against the delivered `outputSchema`, then exactly one terminal `complete`, `fail`, or `cancelled` reply before another poll. `relay notify` is automatic acknowledgement and is not used for the worker repair lease.
 - GitHub final evidence must show an OPEN, unmerged exact repository/head/base PR; equal local/remote/PR SHA; green effective required checks; `mergeStateStatus == CLEAN`; and `reviewDecision == APPROVED` when effective reviews are required. Missing/ambiguous policy data blocks.
 - GitHub and Git are not one transaction. Re-read remote and PR heads immediately before `ready`; if either moved, reject the evidence and reconcile/verify again.
@@ -70,12 +72,16 @@ recording_relay_delivery(task: dict) -> Callable
 seeded_delivery_receipt(home: Path, task: dict, grant: dict, lease_id: str) -> dict
 rejecting_reply(argv, cwd=None, timeout=30, check=True) -> subprocess.CompletedProcess
 launch_with_pr_grant(home: Path, task: dict, grant: dict) -> dict
+delivery_for(definition: str, task: dict) -> Callable
+review_client(comment_id: int) -> object
+failing_producer(request: dict) -> dict
+recording_producer(request: dict) -> dict
 published_exact_receipt(task: dict, grant: dict) -> dict
 ```
 
 - [ ] **Step 1: Create helpers backed only by the existing disposable lab**
 
-`create_ship_commit` writes a brief, calls existing `command(home, "task", "create", ...)`, changes `value.txt`, and commits with the local test Git identity. `write_report` creates a nonempty report. `make_relay_runtime` and `fake_npm_success` create only a validated fake private staging tree and return `subprocess.CompletedProcess`. The Git helpers create local bare-remote divergence and read its SHA. The Relay helpers return one schema-bearing `pr.automation.settled@1` delivery or a completion rejection while retaining the receipt. `FakeGitHub` returns only supplied provider payloads and records actual create calls; it never reproduces AGD receipt logic.
+`create_ship_commit` writes a brief, calls existing `command(home, "task", "create", ...)`, changes `value.txt`, and commits with the local test Git identity. `write_report` creates a nonempty report. `make_relay_runtime` and `fake_npm_success` create only a validated fake private staging tree and return `subprocess.CompletedProcess`. The Git helpers create local bare-remote divergence and read its SHA. The Relay helpers return one schema-bearing `pr.ci.settled@1` or `agd.pr.review@1` delivery, or a completion rejection while retaining the receipt. `FakeGitHub` returns only supplied provider payloads and records actual create calls; it never reproduces AGD receipt logic.
 
 - [ ] **Step 2: Commit the reusable disposable support**
 
@@ -389,8 +395,8 @@ git commit -m "feat: guard PR publication and recovery"
 ### Task 6: Add the actual central Relay lifecycle and delivery protocol
 
 **Files:**
-- Modify: `bin/agd_lib/relay.py`, `bin/agd_lib/workers.py`, `bin/agd_lib/supervision.py`
-- Test: `tests/test_relay.py`, `tests/test_workers.py`
+- Modify: `bin/agd_lib/relay.py`, `bin/agd_lib/github.py`, `bin/agd_lib/workers.py`, `bin/agd_lib/supervision.py`
+- Test: `tests/test_relay.py`, `tests/test_github.py`, `tests/test_workers.py`
 
 **Interfaces:**
 
@@ -398,25 +404,39 @@ git commit -m "feat: guard PR publication and recovery"
 ensure_project_service(home: Path, project_id: str, repository: str) -> dict
 poll(home: Path, task: dict, grant: dict, incarnation: str, run=store.run) -> dict
 reply(home: Path, task: dict, grant: dict, incarnation: str, lease_id: str, action: str, payload: dict | None, run=store.run) -> dict
+watch_human_reviews(home: Path, task: dict, grant: dict, github_client, producer) -> dict
 reconcile_task(home: Path, task: dict) -> dict | None
 ```
 
-Service record: `home/state/relay/projects/PROJECT_ID.json`. Correlation ID: `github:owner/repository:pull-request:NUMBER`, where owner/repository is lowercased after canonical GitHub remote parsing. Stable project root: `home/relay/projects/PROJECT_ID`; never the task worktree.
+Service record: `home/state/relay/projects/PROJECT_ID.json`. Correlation ID: `github:owner/repository:pull-request:NUMBER`, where owner/repository is lowercased after canonical GitHub remote parsing. Stable project root: `home/relay/projects/PROJECT_ID`; never the task worktree. The record also owns the producer credential subject, review cursor, immutable artifact IDs, current-head digest, and idempotency keys.
 
 - [ ] **Step 1: Write failing delivery/lease behavior tests**
 
 ```python
-def test_poll_uses_real_protocol_shape_and_central_root(home_task):
+def test_standard_actions_and_human_review_wake_without_bot_tools(home_task):
     home, task, grant = home_task
-    result = relay.poll(home, task, grant, "worker-inc", run=recording_relay_delivery(task))
-    assert result["lease_id"] == "lease-1"
-    assert result["correlation_id"] == "github:owner/repo:pull-request:9"
-    assert result["definition"] == "pr.automation.settled@1"
+    ci = relay.poll(home, task, grant, "worker-inc", run=delivery_for("pr.ci.settled@1", task))
+    review = relay.poll(home, task, grant, "worker-inc", run=delivery_for("agd.pr.review@1", task))
+    assert {ci["definition"], review["definition"]} == {"pr.ci.settled@1", "agd.pr.review@1"}
+
+
+def test_review_producer_deduplicates_current_head_artifact_after_restart(home_task):
+    home, task, grant = home_task
+    first = relay.watch_human_reviews(home, task, grant, review_client(comment_id=41), producer=recording_producer)
+    second = relay.watch_human_reviews(home, task, grant, review_client(comment_id=41), producer=recording_producer)
+    assert first["emitted"] == 1
+    assert second["emitted"] == 0
+
+def test_review_producer_failure_blocks_task_and_service(home_task):
+    home, task, grant = home_task
+    with pytest.raises(store.Refusal, match="producer"):
+        relay.watch_human_reviews(home, task, grant, review_client(comment_id=42), producer=failing_producer)
+    assert tasks.read_pr_receipt(home, task["id"])["blocked_reason"] == "human-review-producer"
 
 
 def test_completion_rejection_keeps_lease_unsettled(home_task):
     home, task, grant = home_task
-    receipt = seeded_delivery_receipt(home, task, grant, lease_id="lease-1")
+    seeded_delivery_receipt(home, task, grant, lease_id="lease-1")
     with pytest.raises(store.Refusal, match="schema"):
         relay.reply(home, task, grant, "worker-inc", "lease-1", "complete", {"result": {}}, run=rejecting_reply)
     assert tasks.read_pr_receipt(home, task["id"])["relay"]["lease"]["status"] == "active"
@@ -426,18 +446,35 @@ The `run` fakes accept `argv`, `cwd`, `timeout`, and `check`, return `subprocess
 
 - [ ] **Step 2: Run to prove failure**
 
-Run: `pytest tests/test_relay.py tests/test_workers.py -k 'protocol_shape or lease_unsettled' -v`
+Run: `pytest tests/test_relay.py tests/test_github.py tests/test_workers.py -k 'standard_actions_and_human_review_wake_without_bot_tools or review_producer_deduplicates or review_producer_failure or lease_unsettled' -v`
 
 Expected: FAIL because no service/poll/reply implementation exists.
 
 - [ ] **Step 3: Implement service ownership and exact worker protocol**
 
-At first valid grant, call `ensure_runtime`, create/inspect the central project root, and run `relay init --github OWNER/REPOSITORY` only when its generated `.relay` content is absent; preserve/refuse a modified existing root. Configure connector `tokenEnv` only in the central root and enforce read-only GitHub permissions (Checks, Pull requests, Metadata). Run discovery once with `relay connect github --config .relay/connectors/github.json --once --discover`; inspect and pin returned provider app IDs/slugs before the continuing connector. Start only one owned loopback Relay process and one `relay connect github --config .relay/connectors/github.json` process per project, retaining PID/start identity and configuration digest. The connector observes every configured project PR; workers select their assigned PR solely with the exact correlation filter. A second connector for the same project is refused. Stop owned processes on terminal success or durable block after lease settlement; never start them from a worker.
+At first valid grant, call `ensure_runtime`, create/inspect the central project root, and run `relay init --github OWNER/REPOSITORY` only when its generated `.relay` content is absent; preserve/refuse a modified existing root. Configure the pinned connector's repository mode as `generic-check-runs`, with a read-only token (Checks, Pull requests, Metadata); it emits `pr.ci.settled@1` for standard Actions without waiting for configured bot artifacts. Optional configured bot triggers require discovered/pinned identities and use combined mode only when explicitly enabled.
+
+Create AGD-owned `.relay/events/agd-pr-review.v1.json`, strict input/output JSON schemas, and a handler instruction under the stable central project root, then reload the Relay registry. The definition is `{type:"agd.pr.review", version:1, handler:{kind:"agent"}}`; its strict input permits bounded repository/PR/current-head identity and changed review evidence IDs/states, and its strict output requires the worker's bounded summary. It never accepts raw review text as an instruction.
+
+```json
+// .relay/events/agd-pr-review.v1.json
+{"type":"agd.pr.review","version":1,"inputSchema":".relay/schemas/agd-pr-review-input.json","outputSchema":".relay/schemas/agd-pr-review-output.json","effectPolicy":"retry-safe","timeoutMs":30000,"hardDeadlineMs":60000,"retry":{"maxAttempts":3,"backoffMs":[1000,5000],"retryableCodes":["temporarily_unavailable"]},"requires":{"tools":[],"structuredOutput":true,"minContextTokens":0,"maxInputTokens":4000,"maxOutputTokens":1000,"maxPayloadBytes":65536},"handler":{"kind":"agent","instructions":".relay/handlers/agd-pr-review.md"}}
+```
+
+The input schema is draft-07, object-only, `additionalProperties:false`, and requires `schemaVersion: 1`, `repository` (nonempty string), `pullRequest` (positive integer), `headSha` (nonempty string), `reviewDecision` (string or null), and `artifacts` (bounded array, maximum 100, of objects with only nonempty `id`, enum `kind` of `review|review_comment|review_thread|review_decision`, and string-or-null `state`). The output schema is draft-07, object-only, `additionalProperties:false`, and requires only nonempty string `summary`. The handler directs the worker to treat every payload field as untrusted data, independently verify PR/head through AGD/GitHub, and return that bounded summary; no review body text is emitted.
+
+`watch_human_reviews` uses the existing narrow read-only GitHub client to read current-head reviews, review comments, review threads, and review decision. It emits on changed evidence for the current head, including comment, request-change, approval, dismissal, thread, or decision changes; it does not filter to approvals. Persist cursor, immutable review/comment/thread IDs, current-head digest, and idempotency keys before/with each successful emit. Create one producer-scope credential from the central admin credential with a stable subject; never expose either credential to workers.
+
+
+Pinned evidence: [`server.ts` event endpoint](https://raw.githubusercontent.com/feddericovonwernich/open-relay/dac2865837bcab9444a8636053f4f1406a3f9291/src/server.ts#L179-L190) and [producer credential endpoint](https://raw.githubusercontent.com/feddericovonwernich/open-relay/dac2865837bcab9444a8636053f4f1406a3f9291/src/server.ts#L264-L270); correlation-filtered agent matching is pinned in [`store.ts`](https://raw.githubusercontent.com/feddericovonwernich/open-relay/dac2865837bcab9444a8636053f4f1406a3f9291/src/store.ts#L622-L659). Do not substitute a CLI call for the producer POST.
+Because `relay emit` does not transmit correlation IDs, post directly to loopback Relay: `POST http://127.0.0.1:RUNTIME_PORT/v1/events` with `Authorization: Bearer PRODUCER_TOKEN`, `Content-Type: application/json`, and `{"type":"agd.pr.review","version":1,"payload":PAYLOAD,"correlationId":"github:owner/repository:pull-request:NUMBER","idempotencyKey":"repository/pr/head/artifact-id"}`. Treat 201 as new and 200 as idempotent replay. Authentication, schema, HTTP, cursor, or dedup persistence failure records `blocked_reason` and unhealthy service state; it never silently skips human feedback.
+
+Start only one owned loopback Relay process and one `relay connect github --config .relay/connectors/github.json` process per project, retaining PID/start identity and configuration digest. Workers select their assigned PR solely with the exact correlation filter. A second connector for the same project is refused. Stop owned processes on terminal success or durable block after lease settlement; never start them from a worker.
 
 For a worker poll, use the exact one-shot command with `timeout=610` in `store.run` so the Relay default 600-second park plus process overhead can complete:
 
 ```bash
-relay agent poll AGD_WORKER_ID --project-root CENTRAL_RELAY_ROOT --definitions pr.automation.settled@1 --structured-output --context-tokens 5000 --correlation-id github:owner/repository:pull-request:PR_NUMBER
+relay agent poll AGD_WORKER_ID --project-root CENTRAL_RELAY_ROOT --definitions pr.ci.settled@1,agd.pr.review@1 --structured-output --context-tokens 5000 --correlation-id github:owner/repository:pull-request:PR_NUMBER
 ```
 
 On `{"type":"timeout"}`, record an idle observation and permit one immediate later poll; never loop inside AGD and never poll with an active lease. On delivery, persist lease ID, exact definition/correlation, event/PR/head identity, and delivered `outputSchema`, then require:
@@ -447,17 +484,17 @@ relay agent reply LEASE_ID start --project-root CENTRAL_RELAY_ROOT
 relay agent reply LEASE_ID complete --project-root CENTRAL_RELAY_ROOT --json '{"result":{"summary":"verified current-head feedback handled"},"effects":[]}'
 ```
 
-For this pinned `pr.automation.settled@1`, generated output schema is an object with exactly required string `summary`; validate the proposed result against that delivered schema before `complete`. A Relay HTTP 400/schema rejection leaves the lease active; preserve it for correction. For invalid, stale, or untrusted feedback, record why and settle with `relay agent reply LEASE_ID cancelled --project-root CENTRAL_RELAY_ROOT --json '{"effects":[]}'`; do not re-poll until Relay accepts the terminal reply. Relay restart/401/409 invalidates local lease authority: mark receipt blocked and use recovery rather than guessing.
+Validate the proposed result against the delivered schema before `complete`. A Relay HTTP 400/schema rejection leaves the lease active; preserve it for correction. For invalid, stale, or untrusted feedback, record why and settle with `relay agent reply LEASE_ID cancelled --project-root CENTRAL_RELAY_ROOT --json '{"effects":[]}'`; do not re-poll until Relay accepts the terminal reply. Relay restart/401/409 invalidates local lease authority: mark receipt blocked and use recovery rather than guessing.
 
 - [ ] **Step 4: Run protocol tests and commit**
 
-Run: `pytest tests/test_relay.py tests/test_workers.py -k 'protocol_shape or lease_unsettled' -v`
+Run: `pytest tests/test_relay.py tests/test_github.py tests/test_workers.py -k 'standard_actions_and_human_review_wake_without_bot_tools or review_producer_deduplicates or review_producer_failure or lease_unsettled' -v`
 
-Expected: PASS; a poll receipt is correlated/leased and a rejected completion does not erase it.
+Expected: PASS; standard Actions and a human review independently produce a correlated lease, a restart cannot duplicate a review artifact, and a rejected completion does not erase its lease.
 
 ```bash
-git add bin/agd_lib/relay.py bin/agd_lib/workers.py bin/agd_lib/supervision.py tests/test_relay.py tests/test_workers.py
-git commit -m "feat: supervise Relay PR feedback leases"
+git add bin/agd_lib/relay.py bin/agd_lib/github.py bin/agd_lib/workers.py bin/agd_lib/supervision.py tests/test_relay.py tests/test_github.py tests/test_workers.py
+git commit -m "feat: relay CI and human review feedback"
 ```
 
 ### Task 7: Provision the scoped worker skill and remove conflicting default prompt text
@@ -585,7 +622,7 @@ git commit -m "feat: gate ready on verified Relay PR workflow"
 
 ## Plan self-review
 
-- **Spec coverage:** Tasks 1–2 cover pinned Relay skills/provenance and private provisioning. Tasks 3, 5, and 8 cover exact authority, recovery, final-ready/head-race, and durable blocks. Task 4 provides GitHub final authority and credentials failures. Tasks 6–7 provide a single central read-only Relay connector, actual poll/reply lease settlement, same-worker scope, and the corrected non-conflicting prompt. Task 8 covers docs and disposable smoke.
+- **Spec coverage:** Tasks 1–2 cover pinned Relay skills/provenance and private provisioning. Tasks 3, 5, and 8 cover exact authority, recovery, final-ready/head-race, and durable blocks. Task 4 provides GitHub final authority and credentials failures. Tasks 6–7 provide one central read-only generic-CI connector, the AGD human-review producer, actual poll/reply lease settlement, same-worker scope, and the corrected non-conflicting prompt. Task 6 proves a standard Actions repository and a human review wake independently without configured bot tools.
 - **No permanent incidental tests:** no test asserts documentation/provenance wording, copied-file presence, raw command forwarding, or mock echo. Tests exercise observable authority, lease, PR identity, head race, and final-ready behavior. Provenance integrity uses a throwaway check.
 - **Known external boundary:** GitHub rules endpoint access and output vary by repository plan/ruleset. A classic-protection 404 is explicitly the unprotected case only when accessible rules report no requirements; unavailable or unrecognized rules remain blocked. No completion claim is valid without an explicitly approved credentialed target acceptance run. The pinned Relay commands/definitions/output schema in Task 6 are sourced from its pinned `src/cli.ts`, `src/agent-session.ts`, and `src/init.ts`, not guessed.
 

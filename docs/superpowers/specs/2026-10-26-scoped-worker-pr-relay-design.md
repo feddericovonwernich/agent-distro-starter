@@ -48,18 +48,22 @@ The launch prompt remains prohibitive by default. Only a task with the recorded 
 
 The skill is selected in curated mode only after the grant is present; it is not part of `DEFAULT_SKILLS`, a default profile, or ordinary task selection. It is frozen and materialized using the existing worker-skill catalog and per-task snapshot mechanism. The worker must poll Relay feedback, make the smallest justified repair in its assigned worktree, commit it, then invoke the guarded non-force publication operation again. It stays active until final GitHub verification succeeds or it emits an actionable durable blocked/decision event. It must settle each Relay lease/reply exactly once through Relay's supported semantics before moving on; failed settlement is retried or blocks, never silently discarded.
 
-The worker's Relay client commands use only:
+The worker polls both the standard-CI `pr.ci.settled@1` and AGD-owned human-feedback `agd.pr.review@1` definitions using its task's exact lowercase `github:<owner/repository>:pull-request:<number>` correlation ID. `pr.automation.settled@1` is not a required wake: the pinned default `configured-tools` aggregate waits for all configured Sonar/Copilot/Bugbot recognizers and can never settle for a standard Actions-only repository. The worker's Relay client commands use only:
 
 ```text
-relay agent poll --project-root <stable-central-runtime> ...
-relay agent reply --project-root <stable-central-runtime> ...
+relay agent poll AGD_WORKER_ID --project-root CENTRAL_RELAY_ROOT --definitions pr.ci.settled@1,agd.pr.review@1 --structured-output --context-tokens 5000 --correlation-id github:owner/repository:pull-request:NUMBER
+relay agent reply LEASE_ID ACTION --project-root CENTRAL_RELAY_ROOT [--json OBJECT]
 ```
 
-The stable project root belongs to the central Relay runtime, not the task worktree. Each request/reply carries the task and recorded PR correlation so feedback cannot be applied to another task. The prompt contains neither a Relay server URL nor connector/admin tokens. Credentials remain in the central runtime's existing protected credential locations and are consumed by the connector, not supplied to the model.
+The stable project root belongs to the central Relay runtime, not the task worktree. Each request/reply carries the task and recorded PR correlation so feedback cannot be applied to another task. The prompt contains neither a Relay server URL nor connector/admin tokens. Credentials remain in the central runtime's existing protected credential locations and are consumed by central services, not supplied to the model.
 
 ### Relay runtime and supply chain
 
-There is one Open Relay server and one read-only GitHub connector per registered project, owned and supervised centrally. It is the only feedback source for these workers; individual workers do not start servers, configure connectors, or administer Relay. The connector's read-only capability is deliberate: all repository mutation stays behind the AGD task grant and guarded publication operation.
+There is one Open Relay server and one read-only GitHub connector per registered project, owned and supervised centrally. The pinned built-in connector is configured `generic-check-runs` for a standard Actions repository, producing `pr.ci.settled@1`; optional configured bot triggers MAY use combined mode only after their identities are explicitly configured, and they never gate CI or human-review wakes. The built-in connector has no general human-review signal, so AGD adds one central read-only GitHub human-review producer. Neither connector nor producer edits GitHub; all repository mutation stays behind the AGD task grant and guarded publication operation. Individual workers do not start servers, configure connectors, administer Relay, or receive producer/admin credentials.
+This chooses one AGD central producer over an Open Relay source change: it keeps the upstream pin/vendor surface intact and confines GitHub human-review polling, deduplication, and health responsibility to AGD; the tradeoff is AGD must preserve the producer's durable cursor and availability.
+The central producer watches GitHub reviews, review comments, review threads, and `reviewDecision` for the exact open PR/current head. It treats all review text and states as untrusted data, emits on any changed current-head review evidence (comment, requested changes, approval, dismissal, thread change, or decision change), and does not filter to approvals. It persists its cursor, immutable review/comment/thread identities, current-head digest, and idempotency keys so restart cannot duplicate a notification. Its AGD-owned `.relay/events/agd-pr-review.v1.json` definition has `handler.kind: "agent"`, a strict Ajv input schema, strict output schema, and an instruction file; its payload includes only bounded identity/evidence metadata and a current-head SHA, never credentials or raw unbounded review text.
+
+The producer obtains a producer-scope credential centrally and POSTs to the loopback Relay API, because pinned `relay emit` cannot send a correlation ID: `POST /v1/events`, `Authorization: Bearer PRODUCER_TOKEN`, `Content-Type: application/json`, and `{type:"agd.pr.review",version:1,payload:PAYLOAD,correlationId:"github:owner/repository:pull-request:number",idempotencyKey:"repository/pr/head/artifact-id"}`. Relay returns 201 for a new event or 200 for the same idempotent event. Producer authentication, API, schema, or durable-dedup failure makes the PR task blocked and the central service unhealthy; it does not silently fall back to polling or claim feedback coverage.
 
 At first PR-scoped use, the orchestrator checks for a compatible system Relay installation using package metadata, not executable existence. Open Relay 0.1.0 supports non-mutating `--help`/`help` usage output, which MAY be used as a smoke check but is not version or provenance evidence; `--version` and `version` are unsupported (exit 1) and MUST NOT be used for detection. A compatible installation must identify the pinned package/version and meet Node >= 22.19. If it is absent or incompatible, the orchestrator automatically stages a private installation under AGD home using:
 
@@ -104,6 +108,8 @@ sequenceDiagram
     W->>A: Guarded publish-pr
     A->>G: Non-force push; reconcile/create one exact PR
     A->>A: Persist remote/head/PR identity
+    A->>G: Read current-head human review evidence
+    A->>R: Emit deduped agd.pr.review event
     loop Feedback and repair
         W->>R: poll with project-root and PR correlation
         R-->>W: leased review/check feedback
