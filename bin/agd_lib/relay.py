@@ -237,6 +237,25 @@ def _service_file(home, project_id):
     return _service_root(home, project_id)/'service.json'
 
 
+def _install_review_definition(root):
+    source = Path(__file__).resolve().parents[2]/'bundled'/'relay'
+    for relative in ('events/agd-pr-review.v1.json', 'schemas/agd-pr-review-input.json',
+                     'schemas/agd-pr-review-output.json', 'handlers/agd-pr-review.md'):
+        origin, destination = source/relative, root/'.relay'/relative
+        if not origin.is_file() or origin.is_symlink():
+            raise store.Refusal('bundled Relay review definition is unavailable')
+        if os.path.lexists(destination):
+            _lstat(destination, 'file')
+            if destination.read_bytes() != origin.read_bytes():
+                raise store.Refusal('Relay review definition was modified')
+        else:
+            if os.path.lexists(destination.parent):
+                _lstat(destination.parent, 'dir')
+            else:
+                destination.parent.mkdir(parents=True, mode=0o700)
+            shutil.copyfile(origin, destination)
+
+
 def ensure_project_service(home, project_id, repository, run=store.run):
     project_id = store.validate_id(project_id)
     if not isinstance(repository, str) or repository.count('/') != 1 or not all(repository.split('/')):
@@ -256,6 +275,7 @@ def ensure_project_service(home, project_id, repository, run=store.run):
                     record.get('runtime') != str(runtime) or record.get('root') != str(root) or
                     record.get('health') not in ('starting', 'healthy')):
                 raise store.Refusal('Relay project service identity changed')
+            _install_review_definition(root)
             return record
         relay_state = root/'.relay'
         if os.path.lexists(relay_state):
@@ -263,6 +283,7 @@ def ensure_project_service(home, project_id, repository, run=store.run):
         else:
             run([str(runtime/'bin'/'relay'), 'init', '--github', repository], cwd=root, timeout=30)
             _lstat(relay_state, 'dir')
+        _install_review_definition(root)
         record = {'schema': 1, 'project': project_id, 'repository': repository,
                   'runtime': str(runtime), 'root': str(root), 'health': 'starting'}
         store.atomic_json(path, record)
