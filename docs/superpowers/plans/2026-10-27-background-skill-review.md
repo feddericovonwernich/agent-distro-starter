@@ -241,39 +241,48 @@ git commit -m "feat: persist reviewer proposals"
 **Interfaces:**
 
 ```ts
-export interface Broker { rpc(op:string,args:unknown):Promise<unknown>; reserveModelCall():Promise<void>; settleModelCall():Promise<void>; persistNativeSessionId(id:string):Promise<void>; finalResult():Promise<{reportId:string; toolNames:string[]}>; }
-export interface ReviewerInput { cwd:string; agentDir:string; sessionDir:string; reviewRunId:string; receipt:{deadline_epoch_ms:number}; model:Model; reviewPrompt:string; broker:Broker; onTools?:(names:string[])=>void; }
-export function runReviewer(input:ReviewerInput, streamFn:StreamFn=streamSimple):Promise<{reportId:string;toolNames:string[]}>;
+export type Native = { ai:any; core:any; sdk:any };
+export interface Broker { rpc(op:string,args:unknown):Promise<unknown>; reserveModelCall():Promise<void>; settleModelCall():Promise<void>; persistNativeSessionId(id:string):Promise<void>; finalResult():Promise<{reportId:string}>; }
+export interface ReviewerInput { cwd:string; agentDir:string; sessionDir:string; reviewRunId:string; receipt:{deadline_epoch_ms:number}; model:any; reviewPrompt:string; broker:Broker; native:Native; onRuntimeTools?:(names:string[])=>void; }
+export function runReviewer(input:ReviewerInput, streamFn?:any):Promise<{reportId:string}>;
 ```
 
-- [ ] **Step 1: Write the actual native-loop fixture and failing test**
+- [ ] **Step 1: Write complete fixture, bridge client, and failing test**
 
 ```ts
-// tests/reviewer-fixture.ts
-import { AssistantMessageEventStream, type AssistantMessage, type ToolCall } from '@oh-my-pi/pi-ai';
-import type { StreamFn } from '@oh-my-pi/pi-agent-core';
-export const toolCall=(name:string,arguments_:unknown):ToolCall=>({type:'toolCall',id:crypto.randomUUID(),name,arguments:arguments_});
-export const scriptedStream=(calls:ToolCall[]):StreamFn => () => {
-  const stream=new AssistantMessageEventStream();
-  const message:AssistantMessage={role:'assistant',content:calls,api:'openai-completions',provider:'test',model:'test',usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},stopReason:'toolUse',timestamp:Date.now()};
-  queueMicrotask(()=>{stream.push({type:'done',reason:'toolUse',message}); stream.end();});
-  return stream;
-};
+// tests/reviewer-fixture.ts — imported only after startBridge dynamically loads installed URLs
+export function scriptedStream(ai:any, turns:Array<Array<any>>, observed:string[]) {
+  let index=0; return (_model:any,context:any) => {
+    observed.splice(0,observed.length,...context.tools.map((x:any)=>x.name));
+    const stream=new ai.AssistantMessageEventStream(), content=turns[index++] ?? [];
+    const message={role:'assistant',content,api:'openai-completions',provider:'offline',model:_model.id,
+      usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},stopReason:content.length?'toolUse':'stop',timestamp:Date.now()};
+    queueMicrotask(()=>{stream.push({type:'done',reason:message.stopReason,message});stream.end(message)}); return stream;
+  };
+}
+export const call=(name:string,args:unknown)=>({type:'toolCall',id:crypto.randomUUID(),name,arguments:args});
 ```
 
 ```ts
 // tests/reviewer.test.ts
-import {expect,test} from 'bun:test'; import {runReviewer} from '../lib/agd-reviewer'; import {scriptedStream,toolCall} from './reviewer-fixture';
-test('native loop uses real bridge and persists returned report',async()=> {
-  const bridge=await startBridge(); try {
-    const seen:string[]=[]; const result=await runReviewer({...bridge.input,onTools:n=>seen.push(...n)},scriptedStream([toolCall('reviewer_search',{query:'failure'}),toolCall('reviewer_submit',bridge.report)]));
-    expect(seen.sort()).toEqual(['reviewer_excerpt','reviewer_search','reviewer_submit']);
-    expect(result.reportId).toBeTruthy(); expect(bridge.readReport(result.reportId).citations).toEqual(bridge.report.findings[0].citations);
-  } finally { await bridge.close(); }
-});
+async function startBridge() {
+  const proc=Bun.spawn(['uv','run','--python','3.12','tests/reviewer_bridge.py'],{stdin:'pipe',stdout:'pipe',stderr:'pipe'});
+  const reader=proc.stdout.getReader(), first=await reader.read(); const hello=JSON.parse(new TextDecoder().decode(first.value).trim());
+  let n=0; const rpc=async(op:string,args:unknown)=>{const id=crypto.randomUUID();proc.stdin.write(JSON.stringify({id,op,args})+'\\n'); for(;;){const r=await reader.read();const v=JSON.parse(new TextDecoder().decode(r.value).trim());if(v.id===id)return v.ok?v.value:Promise.reject(new Error(v.error));}};
+  const broker={rpc,reserveModelCall:()=>rpc('reserve',{}),settleModelCall:()=>rpc('settle',{}),persistNativeSessionId:(id:string)=>rpc('session',{id}),finalResult:()=>rpc('result',{})};
+  return {hello,broker,close:async()=>{proc.stdin.end();await proc.exited;}};
+}
+test('native loop persists returned bridge report',async()=>{const b=await startBridge();try{const ai=await import(b.hello.aiUrl), observed:string[]=[];const {scriptedStream,call}=await import('./reviewer-fixture');const report=b.hello.report;const r=await runReviewer({...b.hello.input,broker:b.broker,native:{ai,...b.hello.native},onRuntimeTools:n=>observed.push(...n)},scriptedStream(ai,[[call('reviewer_search',{query:'failure'})],[call('reviewer_submit',report)],[]],observed));expect(observed.sort()).toEqual(['reviewer_excerpt','reviewer_search','reviewer_submit']);expect((await b.broker.rpc('read',{reportId:r.reportId})).report_id).toBe(r.reportId);}finally{await b.close();}});
 ```
 
-`startBridge()` is defined in this test file: it uses `Bun.spawn(['uv','run','--python','3.12','tests/reviewer_bridge.py'],{stdin:'pipe',stdout:'pipe',stderr:'pipe'})`, reads one JSON handshake line, returns `{input,report,readReport,close}`, closes stdin, awaits process exit, and removes its temporary home. `reviewer_bridge.py` creates Task-1 packet/run inside `with lab()`, emits handshake `{input,report}`, then calls `reviewer_runner.serve_broker(home,run_id,sys.stdin,sys.stdout)`; it does not precompute report IDs.
+```python
+# tests/reviewer_bridge.py
+from tests.test_reviewer import produced_run, build_report
+with lab() as (home, _):
+    run, packet = produced_run(home); report = build_report(packet)
+    print(json.dumps({'aiUrl':capability_urls()['ai'],'native':capability_urls(),'input':bridge_input(home,run,packet),'report':report}),flush=True)
+    serve_broker(home,run['review_run_id'],sys.stdin,sys.stdout)
+```
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -284,32 +293,25 @@ Expected: FAIL because host, fixture, and bridge do not exist.
 - [ ] **Step 3: Implement host, RPC tools, and awaited cap**
 
 ```ts
-function cappedStreamFn(native:StreamFn, broker:Broker):StreamFn {
-  return async (...args) => {
-    await broker.reserveModelCall();             // durable reservation precedes dispatch
-    const stream=await native(...args);
-    const settle=async(event:any)=>{ if(event.type==='done'||event.type==='error') await broker.settleModelCall(); };
-    stream.on('event',settle);                   // terminal native event settles durable receipt
-    return stream;
+function cappedStreamFn(native:any,broker:Broker,ai:any) {
+  return async (...args:any[]) => {
+    await broker.reserveModelCall();
+    const inner=await native(...args), outer=new ai.AssistantMessageEventStream(); outer.forwardLocalWorkFrom(inner);
+    void (async()=>{try { for await (const event of inner) { if(event.type==='done'||event.type==='error') await outer.trackLocalWork(broker.settleModelCall()); outer.push(event); } outer.end(await inner.result()); } catch(error) { outer.fail(error); }})();
+    return outer;
   };
 }
-export async function runReviewer(input:ReviewerInput,streamFn:StreamFn=streamSimple) {
-  await initTelemetryExport();
-  const settings=await Settings.init({cwd:input.cwd,agentDir:input.agentDir});
-  const auth=await discoverAuthStorage(input.agentDir,{cwd:input.cwd,settings});
-  const registry=new ModelRegistry(auth,undefined,{settings}), manager=SessionManager.create(input.cwd,input.sessionDir);
-  await input.broker.persistNativeSessionId(manager.getSessionId()!);
-  const tools=new Map<string,AgentTool>(reviewerTools(input.broker));
-  input.onTools?.([...tools.keys()]);
-  const telemetry=isTelemetryExportEnabled() ? createTelemetryExportConfig({attributes:{purpose:'background-skill-review',review_run_id:input.reviewRunId},captureMessageContent:'full'}) : undefined;
-  const agent=new Agent({initialState:{model:input.model,tools:[...tools.values()],systemPrompt:[input.reviewPrompt]},sessionId:manager.getSessionId(),deadline:input.receipt.deadline_epoch_ms,telemetry,getApiKey:(m,id,opt)=>registry.getApiKey(m,id,opt),streamFn:cappedStreamFn(streamFn,input.broker)});
-  const session=new AgentSession({agent,sessionManager:manager,settings,modelRegistry:registry,toolRegistry:tools,memoryEnabled:false,skills:[],skillsReloadable:false,disableExtensionDiscovery:true,scoutAllowedBySpawnPolicy:false});
-  try { await session.prompt(input.reviewPrompt); await manager.flush(); return await input.broker.finalResult(); }
-  finally { session.beginDispose(); await session.dispose(); await manager.close(); await flushTelemetryExport(); }
+export async function runReviewer(input:ReviewerInput,streamFn:any=input.native.ai.streamSimple) {
+  const {sdk,core,ai}=input.native; await sdk.initTelemetryExport();
+  const settings=await sdk.Settings.init({cwd:input.cwd,agentDir:input.agentDir}), auth=await sdk.discoverAuthStorage(input.agentDir,{cwd:input.cwd,settings}), registry=new sdk.ModelRegistry(auth,undefined,{settings}), manager=sdk.SessionManager.create(input.cwd,input.sessionDir);
+  await input.broker.persistNativeSessionId(manager.getSessionId());
+  const tools=reviewerTools(input.broker); input.onRuntimeTools?.([...tools.keys()]);
+  const telemetry=sdk.isTelemetryExportEnabled()?sdk.createTelemetryExportConfig({attributes:{purpose:'background-skill-review',review_run_id:input.reviewRunId},captureMessageContent:'full'}):undefined;
+  const agent=new core.Agent({initialState:{model:input.model,tools:[...tools.values()],systemPrompt:[input.reviewPrompt]},sessionId:manager.getSessionId(),deadline:input.receipt.deadline_epoch_ms,telemetry,getApiKey:(m:any,id:any,opt:any)=>registry.getApiKey(m,id,opt),streamFn:cappedStreamFn(streamFn,input.broker,ai)});
+  const session=new sdk.AgentSession({agent,sessionManager:manager,settings,modelRegistry:registry,toolRegistry:tools,memoryEnabled:false,skills:[],skillsReloadable:false,disableExtensionDiscovery:true,scoutAllowedBySpawnPolicy:false});
+  try {await session.prompt(input.reviewPrompt);await manager.flush();return await input.broker.finalResult();} finally {session.beginDispose();await session.dispose();await manager.close();await sdk.flushTelemetryExport();}
 }
-function reviewerTools(broker:Broker):Map<string,AgentTool> {
-  return new Map(['reviewer_excerpt','reviewer_search','reviewer_submit'].map(name=>[name,{name,label:name,description:name,parameters:{type:'object'},execute:async(_id,args)=>broker.rpc(name,args)} as AgentTool]));
-}
+function reviewerTools(broker:Broker) { return new Map(['reviewer_excerpt','reviewer_search','reviewer_submit'].map(name=>[name,{name,label:name,description:name,parameters:{type:'object',properties:name==='reviewer_search'?{query:{type:'string'}}:name==='reviewer_excerpt'?{source_id:{type:'string'}}:{report:{type:'object'}},required:name==='reviewer_search'?['query']:name==='reviewer_excerpt'?['source_id']:['report'],additionalProperties:false},execute:async(_id:string,args:any)=>({content:[{type:'text',text:JSON.stringify(await broker.rpc(name,args))}],details:{}})}]));}
 ```
 
 `serve_broker` reads one JSONL request at a time, validates UUID `id`, invokes packet excerpt/search/submit, and writes `{id,ok,value|error}` with the same ID. Python receipt reservation checks absolute deadline/counter before returning; settlement writes `dispatch:'settled'`. If the host dies after reservation, recovery leaves `unknown-provider-outcome` and rejects resume.
