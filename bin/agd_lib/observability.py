@@ -464,8 +464,8 @@ def _collector_diagnostics(home, config):
     except (KeyError, OSError, UnicodeError, urllib.error.URLError):
         result = {'state': 'unknown', 'storage_failure': storage_failure}
     result['storage_failure'] = storage_failure
-    if permanent_rejection and not result.get('permanent_send_failed_spans'):
-        result['permanent_send_failed_spans'] = 1
+    if permanent_rejection:
+        result['permanent_failure'] = 'observed'
     return result
 
 

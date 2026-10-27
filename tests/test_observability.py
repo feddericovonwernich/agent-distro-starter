@@ -317,7 +317,7 @@ def test_collector_diagnostics_reports_sanitized_permanent_rejection_from_logs(m
             'project': 'owned', 'ports': {'collector_metrics_port': 1},
         }) == {
             'state': 'unknown', 'storage_failure': 'unknown',
-            'permanent_send_failed_spans': 1,
+            'permanent_failure': 'observed',
         }
 
 
