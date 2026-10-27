@@ -49,6 +49,10 @@ Routine supervision is hidden from the conversation but stays available to the a
 
 Cursor Agent still needs user authentication and a live transcript bound to its runner before either Cursor/backend combination can be claimed operational. Herdr 0.8.2 with protocol 20 has live OMP worker evidence only inside an explicitly named session. `doctor --harness cursor --backend herdr` diagnoses executable versions; it does not authenticate Cursor or provision a Herdr session.
 
+## Private observability state
+
+Worker incarnation bindings reserve owner-only native-session directories under `data/observability/`; repeated binding lookup preserves existing receipt and transcript data. New managed child environments remove ambient OTEL exporter, protocol, header, and content-capture settings while observability is disabled. This is a storage/configuration boundary only: no managed telemetry command or service is available yet.
+
 ## Landing, publication, and retention
 
 For local landing obtain a concrete user instruction, `task approve NAME --action local-merge --target PROJECT:BASE --instruction FILE`, then `task land NAME --approval ID`. The exact ready head must fast-forward a clean stable clone. After a stopped worker, `task cleanup NAME` conditionally returns the lease. Dirty, unlanded or identity-uncertain work stays intact.

@@ -11,3 +11,4 @@
 - Replaced repeated visible OMP supervision cards with hidden agent context and compact footer status; actionable task wakes and unrecoverable watcher failures remain visible.
 - Added a distro customization reference skill covering instruction/configuration/code surfaces, central-versus-worker scope, private state, safe activation and upstream update implications.
 - Added a scoped `pr-publish` repair workflow: a task-target grant selectively enables one AGD worker bundle, guarded non-force publication, central Relay CI/human-review feedback, and final GitHub verification before readiness. Deployment requires central read-only GitHub credentials; no live GitHub acceptance is claimed.
+- Added private observability state records, per-incarnation OMP session bindings, and disabled child-environment sanitization. Managed telemetry commands and services are not enabled by this boundary.
