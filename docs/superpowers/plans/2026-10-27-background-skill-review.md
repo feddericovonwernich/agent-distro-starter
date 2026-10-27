@@ -301,7 +301,7 @@ export async function runReviewer(input:ReviewerInput,streamFn:StreamFn=streamSi
   await input.broker.persistNativeSessionId(manager.getSessionId()!);
   const tools=new Map<string,AgentTool>(reviewerTools(input.broker));
   input.onTools?.([...tools.keys()]);
-  const telemetry=createTelemetryExportConfig({attributes:{purpose:'background-skill-review',review_run_id:input.reviewRunId}});
+  const telemetry=isTelemetryExportEnabled() ? createTelemetryExportConfig({attributes:{purpose:'background-skill-review',review_run_id:input.reviewRunId},captureMessageContent:'full'}) : undefined;
   const agent=new Agent({initialState:{model:input.model,tools:[...tools.values()],systemPrompt:[input.reviewPrompt]},sessionId:manager.getSessionId(),deadline:input.receipt.deadline_epoch_ms,telemetry,getApiKey:(m,id,opt)=>registry.getApiKey(m,id,opt),streamFn:cappedStreamFn(streamFn,input.broker)});
   const session=new AgentSession({agent,sessionManager:manager,settings,modelRegistry:registry,toolRegistry:tools,memoryEnabled:false,skills:[],skillsReloadable:false,disableExtensionDiscovery:true,scoutAllowedBySpawnPolicy:false});
   try { await session.prompt(input.reviewPrompt); await manager.flush(); return await input.broker.finalResult(); }
