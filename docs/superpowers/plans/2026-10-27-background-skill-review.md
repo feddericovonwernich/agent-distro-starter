@@ -248,40 +248,29 @@ export function runReviewer(input:ReviewerInput, streamFn?:any):Promise<{reportI
 ```
 
 - [ ] **Step 1: Write complete fixture, bridge client, and failing test**
-
 ```ts
-// tests/reviewer-fixture.ts — imported only after startBridge dynamically loads installed URLs
-export function scriptedStream(ai:any, turns:Array<Array<any>>, observed:string[]) {
-  let index=0; return (_model:any,context:any) => {
-    observed.splice(0,observed.length,...context.tools.map((x:any)=>x.name));
-    const stream=new ai.AssistantMessageEventStream(), content=turns[index++] ?? [];
-    const message={role:'assistant',content,api:'openai-completions',provider:'offline',model:_model.id,
-      usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},stopReason:content.length?'toolUse':'stop',timestamp:Date.now()};
-    queueMicrotask(()=>{stream.push({type:'done',reason:message.stopReason,message});stream.end(message)}); return stream;
-  };
-}
+// tests/reviewer-fixture.ts
+export function scriptedStream(ai:any,turns:any[][],observed:string[]){let i=0;return(model:any,context:any)=>{observed.splice(0,observed.length,...context.tools.map((x:any)=>x.name));const stream=new ai.AssistantMessageEventStream(),content=turns[i++]??[],message={role:'assistant',content,api:model.api,provider:model.provider,model:model.id,usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},stopReason:content.length?'toolUse':'stop',timestamp:Date.now()};queueMicrotask(()=>{stream.push({type:'done',reason:message.stopReason,message});stream.end(message)});return stream;};}
 export const call=(name:string,args:unknown)=>({type:'toolCall',id:crypto.randomUUID(),name,arguments:args});
 ```
 
 ```ts
 // tests/reviewer.test.ts
-async function startBridge() {
-  const proc=Bun.spawn(['uv','run','--python','3.12','tests/reviewer_bridge.py'],{stdin:'pipe',stdout:'pipe',stderr:'pipe'});
-  const reader=proc.stdout.getReader(), first=await reader.read(); const hello=JSON.parse(new TextDecoder().decode(first.value).trim());
-  let n=0; const rpc=async(op:string,args:unknown)=>{const id=crypto.randomUUID();proc.stdin.write(JSON.stringify({id,op,args})+'\\n'); for(;;){const r=await reader.read();const v=JSON.parse(new TextDecoder().decode(r.value).trim());if(v.id===id)return v.ok?v.value:Promise.reject(new Error(v.error));}};
-  const broker={rpc,reserveModelCall:()=>rpc('reserve',{}),settleModelCall:()=>rpc('settle',{}),persistNativeSessionId:(id:string)=>rpc('session',{id}),finalResult:()=>rpc('result',{})};
-  return {hello,broker,close:async()=>{proc.stdin.end();await proc.exited;}};
-}
-test('native loop persists returned bridge report',async()=>{const b=await startBridge();try{const ai=await import(b.hello.aiUrl), observed:string[]=[];const {scriptedStream,call}=await import('./reviewer-fixture');const report=b.hello.report;const r=await runReviewer({...b.hello.input,broker:b.broker,native:{ai,...b.hello.native},onRuntimeTools:n=>observed.push(...n)},scriptedStream(ai,[[call('reviewer_search',{query:'failure'})],[call('reviewer_submit',report)],[]],observed));expect(observed.sort()).toEqual(['reviewer_excerpt','reviewer_search','reviewer_submit']);expect((await b.broker.rpc('read',{reportId:r.reportId})).report_id).toBe(r.reportId);}finally{await b.close();}});
+import {expect,test} from 'bun:test';import {createInterface} from 'node:readline';import {Readable} from 'node:stream';import {readFileSync} from 'node:fs';import {join} from 'node:path';import {runReviewer} from '../lib/agd-reviewer';import {scriptedStream,call} from './reviewer-fixture';
+async function startBridge(){const proc=Bun.spawn(['uv','run','--python','3.12','--with','pytest','tests/reviewer_bridge.py'],{stdin:'pipe',stdout:'pipe',stderr:'pipe'}),lines=createInterface({input:Readable.fromWeb(proc.stdout as any),crlfDelay:Infinity})[Symbol.asyncIterator](),stderr=proc.stderr.text(),next=async()=>{const x=await lines.next();if(x.done)throw new Error(`bridge EOF: ${await stderr}`);return x.value;},hello=JSON.parse(await next()),ai=await import(hello.aiUrl),core=await import(hello.coreUrl),sdk=await import(hello.sdkUrl),telemetry=await import(hello.telemetryUrl);let serial=Promise.resolve();const rpc=(op:string,args:unknown)=>serial=serial.then(async()=>{const id=crypto.randomUUID();proc.stdin.write(JSON.stringify({id,op,args})+'\n');const reply=JSON.parse(await next());if(reply.id!==id)throw new Error(`bridge reply mismatch ${reply.id}`);if(!reply.ok)throw new Error(reply.error);return reply.value;});return{hello,native:{ai,core,sdk:{...sdk,...telemetry}},broker:{rpc,reserveModelCall:()=>rpc('reserve',{}),settleModelCall:()=>rpc('settle',{}),persistNativeSessionId:(id:string)=>rpc('session',{id}),finalResult:()=>rpc('result',{})},close:async()=>{proc.stdin.end();await proc.exited;}};}
+test('native loop persists actual bridge report',async()=>{const b=await startBridge();try{const observed:string[]=[],r=await runReviewer({...b.hello.input,broker:b.broker,native:b.native},scriptedStream(b.native.ai,[[call('reviewer_search',{query:'failure'})],[call('reviewer_submit',{report:b.hello.report})],[]],observed));expect(observed.sort()).toEqual(['reviewer_excerpt','reviewer_search','reviewer_submit']);const saved=JSON.parse(readFileSync(join(b.hello.reportDir,`${r.reportId}.json`),'utf8'));expect(saved.findings[0]).toMatchObject({citations:b.hello.report.findings[0].citations,uncertainty:'low',new_skill:b.hello.report.findings[0].new_skill});}finally{await b.close();}});
 ```
 
 ```python
 # tests/reviewer_bridge.py
-from tests.test_reviewer import produced_run, build_report
+import json, sys
+from support import lab
+from test_reviewer import produced_run, build_report
+from agd_lib import reviewer_runner
 with lab() as (home, _):
-    run, packet = produced_run(home); report = build_report(packet)
-    print(json.dumps({'aiUrl':capability_urls()['ai'],'native':capability_urls(),'input':bridge_input(home,run,packet),'report':report}),flush=True)
-    serve_broker(home,run['review_run_id'],sys.stdin,sys.stdout)
+    run,packet=produced_run(home); report=build_report(packet); cap=reviewer_runner.assert_runtime_capability()
+    print(json.dumps({'aiUrl':cap['ai_url'],'coreUrl':cap['core_url'],'sdkUrl':cap['sdk_url'],'telemetryUrl':cap['telemetry_url'],'report':report,'reportDir':str(home/'data/reviewer/reports'),'input':{'cwd':str(home),'agentDir':str(home/'.omp'),'sessionDir':str(home/'data/observability/reviewer'/run['review_run_id']/'omp'),'reviewRunId':run['review_run_id'],'receipt':run,'reviewPrompt':'Review supplied evidence only.','model':{'provider':'test','api':'openai-completions','id':'fixture-model'}}}),flush=True)
+    reviewer_runner.serve_broker(home,run['review_run_id'],sys.stdin,sys.stdout)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
