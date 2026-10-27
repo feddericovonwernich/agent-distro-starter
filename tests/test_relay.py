@@ -241,8 +241,8 @@ def test_terminal_service_restarts_only_the_recorded_owned_process(tmp_path, mon
     monkeypatch.setattr(relay, 'ensure_runtime', lambda *_args: runtime)
     monkeypatch.setattr(relay, '_install_review_definition', lambda *_args: None)
     monkeypatch.setattr(relay, '_configure_connector', lambda *_args, **_kwargs: None)
-    monkeypatch.setattr('agd_lib.supervision.gone', lambda pid, start: pid == 12)
     stopped = []
+    monkeypatch.setattr('agd_lib.supervision.gone', lambda pid, start: pid == 12 or (pid == 11 and bool(stopped)))
     monkeypatch.setattr(relay.os, 'kill', lambda pid, signal: stopped.append((pid, signal)))
 
     restarted = relay.ensure_project_service(home, 'sample', 'owner/repo')

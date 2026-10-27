@@ -303,6 +303,7 @@ def ensure_project_service(home, project_id, repository, run=store.run):
         raise store.Refusal('Relay project repository must be OWNER/REPOSITORY')
     _require_read_token()
     runtime = ensure_runtime(home)
+    restart = None
     with store.lock(home):
         root = _service_root(home, project_id)
         path = root/'service.json'
@@ -319,6 +320,7 @@ def ensure_project_service(home, project_id, repository, run=store.run):
                 raise store.Refusal('Relay project service identity changed')
             if record['health'] in ('unhealthy', 'stopped'):
                 from . import supervision
+                restart = []
                 for name in ('connector', 'server'):
                     process = record.get(name)
                     if _owned(record, name, supervision):
@@ -326,25 +328,46 @@ def ensure_project_service(home, project_id, repository, run=store.run):
                             os.kill(process['pid'], 15)
                         except ProcessLookupError:
                             pass
-                    record.pop(name, None)
-                record.pop('blocked_reason', None)
-                record['health'] = 'starting'
-                store.atomic_json(path, record)
+                        else:
+                            restart.append(process)
+                if restart:
+                    record.update(health='unhealthy', blocked_reason='Relay service is stopping')
+                    store.atomic_json(path, record)
+                else:
+                    record.pop('connector', None)
+                    record.pop('server', None)
+                    record.pop('blocked_reason', None)
+                    record['health'] = 'starting'
+                    store.atomic_json(path, record)
+                    _install_review_definition(root)
+                    _configure_connector(root, repository)
+                    return record
+            else:
+                _install_review_definition(root)
+                _configure_connector(root, repository)
+                return record
+        if restart is not None:
+            pass
+        else:
+            relay_state = root/'.relay'
+            if os.path.lexists(relay_state):
+                raise store.Refusal('Relay project state exists without a service record; preserving it')
+            # ponytail: global home lock during one-time init; use per-project locks if concurrent project provisioning matters.
+            run([str(runtime/'bin'/'relay'), 'init', '--github', repository], cwd=root, timeout=30)
+            _lstat(relay_state, 'dir')
             _install_review_definition(root)
-            _configure_connector(root, repository)
+            _configure_connector(root, repository, fresh_init=True)
+            record = {'schema': 1, 'project': project_id, 'repository': repository,
+                      'runtime': str(runtime), 'root': str(root), 'health': 'starting'}
+            store.atomic_json(path, record)
             return record
-        relay_state = root/'.relay'
-        if os.path.lexists(relay_state):
-            raise store.Refusal('Relay project state exists without a service record; preserving it')
-        # ponytail: global home lock during one-time init; use per-project locks if concurrent project provisioning matters.
-        run([str(runtime/'bin'/'relay'), 'init', '--github', repository], cwd=root, timeout=30)
-        _lstat(relay_state, 'dir')
-        _install_review_definition(root)
-        _configure_connector(root, repository, fresh_init=True)
-        record = {'schema': 1, 'project': project_id, 'repository': repository,
-                  'runtime': str(runtime), 'root': str(root), 'health': 'starting'}
-        store.atomic_json(path, record)
-        return record
+    from . import supervision
+    deadline = time.monotonic() + 1
+    while any(not supervision.gone(process['pid'], process['start']) for process in restart) and time.monotonic() < deadline:
+        time.sleep(.05)
+    if any(not supervision.gone(process['pid'], process['start']) for process in restart):
+        raise store.Refusal('Relay service did not stop; retaining owned process identity')
+    return ensure_project_service(home, project_id, repository, run=run)
 
 
 
@@ -382,10 +405,12 @@ def _start_connector(runtime, root, popen):
 
 
 def stop_project_service(home, project_id, reason=None):
-    """Stop only processes whose persisted identity still belongs to this service."""
+    """Stop only confirmed owned processes; never clear a live identity."""
     from . import supervision
+    path = _service_file(home, project_id)
     with store.lock(home):
-        current = json.loads(_service_file(home, project_id).read_text())
+        current = json.loads(path.read_text())
+        stopping = []
         for name in ('connector', 'server'):
             record = current.get(name)
             if _owned(current, name, supervision):
@@ -393,11 +418,34 @@ def stop_project_service(home, project_id, reason=None):
                     os.kill(record['pid'], 15)
                 except ProcessLookupError:
                     pass
-            current.pop(name, None)
+                else:
+                    stopping.append(record)
+        if stopping:
+            current.update(health='unhealthy', blocked_reason='Relay service is stopping')
+            store.atomic_json(path, current)
+        else:
+            current.pop('connector', None)
+            current.pop('server', None)
+            current['health'] = 'stopped'
+            if reason:
+                current['blocked_reason'] = str(reason)[:500]
+            store.atomic_json(path, current)
+            return current
+    deadline = time.monotonic() + 1
+    while any(not supervision.gone(record['pid'], record['start']) for record in stopping) and time.monotonic() < deadline:
+        time.sleep(.05)
+    if any(not supervision.gone(record['pid'], record['start']) for record in stopping):
+        raise store.Refusal('Relay service did not stop; retaining owned process identity')
+    with store.lock(home):
+        current = json.loads(path.read_text())
+        if any(_owned(current, name, supervision) for name in ('connector', 'server')):
+            raise store.Refusal('Relay service identity changed while stopping')
+        current.pop('connector', None)
+        current.pop('server', None)
         current['health'] = 'stopped'
         if reason:
             current['blocked_reason'] = str(reason)[:500]
-        store.atomic_json(_service_file(home, project_id), current)
+        store.atomic_json(path, current)
         return current
 def _process_record(process):
     from . import supervision
