@@ -28,6 +28,14 @@ def _task_with_pr(home, task_id='reviewed'):
     (root / '.relay' / 'runtime.json').write_text(json.dumps({'pid': 42, 'port': 4312, 'token': 'admin-secret'}))
     return task
 
+def test_unpublished_or_dirty_pr_worker_is_not_blocked(monkeypatch):
+    with lab() as (home, _project):
+        task = _task_with_pr(home)
+        tasks.pr_receipt_file(home, task['id']).unlink()
+        Path(task['worktree'], 'repair.txt').write_text('pending repair\n')
+        assert relay_reviews.tick(home) == {'checked': 0, 'emitted': 0, 'blocked': 0}
+        assert not (tasks.task_file(home, task['id']).parent/'observations'/'human-review-blocked.json').exists()
+
 
 def _github(head):
     return lambda *_: lambda kind, _cursor=None: {'state': 'OPEN', 'headSha': head}
