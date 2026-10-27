@@ -63,7 +63,7 @@ The run lease is acquired before packet collection; it persists `started_at` and
 ### Task 1: Reconcile source and create authoritative reviewer packets
 
 **Files:**
-- Create: `bin/agd_lib/reviewer.py`, `bin/agd_lib/reviewer_runner.py`, `tests/test_reviewer.py`, `tests/reviewer_bridge.py`, `config/reviewer-instruction.txt`
+- Create: `bin/agd_lib/reviewer.py`, `bin/agd_lib/reviewer_runner.py`, `tests/test_reviewer.py`, `tests/reviewer_bridge.py`, `lib/agd-reviewer-instructions.md`
 - Modify: `bin/agd_lib/observability.py`
 
 **Interfaces:** Consumes merged `observability.worker_binding(home, task_id, incarnation)`. Produces `select_packet`, `enqueue_intent`, `begin_run`, and reviewer binding.
@@ -168,7 +168,7 @@ def read_report(home,report_id): _hex_id(report_id); row=json.loads((paths(home)
 
 `select_packet` snapshots validated config/limits and instruction bytes before collection. It (1) finds retained `runner-exit` observations at/before cutoff and their task/incarnation bindings: phase is irrelevant; a current incarnation needs `worker_alive is False`; a prior incarnation requires its closed observation and remains eligible even while a newer incarnation runs; (2) admits at most configured `max_candidates` distinct task/incarnation episodes; group retries of same task/incident together, never count them as independent recurrence; (3) incrementally parses each bound native v3 JSONL only to a frozen byte watermark, validates header and outer record timestamp, and stores bounded actual text excerpts with `source_id,kind,task_id,incarnation,session_id,message_id,span,source_path,version,sha256,cutoff,relation`; it never copies whole histories; (4) retains only explicitly linked decisions/human feedback matching task/incarnation/session plus bounded historical counterevidence; errors, partial files, withheld excerpts, active/unknown links, and no retained end proof become named coverage records rather than fabricated timestamps or negative findings; (5) snapshots real worker-skill catalog plus manifest bytes/hash, recording assigned/loaded/used/causal provenance separately and unknown when not evidenced; (6) admits closed prior review IDs only, records current/later/unknown IDs in coverage, excludes reviewer feedback by default, and permits one bounded later follow-up only when a material-basis watermark gains a linked feedback/span hash; (7) charges canonical packet metadata plus stored UTF-8 excerpts against the whole packet bound and rejects infeasible metadata before model dispatch. Packet fields are `schema,packet_id,cutoff,limits,episodes,sources,coverage,skill_inventory,material_basis`; episode fields are `task_id,incarnation,exit_observation_id,exit_observed_at,binding`; coverage has `unknown_relation,inaccessible,partial,withheld,retrospective`; inventory contains catalog and manifest content hashes plus provenance labels.
 
-Selected excerpts and packet are content-hash create-only immutable files; live JSONL is not claimed immutable. `begin_run` writes mutable receipt `{review_run_id,intent_id,packet_id,model,config_snapshot_ref,instruction_snapshot_ref,started_at,deadline_epoch_ms,native_session_id,model_calls,input_bytes,output_bytes,dispatch}` under `state/reviewer/receipts`, preserving its passed intent/start/deadline. After the actual native session ID exists and before first reserve, it create-only publishes the immutable run manifest. Default config is calendar `02:00 UTC`; `review_model=None` inherits the native model. `config/reviewer-instruction.txt` is the frozen instruction source and requires grounding, citations/counterexamples, uncertainty, no recursive reviewer feedback, inert draft skills, and the report schema.
+Selected excerpts and packet are content-hash create-only immutable files; live JSONL is not claimed immutable. `INSTRUCTION_FILE=Path(__file__).resolve().parents[2]/'lib/agd-reviewer-instructions.md'`; snapshot it as immutable JSON `{text,raw_utf8_sha256}` and make `instruction_snapshot_ref` point to it. `begin_run` writes mutable receipt `{review_run_id,intent_id,packet_id,model,config_snapshot_ref,instruction_snapshot_ref,started_at,deadline_epoch_ms,native_session_id,model_calls,input_bytes,output_bytes,dispatch}` under `state/reviewer/receipts`, preserving its passed intent/start/deadline. Native `reviewPrompt` loads this frozen blob text, never the live bundle. After actual native session ID exists and before first reserve, create-only publish the immutable run manifest. Default config is calendar `02:00 UTC`; `review_model=None` inherits native model.
 
 - [ ] **Step 5: Run packet tests to verify pass**
 
@@ -179,7 +179,7 @@ Expected: PASS; no model, Langfuse API, Docker, or systemd call.
 - [ ] **Step 6: Commit Task 1**
 
 ```bash
-git add bin/agd_lib/reviewer.py bin/agd_lib/reviewer_runner.py bin/agd_lib/observability.py config/reviewer-instruction.txt tests/test_reviewer.py tests/reviewer_bridge.py
+git add bin/agd_lib/reviewer.py bin/agd_lib/reviewer_runner.py bin/agd_lib/observability.py lib/agd-reviewer-instructions.md tests/test_reviewer.py tests/reviewer_bridge.py
 git commit -m "feat: persist reviewer evidence packets"
 ```
 
@@ -196,7 +196,7 @@ git commit -m "feat: persist reviewer evidence packets"
 from agd_lib import store, supervision, worker_skills
 def produced_run(home):
     started=time.time(); ended_worker(home,'failed',str(uuid.uuid4()),'failure',1); ended_worker(home,'success',str(uuid.uuid4()),'counterexample',0); ended_worker(home,'additional',str(uuid.uuid4()),'additional failure',1)
-    config=reviewer.read_config(home); packet=reviewer.select_packet(home,cutoff=time.time()); instruction=Path('config/reviewer-instruction.txt').read_bytes()
+    config=reviewer.read_config(home); packet=reviewer.select_packet(home,cutoff=time.time()); instruction=reviewer.INSTRUCTION_FILE.read_bytes()
     return reviewer.begin_run(home,packet,reviewer.enqueue_intent(home,kind='default'),model='openai/reviewer-fixture',config_snapshot=config,instruction_snapshot=instruction,started_at=started,deadline_epoch_ms=int((started+config['limits']['max_runtime_seconds'])*1000)),packet
 def build_report(packet):
     failed=next(s['source_id'] for s in packet['sources'] if s['task_id']=='failed'); success=next(s['source_id'] for s in packet['sources'] if s['task_id']=='success')
