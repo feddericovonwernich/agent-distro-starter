@@ -227,6 +227,8 @@ def watch(home, owner_pid, owner_start, generation):
         store.atomic_json(home/'state'/'owner.json', owner)
         print(json.dumps({'type': 'ready', 'generation': generation}), flush=True)
         seen = set()
+        next_review = 0.0
+        from . import relay_reviews
         while True:
             try:
                 owner_alive = process_start(owner_pid) == owner_start
@@ -241,4 +243,27 @@ def watch(home, owner_pid, owner_start, generation):
             if fresh:
                 print(json.dumps({'type': 'events', 'ids': sorted(fresh)}), flush=True)
             seen = current
+            if time.monotonic() >= next_review:
+                next_review = time.monotonic() + 15
+                try:
+                    relay_reviews.tick(home)
+                except Exception:
+                    pass
             time.sleep(2)
+
+    _stop_owned_relay_services(home)
+
+
+def _stop_owned_relay_services(home):
+    from . import relay
+    projects = Path(home) / 'state' / 'relay' / 'projects'
+    if not projects.is_dir() or projects.is_symlink():
+        return
+    for path in sorted(projects.iterdir()):
+        service = path / 'service.json'
+        if path.is_symlink() or not service.is_file() or service.is_symlink():
+            continue
+        try:
+            relay.stop_project_service(home, path.name, 'central owner exited')
+        except (store.Refusal, OSError, json.JSONDecodeError):
+            pass

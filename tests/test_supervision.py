@@ -3,9 +3,10 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+import pytest
 from test_projects import CLI, run
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'bin'))
 from agd_lib.supervision import process_start
+from agd_lib import supervision
 
 from support import lab, command
 
@@ -156,6 +157,37 @@ def test_recovered_ready_check_rearms_next_failure():
         command(home, 'session', 'reconcile')
         assert any(e['kind'] == 'blocked' and e['id'] != first['id']
                    for e in command(home, 'events', 'list'))
+
+
+def test_watcher_runs_central_review_tick_after_reconcile(monkeypatch, tmp_path):
+    home = tmp_path / 'home'
+    monkeypatch.setenv('AGD_OWNER', 'owner-token')
+    monkeypatch.setattr(supervision, 'process_start', lambda _pid: 'start')
+    calls = []
+    monkeypatch.setattr(supervision, 'reconcile', lambda _home: calls.append('reconcile') or {'pending': []})
+    monkeypatch.setattr('agd_lib.relay_reviews.tick', lambda _home: calls.append('tick'))
+    monkeypatch.setattr(supervision.time, 'sleep',
+                        lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        supervision.watch(home, 1, 'start', 'generation')
+    assert calls == ['reconcile', 'tick']
+
+
+def test_owner_exit_stops_only_regular_owned_relay_service(monkeypatch, tmp_path):
+    home = tmp_path / 'home'
+    good = home / 'state' / 'relay' / 'projects' / 'sample'
+    good.mkdir(parents=True)
+    (good / 'service.json').write_text('{}')
+    unsafe = home / 'state' / 'relay' / 'projects' / 'unsafe'
+    unsafe.mkdir()
+    (unsafe / 'service.json').symlink_to(tmp_path / 'outside.json')
+    stopped = []
+    monkeypatch.setattr('agd_lib.relay.stop_project_service',
+                        lambda received_home, project, reason: stopped.append((received_home, project, reason)))
+
+    supervision._stop_owned_relay_services(home)
+
+    assert stopped == [(home, 'sample', 'central owner exited')]
 
 if __name__ == '__main__':
     test_acknowledging_wake_does_not_answer_decision()
