@@ -88,21 +88,23 @@ from pathlib import Path
 import pytest
 from support import lab, command
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
-from agd_lib import observability, reviewer, tasks
+from agd_lib import observability, reviewer, tasks, workers
 
-def ended_worker(home, task_id, incarnation, text):
+def ended_worker(home, task_id, incarnation, text, status):
     brief=home/f'{task_id}.md'; brief.write_text('Inspect value.txt.\n')
     task=command(home,'task','create',task_id,'--project','sample','--brief',str(brief))
-    task.update(executor='worker',incarnation=incarnation,phase='failed',worker_alive=False); tasks.save(home,task)
+    task.update(executor='worker',incarnation=incarnation,phase='running',worker_alive=False); tasks.save(home,task)
     binding=observability.worker_binding(home,task_id,incarnation); sid=str(uuid.uuid4()); iso='2026-01-01T00:00:00.000Z'
-    rows=[{'type':'session','version':3,'id':sid,'timestamp':iso,'cwd':str(home)},
-          {'type':'message','id':str(uuid.uuid4()),'parentId':None,'timestamp':iso,'message':{'role':'user','content':text,'timestamp':1767225600000}}]
-    Path(binding['session_dir'],f'{sid}.jsonl').write_text(''.join(json.dumps(x)+'\n' for x in rows)); return task
+    rows=[{'type':'session','version':3,'id':sid,'timestamp':iso,'cwd':str(home)},{'type':'message','id':str(uuid.uuid4()),'parentId':None,'timestamp':iso,'message':{'role':'user','content':text,'timestamp':1767225600000}}]
+    Path(binding['session_dir'],f'{sid}.jsonl').write_text(''.join(json.dumps(x)+'\n' for x in rows))
+    workers.event(home,task,'failed' if status else 'idle','runner-exit',key='runner-exit',message=f'exit {status}',incarnation=incarnation)
+    return task
 def test_packet_has_distinct_failure_and_counterexample_sources():
     with lab() as (home,_):
-        a=ended_worker(home,'failed',str(uuid.uuid4()),'failure'); b=ended_worker(home,'success',str(uuid.uuid4()),'counterexample')
+        a=ended_worker(home,'failed',str(uuid.uuid4()),'failure',1); b=ended_worker(home,'success',str(uuid.uuid4()),'counterexample',0)
         packet=reviewer.select_packet(home,cutoff=time.time()); native=[s for s in packet['sources'] if s['kind']=='native-jsonl']
-        assert {x['task_id'] for x in packet['episodes']}=={a['id'],b['id']}; assert len({x['source_id'] for x in native})==2
+        assert {x['task_id'] for x in packet['episodes']}=={a['id'],b['id']}
+        assert len({x['source_id'] for x in native})==2
 ```
 
 - [ ] **Step 3: Run test to verify it fails**
