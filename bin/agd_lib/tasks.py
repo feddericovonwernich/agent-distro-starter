@@ -1,4 +1,6 @@
 import hashlib
+import stat
+import re
 import json
 import os
 import uuid
@@ -122,30 +124,195 @@ def verify_worker_skills(home, task):
             raise store.Refusal('worker skill artifact appears in task history')
 
 
+
+def _pr_publish_granted(home, task):
+    for path in (task_file(home, task['id']).parent/'approvals').glob('*.json'):
+        try:
+            approval = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            continue
+        if approval.get('action') == 'pr-publish' and approval.get('task') == task['id']:
+            return True
+    return False
+
+
+
+def _ready_locked(home, task_id, text):
+    task = read(home, task_id)
+    if task['phase'] not in ('prepared', 'running'):
+        raise store.Refusal('task not prepared or running')
+    if os.environ.get('AGD_TASK_ID') and (os.environ['AGD_TASK_ID'] != task_id or
+                                          os.environ.get('AGD_INCARNATION') != task.get('incarnation')):
+        raise store.Refusal('worker incarnation cannot report this task')
+    work = verify_workspace(home, task)
+    verify_worker_skills(home, task)
+    if not store.clean(work):
+        raise store.Refusal('task workspace has uncommitted or untracked changes')
+    head = store.git(work, 'rev-parse', 'HEAD')
+    if task['kind'] == 'ship' and _pr_publish_granted(home, task):
+        receipt = read_pr_receipt(home, task_id)
+        verification = receipt.get('verification') if receipt else None
+        final = verification.get('final') if isinstance(verification, dict) else None
+        if (not isinstance(verification, dict) or not isinstance(final, dict) or
+                final.get('head_sha') != head or not isinstance(final.get('pr'), dict) or
+                final['pr'].get('headRefOid') != head or
+                receipt.get('grant_id') != verification.get('grant_id') or
+                receipt.get('remote') != verification.get('remote') or
+                receipt.get('repository') != verification.get('repository') or
+                receipt.get('branch') != verification.get('branch') or
+                receipt.get('base') != verification.get('base') or
+                receipt.get('pr', {}).get('number') != verification.get('pr_number') or
+                receipt.get('pr', {}).get('id') != verification.get('pr_id') or
+                verification.get('head') != head or verification.get('remote_head') != head or
+                verification.get('pr_head') != head):
+            raise store.Refusal('PR verification is missing or superseded')
+        _authorize_pr_publish_locked(home, task, receipt['grant_id'])
+    if task['kind'] == 'ship' and (head == task['start'] or store.run(['git', 'merge-base', '--is-ancestor', task['start'], head], cwd=work, check=False).returncode):
+        raise store.Refusal('ship task needs committed changes from its base')
+    if task['kind'] == 'scout' and head != task['start']:
+        raise store.Refusal('scout contains unexpected commits')
+    (task_file(home, task_id).parent/'report.md').write_text(text)
+    task.update(phase='ready', ready_head=head, report='report.md')
+    save(home, task)
+    return task
+
+
 def ready(home, task_id, report):
     text = Path(report).read_text()
     if not text.strip():
         raise store.Refusal('empty report')
     with store.lock(home):
+        return _ready_locked(home, task_id, text)
+
+
+def pr_receipt_file(home, task_id):
+    return task_file(home, task_id).parent/'pr.json'
+
+
+def validate_pr_receipt(receipt):
+    if (not isinstance(receipt, dict) or receipt.get('schema') != 1 or
+            not isinstance(receipt.get('grant_id'), str) or not receipt['grant_id']):
+        raise store.Refusal('PR receipt is invalid')
+    if 'blocked_reason' in receipt:
+        if not isinstance(receipt['blocked_reason'], str) or not receipt['blocked_reason']:
+            raise store.Refusal('PR receipt is invalid')
+        return receipt
+    required = ('remote', 'repository', 'branch', 'base', 'local_head', 'remote_head', 'pr')
+    if any(not isinstance(receipt.get(key), str) or not receipt[key] for key in required[:-1]):
+        raise store.Refusal('PR receipt is invalid')
+    pull_request = receipt['pr']
+    if (not isinstance(pull_request, dict) or not isinstance(pull_request.get('number'), int) or
+            pull_request['number'] < 1 or not isinstance(pull_request.get('url'), str) or
+            not pull_request['url'] or not isinstance(pull_request.get('id'), str) or not pull_request['id']):
+        raise store.Refusal('PR receipt is invalid')
+    verification = receipt.get('verification')
+    if verification is not None:
+        required_verification = ('grant_id', 'remote', 'repository', 'branch', 'base', 'head',
+                                 'remote_head', 'pr_head', 'pr_id', 'pr_number')
+        final = verification.get('final') if isinstance(verification, dict) else None
+        if (not isinstance(verification, dict) or
+                any(not isinstance(verification.get(key), str) or not verification[key]
+                    for key in required_verification[:-1]) or
+                not isinstance(verification.get('pr_number'), int) or verification['pr_number'] < 1 or
+                not isinstance(final, dict) or not isinstance(final.get('head_sha'), str) or
+                not final['head_sha'] or not isinstance(final.get('pr'), dict)):
+            raise store.Refusal('PR receipt is invalid')
+    return receipt
+
+
+
+
+def read_pr_receipt(home, task_id):
+    path = pr_receipt_file(home, task_id)
+    if not path.exists():
+        return None
+    if path.is_symlink() or not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode):
+        raise store.Refusal('PR receipt is unsafe')
+    try:
+        return validate_pr_receipt(json.loads(path.read_text()))
+    except json.JSONDecodeError as error:
+        raise store.Refusal('PR receipt is invalid') from error
+
+
+def _write_pr_receipt_locked(home, task_id, receipt, allow_final=False):
+    validate_pr_receipt(receipt)
+    if receipt.get('verification') is not None and not allow_final:
+        raise store.Refusal('PR final verification is private')
+    read(home, task_id)
+    path = pr_receipt_file(home, task_id)
+    if path.exists() and (path.is_symlink() or not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode)):
+        raise store.Refusal('PR receipt is unsafe')
+    store.atomic_json(path, receipt)
+
+
+def write_pr_receipt(home, task_id, receipt):
+    with store.lock(home):
+        _write_pr_receipt_locked(home, task_id, receipt)
+
+
+def grant_pr_publish(home, task_id, target, instruction):
+    with store.lock(home):
         task = read(home, task_id)
-        if task['phase'] not in ('prepared', 'running'):
-            raise store.Refusal('task not prepared or running')
-        if os.environ.get('AGD_TASK_ID') and (os.environ['AGD_TASK_ID'] != task_id or
-                                              os.environ.get('AGD_INCARNATION') != task.get('incarnation')):
-            raise store.Refusal('worker incarnation cannot report this task')
+        if task['kind'] != 'ship':
+            raise store.Refusal('PR publication requires a ship task')
+        try:
+            remote, branch = target.split(':', 1)
+        except ValueError as error:
+            raise store.Refusal('PR publication target must be REMOTE:BRANCH') from error
+        if not remote or branch != task['branch']:
+            raise store.Refusal('PR publication target must match the assigned task branch')
+        text = Path(instruction).read_text()
+        if not text.strip():
+            raise store.Refusal('explicit instruction required')
+        if not re.search(rf'(?<![A-Za-z0-9-]){re.escape(target)}(?![A-Za-z0-9-])', text):
+            raise store.Refusal('instruction must identify exact task and target')
+        task_without_target = re.sub(rf'(?<![A-Za-z0-9-]){re.escape(target)}(?![A-Za-z0-9-])', '', text)
+        if not re.search(rf'(?<![A-Za-z0-9-]){re.escape(task_id)}(?![A-Za-z0-9-])', task_without_target):
+            raise store.Refusal('instruction must independently name exact task')
         work = verify_workspace(home, task)
-        verify_worker_skills(home, task)
         if not store.clean(work):
             raise store.Refusal('task workspace has uncommitted or untracked changes')
-        head = store.git(work, 'rev-parse', 'HEAD')
-        if task['kind'] == 'ship' and (head == task['start'] or store.run(['git', 'merge-base', '--is-ancestor', task['start'], head], cwd=work, check=False).returncode):
-            raise store.Refusal('ship task needs committed changes from its base')
-        if task['kind'] == 'scout' and head != task['start']:
-            raise store.Refusal('scout contains unexpected commits')
-        (task_file(home, task_id).parent/'report.md').write_text(text)
-        task.update(phase='ready', ready_head=head, report='report.md')
-        save(home, task)
-    return task
+        remote_url = store.git(work, 'remote', 'get-url', remote, check=False)
+        if not remote_url:
+            raise store.Refusal('PR publication remote is unavailable')
+        grant = dict(id=str(uuid.uuid4()), task=task_id, action='pr-publish', target=target,
+                     instruction=text, grant_head=store.git(work, 'rev-parse', 'HEAD'),
+                     branch=task['branch'], base=task['base'], remote=remote, remote_url=remote_url)
+        store.atomic_json(task_file(home, task_id).parent/'approvals'/f'{grant["id"]}.json', grant)
+        return grant
+
+
+def _authorize_pr_publish_locked(home, task, grant_id, require_clean=True):
+    task = read(home, task['id'])
+    try:
+        grant_id = str(uuid.UUID(grant_id))
+        grant = json.loads((task_file(home, task['id']).parent/'approvals'/f'{grant_id}.json').read_text())
+    except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
+        raise store.Refusal('PR publication grant missing or invalid') from error
+    if (not isinstance(grant, dict) or grant.get('id') != grant_id or grant.get('task') != task['id'] or
+            grant.get('action') != 'pr-publish' or grant.get('branch') != task['branch'] or
+            grant.get('base') != task['base'] or grant.get('target') != f'{grant.get("remote")}:{task["branch"]}' or
+            any(not isinstance(grant.get(key), str) or not grant[key] for key in ('remote', 'remote_url', 'grant_head'))):
+        raise store.Refusal('PR publication grant does not match task target')
+    work = verify_workspace(home, task)
+    if require_clean and not store.clean(work):
+        raise store.Refusal('task workspace has uncommitted or untracked changes')
+    if store.git(work, 'remote', 'get-url', grant['remote'], check=False) != grant.get('remote_url'):
+        raise store.Refusal('PR publication remote changed')
+    if store.run(['git', 'merge-base', '--is-ancestor', grant['grant_head'], 'HEAD'],
+                 cwd=work, check=False).returncode:
+        raise store.Refusal('PR publication head is not a descendant of grant head')
+    return grant
+
+
+def authorize_pr_publish(home, task, grant_id):
+    with store.lock(home):
+        return _authorize_pr_publish_locked(home, task, grant_id)
+
+
+def authorize_pr_feedback(home, task, grant_id):
+    with store.lock(home):
+        return _authorize_pr_publish_locked(home, task, grant_id, require_clean=False)
 
 
 def approve(home, task_id, action, target, instruction):

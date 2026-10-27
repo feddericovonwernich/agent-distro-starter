@@ -195,6 +195,65 @@ def test_relaunch_restores_frozen_skill_after_catalog_changes():
         assert (Path(task['worktree'])/'.omp'/'skills'/'agd-probe'/'SKILL.md').is_file()
 
 
+
+
+def test_granted_launch_uses_frozen_private_scoped_skill_and_prompt():
+    from unittest.mock import patch
+    from agd_lib import workers
+    with lab() as (home, project):
+        brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
+        task = command(home, 'task', 'create', 'granted', '--project', 'sample', '--brief', str(brief), '--kind', 'ship')
+        instruction = home/'grant.md'
+        instruction.write_text('Task granted may publish origin:agd/granted for task granted.\n')
+        grant = tasks.grant_pr_publish(home, 'granted', 'origin:agd/granted', instruction)
+        class FakeBackend:
+            def create(self, *_args): return {'created': True, 'incarnation': _args[2]}
+        with patch.object(workers.harnesses, 'launch_argv', return_value=['true']), \
+             patch.object(__import__('agd_lib.pr', fromlist=['github_repository']), 'github_repository',
+                          return_value='owner/repo'), \
+             patch.object(__import__('agd_lib.relay', fromlist=['start_project_service']), 'start_project_service'), \
+             patch.object(workers, 'backend', return_value=FakeBackend()), \
+             patch.object(workers.shutil, 'which', return_value='/bin/true'):
+            launched = workers.launch(home, 'granted', pr_grant=grant['id'])
+        manifest = launched['worker_skills']
+        assert manifest['skills'][0]['id'] == 'agd-scoped-pr-relay'
+        assert not (home/'config'/'worker-skills'/'agd-scoped-pr-relay').exists()
+        assert (Path(manifest['skills'][0]['snapshot'])/'SKILL.md').is_file()
+        scoped = dict(launched, worker_skills=manifest, pr_grant=grant['id'])
+        scoped['incarnation'] = 'worker-incarnation'
+        argv = __import__('agd_lib.harnesses', fromlist=['launch_argv']).launch_argv(
+            scoped, tasks.task_file(home, 'granted').parent/'brief.md')
+        text = argv[-1]
+        assert grant['id'] in text and '--incarnation $AGD_INCARNATION' in text
+        assert f'worker verify-pr granted' in text and str(home) in text
+        reply_path = tasks.task_file(home, 'granted').parent/'relay-reply.json'
+        assert reply_path == home/'data'/'tasks'/'granted'/'relay-reply.json'
+        assert '--action start' in text and '--action complete' in text and '--action cancelled' in text
+        assert 'start|complete|cancelled' not in text
+        assert f'--payload {reply_path}' in text
+        assert 'feedback received; repair pending' in text
+        current = tasks.read(home, 'granted')
+        current['worker_alive'] = False
+        tasks.save(home, current)
+        with patch.object(workers, 'inspect', return_value={'endpoint': {'presence': 'missing'}}), \
+             patch.object(workers, 'backend', return_value=FakeBackend()):
+            relaunched = workers.relaunch(home, 'granted')
+        assert relaunched['incarnation'] != launched['incarnation']
+        assert (Path(manifest['skills'][0]['snapshot'])/'SKILL.md').is_file()
+
+
+def test_granted_launch_refuses_non_github_remote_before_worker_creation():
+    import pytest
+    from agd_lib import store, workers
+    with lab() as (home, _project):
+        brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
+        command(home, 'task', 'create', 'nongithub', '--project', 'sample', '--brief', str(brief), '--kind', 'ship')
+        instruction = home/'grant.md'; instruction.write_text('Task nongithub grant origin:agd/nongithub.\n')
+        grant = tasks.grant_pr_publish(home, 'nongithub', 'origin:agd/nongithub', instruction)
+        with pytest.raises(store.Refusal, match='GitHub'):
+            workers.launch(home, 'nongithub', pr_grant=grant['id'])
+        assert tasks.read(home, 'nongithub')['phase'] == 'prepared'
+        assert (tasks.task_file(home, 'nongithub').parent/'relay-blocked.json').is_file()
 def test_concurrent_skill_launch_has_one_winner_without_orphans():
     from concurrent.futures import ThreadPoolExecutor
     from unittest.mock import patch
