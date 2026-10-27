@@ -6,7 +6,7 @@ import json
 import sys
 import uuid
 from pathlib import Path
-from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr
+from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr, relay
 
 
 def parser():
@@ -72,7 +72,7 @@ def parser():
     profiles = worker.add_parser('profiles').add_subparsers(dest='profile_operation', required=True)
     profiles.add_parser('list')
     for action in ('launch', 'run', 'event', 'inspect', 'send', 'inbox', 'acknowledge', 'interrupt', 'stop', 'relaunch',
-                   'publish-pr', 'verify-pr'):
+                   'publish-pr', 'verify-pr', 'relay-poll', 'relay-reply'):
         op = worker.add_parser(action)
         op.add_argument('id')
         if action == 'launch':
@@ -103,6 +103,13 @@ def parser():
             op.add_argument('--incarnation', required=True)
             op.add_argument('--grant', required=True)
             op.add_argument('--report', required=True)
+        if action in ('relay-poll', 'relay-reply'):
+            op.add_argument('--incarnation', required=True)
+            op.add_argument('--grant', required=True)
+        if action == 'relay-reply':
+            op.add_argument('--lease', required=True)
+            op.add_argument('--action', choices=('start', 'complete', 'cancelled'), required=True)
+            op.add_argument('--payload')
     decision = sub.add_parser('decision').add_subparsers(dest='operation', required=True)
     resolve = decision.add_parser('resolve')
     resolve.add_argument('id')
@@ -132,7 +139,8 @@ def main(args):
                 args.command == 'session' and args.operation == 'reconcile' or
                 args.command == 'events' and args.operation == 'acknowledge')
     if mutation:
-        worker_scoped = (args.command == 'worker' and args.operation in ('run', 'event', 'acknowledge', 'publish-pr', 'verify-pr') or
+        worker_scoped = (args.command == 'worker' and args.operation in ('run', 'event', 'acknowledge', 'publish-pr', 'verify-pr',
+                                                                           'relay-poll', 'relay-reply') or
                          args.command == 'task' and args.operation == 'ready')
         store.require_owner(home, worker_scoped)
     if args.command == 'init':
@@ -229,6 +237,14 @@ def main(args):
                               Path(args.title).read_text(), Path(args.body).read_text())
         if args.operation == 'verify-pr':
             return pr.verify_and_ready(home, args.id, args.incarnation, args.grant, Path(args.report))
+        if args.operation == 'relay-poll':
+            task = tasks.read(home, args.id)
+            return relay.poll(home, task, tasks.authorize_pr_publish(home, task, args.grant), args.incarnation)
+        if args.operation == 'relay-reply':
+            task = tasks.read(home, args.id)
+            payload = json.loads(Path(args.payload).read_text()) if args.payload else None
+            return relay.reply(home, task, tasks.authorize_pr_publish(home, task, args.grant),
+                               args.incarnation, args.lease, args.action, payload)
         if args.operation == 'run':
             return workers.run_worker(home, args.id, args.incarnation)
         if args.operation == 'event':

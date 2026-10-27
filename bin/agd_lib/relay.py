@@ -462,3 +462,88 @@ def start_project_service(home, project_id, repository, popen=subprocess.Popen, 
                                   'status': 'running'}, health='healthy')
         store.atomic_json(_service_file(home, project_id), current)
         return current
+
+
+def _relay_task(home, task, grant, incarnation):
+    from . import tasks
+    if task.get('incarnation') != incarnation:
+        raise store.Refusal('Relay worker incarnation is stale')
+    tasks.authorize_pr_publish(home, task, grant['id'])
+    receipt = tasks.read_pr_receipt(home, task['id'])
+    if not receipt or receipt.get('grant_id') != grant['id']:
+        raise store.Refusal('Relay task receipt is unavailable')
+    pull = receipt.get('pr', {})
+    repository, number = receipt.get('repository'), pull.get('number')
+    if not isinstance(repository, str) or not isinstance(number, int):
+        raise store.Refusal('Relay task PR identity is unavailable')
+    service = json.loads(_service_file(home, task['project']).read_text())
+    root = Path(service['root'])
+    correlation = f'github:{repository.lower()}:pull-request:{number}'
+    return receipt, service, root, correlation
+
+
+def poll(home, task, grant, incarnation, run=store.run):
+    from . import tasks
+    receipt, service, root, correlation = _relay_task(home, task, grant, incarnation)
+    relay_state = receipt.get('relay', {})
+    if relay_state.get('lease', {}).get('status') == 'active':
+        raise store.Refusal('Relay lease must settle before polling again')
+    result = run([str(Path(service['runtime'])/'bin'/'relay'), 'agent', 'poll', incarnation,
+                  '--project-root', str(root), '--definitions', 'pr.ci.settled@1,agd.pr.review@1',
+                  '--structured-output', '--context-tokens', '5000', '--correlation-id', correlation], timeout=610)
+    try:
+        delivery = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise store.Refusal('Relay poll returned invalid JSON') from error
+    if delivery.get('type') == 'timeout':
+        receipt['relay'] = {**relay_state, 'idle_at': time.time()}
+        tasks.write_pr_receipt(home, task['id'], receipt)
+        return {'status': 'idle'}
+    lease = delivery.get('leaseId', delivery.get('lease_id'))
+    definition = delivery.get('definition')
+    actual = delivery.get('correlationId', delivery.get('correlation_id'))
+    if (not isinstance(lease, str) or not lease or definition not in ('pr.ci.settled@1', 'agd.pr.review@1') or
+            actual != correlation):
+        raise store.Refusal('Relay delivery identity is invalid')
+    receipt['relay'] = {**relay_state, 'lease': {'id': lease, 'status': 'active', 'definition': definition,
+                                                  'correlation': correlation},
+                        'pending_feedback': {'status': 'pending', 'delivery': delivery}}
+    tasks.write_pr_receipt(home, task['id'], receipt)
+    return {'status': 'delivered', 'lease_id': lease, 'definition': definition}
+
+
+def reply(home, task, grant, incarnation, lease_id, action, payload, run=store.run):
+    from . import tasks
+    if action not in ('start', 'complete', 'cancelled'):
+        raise ValueError('unsupported Relay reply action')
+    receipt, service, root, _correlation = _relay_task(home, task, grant, incarnation)
+    relay_state = receipt.get('relay', {})
+    lease = relay_state.get('lease', {})
+    if lease.get('id') != lease_id or lease.get('status') not in ('active', 'started'):
+        raise store.Refusal('Relay lease is not active')
+    if action == 'complete':
+        if not (isinstance(payload, dict) and isinstance(payload.get('result'), dict) and
+                isinstance(payload['result'].get('summary'), str) and payload['result']['summary'].strip() and
+                isinstance(payload.get('effects'), list)):
+            raise store.Refusal('Relay completion payload does not satisfy delivered schema')
+    if action == 'cancelled' and (not isinstance(payload, dict) or not isinstance(payload.get('effects'), list)):
+        raise store.Refusal('Relay cancellation payload is invalid')
+    argv = [str(Path(service['runtime'])/'bin'/'relay'), 'agent', 'reply', lease_id, action,
+            '--project-root', str(root)]
+    if payload is not None:
+        argv += ['--json', json.dumps(payload, separators=(',', ':'))]
+    try:
+        result = run(argv, timeout=30)
+        response = json.loads(result.stdout) if result.stdout.strip() else {}
+    except (json.JSONDecodeError, subprocess.SubprocessError, OSError) as error:
+        raise store.Refusal('Relay reply authority is uncertain') from error
+    if response.get('status') not in (None, 'settled', 'started'):
+        raise store.Refusal('Relay reply was rejected')
+    if action == 'start':
+        lease['status'] = 'started'
+    else:
+        lease['status'] = 'settled'
+        relay_state.setdefault('pending_feedback', {})['status'] = 'acknowledged' if action == 'complete' else 'cancelled'
+    receipt['relay'] = relay_state
+    tasks.write_pr_receipt(home, task['id'], receipt)
+    return {'status': lease['status']}
