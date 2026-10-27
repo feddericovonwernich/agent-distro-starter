@@ -1,0 +1,253 @@
+import os
+import re
+import stat
+import time
+from pathlib import Path
+
+
+from . import store, tasks
+
+
+def github_repository(remote_url):
+    match = re.fullmatch(r'(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?', remote_url)
+    if not match:
+        raise store.Refusal('PR publication remote must be a canonical GitHub repository')
+    return f'{match.group(1)}/{match.group(2)}'
+
+
+def _check_current_pr(provider, repository, branch, base, head, number):
+    candidate = provider.get_pr(repository, number)
+    if (candidate.get('repository') != repository or candidate.get('state') != 'OPEN' or
+            candidate.get('headRefName') != branch or candidate.get('baseRefName') != base or
+            candidate.get('headRefOid') != head):
+        raise store.Refusal('PR identity or current head does not match publication')
+    return candidate
+
+
+def reconcile(home, task_id, incarnation, grant_id, github_client=None):
+    default_github = github_client is None
+    if default_github:
+        from . import github as github_client
+    with store.lock(home):
+        task = tasks.read(home, task_id)
+        if (task.get('phase') != 'running' or task.get('executor') != 'worker' or
+                not isinstance(task.get('incarnation'), str) or not task['incarnation'] or
+                task['incarnation'] != incarnation or os.environ.get('AGD_TASK_ID') != task_id or
+                os.environ.get('AGD_INCARNATION') != incarnation):
+            raise store.Refusal('publication requires the current worker')
+        grant = tasks._authorize_pr_publish_locked(home, task, grant_id)
+        repository = github_repository(grant['remote_url']) if default_github else grant['remote_url']
+        work = tasks.verify_workspace(home, task)
+        head = store.git(work, 'rev-parse', 'HEAD')
+        remote = store.git(work, 'ls-remote', '--heads', grant['remote'], f'refs/heads/{task["branch"]}')
+        receipt = tasks.read_pr_receipt(home, task_id)
+        if not remote:
+            if receipt is None:
+                return None
+            raise store.Refusal('recorded PR remote head cannot be reconciled')
+        if remote.split()[0] != head:
+            raise store.Refusal('recorded PR remote head cannot be reconciled')
+        remote_head = remote.split()[0]
+        if receipt is not None:
+            if (receipt.get('grant_id') != grant['id'] or receipt.get('remote') != grant['remote'] or
+                    receipt.get('repository') != repository or receipt.get('branch') != task['branch'] or
+                    receipt.get('base') != task['base'] or receipt.get('remote_head') != remote_head):
+                raise store.Refusal('recorded PR does not match publication')
+            try:
+                current = _check_current_pr(github_client, repository, task['branch'], task['base'], head,
+                                            receipt['pr']['number'])
+            except store.Refusal as error:
+                raise store.Refusal('recorded PR cannot be reconciled') from error
+            receipt.pop('verification', None)
+            receipt.update(local_head=head, remote_head=remote_head, pr=current)
+            tasks._write_pr_receipt_locked(home, task_id, receipt)
+            return receipt
+        candidates = github_client.find_open_pr(repository, task['branch'], task['base'])
+        if len(candidates) > 1:
+            raise store.Refusal('multiple matching open pull requests')
+        if not candidates:
+            return None
+        current = _check_current_pr(github_client, repository, task['branch'], task['base'], head,
+                                    candidates[0]['number'])
+        receipt = {'schema': 1, 'grant_id': grant['id'], 'remote': grant['remote'],
+                   'repository': repository, 'branch': task['branch'], 'base': task['base'],
+                   'local_head': head, 'remote_head': remote_head, 'pr': current}
+        tasks._write_pr_receipt_locked(home, task_id, receipt)
+        return receipt
+
+
+def _authorize_publishing_worker(home, task_id, incarnation, grant_id):
+    task = tasks.read(home, task_id)
+    if (task.get('phase') != 'running' or task.get('executor') != 'worker' or
+            not isinstance(task.get('incarnation'), str) or not task['incarnation'] or
+            task['incarnation'] != incarnation or os.environ.get('AGD_TASK_ID') != task_id or
+            os.environ.get('AGD_INCARNATION') != incarnation):
+        raise store.Refusal('publication requires the current worker')
+    return task, tasks._authorize_pr_publish_locked(home, task, grant_id)
+
+
+def _publish_text(path, expected, maximum, label, single_line=False):
+    path = Path(path)
+    if path != expected:
+        raise store.Refusal(f'PR {label} must be task-owned')
+    try:
+        identity = os.lstat(path)
+    except OSError as error:
+        raise store.Refusal(f'PR {label} is unavailable') from error
+    if (stat.S_ISLNK(identity.st_mode) or not stat.S_ISREG(identity.st_mode) or
+            identity.st_nlink != 1 or not 0 < identity.st_size <= maximum):
+        raise store.Refusal(f'PR {label} is unsafe or out of bounds')
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError) as error:
+        raise store.Refusal(f'PR {label} is unreadable') from error
+    if not text.strip() or len(text) > maximum or single_line and ('\n' in text or '\r' in text):
+        raise store.Refusal(f'PR {label} is invalid')
+    return text
+
+
+def publication_texts(home, task_id, incarnation, grant_id, title_path, body_path):
+    """Authenticate before accepting only bounded task-owned PR text."""
+    with store.lock(home):
+        _authorize_publishing_worker(home, task_id, incarnation, grant_id)
+        folder = tasks.task_file(home, task_id).parent
+        return (_publish_text(title_path, folder/'pr-title.txt', 200, 'title', single_line=True),
+                _publish_text(body_path, folder/'pr-body.md', 20000, 'body'))
+
+
+def publish(home, task_id, incarnation, grant_id, title, body, run=store.run, github_client=None):
+    default_github = github_client is None
+    if default_github:
+        from . import github as github_client
+    with store.lock(home):
+        task, grant = _authorize_publishing_worker(home, task_id, incarnation, grant_id)
+        repository = github_repository(grant['remote_url']) if default_github else grant['remote_url']
+        work = tasks.verify_workspace(home, task)
+        head = store.git(work, 'rev-parse', 'HEAD')
+        remote_head = store.git(work, 'ls-remote', '--heads', grant['remote'], f'refs/heads/{task["branch"]}')
+        if remote_head:
+            remote_sha = remote_head.split()[0]
+            run(['git', 'fetch', grant['remote'], task['branch']], cwd=work)
+            if run(['git', 'merge-base', '--is-ancestor', remote_sha, head], cwd=work, check=False).returncode:
+                raise store.Refusal('remote branch cannot fast-forward')
+        run(['git', 'push', '--no-force', grant['remote'], f'HEAD:refs/heads/{task["branch"]}'], cwd=work)
+        remote_head = store.git(work, 'ls-remote', '--heads', grant['remote'], f'refs/heads/{task["branch"]}')
+        if not remote_head or remote_head.split()[0] != head:
+            raise store.Refusal('remote branch head was not confirmed')
+        observed_remote_head = remote_head.split()[0]
+        receipt = tasks.read_pr_receipt(home, task_id)
+        if receipt is not None:
+            if (receipt.get('grant_id') != grant['id'] or receipt.get('remote') != grant['remote'] or
+                    receipt.get('repository') != repository or receipt.get('branch') != task['branch'] or
+                    receipt.get('base') != task['base']):
+                raise store.Refusal('recorded PR does not match publication')
+            try:
+                pull_request = _check_current_pr(github_client, repository, task['branch'], task['base'], head,
+                                                  receipt['pr']['number'])
+            except store.Refusal as error:
+                raise store.Refusal('recorded PR cannot be reconciled') from error
+            receipt.pop('verification', None)
+            receipt.pop('blocked_reason', None)
+            receipt.update(local_head=head, remote_head=observed_remote_head, pr=pull_request)
+            tasks._write_pr_receipt_locked(home, task_id, receipt)
+            return receipt
+        matches = github_client.find_open_pr(repository, task['branch'], task['base'])
+        if len(matches) > 1:
+            raise store.Refusal('multiple matching open pull requests')
+        pull_request = (_check_current_pr(github_client, repository, task['branch'], task['base'], head,
+                                           matches[0]['number']) if matches else
+                        _check_current_pr(github_client, repository, task['branch'], task['base'], head,
+                                          github_client.create_pr(repository, task['branch'], task['base'], title, body)['number']))
+        receipt = {'schema': 1, 'grant_id': grant['id'], 'remote': grant['remote'],
+                   'repository': repository, 'branch': task['branch'], 'base': task['base'],
+                   'local_head': head, 'remote_head': observed_remote_head, 'pr': pull_request}
+        tasks._write_pr_receipt_locked(home, task_id, receipt)
+        return receipt
+
+
+def _verification_report(home, task_id, report_path):
+    expected = tasks.task_file(home, task_id).parent/'report-draft.md'
+    path = Path(report_path)
+    if path != expected:
+        raise store.Refusal('PR verification report must be the task report-draft.md')
+    try:
+        identity = os.lstat(path)
+    except OSError as error:
+        raise store.Refusal('PR verification report is unavailable') from error
+    if stat.S_ISLNK(identity.st_mode) or not stat.S_ISREG(identity.st_mode) or not 0 < identity.st_size <= 20000:
+        raise store.Refusal('PR verification report is unsafe or out of bounds')
+    text = path.read_text()
+    if not text.strip():
+        raise store.Refusal('empty report')
+    return text
+
+
+def _block_verification_locked(home, task_id, task, receipt, reason, terminal=False):
+    reason = reason[:400]
+    if terminal and receipt is not None:
+        receipt.pop('verification', None)
+        receipt['blocked_reason'] = f'PR verification blocked: {reason}'
+        tasks._write_pr_receipt_locked(home, task_id, receipt)
+    folder = tasks.task_file(home, task_id).parent
+    store.atomic_json(folder/'verification-blocked.json', {'reason': reason})
+    store.atomic_json(folder/'observations'/'verification-blocked.json',
+                      {'id': 'verification-blocked', 'task': task_id, 'incarnation': task['incarnation'],
+                       'kind': 'blocked' if terminal else 'busy', 'key': 'verification', 'message': reason,
+                       'observed_at': time.time()})
+
+
+def verify_and_ready(home, task_id, incarnation, grant_id, report_path, github_client=None, run=store.run):
+    from . import github
+    if github_client is None:
+        github_client = github
+    with store.lock(home):
+        task = tasks.read(home, task_id)
+        if (task.get('phase') != 'running' or task.get('executor') != 'worker' or
+                task.get('incarnation') != incarnation or os.environ.get('AGD_TASK_ID') != task_id or
+                os.environ.get('AGD_INCARNATION') != incarnation):
+            raise store.Refusal('PR verification requires the current worker')
+        try:
+            text = _verification_report(home, task_id, report_path)
+            grant = tasks._authorize_pr_publish_locked(home, task, grant_id)
+            repository = github_repository(grant['remote_url']) if github_client is github else grant['remote_url']
+            receipt = tasks.read_pr_receipt(home, task_id)
+            if (receipt is None or receipt.get('grant_id') != grant['id'] or
+                    receipt.get('remote') != grant['remote'] or receipt.get('repository') != repository or
+                    receipt.get('branch') != task['branch'] or receipt.get('base') != task['base']):
+                raise store.Refusal('PR verification requires the recorded publication receipt')
+            work = tasks.verify_workspace(home, task)
+            head = store.git(work, 'rev-parse', 'HEAD')
+            remote = store.git(work, 'ls-remote', '--heads', grant['remote'], f'refs/heads/{task["branch"]}')
+            if not remote or remote.split()[0] != head:
+                raise store.Refusal('PR verification remote head does not match local head')
+            current = _check_current_pr(github_client, repository, task['branch'], task['base'], head,
+                                        receipt['pr']['number'])
+            policy = github_client.effective_policy(repository, task['base'], run=run)
+            evidence = github.finalize(current, policy, head, repository, task['branch'], task['base'])
+            remote = store.git(work, 'ls-remote', '--heads', grant['remote'], f'refs/heads/{task["branch"]}')
+            current = _check_current_pr(github_client, repository, task['branch'], task['base'], head,
+                                        receipt['pr']['number'])
+            if not remote or remote.split()[0] != head:
+                raise store.Refusal('PR verification changed before ready')
+            policy = github_client.effective_policy(repository, task['base'], run=run)
+            github.finalize(current, policy, head, repository, task['branch'], task['base'])
+            receipt.update(local_head=head, remote_head=head, pr=current,
+                           verification={'grant_id': grant['id'], 'remote': grant['remote'],
+                                         'repository': repository, 'branch': task['branch'], 'base': task['base'],
+                                         'head': head, 'remote_head': head, 'pr_head': current['headRefOid'],
+                                         'pr_number': current['number'], 'pr_id': current['id'],
+                                         'final': evidence})
+            receipt.pop('blocked_reason', None)
+            folder = tasks.task_file(home, task_id).parent
+            for path in (folder/'verification-blocked.json', folder/'observations'/'verification-blocked.json'):
+                if path.exists():
+                    path.unlink()
+            tasks._write_pr_receipt_locked(home, task_id, receipt, allow_final=True)
+            return tasks._ready_locked(home, task_id, text)
+        except (store.Refusal, store.DependencyError) as error:
+            reason = str(error)
+            waiting = ('merge state is not CLEAN', 'required checks are not green',
+                       'required reviews are not APPROVED')
+            _block_verification_locked(home, task_id, task, locals().get('receipt'), reason,
+                                       isinstance(error, store.DependencyError) or not any(item in reason for item in waiting))
+            raise
