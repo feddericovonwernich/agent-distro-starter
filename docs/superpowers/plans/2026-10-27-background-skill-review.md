@@ -352,13 +352,15 @@ git commit -m "feat: run restricted native reviewers"
 
 **Files:**
 - Create: `bin/agd_lib/reviewer_timer.py`, `tests/test_reviewer_timer.py`
-- Modify: `bin/agd_lib/reviewer.py`, `bin/agd_lib/reviewer_runner.py`, `bin/agd`
+- Modify: `bin/agd_lib/reviewer.py`, `bin/agd_lib/reviewer_runner.py`
 
 **Interfaces:** `calculate_due(schedule,checkpoint,now_utc)->{'due_at':float|None,'next_due':float|None,'checkpoint':dict}`. Config defaults to `{'mode':'calendar','timezone':'UTC','calendar':'02:00','interval_hours':None}`; config alone is inert.
 
 - [ ] **Step 1: Write failing schedule and manual-path tests**
 
 ```python
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 def utc(s): return datetime.fromisoformat(s.replace('Z','+00:00')).timestamp()
 def test_interval_hour_anchor_catches_up_once():
     s={'mode':'interval','timezone':None,'calendar':None,'interval_hours':12}
@@ -368,11 +370,6 @@ def test_native_calendar_gap_and_fold():
     assert reviewer_timer.native_next_calendar(s,utc('2027-03-28T00:59Z'))==utc('2027-03-29T00:00Z')
     assert reviewer_timer.native_next_calendar(s,utc('2027-10-30T00:00Z'))==utc('2027-10-31T00:00Z')
     assert reviewer_timer.native_next_calendar(s,utc('2027-10-31T00:15Z'))==utc('2027-11-01T01:00Z')
-    assert ZoneInfo('Europe/Berlin').utcoffset(datetime(2027,10,31,2,0,fold=0)) is not None
-def test_manual_cli_does_not_mutate_checkpoint():
-    with lab() as (home,_):
-        reviewer_timer.enable(home); before=reviewer_timer.checkpoint_path(home).read_bytes()
-        command(home,'reviewer','run'); assert reviewer_timer.checkpoint_path(home).read_bytes()==before
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -384,21 +381,24 @@ Expected: FAIL because the timer kernel does not exist.
 - [ ] **Step 3: Implement timer kernel and explicit enablement**
 
 ```python
+import os, re, subprocess
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 def validate_schedule(s):
-    if set(s)!={'mode','timezone','calendar','interval_hours'}: raise store.Refusal('schedule keys')
+    if not isinstance(s,dict) or set(s)!={'mode','timezone','calendar','interval_hours'}: raise store.Refusal('schedule keys')
     if s['mode']=='manual-only':
         if s['timezone'] is not None or s['calendar'] is not None or s['interval_hours'] is not None: raise store.Refusal('manual fields')
     elif s['mode']=='interval':
         if s['timezone'] is not None or s['calendar'] is not None or isinstance(s['interval_hours'],bool) or not isinstance(s['interval_hours'],int) or s['interval_hours']<=0: raise store.Refusal('interval')
     elif s['mode']=='calendar':
-        if s['interval_hours'] is not None or not isinstance(s['calendar'],str) or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',s['calendar']): raise store.Refusal('calendar')
+        if s['interval_hours'] is not None or not isinstance(s['calendar'],str) or not isinstance(s['timezone'],str) or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',s['calendar']): raise store.Refusal('calendar')
         try: ZoneInfo(s['timezone'])
-        except Exception as e: raise store.Refusal('timezone') from e
+        except ZoneInfoNotFoundError as e: raise store.Refusal('timezone') from e
     else: raise store.Refusal('mode')
     return s
 def native_next_calendar(s,base):
     text=subprocess.run(['systemd-analyze','calendar',f"*-*-* {s['calendar']}:00 {s['timezone']}",'--base-time',datetime.fromtimestamp(base,timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),'--iterations=1'],env={**os.environ,'LC_ALL':'C','TZ':'UTC'},timeout=10,check=True,capture_output=True,text=True).stdout
-    m=re.search(r'^Next elapse:\s*(.+)$',text,re.M)
+    m=re.search(r'^\s*Next elapse:\s*(.+)$',text,re.M)
     if not m: raise store.Refusal('native calendar unavailable')
     try: return datetime.strptime(m.group(1).replace(' UTC',''),'%a %Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc).timestamp()
     except ValueError as e: raise store.Refusal('native calendar invalid') from e
@@ -426,7 +426,7 @@ Expected: PASS; no real unit enabled except separately approved disposable user-
 - [ ] **Step 5: Commit Task 4**
 
 ```bash
-git add bin/agd_lib/reviewer_timer.py bin/agd_lib/reviewer.py bin/agd_lib/reviewer_runner.py bin/agd tests/test_reviewer_timer.py tests/test_reviewer.py
+git add bin/agd_lib/reviewer_timer.py bin/agd_lib/reviewer.py bin/agd_lib/reviewer_runner.py tests/test_reviewer_timer.py tests/test_reviewer.py
 git commit -m "feat: schedule bounded reviewer runs"
 ```
 
@@ -445,6 +445,19 @@ def test_reviewer_cli_preserves_foreign_owner(tmp_path):
         command(home,'reviewer','status')
         assert ((home/'state'/'owner.json').read_bytes() if (home/'state'/'owner.json').exists() else None) == before
 ```
+
+```python
+def test_manual_empty_corpus_leaves_private_timer_state_and_makes_no_model_call():
+    with lab() as (home,_):
+        checkpoint=home/'state/reviewer/checkpoint.json'; checkpoint.parent.mkdir(parents=True); checkpoint.write_bytes(b'{"anchor":0,"last_due":0}')
+        units=home/'private-units'; units.mkdir(); (units/'owned.timer').write_text('owned')
+        before=(checkpoint.read_bytes(),{p.name:p.read_bytes() for p in units.iterdir()})
+        result=command(home,'reviewer','run')
+        assert result['state']=='no-work'
+        assert (checkpoint.read_bytes(),{p.name:p.read_bytes() for p in units.iterdir()})==before
+```
+
+Manual `reviewer run` with no eligible evidence exits `no-work` before native-host/model dispatch; this is the sole manual-inertness acceptance path and never enables a user unit.
 
 Extend existing `session switch replaces only its owned watcher` test only after its `home`, `deliveries`, and `hooks` definitions:
 
