@@ -647,6 +647,20 @@ def _require_owned_resources(rendered):
             raise store.Refusal('observability ownership is uncertain')
         if value.get('Labels', {}).get('agd.home_id') != home_id:
             raise store.Refusal('observability resource belongs to another home')
+    containers = subprocess.run(['docker', 'ps', '-aq', '--filter',
+                                 f'label=com.docker.compose.project={rendered["project"]}'],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+    if containers.returncode:
+        raise store.Refusal('observability container ownership is uncertain')
+    for container_id in containers.stdout.split():
+        inspected = subprocess.run(['docker', 'container', 'inspect', container_id], stdin=subprocess.DEVNULL,
+                                   capture_output=True, text=True, timeout=10)
+        try:
+            value = json.loads(inspected.stdout)[0]
+        except (IndexError, ValueError, TypeError):
+            raise store.Refusal('observability container ownership is uncertain')
+        if value.get('Config', {}).get('Labels', {}).get('agd.home_id') != home_id:
+            raise store.Refusal('observability resource belongs to another home')
 
 
 def _ready(rendered, value):
