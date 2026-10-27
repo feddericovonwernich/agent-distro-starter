@@ -18,7 +18,7 @@ An `init` seeds an empty external private home, or a checkout home with no priva
 
 If seeding is interrupted after the catalog appears but before `workers.json`, init preserves it rather than retrying or overwriting it; inspect the catalog, then either write the matching profile manually or remove it deliberately before a manual opt-in.
 
-For an existing home, opt in only when requested: copy the chosen reviewed bundle directories from `bundled/worker-skills/` without replacing existing directories, then save a matching `workers.json`. For the reviewed default set, use `{"default_profile":"default","profiles":{"default":{"skills":["agd-ponytail","agd-ponytail-audit","agd-ponytail-debt","agd-ponytail-gain","agd-ponytail-help","agd-ponytail-review","agd-superpowers-systematic-debugging","agd-superpowers-test-driven-development","agd-superpowers-verification-before-completion"]}}}`. The central agent has all 21 pinned upstream skills under `.agents/skills/`; workers receive only these nine reviewed bundles. Pinned upstream SHAs and MIT notices are in `third_party/PROVENANCE.md`.
+For an existing home, opt in only when requested: copy the chosen reviewed bundle directories from `bundled/worker-skills/` without replacing existing directories, then save a matching `workers.json`. For the reviewed default set, use `{"default_profile":"default","profiles":{"default":{"skills":["agd-ponytail","agd-ponytail-audit","agd-ponytail-debt","agd-ponytail-gain","agd-ponytail-help","agd-ponytail-review","agd-superpowers-systematic-debugging","agd-superpowers-test-driven-development","agd-superpowers-verification-before-completion"]}}}`. The Relay integration adds five upstream central skills under `.agents/skills`; ordinary workers still receive only these nine reviewed default bundles. A valid `pr-publish` grant adds the sole AGD-authored `agd-scoped-pr-relay` bundle for that task. Pinned upstream SHAs and license notices are in `third_party/PROVENANCE.md`.
 
 Both paths are relative to the effective private home (`AGD_HOME` when set), not the tracked distro checkout. A minimal catalog is:
 
@@ -53,6 +53,26 @@ Cursor Agent still needs user authentication and a live transcript bound to its 
 
 For local landing obtain a concrete user instruction, `task approve NAME --action local-merge --target PROJECT:BASE --instruction FILE`, then `task land NAME --approval ID`. The exact ready head must fast-forward a clean stable clone. After a stopped worker, `task cleanup NAME` conditionally returns the lease. Dirty, unlanded or identity-uncertain work stays intact.
 
-For a PR, `task approve NAME --action publish --target REMOTE:BRANCH --instruction FILE`; use the organization's **existing** forge tool for the approved push/review; `task publication-record NAME --approval ID --remote REMOTE --branch BRANCH --url URL --evidence FILE` checks the remote head and requires the URL in the supplied forge output. It does not independently query the forge review object, publish, merge or clean up. No PR publication has been authorized in this session.
+`publish` remains the existing one-head publication approval: `task approve NAME --action publish --target REMOTE:BRANCH --instruction FILE` records evidence for a ready head and does not run an iterative PR repair loop. The separate `pr-publish` grant is only for a running `ship` task's assigned branch and authorizes iterative non-force publication to that one target:
+
+```sh
+bin/agd task approve NAME --action pr-publish --target REMOTE:agd/NAME --instruction FILE
+bin/agd worker launch NAME --pr-grant UUID
+bin/agd worker publish-pr NAME --incarnation "$AGD_INCARNATION" --grant UUID \
+  --title <TASK_FILES>/pr-title.txt --body <TASK_FILES>/pr-body.md
+bin/agd worker relay-poll NAME --incarnation "$AGD_INCARNATION" --grant UUID
+bin/agd worker relay-reply NAME --incarnation "$AGD_INCARNATION" --grant UUID \
+  --lease LEASE --action start
+bin/agd worker relay-reply NAME --incarnation "$AGD_INCARNATION" --grant UUID \
+  --lease LEASE --action complete --payload <TASK_FILES>/relay-reply.json
+bin/agd worker verify-pr NAME --incarnation "$AGD_INCARNATION" --grant UUID \
+  --report <TASK_FILES>/report-draft.md
+```
+
+`<TASK_FILES>` means the task-owned files supplied to the granted worker: title and body for publication, report for final verification, and a reply file for terminal Relay replies. The complete reply file is bounded JSON with `{"result":{"summary":"..."},"effects":[]}`; `start` has no payload. A Relay delivery is persisted and acknowledged before a potentially lengthy repair or test; acknowledgement is not proof the repair is complete. The worker settles that lease before polling again. Invalid, uncertain, or expired delivery/reply authority, ambiguous PR reconciliation, or failed provider checks leaves durable `blocked` evidence rather than guessing or retrying against another task.
+
+`publish-pr` only pushes the granted task branch without force and reconciles at most one exact open PR; it never merges, tags, changes the base branch, or publishes another branch. `verify-pr` permits `ready` only after a live GitHub observation of the exact current head with effective required checks and reviews satisfied and `mergeStateStatus` `CLEAN`. The CLI checks task/incarnation/grant and owner state to prevent accidental same-UID misuse; it is not an OS sandbox.
+
+Relay is installed on demand and privately under AGD home from Open Relay commit `dac2865837bcab9444a8636053f4f1406a3f9291`; it requires Node >=22.19 and does not modify user-global npm packages. Deployment requires central `AGD_RELAY_GITHUB_READ_TOKEN` with fine-grained repository **Checks**, **Pull requests**, and **Metadata** read access. The central connector uses `generic-check-runs` and the central human-review watcher reads review evidence. Producer/admin tokens remain in the central runtime and never enter a worker prompt. No target credentials are supplied by this documentation, and no live GitHub PR publication or acceptance is claimed here.
 
 Discard is irreversible: inventory the task and obtain explicit user instruction, then `task approve NAME --action discard --target NAME --instruction FILE`; `task cleanup NAME --discard --approval ID` applies only that approval and only after the worker is proved stopped. Keep an uncertain lease rather than risk losing work.
