@@ -260,6 +260,19 @@ def test_poll_and_reply_accept_pinned_delivery_shape(tmp_path, monkeypatch):
         assert relay.reply(home, task, grant, 'worker-1', 'lease-1', 'start', None, run=run)['status'] == 'started'
         assert relay.reply(home, task, grant, 'worker-1', 'lease-1', 'complete',
                            {'result': {'summary': 'received'}, 'effects': []}, run=run)['status'] == 'settled'
+        stale = {'event': {'id': 'event-2', 'type': 'pr.ci.settled', 'version': 1,
+                 'correlationId': 'github:owner/repo:pull-request:7',
+                 'payload': {'repository': {'fullName': 'owner/repo'},
+                             'pullRequest': {'number': 7, 'headSha': 'stale', 'baseRef': task['base']}}},
+                 'outputSchema': delivery['outputSchema'], 'attempt': 1, 'workerId': 'worker-1',
+                 'leaseId': 'lease-2', 'leaseExpiresAt': 'x', 'hardDeadlineAt': 'y'}
+        calls = []
+        def stale_run(argv, **_kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(stale if 'poll' in argv else {'ok': True}), '')
+        with pytest.raises(store.Refusal, match='delivery identity'):
+            relay.poll(home, task, grant, 'worker-1', run=stale_run)
+        assert any(argv[2:5] == ['reply', 'lease-2', 'cancelled'] for argv in calls)
 
 
 def test_poll_rejects_prepared_or_stale_worker_without_subprocess(tmp_path, monkeypatch):
