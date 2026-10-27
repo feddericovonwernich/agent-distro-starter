@@ -107,9 +107,9 @@ def test_central_uses_private_session_root_and_refuses_native_conflicts():
 
 @pytest.mark.parametrize('omp_args', [
     ['--cwd', '/tmp'], ['--cwd=/tmp'], ['--session-dir', '/tmp'], ['--session-dir=/tmp'],
-    ['--continue'], ['-c'], ['--resume'], ['--resume=session-id'], ['-r'], ['--session'],
-    ['--session=session-id'], ['--fork', 'session-id'], ['--fork=session-id'],
-    ['--from-claude'], ['--from-codex'],
+    ['--continue'], ['--continue=1'], ['-c'], ['--resume'], ['--resume=session-id'], ['-r'], ['--session'],
+    ['--session=session-id'], ['--no-session'], ['--no-session=1'], ['--fork', 'session-id'], ['--fork=session-id'],
+    ['--from-claude'], ['--from-claude=1'], ['--from-codex'], ['--from-codex=1'],
 ])
 def test_central_refuses_every_omp_session_source_control(omp_args):
     with lab() as (home, _):
