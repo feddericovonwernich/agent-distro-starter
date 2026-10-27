@@ -225,6 +225,11 @@ def test_granted_launch_uses_frozen_private_scoped_skill_and_prompt():
         text = argv[-1]
         assert grant['id'] in text and '--incarnation $AGD_INCARNATION' in text
         assert f'worker verify-pr granted' in text and str(home) in text
+        reply_path = home/'state'/'tasks'/'granted'/'relay-reply.json'
+        assert '--action start' in text and '--action complete' in text and '--action cancelled' in text
+        assert 'start|complete|cancelled' not in text
+        assert f'--payload {reply_path}' in text
+        assert 'feedback received; repair pending' in text
         current = tasks.read(home, 'granted')
         current['worker_alive'] = False
         tasks.save(home, current)
