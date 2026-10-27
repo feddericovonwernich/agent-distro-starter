@@ -118,32 +118,35 @@ Expected: every command exits 0 and retains approved documentation. Verify PR 5'
 - [ ] **Step 2: Write failing core tests**
 
 ```python
+INCARNATION = '00000000-0000-4000-8000-000000000001'
+
 def ended_task(home, task_id, phase):
     brief = home / f'{task_id}.md'; brief.write_text('Inspect value.txt.\n')
     task = command(home, 'task', 'create', task_id, '--project', 'sample', '--brief', str(brief))
-    task.update(executor='worker', incarnation=f'{task_id}-run', phase=phase, worker_alive=False)
+    task.update(executor='worker', incarnation=INCARNATION, phase=phase, worker_alive=False)
     tasks.save(home, task)
     return task
 
-def test_packet_uses_recorded_ended_sources_and_explicit_history():
+def native_binding_with_message(home, task):
+    binding = observability.worker_binding(home, task['id'], task['incarnation'])
+    iso, millis = '2027-01-01T00:00:00.000Z', 1798761600000
+    rows = [
+        {'type':'session','version':3,'id':'00000000-0000-4000-8000-000000000010',
+         'timestamp':iso,'cwd':str(home)},
+        {'type':'message','id':'00000000-0000-4000-8000-000000000011','parentId':None,
+         'timestamp':iso,'message':{'role':'user','content':'fixture failure evidence','timestamp':millis}},
+    ]
+    path = Path(binding['session_dir']) / 'fixture.jsonl'
+    path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+
+def test_packet_uses_recorded_ended_native_sources():
     with lab() as (home, _):
         failed = ended_task(home, 'failed', 'failed')
-        idle = ended_task(home, 'idle', 'idle')
-        observability.record_process_generation(home, failed['id'], failed['incarnation'], {'session_file': str(home/'fixture.jsonl')})
-        (home/'fixture.jsonl').write_text('tool failed\ncounterexample succeeded\n')
-        packet = reviewer.select_packet(home, cutoff=10.0,
-                                        retrospective_run_ids=(idle['incarnation'],))
-        assert {episode['task_id'] for episode in packet['episodes']} == {'failed', 'idle'}
+        native_binding_with_message(home, failed)
+        packet = reviewer.select_packet(home, cutoff=1798848000.0)
+        assert [episode['task_id'] for episode in packet['episodes']] == ['failed']
         assert packet['packet_id'] == reviewer.packet_id(packet)
         assert sum(source['span']['bytes'] for source in packet['sources']) <= packet['limits']['max_input_bytes']
-
-def test_active_and_reviewer_runs_are_excluded_without_incidental_wording():
-    with lab() as (home, _):
-        active = ended_task(home, 'active', 'running')
-        active.update(worker_alive=True); tasks.save(home, active)
-        packet = reviewer.select_packet(home, cutoff=10.0)
-        assert packet['episodes'] == []
-        assert packet['coverage']['excluded']['active'] == [active['incarnation']]
 ```
 
 - [ ] **Step 3: Run focused tests to prove absence**
