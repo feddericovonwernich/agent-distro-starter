@@ -542,7 +542,23 @@ git commit -m "feat: expose reviewer inbox"
 
 - [ ] **Step 1: Run a throwaway native bridge/CLI smoke**
 
-Move/export `startBridge` (Node imports only; no `bun:test`) into `tests/reviewer-fixture.ts`; reviewer tests import it. Generate `tests/.reviewer-smoke.ts` by here-doc, run it with `PATH=/tmp/agd-treehouse-v3.1.6:$PATH bun tests/.reviewer-smoke.ts`, and delete it in `finally`. It uses real `startBridge`, `runReviewer`, `scriptedStream`, three tool calls, then `broker.rpc('finish',{})` after host disposal; actual returned IDs drive `bin/agd --home H reviewer reports show`, proposals show/dispose, events list/ack, worker skills/profile/task list. It snapshots catalog/profile/task/skill bytes, asserts accepted proposal and acknowledged event do not change them, acknowledgement leaves triage pending, receipt session ID equals native JSONL v3 header ID, event purpose/run match, three runtime tools exactly, and first model context includes authorized packet citation/inventory but not sentinel. No model HTTP, user unit, fixed IDs, handwritten report, or undefined helper.
+```bash
+test ! -e tests/.reviewer-smoke.ts
+trap 'rm -f tests/.reviewer-smoke.ts' EXIT
+cat >tests/.reviewer-smoke.ts <<'EOF'
+import {existsSync,readdirSync,readFileSync} from 'node:fs'; import {join} from 'node:path';
+import {startBridge,scriptedStream,call} from './reviewer-fixture'; import {runReviewer} from '../lib/agd-reviewer';
+const json=async(...args:string[])=>{const p=Bun.spawn(['bin/agd',...args],{stdout:'pipe',stderr:'pipe'}),[out,err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);if(code)throw Error(err);return JSON.parse(out)};
+const tree=(p:string):Record<string,string>=>existsSync(p)?Object.fromEntries(readdirSync(p,{recursive:true}).filter((x:any)=>{const q=join(p,x);return Bun.file(q).size!==undefined}).map((x:any)=>[x,readFileSync(join(p,x),'utf8')])):{};
+const b=await startBridge();try{const home=b.hello.input.cwd,before=JSON.stringify([await json('--home',home,'worker','skills','list'),await json('--home',home,'worker','profiles','list'),await json('--home',home,'task','list'),tree(join(home,'config/worker-skills'))]),tools:string[]=[],messages:any[]=[];
+ const r=await runReviewer({...b.hello.input,broker:b.broker,native:b.native},scriptedStream(b.native.ai,[[call('reviewer_search',{query:'failure'})],[call('reviewer_submit',{report:b.hello.report})],[]],tools,messages)); await b.broker.rpc('finish',{});
+ const report=await json('--home',home,'reviewer','reports','show',r.reportId),proposals=await json('--home',home,'reviewer','proposals','list');if(proposals.length!==1)throw Error('proposal count');const proposal=proposals[0].proposal_id,events=(await json('--home',home,'events','list')).filter((e:any)=>e.purpose==='background-skill-review'&&e.review_run_id===b.hello.input.reviewRunId);if(events.length!==1)throw Error('event count');
+ const pending=await json('--home',home,'reviewer','proposals','show',proposal);await json('--home',home,'events','acknowledge',events[0].id);if(JSON.stringify(await json('--home',home,'reviewer','proposals','show',proposal))!==JSON.stringify(pending))throw Error('ack triage');await json('--home',home,'reviewer','proposals','dispose',proposal,'--status','accepted');if((await json('--home',home,'reviewer','proposals','show',proposal)).current!=='accepted')throw Error('triage');
+ const receipt=JSON.parse(readFileSync(join(home,'state/reviewer/receipts',`${b.hello.input.reviewRunId}.json`),'utf8')), session=JSON.parse(readFileSync(readdirSync(b.hello.input.sessionDir).map(x=>join(b.hello.input.sessionDir,x)).find(x=>x.endsWith('.jsonl'))!,'utf8').split('\n')[0]);const first=JSON.stringify(messages);if(session.id!==receipt.native_session_id||tools.sort().join()!=['reviewer_excerpt','reviewer_search','reviewer_submit'].join()||!first.includes(b.hello.report.findings[0].citations[0])||!first.includes('skill_inventory')||first.includes('OUTSIDE_PACKET_SENTINEL')||JSON.stringify([await json('--home',home,'worker','skills','list'),await json('--home',home,'worker','profiles','list'),await json('--home',home,'task','list'),tree(join(home,'config/worker-skills'))])!==before)throw Error('smoke invariant');console.log(JSON.stringify({report:r.reportId,run:b.hello.input.reviewRunId,session:session.id,event:events[0].id,proposal,state:report}));
+}finally{await b.close()}
+EOF
+PATH=/tmp/agd-treehouse-v3.1.6:$PATH bun tests/.reviewer-smoke.ts
+```
 
 - [ ] **Step 2: Add acceptance/docs matrix**
 
@@ -575,7 +591,7 @@ Expected: PASS. Record native-only online/offline optional index behavior, linke
 - [ ] **Step 5: Commit Task 6**
 
 ```bash
-git add README.md docs/operations.md docs/compatibility.md CHANGELOG.md tests/test_reviewer.py tests/reviewer.test.ts
+git add README.md docs/operations.md docs/compatibility.md CHANGELOG.md tests/test_reviewer.py tests/reviewer.test.ts tests/reviewer-fixture.ts
 git commit -m "docs: describe bounded skill review"
 ```
 
