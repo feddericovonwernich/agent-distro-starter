@@ -116,32 +116,35 @@ Expected: FAIL because `agd_lib.reviewer` does not exist.
 - [ ] **Step 4: Implement packet/intent/run kernel**
 
 ```python
-def _canonical(v): return json.dumps(v,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()
-def _digest(v): return hashlib.sha256(_canonical(v)).hexdigest()
 def paths(home):
-    root=store.home(home); return {'config':root/'data/reviewer/config.json','packets':root/'data/reviewer/packets','runs':root/'data/reviewer/runs','pending':root/'state/reviewer/pending','lock':root/'state/reviewer/run.lock'}
-def _sources(home,cutoff,max_candidates):
-    found=[]
-    for p in sorted((store.home(home)/'data/tasks').glob('*/task.json')):
-        task=json.loads(p.read_text())
-        if task.get('worker_alive') is not False or task.get('phase')=='running': continue
-        b=store.home(home)/f"data/observability/tasks/{task['id']}/omp/{task['incarnation']}/binding.json"
-        if not b.is_file(): continue
-        for jsonl in sorted(Path(json.loads(b.read_text())['session_dir']).glob('*.jsonl')):
-            raw=jsonl.read_bytes()
-            if jsonl.stat().st_mtime<=cutoff: found.append({'source_id':_digest([task['id'],task['incarnation'],hashlib.sha256(raw).hexdigest()]),'kind':'native-jsonl','task_id':task['id'],'incarnation':task['incarnation'],'version':hashlib.sha256(raw).hexdigest(),'sha256':hashlib.sha256(raw).hexdigest(),'span':{'start':0,'bytes':len(raw)},'relation':'ended-worker'})
-    return found[:max_candidates]
-def select_packet(home,*,cutoff,retrospective_review_run_ids=()):
-    config=read_config(home); src=[]; used=0
-    for row in _sources(home,cutoff,config['limits']['max_candidates']):
-        if used+row['span']['bytes']<=config['limits']['max_input_bytes']: src.append(row); used+=row['span']['bytes']
-    packet={'schema':1,'cutoff':cutoff,'sources':src,'episodes':[{'task_id':x['task_id'],'incarnation':x['incarnation']} for x in src],'limits':config['limits'],'skill_inventory':[],'coverage':{'unknown_relation':[],'inaccessible':[],'withheld':[]},'langfuse_index':'unused'}; packet['packet_id']=_digest(packet); store.atomic_json(paths(home)['packets']/f"{packet['packet_id']}.json",packet); return packet
-def begin_run(home,packet,intent,*,model,config_digest,instruction_digest,started_at,deadline_epoch_ms):
-    if not model or not all(len(x)==64 for x in (config_digest,instruction_digest)) or deadline_epoch_ms<=int(started_at*1000): raise store.Refusal('unfrozen run')
-    run={'schema':1,'review_run_id':str(uuid.uuid4()),'packet_id':packet['packet_id'],'cutoff':packet['cutoff'],'model':model,'config_digest':config_digest,'instruction_digest':instruction_digest,'limits':packet['limits'],'started_at':started_at,'deadline_epoch_ms':deadline_epoch_ms,'native_session_id':None,'input_bytes':0,'output_bytes':0,'model_calls':0,'dispatch':'none','state':'created'}; store.atomic_json(paths(home)['runs']/f"{run['review_run_id']}.json",run); return run
+    root=store.home(home); return {'config':root/'data/reviewer/config.json','packets':root/'data/reviewer/packets','reports':root/'data/reviewer/reports','proposals':root/'data/reviewer/proposals','manifests':root/'data/reviewer/manifests','triage':root/'data/reviewer/triage','receipts':root/'state/reviewer/receipts','pending':root/'state/reviewer/pending','checkpoint':root/'state/reviewer/checkpoint.json','lock':root/'state/reviewer/run.lock'}
+def publish_immutable(path,value):
+    body=json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode(); digest=hashlib.sha256(body).hexdigest(); target=path/digest
+    path.mkdir(parents=True,exist_ok=True)
+    if target.exists():
+        if target.read_bytes()!=body: raise store.Refusal('immutable collision')
+    else: store._create_json(target,value)  # create-only; never exposes partial files
+    return digest
+def validate_config(v):
+    if not isinstance(v,dict) or set(v)!={'schedule','limits','review_model'}: raise store.Refusal('config schema')
+    s=v['schedule']; required={'mode','timezone','calendar','interval_hours'}
+    if not isinstance(s,dict) or set(s)!=required: raise store.Refusal('schedule schema')
+    if s['mode']=='calendar' and (not isinstance(s['timezone'],str) or not isinstance(s['calendar'],str) or s['interval_hours'] is not None): raise store.Refusal('calendar schedule')
+    if s['mode']=='interval' and (isinstance(s['interval_hours'],bool) or not isinstance(s['interval_hours'],int) or s['interval_hours']<=0 or s['timezone'] is not None or s['calendar'] is not None): raise store.Refusal('interval schedule')
+    if s['mode']=='manual-only' and any(s[k] is not None for k in ('timezone','calendar','interval_hours')): raise store.Refusal('manual schedule')
+    if s['mode'] not in {'calendar','interval','manual-only'} or not isinstance(v['limits'],dict) or set(v['limits'])!={'max_input_bytes','max_output_bytes','max_model_calls','max_runtime_seconds','max_candidates'} or any(isinstance(n,bool) or not isinstance(n,int) or n<=0 for n in v['limits'].values()) or v['review_model'] is not None and not isinstance(v['review_model'],str): raise store.Refusal('config values')
+    return v
+def read_config(home): return validate_config(json.loads(paths(home)['config'].read_text()))
+def read_packet(home,packet_id): return json.loads((paths(home)['packets']/packet_id).read_text())
+def read_report(home,report_id): return json.loads((paths(home)['reports']/report_id).read_text())
+# Public contracts implemented by the seven-stage algorithm below:
+# assert_runtime_capability() -> {'ai_url':str,'core_url':str,'sdk_url':str,'telemetry_url':str}
+# select_packet(home,*,cutoff:float,retrospective_review_run_ids:tuple[str,...]=()) -> dict; begin_run(home,packet,intent,*,model,config_snapshot,instruction_snapshot,started_at:float,deadline_epoch_ms:int) -> dict
 ```
 
-`read_config` validates exact schema/schedule/limits/review_model once, and `review_model=None` inherits native default before `begin_run`; retrospective branch accepts only closed prior reviewer UUIDs and records unknown/current/later IDs in coverage.
+`select_packet` snapshots validated config/limits and instruction bytes before collection. It (1) finds retained `runner-exit` observations at/before cutoff and their task/incarnation bindings: phase is irrelevant; a current incarnation needs `worker_alive is False`; a prior incarnation requires its closed observation and remains eligible even while a newer incarnation runs; (2) admits at most 20 distinct task/incarnation episodes, grouping retries independently; (3) incrementally parses each bound native v3 JSONL only to a frozen byte watermark, validates header and outer record timestamp, and stores bounded actual text excerpts with `source_id,kind,task_id,incarnation,session_id,message_id,span,source_path,version,sha256,cutoff,relation`; it never copies whole histories; (4) retains only explicitly linked decisions/human feedback matching task/incarnation/session plus bounded historical counterevidence; errors, partial files, withheld excerpts, active/unknown links, and no retained end proof become named coverage records rather than fabricated timestamps or negative findings; (5) snapshots real worker-skill catalog plus manifest bytes/hash, recording assigned/loaded/used/causal provenance separately and unknown when not evidenced; (6) admits closed prior review IDs only, records current/later/unknown IDs in coverage, excludes reviewer feedback by default, and permits one bounded later follow-up only when a material-basis watermark gains a linked feedback/span hash; (7) charges canonical packet metadata plus stored UTF-8 excerpts against the whole packet bound and rejects infeasible metadata before model dispatch. Packet fields are `schema,packet_id,cutoff,limits,episodes,sources,coverage,skill_inventory,material_basis`; episode fields are `task_id,incarnation,exit_observation_id,exit_observed_at,binding`; coverage has `unknown_relation,inaccessible,partial,withheld,retrospective`; inventory contains catalog and manifest content hashes plus provenance labels.
+
+Selected excerpts and packet are content-hash create-only immutable files; live JSONL is not claimed immutable. `begin_run` writes mutable receipt `{review_run_id,intent_id,packet_id,model,config_snapshot_ref,instruction_snapshot_ref,started_at,deadline_epoch_ms,native_session_id,model_calls,input_bytes,output_bytes,dispatch}` under `state/reviewer/receipts`, preserving its passed intent/start/deadline. After the actual native session ID exists and before first reserve, it create-only publishes the immutable run manifest. Default config is calendar `02:00 UTC`; `review_model=None` inherits the native model. `config/reviewer-instruction.txt` is the frozen instruction source and requires grounding, citations/counterexamples, uncertainty, no recursive reviewer feedback, inert draft skills, and the report schema.
 
 - [ ] **Step 5: Run packet tests to verify pass**
 
