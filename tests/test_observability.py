@@ -94,6 +94,18 @@ def test_disabled_environment_removes_only_ambient_otel_controls(monkeypatch):
         'PROTOCOL' in key or 'HEADER' in key or 'CONTENT' in key)) for key in observed)
 
 
+
+def test_central_uses_private_session_root_and_refuses_native_conflicts():
+    with lab() as (home, _):
+        argv, env, warning = observability.central_argv(home, [])
+        assert Path(argv[argv.index('--session-dir') + 1]).is_dir()
+        assert env['AGD_HOME'] == str(home)
+        assert warning is None
+        with pytest.raises(store.Refusal):
+            observability.central_argv(home, ['--no-session'])
+        with pytest.raises(store.Refusal):
+            observability.central_argv(home, ['--cwd', '/tmp'])
+
 def test_rendered_stack_keeps_only_browser_collector_and_media_ports_on_loopback():
     with lab() as (home, _):
         rendered = observability.render_stack(home)

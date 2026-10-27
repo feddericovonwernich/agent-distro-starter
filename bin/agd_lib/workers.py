@@ -4,7 +4,7 @@ import shutil
 import time
 import uuid
 from pathlib import Path
-from . import harnesses, projects, store, tasks, tmux, worker_skills
+from . import harnesses, observability, projects, store, tasks, tmux, worker_skills
 
 
 def backend(task):
@@ -99,6 +99,8 @@ def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=Fal
         incarnation = str(uuid.uuid4())
         task.update(executor='worker', incarnation=incarnation, phase='running', worker_alive=None,
                     unattended=unattended)
+        if harness == 'omp':
+            task['observability'] = observability.worker_binding_locked(home, task_id, incarnation)
         tasks.save(home, task)
     endpoint = module.create(home, task_id, incarnation, work,
                              ['env', f'AGD_TASK_ID={task_id}', f'AGD_INCARNATION={incarnation}',
@@ -125,14 +127,23 @@ def run_worker(home, task_id, incarnation):
     tasks.verify_workspace(home, task)
     if task.get('worker_skills'):
         worker_skills.verify(home, task)
-    env = dict(os.environ, AGD_HOME=str(home), AGD_TASK_ID=task_id, AGD_INCARNATION=incarnation)
-    env.pop('AGD_OWNER', None)
+    if task['harness'] == 'omp':
+        child_env, _generation, warning = observability.managed_environment(home, 'worker', task, incarnation)
+        session_dir = Path(task['observability']['session_dir'])
+    else:
+        child_env = dict(os.environ, AGD_HOME=str(home), AGD_TASK_ID=task_id, AGD_INCARNATION=incarnation)
+        session_dir = None
+        warning = None
+    child_env.pop('AGD_OWNER', None)
     import subprocess
     from .supervision import process_start
-    args = harnesses.launch_argv(task, tasks.task_file(home, task_id).parent/'brief.md', task['unattended'])
+    args = harnesses.launch_argv(task, tasks.task_file(home, task_id).parent/'brief.md', task['unattended'],
+                                session_dir=session_dir)
     receipt = home/'state'/'tasks'/task_id/'runner.json'
     runner = dict(incarnation=incarnation, pid=os.getpid(), start=process_start(os.getpid()),
                   phase='spawning')
+    if warning:
+        runner['observability_warning'] = warning
     store.atomic_json(receipt, runner)
     with store.lock(home):
         current = tasks.read(home, task_id)
@@ -142,7 +153,7 @@ def run_worker(home, task_id, incarnation):
         tasks.save(home, current)
     child = None
     try:
-        child = subprocess.Popen(args, cwd=task['worktree'], env=env, stdin=None)
+        child = subprocess.Popen(args, cwd=task['worktree'], env=child_env, stdin=None)
         runner.update(phase='spawned', child_pid=child.pid, child_start=process_start(child.pid))
         store.atomic_json(receipt, runner)
         status = child.wait()
@@ -283,6 +294,8 @@ def relaunch(home, task_id):
             raise store.Refusal('prior worker changed during relaunch; no endpoint created')
         if current.get('pr_grant'):
             tasks._authorize_pr_publish_locked(home, current, current['pr_grant'])
+        if task['harness'] == 'omp':
+            task['observability'] = observability.worker_binding_locked(home, task_id, incarnation)
         tasks.save(home, task)
     endpoint = backend(task).create(home, task_id, incarnation, work,
                                     ['env', f'AGD_TASK_ID={task_id}', f'AGD_INCARNATION={incarnation}',

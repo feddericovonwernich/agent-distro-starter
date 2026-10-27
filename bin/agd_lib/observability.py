@@ -3,6 +3,7 @@ import fcntl
 import json
 import os
 import secrets
+import shutil
 import socket
 import stat
 import subprocess
@@ -147,16 +148,71 @@ def worker_binding(home, task_id, incarnation):
 
 
 def managed_environment(home, role, task, incarnation):
+    home = _home(home)
     config = read_config(home)
     if role not in ('central', 'worker'):
         raise ValueError('invalid observability role')
     if role == 'worker':
         if not isinstance(task, dict):
             raise ValueError('invalid task')
-        store.validate_id(task.get('id'))
-        _incarnation(incarnation)
-    env = {key: value for key, value in os.environ.items() if not _ambient_otel(key)}
-    return env, config['generation'], None
+        task_id = store.validate_id(task.get('id'))
+        incarnation = _incarnation(incarnation)
+    env = {key: value for key, value in os.environ.items() if not key.startswith('OTEL_')}
+    env['AGD_HOME'] = str(home)
+    if role == 'central':
+        env['AGD_MANAGED_CENTRAL'] = '1'
+    if role == 'worker':
+        env.update(AGD_TASK_ID=task_id, AGD_INCARNATION=incarnation)
+    if config['mode'] == 'disabled':
+        return env, config['generation'], None
+    allocation = config.get('ports')
+    if not isinstance(allocation, dict) or not isinstance(allocation.get('otlp_http_port'), int):
+        raise store.Refusal('observability configuration is malformed')
+    project_id = _secrets(home, _allocation(home))['project_id']
+    attributes = {
+        'service.name': 'agent-distro', 'agd.home_id': config['home_id'],
+        'agd.langfuse_project': project_id, 'agd.role': role,
+        'agd.session_scope': 'central' if role == 'central' else 'task-incarnation',
+    }
+    if role == 'worker':
+        attributes.update({'agd.task_id': task_id, 'agd.incarnation': incarnation})
+    endpoint = f"http://127.0.0.1:{allocation['otlp_http_port']}"
+    env.update(
+        OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=endpoint + '/v1/traces',
+        OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=endpoint + '/v1/logs',
+        OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=endpoint + '/v1/metrics',
+        OTEL_EXPORTER_OTLP_TRACES_PROTOCOL='http/protobuf',
+        OTEL_EXPORTER_OTLP_LOGS_PROTOCOL='http/protobuf',
+        OTEL_EXPORTER_OTLP_METRICS_PROTOCOL='http/protobuf',
+        OTEL_TRACES_EXPORTER='otlp', OTEL_LOGS_EXPORTER='otlp', OTEL_METRICS_EXPORTER='otlp',
+        OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT='true',
+        OTEL_RESOURCE_ATTRIBUTES=','.join(f'{key}={value}' for key, value in attributes.items()),
+        OTEL_SERVICE_NAME='agent-distro',
+    )
+    warning = None if read_status(home)['runtime'] == 'healthy' else 'observability is degraded; continuing without confirmed Collector health'
+    return env, config['generation'], warning
+
+
+def central_argv(home, omp_args):
+    home = _home(home)
+    forbidden = {'--cwd', '--session-dir', '--continue', '--resume', '--no-session'}
+    if any(argument in forbidden or any(argument.startswith(flag + '=') for flag in forbidden)
+           for argument in omp_args):
+        raise store.Refusal('managed central refuses forwarded cwd or native session controls')
+    config = read_config(home)
+    warning = None
+    if config['mode'] == 'enabled':
+        try:
+            start(home)
+        except store.Refusal as error:
+            warning = f'observability degraded: {error}'
+    env, _generation, environment_warning = managed_environment(home, 'central', None, None)
+    warning = warning or environment_warning
+    _private_directory(home, 'data', 'observability', 'central', 'omp')
+    binary = shutil.which('omp')
+    if not binary:
+        raise store.DependencyError('omp is not installed')
+    return [binary, '--cwd', str(home), '--session-dir', str(paths(home)['central_sessions']), *omp_args], env, warning
 
 
 def _home(value):

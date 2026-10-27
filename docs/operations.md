@@ -51,7 +51,11 @@ Cursor Agent still needs user authentication and a live transcript bound to its 
 
 ## Private observability state
 
-Worker incarnation bindings reserve owner-only native-session directories under `data/observability/`; repeated binding lookup preserves existing receipt and transcript data. Disabled child environments remove ambient OTEL exporter, protocol, header, and content-capture settings. `observability enable`, `status`, `stop`, `start`, and `disable` own one private, pinned loopback-only Langfuse/Collector stack; stop and disable preserve its volumes, archives, queue, and credentials. Managed central/worker launch integration remains unavailable at this lifecycle milestone.
+`agd observability central [OMP_ARGS...]` starts a managed OMP central from the private home with a fresh native session under `data/observability/central/omp`. It refuses forwarded working-directory, session, resume, continue, and no-session controls. When enabled, it attempts bounded stack health first and warns rather than blocking OMP on degradation; when disabled, it starts no Docker services and removes ambient OTEL configuration. A directly started `omp` session remains unmanaged and is warned by the extension; AGD does not relocate it.
+
+OMP worker launch and relaunch reserve a fresh, owner-only task/incarnation session directory before the endpoint exists. Prior native JSONL and artifact data remains in its original incarnation directory. Managed OMP processes receive only Collector loopback OTLP settings, full native capture, and role/home/task/incarnation resource identity when enabled; workers never receive Langfuse credentials. Cursor remains unsupported for native observability and receives no such configuration.
+
+`observability enable`, `status`, `stop`, `start`, and `disable` own one private, pinned loopback-only Langfuse/Collector stack; stop and disable preserve its volumes, archives, queue, and credentials.
 
 ## Landing, publication, and retention
 

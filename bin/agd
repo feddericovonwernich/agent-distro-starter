@@ -2,6 +2,7 @@
 import argparse
 import shutil
 import subprocess
+import os
 import json
 import sys
 import uuid
@@ -129,6 +130,8 @@ def parser():
     observability_command = sub.add_parser('observability').add_subparsers(dest='operation', required=True)
     for action in ('enable', 'start', 'stop', 'status', 'disable'):
         observability_command.add_parser(action)
+    central = observability_command.add_parser('central')
+    central.add_argument('omp_args', nargs=argparse.REMAINDER)
     return p
 
 
@@ -147,6 +150,12 @@ def main(args):
                                                                            'relay-poll', 'relay-reply') or
                          args.command == 'task' and args.operation == 'ready')
         store.require_owner(home, worker_scoped)
+    if args.command == 'observability' and args.operation == 'central':
+        argv, env, warning = observability.central_argv(home, args.omp_args)
+        if warning:
+            print(warning, file=sys.stderr)
+        os.chdir(home)
+        os.execvpe(argv[0], argv, env)
     if args.command == 'init':
         if home == Path(__file__).resolve().parents[1]:
             fresh = not any((home/name).exists() or (home/name).is_symlink()

@@ -1,9 +1,12 @@
 import os
 import sys
+import uuid
 from pathlib import Path
+from unittest.mock import patch
+
 from support import lab, command
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'bin'))
-from agd_lib import tasks
+from agd_lib import tasks, workers
 
 
 def test_old_worker_cannot_change_current_task():
@@ -45,6 +48,54 @@ def test_ready_worker_cannot_release_its_live_workspace():
         assert Path(task['worktree']).is_dir()
         assert tasks.read(home, 'live')['lease_id'] == task['lease_id']
 
+
+def test_omp_launch_persists_fresh_native_binding_before_endpoint_creation():
+    with lab() as (home, _):
+        brief = home / 'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'native', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        class Endpoint:
+            def create(self, _home, task_id, incarnation, _work, _argv):
+                saved = tasks.read(home, task_id)
+                assert saved['observability']['incarnation'] == incarnation
+                assert Path(saved['observability']['session_dir']).is_dir()
+                return {'task': task_id, 'incarnation': incarnation}
+        with patch.object(workers.shutil, 'which', return_value='/bin/true'), \
+             patch.object(workers, 'backend', return_value=Endpoint()):
+            launched = workers.launch(home, task['id'])
+        saved = tasks.read(home, task['id'])
+        assert uuid.UUID(saved['observability']['incarnation'])
+        assert saved['incarnation'] == launched['incarnation']
+
+
+
+def test_relaunch_keeps_prior_native_data_when_final_executable_is_true(monkeypatch):
+    with lab() as (home, _):
+        brief = home / 'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'retained', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        class Endpoint:
+            def create(self, _home, _task_id, incarnation, _work, _argv):
+                return {'incarnation': incarnation}
+            def inspect(self, _endpoint):
+                return {'presence': 'missing'}
+        monkeypatch.setattr(workers.shutil, 'which', lambda _name: '/bin/true')
+        monkeypatch.setattr(workers, 'backend', lambda _task: Endpoint())
+        first = workers.launch(home, task['id'])
+        monkeypatch.setenv('AGD_TASK_ID', task['id'])
+        monkeypatch.setenv('AGD_INCARNATION', first['incarnation'])
+        assert workers.run_worker(home, task['id'], first['incarnation']) == {'exit': 0}
+        first_dir = Path(first['observability']['session_dir'])
+        (first_dir / 'native.jsonl').write_bytes(b'old transcript\n')
+        artifact = first_dir / 'native-artifacts'; artifact.mkdir()
+        (artifact / 'blob').write_bytes(b'old artifact')
+        current = tasks.read(home, task['id'])
+        current['worker_alive'] = False
+        tasks.save(home, current)
+        second = workers.relaunch(home, task['id'])
+        assert second['observability']['session_dir'] != str(first_dir)
+        assert (first_dir / 'native.jsonl').read_bytes() == b'old transcript\n'
+        assert (artifact / 'blob').read_bytes() == b'old artifact'
 
 def test_relaunch_refuses_unknown_prior_process():
     with lab() as (home, project):
