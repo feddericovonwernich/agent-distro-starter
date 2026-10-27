@@ -15,6 +15,10 @@ export function stopDecision(stopHookActive: boolean, health: Health) {
     additionalContext: 'Delegated work has no healthy watcher. Restore supervision or report the concrete failure; do not claim it is monitored.' };
 }
 
+export function centralWarning(managed: boolean) {
+  return managed ? undefined : 'This bare OMP session is unmanaged: AGD does not control its transcript location or telemetry export. Start `agd observability central` for a managed central session.';
+}
+
 function startEvidence(pid: number): string {
   return readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ', 2)[1].split(' ')[19];
 }
@@ -162,9 +166,10 @@ export default function primary(api: ExtensionAPI) {
   api.on('before_agent_start', (_event, context) => {
     const status = showStatus(context);
     const events = command('events', 'list');
-    const content = [startup, `Home: ${home}`,
+    const warning = centralWarning(process.env.AGD_MANAGED_CENTRAL === '1');
+    const content = [warning, startup, `Home: ${home}`,
       status.ok ? `Supervision: ${JSON.stringify(status.data)}` : `Supervision unavailable: ${status.data}`,
-      events.ok ? `Pending events: ${JSON.stringify(events.data)}` : `Pending events unavailable: ${events.data}`].join('\n');
+      events.ok ? `Pending events: ${JSON.stringify(events.data)}` : `Pending events unavailable: ${events.data}`].filter(Boolean).join('\n');
     startup = '';
     return { message: { customType: 'agd:supervision', content: content.slice(0, 16000), display: false } };
   });

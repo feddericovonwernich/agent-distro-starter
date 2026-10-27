@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, expect } from 'bun:test';
-import { stopDecision } from '../.omp/extensions/agd-primary';
+import { centralWarning, stopDecision } from '../.omp/extensions/agd-primary';
 
 test('active delegated work cannot end without monitoring', () => {
   const broken = { delegatedWork: true, watcherHealthy: false };
@@ -10,6 +10,11 @@ test('active delegated work cannot end without monitoring', () => {
   expect(stopDecision(true, broken)).toBeUndefined();
   expect(stopDecision(false, { ...broken, watcherHealthy: true })).toBeUndefined();
   expect(stopDecision(false, { ...broken, delegatedWork: false })).toBeUndefined();
+});
+
+test('bare OMP central warning distinguishes managed launch', () => {
+  expect(centralWarning(false)).toContain('unmanaged');
+  expect(centralWarning(true)).toBeUndefined();
 });
 
 test('session switch replaces only its owned watcher', async () => {

@@ -1,0 +1,45 @@
+extensions:
+  file_storage/trace_queue:
+    directory: "{{QUEUE}}"
+  health_check:
+    endpoint: "0.0.0.0:13133"
+receivers:
+  otlp:
+    protocols:
+      grpc: {endpoint: "0.0.0.0:4317"}
+      http: {endpoint: "0.0.0.0:4318"}
+processors:
+  transform/langfuse:
+    trace_statements:
+      - context: span
+        statements:
+          - set(attributes["langfuse.session.id"], attributes["gen_ai.conversation.id"]) where attributes["gen_ai.conversation.id"] != nil
+          - set(attributes["langfuse.trace.metadata.agd.home_id"], resource.attributes["agd.home_id"]) where resource.attributes["agd.home_id"] != nil
+          - set(attributes["langfuse.trace.metadata.agd.distro_id"], resource.attributes["agd.distro_id"]) where resource.attributes["agd.distro_id"] != nil
+          - set(attributes["langfuse.trace.metadata.agd.role"], resource.attributes["agd.role"]) where resource.attributes["agd.role"] != nil
+          - set(attributes["langfuse.trace.metadata.agd.task_id"], resource.attributes["agd.task_id"]) where resource.attributes["agd.task_id"] != nil
+          - set(attributes["langfuse.trace.metadata.agd.incarnation"], resource.attributes["agd.incarnation"]) where resource.attributes["agd.incarnation"] != nil
+exporters:
+  file/traces: {path: "{{TRACE_ARCHIVE}}", append: true}
+  file/logs: {path: "{{LOG_ARCHIVE}}", append: true}
+  file/metrics: {path: "{{METRIC_ARCHIVE}}", append: true}
+  otlphttp/langfuse:
+    traces_endpoint: "{{OTLP_ENDPOINT}}"
+    headers: {Authorization: "{{OTLP_AUTHORIZATION}}", x-langfuse-ingestion-version: "4"}
+    sending_queue: {enabled: true, storage: file_storage/trace_queue, queue_size: 1000}
+    retry_on_failure: {enabled: true, initial_interval: 1s, max_interval: 30s, max_elapsed_time: 5m}
+service:
+  extensions: [file_storage/trace_queue, health_check]
+  telemetry:
+    metrics:
+      level: detailed
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    traces: {receivers: [otlp], processors: [transform/langfuse], exporters: [file/traces, otlphttp/langfuse]}
+    logs: {receivers: [otlp], exporters: [file/logs]}
+    metrics: {receivers: [otlp], exporters: [file/metrics]}

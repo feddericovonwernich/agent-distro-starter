@@ -49,6 +49,30 @@ Routine supervision is hidden from the conversation but stays available to the a
 
 Cursor Agent still needs user authentication and a live transcript bound to its runner before either Cursor/backend combination can be claimed operational. Herdr 0.8.2 with protocol 20 has live OMP worker evidence only inside an explicitly named session. `doctor --harness cursor --backend herdr` diagnoses executable versions; it does not authenticate Cursor or provision a Herdr session.
 
+## Managed observability
+
+Managed observability is opt-in and needs Docker Engine 29.6.0, Docker Compose v5.1.4, and the private Treehouse v3.1.6 binary on `PATH`:
+
+```sh
+export PATH=/tmp/agd-treehouse-v3.1.6:$PATH
+bin/agd --home "$AGD_HOME" init
+bin/agd --home "$AGD_HOME" observability enable
+bin/agd --home "$AGD_HOME" observability status
+bin/agd --home "$AGD_HOME" observability stop
+bin/agd --home "$AGD_HOME" observability start
+bin/agd --home "$AGD_HOME" observability disable
+```
+
+Each home owns a distinct Docker project, named volumes, Langfuse project credentials, and loopback-only browser, media, OTLP, health, and diagnostics ports. Never reuse one home's private observability records in another home: identity validation refuses them. `enable` does not install Docker, Compose, or elevate privileges.
+
+`agd observability central [OMP_ARGS...]` starts a managed OMP central from the private home with a fresh native session under `data/observability/central/omp`. It refuses forwarded working-directory, session, resume, continue, and no-session controls. When enabled, it attempts bounded stack health first and warns rather than blocking OMP on degradation; when disabled, it starts no Docker services and removes ambient OTEL configuration. A directly started `omp` session remains unmanaged and is warned by the extension; AGD does not relocate it.
+
+OMP worker launch and relaunch reserve a fresh, owner-only task/incarnation session directory before the endpoint exists. Prior native JSONL and artifacts remain in their original incarnation directory. Managed OMP processes receive only Collector loopback OTLP settings, full native capture, and role/home/distro/task/incarnation resource identity when enabled; workers never receive Langfuse credentials or create service records. Cursor remains unsupported for native observability and receives no such configuration.
+
+`stop` and `disable` preserve native JSONL/artifacts, Collector archives and persistent queue files, credentials, and named volumes. The durable config holds the selected exact immutable lock and non-secret Langfuse project ID; mismatched lock evidence is refused rather than upgraded. Status reads a configured stack even when desired mode is disabled or the last runtime was stopped, so desired mode and observed runtime stay separate. It reports central receipt history, worker session directories/materialization, and durable queue/archive paths with byte sizes without exposing content. A mode toggle advances the desired generation; existing managed processes can therefore be `stale-restart-required` until relaunched. A failed lifecycle operation is `degraded` or `unknown`, never proof that export stopped. Collector queue data is accepted only after `file_storage` admission; receiver acknowledgement, in-memory buffering, archive writes, and historical sent counters do not prove queueing or delivery. The configured queue is 1000 batches with bounded retry; permanent rejection, queue/full-storage admission failure, pre-queue loss, duplicate delivery, non-fsynced archives, unsupported attachment/reference shapes, and payload limits remain accepted limits rather than lossless-delivery claims.
+
+Full captured prompts, system instructions, tool arguments/results, and any supported attachments may be sensitive. They remain in private native sessions and may reach the local Langfuse project while enabled; do not copy credentials or payloads into shell history, tickets, or logs. Collector routes traces to Langfuse and local trace archives only. OTLP logs and metrics are archived locally and are not Langfuse ingestion.
+
 ## Landing, publication, and retention
 
 For local landing obtain a concrete user instruction, `task approve NAME --action local-merge --target PROJECT:BASE --instruction FILE`, then `task land NAME --approval ID`. The exact ready head must fast-forward a clean stable clone. After a stopped worker, `task cleanup NAME` conditionally returns the lease. Dirty, unlanded or identity-uncertain work stays intact.

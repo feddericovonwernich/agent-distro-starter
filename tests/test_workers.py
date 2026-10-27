@@ -1,9 +1,12 @@
 import os
 import sys
+import uuid
 from pathlib import Path
+from unittest.mock import patch
+
 from support import lab, command
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'bin'))
-from agd_lib import tasks
+from agd_lib import tasks, workers
 
 
 def test_old_worker_cannot_change_current_task():
@@ -45,6 +48,96 @@ def test_ready_worker_cannot_release_its_live_workspace():
         assert Path(task['worktree']).is_dir()
         assert tasks.read(home, 'live')['lease_id'] == task['lease_id']
 
+
+def test_omp_launch_persists_fresh_native_binding_before_endpoint_creation():
+    with lab() as (home, _):
+        brief = home / 'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'native', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        class Endpoint:
+            def create(self, _home, task_id, incarnation, _work, _argv):
+                saved = tasks.read(home, task_id)
+                assert saved['observability']['incarnation'] == incarnation
+                assert Path(saved['observability']['session_dir']).is_dir()
+                return {'task': task_id, 'incarnation': incarnation}
+        with patch.object(workers.shutil, 'which', return_value='/bin/true'), \
+             patch.object(workers, 'backend', return_value=Endpoint()):
+            launched = workers.launch(home, task['id'])
+        saved = tasks.read(home, task['id'])
+        assert uuid.UUID(saved['observability']['incarnation'])
+        assert saved['incarnation'] == launched['incarnation']
+
+
+
+def test_relaunch_keeps_prior_native_data_when_final_executable_is_true(monkeypatch):
+    with lab() as (home, _):
+        brief = home / 'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'retained', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        class Endpoint:
+            def create(self, _home, _task_id, incarnation, _work, _argv):
+                return {'incarnation': incarnation}
+            def inspect(self, _endpoint):
+                return {'presence': 'missing'}
+        monkeypatch.setattr(workers.shutil, 'which', lambda _name: '/bin/true')
+        monkeypatch.setattr(workers, 'backend', lambda _task: Endpoint())
+        first = workers.launch(home, task['id'])
+        monkeypatch.setenv('AGD_TASK_ID', task['id'])
+        monkeypatch.setenv('AGD_INCARNATION', first['incarnation'])
+        assert workers.run_worker(home, task['id'], first['incarnation']) == {'exit': 0}
+        first_dir = Path(first['observability']['session_dir'])
+        (first_dir / 'native.jsonl').write_bytes(b'old transcript\n')
+        artifact = first_dir / 'native-artifacts'; artifact.mkdir()
+        (artifact / 'blob').write_bytes(b'old artifact')
+        current = tasks.read(home, task['id'])
+        current['worker_alive'] = False
+        tasks.save(home, current)
+        second = workers.relaunch(home, task['id'])
+        assert second['observability']['session_dir'] != str(first_dir)
+        assert (first_dir / 'native.jsonl').read_bytes() == b'old transcript\n'
+        assert (artifact / 'blob').read_bytes() == b'old artifact'
+
+
+def test_two_live_worker_launches_keep_stale_receipts_per_task_incarnation():
+    import subprocess
+    import time
+    from test_projects import CLI
+    from agd_lib import observability
+
+    with lab() as (home, _):
+        executable = home / 'omp'
+        executable.write_text('#!/bin/sh\nsleep 3\n')
+        executable.chmod(0o755)
+        launched = []
+        for task_id in ('first', 'second'):
+            brief = home / f'{task_id}.md'
+            brief.write_text('Inspect value.txt.\n')
+            task = command(home, 'task', 'create', task_id, '--project', 'sample', '--brief', str(brief),
+                           '--kind', 'scout')
+            incarnation = str(uuid.uuid4())
+            task.update(executor='worker', incarnation=incarnation, harness='omp', backend='tmux',
+                        phase='running', worker_alive=None, unattended=False, endpoint={'incarnation': incarnation},
+                        observability=observability.worker_binding(home, task_id, incarnation))
+            tasks.save(home, task)
+            env = dict(os.environ, PATH=f'{home}:{os.environ["PATH"]}', AGD_TASK_ID=task_id,
+                       AGD_INCARNATION=incarnation)
+            launched.append(subprocess.Popen(
+                [str(CLI), '--home', str(home), 'worker', 'run', task_id, '--incarnation', incarnation],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env))
+        try:
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if len(observability.status(home)['workers']) == 2:
+                    break
+                time.sleep(.05)
+            observability.record_desired_generation(home, '1', 'enabled')
+            receipts = observability.status(home)['workers']
+            assert {(row['task_id'], row['incarnation']) for row in receipts} == {
+                (task_id, tasks.read(home, task_id)['incarnation']) for task_id in ('first', 'second')}
+            assert {row['state'] for row in receipts} == {'stale-restart-required'}
+        finally:
+            for process in launched:
+                assert process.wait(timeout=5) == 0, process.stderr.read()
 
 def test_relaunch_refuses_unknown_prior_process():
     with lab() as (home, project):

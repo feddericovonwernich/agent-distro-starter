@@ -10,7 +10,7 @@ def worker_skill_roots(harness):
     raise ValueError('unsupported harness')
 
 
-def launch_argv(task, brief_path, unattended=False):
+def launch_argv(task, brief_path, unattended=False, session_dir=None):
     code_root = Path(__file__).resolve().parents[2]
     if task.get('pr_grant'):
         agd = f'{code_root / "bin" / "agd"} --home {brief_path.parents[3]}'
@@ -55,7 +55,10 @@ def launch_argv(task, brief_path, unattended=False):
         binary = shutil.which('omp')
         if not binary:
             raise store.DependencyError('omp is not installed')
-        args = [binary, '--cwd', task['worktree'], '-e', str(code_root/'lib'/'omp-worker.ts'), prompt]
+        args = [binary, '--cwd', task['worktree']]
+        if session_dir is not None:
+            args.extend(['--session-dir', str(session_dir)])
+        args.extend(['-e', str(code_root/'lib'/'omp-worker.ts'), prompt])
         if unattended:
             args.insert(1, '--auto-approve')
         return args
