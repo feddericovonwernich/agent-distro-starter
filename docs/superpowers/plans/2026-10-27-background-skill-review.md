@@ -294,39 +294,15 @@ export function runReviewer(input:ReviewerInput, streamFn?:any):Promise<{reportI
 - [ ] **Step 1: Write complete fixture, bridge client, and failing test**
 ```ts
 // tests/reviewer-fixture.ts
-export function scriptedStream(ai:any,turns:any[][],observed:string[],messages:any[]){let i=0;return(model:any,context:any)=>{observed.splice(0,observed.length,...context.tools.map((x:any)=>x.name));messages.splice(0,messages.length,...context.messages);const stream=new ai.AssistantMessageEventStream(),content=turns[i++]??[],message={role:'assistant',content,api:model.api,provider:model.provider,model:model.id,usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},stopReason:content.length?'toolUse':'stop',timestamp:Date.now()};queueMicrotask(()=>{stream.push({type:'done',reason:message.stopReason,message});stream.end(message)});return stream;};}
+import {createInterface} from 'node:readline'; import {Readable} from 'node:stream';
+export async function startBridge(){const proc=Bun.spawn(['uv','run','--python','3.12','--with','pytest','tests/reviewer_bridge.py'],{stdin:'pipe',stdout:'pipe',stderr:'pipe'}),lines=createInterface({input:Readable.fromWeb(proc.stdout as any),crlfDelay:Infinity})[Symbol.asyncIterator](),stderr=new Response(proc.stderr).text(),close=async()=>{proc.stdin.end();const timeout=setTimeout(()=>{if(proc.exitCode===null)proc.kill()},5000);try{await proc.exited}finally{clearTimeout(timeout);await lines.return?.()}},next=async()=>{const row=await lines.next();if(row.done)throw new Error(`bridge EOF: ${await stderr}`);return row.value};try{const hello=JSON.parse(await next()),ai=await import(hello.aiUrl),core=await import(hello.coreUrl),sdk=await import(hello.sdkUrl),telemetry=await import(hello.telemetryUrl);let serial:Promise<unknown>=Promise.resolve();const rpc=(op:string,args:unknown)=>{const result=serial.then(async()=>{const id=crypto.randomUUID();proc.stdin.write(JSON.stringify({id,op,args})+'\n');await proc.stdin.flush();const reply=JSON.parse(await next());if(reply.id!==id)throw new Error('bridge reply mismatch');if(!reply.ok)throw new Error(reply.error);return reply.value});serial=result.catch(()=>undefined);return result};return{hello,native:{ai,core,sdk,telemetry},broker:{rpc,reserveModelCall:()=>rpc('reserve',{}),settleModelCall:()=>rpc('settle',{}),persistNativeSessionId:(id:string)=>rpc('session',{id}),finalResult:()=>rpc('result',{})},close}}catch(error){await close();throw error}}
+export function scriptedStream(ai:any,turns:any[][],observed:string[],messages:any[]){let i=0;return(model:any,context:any)=>{observed.splice(0,observed.length,...context.tools.map((x:any)=>x.name));if(i===0)messages.push(...structuredClone(context.messages));const stream=new ai.AssistantMessageEventStream(),content=turns[i++]??[],message={role:'assistant',content,api:model.api,provider:model.provider,model:model.id,usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},stopReason:content.length?'toolUse':'stop',timestamp:Date.now()};queueMicrotask(()=>{stream.push({type:'done',reason:message.stopReason,message});stream.end(message)});return stream;};}
 export const call=(name:string,args:unknown)=>({type:'toolCall',id:crypto.randomUUID(),name,arguments:args});
-```
 
 ```ts
 // tests/reviewer.test.ts
-import {expect,test} from 'bun:test';import {createInterface} from 'node:readline';import {Readable} from 'node:stream';import {readFileSync} from 'node:fs';import {join} from 'node:path';import {runReviewer} from '../lib/agd-reviewer';import {scriptedStream,call} from './reviewer-fixture';
-async function startBridge() {
- const proc = Bun.spawn(['uv','run','--python','3.12','--with','pytest','tests/reviewer_bridge.py'], {stdin:'pipe',stdout:'pipe',stderr:'pipe'});
- const lines = createInterface({input:Readable.fromWeb(proc.stdout as any),crlfDelay:Infinity})[Symbol.asyncIterator]();
- const stderr = new Response(proc.stderr).text();
- const close = async () => {
-  proc.stdin.end();
-  const timeout = setTimeout(() => { if (proc.exitCode === null) proc.kill(); }, 5000);
-  try { await proc.exited; } finally { clearTimeout(timeout); await lines.return?.(); }
- };
- const next = async () => { const row = await lines.next(); if(row.done) throw new Error(`bridge EOF: ${await stderr}`); return row.value; };
- try {
-  const hello = JSON.parse(await next());
-  const ai = await import(hello.aiUrl), core = await import(hello.coreUrl), sdk = await import(hello.sdkUrl), telemetry = await import(hello.telemetryUrl);
-  let serial: Promise<unknown> = Promise.resolve();
-  const rpc = (op:string,args:unknown) => {
-   const result = serial.then(async () => {
-    const id = crypto.randomUUID(); proc.stdin.write(JSON.stringify({id,op,args})+'\n'); await proc.stdin.flush();
-    const reply = JSON.parse(await next()); if(reply.id !== id) throw new Error('bridge reply mismatch');
-    if(!reply.ok) throw new Error(reply.error); return reply.value;
-   });
-   serial = result.catch(() => undefined); return result;
-  };
-  return {hello,native:{ai,core,sdk,telemetry},broker:{rpc,reserveModelCall:()=>rpc('reserve',{}),settleModelCall:()=>rpc('settle',{}),persistNativeSessionId:(id:string)=>rpc('session',{id}),finalResult:()=>rpc('result',{})},close};
- } catch(error) { await close(); throw error; }
-}
-test('native loop persists actual bridge report',async()=>{const b=await startBridge();try{const observed:string[]=[],r=await runReviewer({...b.hello.input,broker:b.broker,native:b.native},scriptedStream(b.native.ai,[[call('reviewer_search',{query:'failure'})],[call('reviewer_submit',{report:b.hello.report})],[]],observed));expect(observed.sort()).toEqual(['reviewer_excerpt','reviewer_search','reviewer_submit']);const saved=JSON.parse(readFileSync(join(b.hello.reportDir,`${r.reportId}.json`),'utf8'));expect(saved.findings[0]).toMatchObject({citations:b.hello.report.findings[0].citations,uncertainty:'low',new_skill:b.hello.report.findings[0].new_skill});}finally{await b.close();}});
+import {expect,test} from 'bun:test';import {readFileSync} from 'node:fs';import {join} from 'node:path';import {runReviewer} from '../lib/agd-reviewer';import {startBridge,scriptedStream,call} from './reviewer-fixture';
+test('native loop persists actual bridge report',async()=>{const b=await startBridge();try{const observed:string[]=[],messages:any[]=[],r=await runReviewer({...b.hello.input,broker:b.broker,native:b.native},scriptedStream(b.native.ai,[[call('reviewer_search',{query:'failure'})],[call('reviewer_submit',{report:b.hello.report})],[]],observed,messages));await b.broker.rpc('finish',{});expect(observed.sort()).toEqual(['reviewer_excerpt','reviewer_search','reviewer_submit']);const first=JSON.stringify(messages);expect(first).toContain(b.hello.report.findings[0].citations[0]);expect(first).toContain('failure');expect(first).toContain('skill_inventory');expect(first).not.toContain('OUTSIDE_PACKET_SENTINEL');await expect(b.broker.rpc('reviewer_excerpt',{source_id:'unknown'})).rejects.toThrow();const saved=JSON.parse(readFileSync(join(b.hello.reportDir,`${r.reportId}.json`),'utf8'));expect(saved.findings[0]).toMatchObject({citations:b.hello.report.findings[0].citations,uncertainty:'low',new_skill:b.hello.report.findings[0].new_skill});}finally{await b.close();}});
 ```
 
 ```python
