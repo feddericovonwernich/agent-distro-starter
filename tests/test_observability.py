@@ -320,6 +320,17 @@ def test_collector_diagnostics_reports_sanitized_permanent_rejection_from_logs(m
             'permanent_failure': 'observed',
         }
 
+def test_permanent_delivery_rejection_degrades_observed_runtime(monkeypatch):
+    with lab() as (home, _):
+        rendered = observability.render_stack(home)
+        observability._save_state(home, 'enabled', 'healthy', rendered)
+        monkeypatch.setattr(
+            observability, '_collector_diagnostics',
+            lambda *_: {'state': 'known', 'permanent_failure': 'observed', 'storage_failure': 'unknown'})
+        status = observability._with_process_status(home, observability.read_config(home), observability.read_status(home))
+        assert status['runtime'] == 'degraded'
+        assert status['delivery']['permanent_failure'] == 'observed'
+
 
 def test_scout_cleanup_preserves_native_binding_queue_and_archive_bytes():
     with lab() as (home, _):

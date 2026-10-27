@@ -447,8 +447,11 @@ def _with_process_status(home, config, observed):
     result['central'] = (next((item for item in reversed(central)
                                if item['state'] != 'stopped'), central[-1] if central else {'state': 'unknown'}))
     result['workers'] = workers
-    result['delivery'] = (_collector_diagnostics(home, config) if config['mode'] == 'enabled' and
-                          observed['runtime'] in ('healthy', 'degraded') else {'state': 'unknown'})
+    delivery = (_collector_diagnostics(home, config) if config['mode'] == 'enabled' and
+                observed['runtime'] in ('healthy', 'degraded') else {'state': 'unknown'})
+    if observed['runtime'] == 'healthy' and delivery.get('permanent_failure') == 'observed':
+        result['runtime'] = 'degraded'
+    result['delivery'] = delivery
     return result
 
 
@@ -491,8 +494,8 @@ def _classify_collector_errors(text):
     return 'unknown'
 
 def _has_permanent_rejection(text):
-    text = text.lower()
-    return 'permanent' in text and ('status code: 4' in text or 'status=4' in text or ' 4' in text)
+    return bool(re.search(r'(?:status code|status)\s*[:=]?\s*4\d\d\b', text.lower()) and
+                'permanent' in text.lower())
 
 
 def _parse_collector_metrics(text):
