@@ -4,7 +4,7 @@
 
 The conversation has approved this design. This file is awaiting user review before an implementation plan is written. It authorizes neither implementation, scheduler/timer installation, unattended model execution, skill/source edits, publication, landing, nor changes to a running instance.
 
-The feature produces evidence-backed **proposals** for improving an existing skill or creating a new skill. It does not change a skill, source file, profile, configuration, task, or runtime record. A human disposition is not permission to edit: each accepted proposal needs a separate, explicitly approved implementation task.
+The feature produces evidence-backed **proposals** for improving an existing skill or creating a new skill. It never changes reviewed sources/skills, profiles, task lifecycle records, or non-review runtime state. It may write only explicitly owned reviewer configuration, checkpoints, native reviewer output, evidence/review/proposal records, notification receipts, and operator-requested triage records. A human disposition is not permission to edit: each accepted proposal needs a separate, explicitly approved implementation task.
 
 The feature is an observer of completed worker work and related central decisions/human feedback. It is not a general task scheduler, transcript query API, skill auto-author, source optimizer, or recursive reviewer.
 
@@ -20,7 +20,7 @@ AGD currently has:
 
 Current `worker launch` is task/worktree-oriented. It is not a reviewer-run API. Current worker-scoped ownership checks are accidental-misuse guards, not OS sandboxing. No existing AGD generic scheduler, transcript query API, reviewer session contract, or proposal lifecycle API is assumed.
 
-OMP native JSONL is authoritative source evidence. A line-feed index is only a shared Collector discovery accelerator; absence, delay, or failure of that index must not block native-backed review. Neither existing OMP CLI flags nor extension/tool configuration are claimed sufficient until the implementation acceptance smoke establishes the actual enabled-tool inventory.
+OMP native JSONL is authoritative source evidence. Langfuse indexed traces are an optional discovery accelerator; absence, delay, or failure of Langfuse must not block native-backed review. The existing OpenTelemetry Collector remains an observability transport only: it does not read JSONL or execute reviewer logic. Neither existing OMP CLI flags nor extension/tool configuration are claimed sufficient until the implementation acceptance smoke establishes the actual enabled-tool inventory.
 
 ## Goals
 
@@ -37,7 +37,7 @@ OMP native JSONL is authoritative source evidence. A line-feed index is only a s
 - No automatic implementation task creation from a proposal.
 - No report-triggered reviewer run, self-approval, or recursive self-review. A separately requested retrospective review may include reviewer sessions only when explicitly selected.
 - No general filesystem, shell, package-install, Git, network, SQL, generic transcript-query, or unrestricted tool access for the reviewer model.
-- No new custom SDK, provider, transcript database/index, or resident AGD scheduler service.
+- No new custom SDK, provider, transcript database/index, Collector deployment, or resident AGD scheduler service.
 - No promise of perfect secret redaction. Withheld or redacted material is explicit coverage loss, not evidence that the material was harmless.
 - No assumption that an event acknowledgement resolves a decision, accepts/rejects a proposal, or authorizes edits.
 
@@ -50,7 +50,7 @@ Proposed configuration shape (exact storage/file naming is an implementation dec
 ```json
 {
   "schedule": {
-    "mode": "nightly-and-manual",
+    "mode": "calendar",
     "timezone": "UTC",
     "calendar": "02:00",
     "interval_hours": null
@@ -62,22 +62,21 @@ Proposed configuration shape (exact storage/file naming is an implementation dec
     "max_output_bytes": 65536,
     "max_runtime_seconds": 1800
   },
-  "review_model": "configured-review-model"
+  "review_model": null
 }
 ```
 
-These are boring proposed defaults, not approved cost or quality guarantees. `review_model` names a model configured in the native OMP provider configuration; it does not introduce a telemetry API or promise exact token/cost accounting. Limits bound inputs, calls, output, and elapsed runtime; they cannot guarantee a USD ceiling.
+These are proposed defaults, not approved cost or quality guarantees. A null `review_model` inherits the native configured OMP model. The runner resolves and records the concrete model identifier before a call; inability to resolve it refuses the run before any call. This does not introduce a telemetry API or promise exact token/cost accounting. Limits bound inputs, calls, output, and elapsed runtime; they cannot guarantee a USD ceiling.
 
-`timezone` is required for `calendar` and `nightly-and-manual`. `calendar` is required only for those modes and must be `null` for `manual-only` and `interval`; `interval_hours` is required only for `interval` and must be `null` otherwise. `interval_hours` is a positive whole number. The timer must reject any other combination.
+`timezone` and `calendar` are required only for `calendar` mode and must be null for other modes. `interval_hours` is required only for `interval` and must be null otherwise; it is a positive whole number. The runner rejects every other combination. Manual invocation is available in every mode, so the calendar default is the approved nightly-plus-manual behavior without a second mode.
 
 Supported schedule modes are:
 
-- `manual-only`: only explicit `reviewer run` calls;
-- `interval`: an integer-hour interval, such as 12 hours;
-- `calendar`: one local wall-clock time and IANA timezone;
-- `nightly-and-manual`: default, equivalent to the proposed calendar default plus manual calls.
+- `manual-only`: no timer; only explicit `reviewer run` calls;
+- `interval`: an integer-hour timer interval, such as 12 hours, plus manual runs;
+- `calendar`: one local wall-clock time and IANA timezone, plus manual runs. This is the default.
 
-Calendar scheduling is delegated to a native Linux user timer, not parsed by a bespoke cron/calendar engine. The generated timer must use the configured timezone/calendar semantics supported by the native timer. The implementation must document and test the selected systemd behavior for a nonexistent DST local time and a repeated local time; the recommended policy is skip the nonexistent occurrence and run once for a repeated local time. Missed/offline executions run one bounded catch-up at the next enabled timer activation, then calculate the next due time from the configured calendar/interval rather than from run completion. Thus a slow run does not drift the schedule.
+Calendar scheduling is delegated to a native Linux user timer, not parsed by a bespoke cron/calendar engine. The design's chosen DST contract is: skip a nonexistent local wall-clock occurrence and run once for a repeated occurrence. Before relying on that behavior, implementation must verify that the selected native timer provides it; otherwise it must refuse calendar enablement rather than silently substitute semantics. Missed/offline executions run one bounded catch-up at the next enabled timer activation, then calculate the next due time from the configured calendar/interval rather than from run completion. Thus a slow run does not drift the schedule.
 
 Enabling or installing the user timer is a separately explicit, target-scoped approval because it creates background model activity. Manual review works with no timer. A timer starts a bounded one-shot runner, not a new resident scheduler; the runner exits after its run. The user timer must not be installed or started implicitly by configuration, initialization, update, or central-session startup.
 
@@ -85,25 +84,25 @@ Enabling or installing the user timer is a separately explicit, target-scoped ap
 
 ### Eligibility and cutoff
 
-A candidate is a worker task whose incarnation has ended, including failed or otherwise exited tasks; successful completion is not the only eligible result. For a final worker-transcript review, the collector requires evidence that the selected incarnation ended before the candidate cutoff. Tasks still actively executing are excluded from that final pass.
+A candidate episode is a worker task/incarnation that has ended, including failed or otherwise exited tasks; successful completion is not the only eligible result. For a final worker-transcript review, the trusted evidence broker/reader requires evidence that the selected incarnation ended before the candidate cutoff. Tasks still actively executing are excluded from that final pass.
 
-For each run, the Collector records a durable candidate cutoff before selecting evidence. It combines:
+For each run, the broker records a durable cutoff and constructs one bounded evidence allowlist before model calls. It contains selected candidate episodes plus only explicitly selected historical/counterexample/prior-proposal context available at that cutoff. Each packet records the exact source IDs and source versions for:
 
-- the task record and exact task/incarnation identity;
-- the native worker OMP JSONL session(s) associated with that incarnation;
-- worker observations, runner receipts, report/ready state when present;
-- associated central decisions and their answers;
-- associated human feedback available at the cutoff.
+- task/incarnation records, native worker OMP JSONL sessions, observations, runner receipts, and report/ready state when present;
+- associated central decisions/answers and human feedback;
+- selected historical episodes, counterexamples, and prior proposal revisions.
+
+This permits comparison across independent tasks without an unlimited history query. Retried runs of the same incident are not independent examples. A report states its episode denominator/coverage and identifies a finding as a single high-impact incident or a recurrence only when the distinct selected evidence supports that conclusion.
 
 Active central episodes may be linked only when their relationship is explicit in retained records. A missing link is `unknown`, not inferred from timing or prose. Reviewer-originated sessions are excluded by default. Explicit retrospective mode changes that eligibility rule but still cannot schedule or approve itself.
 
 New human feedback, a new native source-session version, or any material evidence after cutoff does not rewrite a completed review. It creates a later evidence revision/follow-up candidate. Deduplication must never suppress materially new evidence.
 
-### Collector and LF discovery
+### Evidence reader and Langfuse discovery
 
-The Collector is shared infrastructure with the existing transcript/LF-discovery direction, but it records reviewer purpose separately from worker task identities and leaves native OMP conversation IDs intact. It must not replace those IDs or claim that AGD currently exposes a managed reviewer-run API.
+The reviewer runner contains the separate trusted evidence broker/reader. It reads native JSONL as data, never as executable instructions, and records source path/identity, byte range or line span, content hash, collection time, and whether content was withheld, redacted, unavailable, or complete. It does not alter or deploy the OpenTelemetry Collector.
 
-The Collector reads native JSONL as data, never as executable instructions. It records source path/identity, byte range or line span, content hash, collection time, and whether content was withheld, redacted, unavailable, or complete. An LF index may identify useful spans efficiently. If it is late or unavailable, the Collector selects from native JSONL directly and records the resulting coverage. Late index material can create a bounded follow-up; it cannot induce infinite pending/retry behavior.
+Langfuse indexed traces may identify useful spans efficiently. If Langfuse is late or unavailable, the broker selects from native JSONL directly and records the resulting coverage. Late Langfuse material can create a bounded follow-up; it cannot induce infinite pending/retry behavior. No reviewer-specific Langfuse key is given to the model or introduced by this design.
 
 ### Scoped evidence broker
 
@@ -115,22 +114,28 @@ The proposed broker may expose only:
 2. bounded search over the packet's pre-authorized evidence set; and
 3. submit a structured review report.
 
-Search/fetch arguments are validated against the candidate allowlist, cutoff, byte budget, and call budget. They cannot name arbitrary paths, SQL, URLs, LF keys, task IDs outside the candidate, or a general query language. The reviewer receives no shell, edit, write, install, publish, Git, MCP, repository-discovered extension, or unrestricted filesystem tool.
+Search/fetch arguments are validated against the packet allowlist, cutoff, byte budget, and call budget. They cannot name arbitrary paths, SQL, URLs, Langfuse keys, task IDs outside the packet allowlist, or a general query language. The reviewer receives no shell, edit, write, install, publish, Git, MCP, repository-discovered extension, or unrestricted filesystem tool.
 
 A trusted OMP extension/runner owns the provider credential in its native process environment and captures the result. Credentials are never inserted into the model prompt. The report-submit capability validates citations against the broker allowlist and validates proposal shape, but cannot prove the report's semantic truth. Tool restriction is a model-tool boundary, not a same-UID OS sandbox.
 
 Before claiming this boundary works, an acceptance smoke must launch the real installed OMP version with the reviewer extension/configuration and prove the enabled inventory includes only the intended broker tools, while extra built-ins, shell, MCP, repository extensions, and discovered extras are denied. This is required runtime evidence, not a claim based only on prospective CLI flags.
 
-## Reviewer instruction and skill provenance
+## Reviewer instruction, native persistence, and skill provenance
 
-The reviewer instruction bundle is frozen for each run and recorded by exact bytes hash/version, like worker skill snapshots. Each report identifies the configured model identifier, installed OMP version, observer instruction-bundle hash, and every skill snapshot/catalog version consulted.
+The reviewer instruction bundle is frozen for each run and recorded by exact bytes hash/version, like worker skill snapshots. Each report identifies the resolved model identifier, installed OMP version, observer instruction-bundle hash, and every skill snapshot/catalog version consulted.
 
-Before proposing a change, the Collector supplies the available relevant-skill inventory and provenance. The reviewer must compare an opportunity with existing skills rather than manufacture a duplicate. A proposal is one of:
+Reviewer execution uses shared native OMP exporter/session infrastructure but has a distinct reviewer-run native JSONL and artifact namespace under `AGD_HOME`. It is always persisted even when telemetry is disabled. When existing Collector/Langfuse transport is enabled, it receives reviewer observability annotated with `purpose=background-skill-review` and `review_run_id`; it does not receive a new Collector deployment or reviewer-specific Langfuse key. Native conversation IDs remain unchanged, and the runner must not invent ordinary task IDs. Current APIs do not yet provide this reviewer adapter/extension; implementation must add it rather than misrepresenting `worker launch` as support.
+
+Before proposing a change, the broker supplies the available relevant-skill inventory and provenance. The reviewer must compare an opportunity with existing skills rather than manufacture a duplicate. A proposal is one of:
 
 - **improve existing skill**: names the existing skill/version and the bounded suggested change; or
 - **new skill**: establishes an uncovered workflow and gives intended scope, triggers, draft content, prerequisites, and validation limits.
 
-A new-skill proposal is inert: it does not materialize a skill bundle, alter profiles, or become visible in any skill-discovery root. A singular high-impact uncovered workflow may be proposed with its impact evidence and uncertainty; a recurrence count is reported only when evidence supports it.
+An assigned worker-skill manifest establishes only provisioned bytes, not that a skill was loaded, used, or caused a failure. Skill usage/version/cause is `unknown` unless the selected evidence proves it. A new-skill proposal is inert: it does not materialize a skill bundle, alter profiles, or become visible in any skill-discovery root. A singular high-impact uncovered workflow may be proposed with its impact evidence and uncertainty; a recurrence count is reported only when evidence supports it.
+
+### Retrospective self-review
+
+Retrospective self-review is an explicit `reviewer run` scope with selected closed reviewer-run IDs, a frozen cutoff, and an allowlist that excludes the current run and all later runs. It uses the same read/report-only tools and cannot approve, trigger, alter its own policy, or schedule another review. Default candidate selection excludes all reviewer-run native output.
 
 ## Proposal and report model
 
@@ -155,7 +160,7 @@ Minimum proposed immutable review fields:
 
 Each proposal revision contains: stable proposal ID; revision ID; kind (`existing-skill` or `new-skill`); evidence citation IDs; counterexamples considered; uncertainty/coverage limitations; suggested resolution; suggested validation; deduplication basis; and, for new skills, draft content, intended triggers/scope, prerequisites, and validation limits. Proposals without actual evidence references are refused.
 
-Proposal identity is deterministic from its canonical target/category plus evidence basis, not from scheduling time. An equivalent re-observation appends evidence or a revision without erasing history. A materially new basis may resurface a formerly rejected/deferred/superseded proposal as a new revision, explicitly preserving the prior human outcome and why it differs. A rejection is never silently overwritten.
+The stable proposal key is a canonical tuple of proposal schema, kind, target (`existing skill ID` or normalized uncovered-workflow key), and finding category. It excludes the growing evidence set and proposed wording. The revision ID hashes the stable proposal key, evidence basis, and proposed change. Equivalent re-observation appends evidence or a revision without erasing history. If a match is uncertain, the runner preserves a distinct proposal rather than suppressing it. Materially new evidence may create a new revision of a rejected/deferred/superseded proposal only with an explicit statement of the prior disposition and new basis; it never auto-accepts or overwrites a prior human outcome.
 
 Minimum mutable triage entry:
 
@@ -163,20 +168,15 @@ Minimum mutable triage entry:
 {
   "proposal_id": "stable-id",
   "current": "accepted|rejected|deferred|superseded",
-  "history": [{"at": "timestamp", "status": "deferred", "reason": "human text", "actor": "human"}]
+  "history": [{"at": "timestamp", "status": "deferred", "reason": null, "operator": {"uid": 1000, "identity": "observed-local-cli-identity"}}]
 }
 ```
 
-A reason is required for every human disposition. `accepted` means only that the human accepts the proposal as a candidate for a separate task; it performs no edit and creates no task. `superseded` references the replacement proposal/revision. Triage tools must not let the reviewer approve or alter its own proposal state.
+A disposition reason is optional, though useful for rejection/defer/supersede. The CLI records the observed local operator identity/UID as local evidence; it does not take an unverified model-supplied `actor` value. `accepted` means only that the human accepts the proposal as a candidate for a separate task; it performs no edit and creates no task. `superseded` references the replacement proposal/revision. Triage tools must not let the reviewer approve or alter its own proposal state.
 
 ## Durability, notifications, and recovery
 
-Private durable data is separate from scheduler state:
-
-- immutable evidence/review/proposal/revision records;
-- mutable proposal triage histories;
-- scheduler lock, checkpoint, trigger/catch-up state, and runner receipt;
-- existing durable supervision event/acknowledgement receipts.
+Private durable data is separate from scheduler state. Under the effective `AGD_HOME`, the reviewer-owned namespace contains immutable native reviewer JSONL/artifacts, evidence/review/proposal/revision records, and mutable proposal-triage records; a sibling reviewer scheduler namespace contains only the dedicated lock, checkpoint, trigger/catch-up state, and runner receipt. Existing `state/events` and `state/events-handled` retain notification receipts. These namespaces must not be conflated with ordinary task directories or task IDs.
 
 Old sessions, evidence, reports, proposals, and triage history are retained; this design includes no pruning policy.
 
@@ -195,7 +195,7 @@ These are minimal conceptual CLI operations, not a requirement for a generic CLI
 - `reviewer status`: show lock/runner/checkpoint/schedule state without triggering a run.
 - `reviewer reports list|show`: read immutable reports/evidence coverage and proposals.
 - `reviewer proposals list|show`: inspect a proposal and all revisions/history.
-- `reviewer proposals dispose ID --status accepted|rejected|deferred|superseded --reason FILE [--replacement ID]`: append a human disposition only.
+- `reviewer proposals dispose ID --status accepted|rejected|deferred|superseded [--reason FILE] [--replacement ID]`: append a human disposition only.
 
 The exact command spelling, config location, event kind, and record paths are implementation details. They must follow AGD's existing effective-private-home, atomic JSON, locking, ownership, and durable-event conventions. No command may accept a report disposition as authority to edit a skill or source.
 
@@ -213,15 +213,16 @@ The exact command spelling, config location, event kind, and record paths are im
 An implementation is not complete until it demonstrates all of the following using disposable private homes/projects and real installed OMP where stated:
 
 1. The real reviewer launch inventory grants only the intended broker tools; shell, filesystem mutation, generic read/query, MCP, repo extensions, task spawning, install, publish, and extra discovered tools are denied.
-2. The broker cannot fetch outside an allowlisted candidate/cutoff and rejects invalid citations/report shape; provider credentials do not appear in the reviewer prompt/transcript packet.
-3. Native JSONL-backed collection works with LF discovery available and unavailable; late material creates one bounded follow-up/coverage state rather than an infinite pending loop.
-4. Manual review works with no user timer; configuration alone starts no model work. Timer installation/enabling requires the explicit approval boundary, survives central UI absence, catches up once after offline time, avoids schedule drift, and does not overlap runs.
-5. Runner crash/fault recovery preserves checkpoints and evidence/history without duplicate destructive effects or an exactly-once claim.
-6. A central-offline batch event remains durable; an available central sees it; acknowledging it changes neither proposal disposition nor edit authority.
-7. Deduplication preserves rejected/deferred/superseded history, appends equivalent new evidence safely, and permits a materially new basis to resurface explicitly.
-8. Existing-skill and new-skill proposals both require evidence/counterexamples/uncertainty/validation. A proposed new skill remains absent from discovery roots and profiles until a separately approved implementation task changes it.
-9. Reviewer reports do not auto-trigger a reviewer, alter their own policy/disposition, create tasks, or apply an accepted proposal.
-10. Associated central decisions/human feedback are linked only when retained evidence proves the relationship; active/unknown relations and withheld evidence are reported as coverage limitations.
+2. The broker cannot fetch outside a packet allowlist/cutoff and rejects invalid citations/report shape; provider credentials do not appear in the reviewer prompt/transcript packet.
+3. Native JSONL-backed collection works with Langfuse discovery available and unavailable; late material creates one bounded follow-up/coverage state rather than an infinite pending loop.
+4. A reviewer run writes its own native JSONL/artifacts and `review_run_id` metadata under the reviewer namespace even with telemetry disabled. When existing observability transport is enabled, purpose/run metadata is present without changing OpenTelemetry Collector roles or adding a reviewer Langfuse key.
+5. Manual review works with no user timer; configuration alone starts no model work. Timer installation/enabling requires the explicit approval boundary, survives central UI absence, catches up once after offline time, avoids schedule drift, and does not overlap runs.
+6. Runner crash/fault recovery preserves checkpoints and evidence/history without duplicate destructive effects or an exactly-once claim.
+7. A central-offline batch event remains durable; an available central sees it; acknowledging it changes neither proposal disposition nor edit authority.
+8. Deduplication preserves rejected/deferred/superseded history, appends equivalent new evidence safely, permits a materially new basis to resurface explicitly, and preserves a distinct finding on uncertain merge.
+9. Existing-skill and new-skill proposals both require evidence/counterexamples/uncertainty/validation. A proposed new skill remains absent from discovery roots and profiles until a separately approved implementation task changes it.
+10. Reviewer reports do not auto-trigger a reviewer, alter their own policy/disposition, create tasks, or apply an accepted proposal. An explicit retrospective run proves its cutoff excludes its current/later reviewer runs and cannot self-approve.
+11. Associated central decisions/human feedback are linked only when retained evidence proves the relationship; active/unknown relations and withheld evidence are reported as coverage limitations.
 
 ## Handoff
 
