@@ -188,69 +188,58 @@ git commit -m "feat: persist reviewer evidence packets"
 **Files:**
 - Modify: `bin/agd_lib/reviewer.py`, `tests/test_reviewer.py`
 
-**Interfaces:** Consumes Task 1 receipt/packet. Produces `submit_report`, `dispose`, reviewer-purpose pending/handled event behavior through unchanged supervision helpers.
+**Interfaces:** `submit_report(home,review_run_id,request_id,report)->{'report_id':str,'proposal_ids':list[str]}`, `finalize_run(home,review_run_id,outcome)->dict`, `dispose(home,proposal_id,status,reason,replacement_proposal_id,operator)->dict`; `proposal_path(home,id)->Path`, `triage_path(home,id)->Path`, `read_triage(home,id)->{'schema':1,'proposal_id':str,'current':'pending|accepted|rejected|deferred|superseded','history':list[dict]}`, `list_proposals(home)->list[dict]`.
 
-- [ ] **Step 1: Write failing report/new-skill/triage tests**
+- [ ] **Step 1: Write failing report/revision/triage tests**
 
 ```python
 from agd_lib import store, supervision, worker_skills
-
 def produced_run(home):
-    ended_worker(home,'failed',str(uuid.uuid4()),'failure'); ended_worker(home,'success',str(uuid.uuid4()),'counterexample')
-    packet=reviewer.select_packet(home,cutoff=time.time()); config=reviewer.read_config(home); started=time.time()
-    instruction=b'Review only supplied evidence.'
-    return reviewer.begin_run(home,packet,reviewer.enqueue_intent(home,kind='default'),model='openai/reviewer-fixture',
-      config_digest=hashlib.sha256(json.dumps(config,sort_keys=True).encode()).hexdigest(),instruction_digest=hashlib.sha256(instruction).hexdigest(),
-      started_at=started,deadline_epoch_ms=int((started+packet['limits']['max_runtime_seconds'])*1000)),packet
-
+    started=time.time(); ended_worker(home,'failed',str(uuid.uuid4()),'failure',1); ended_worker(home,'success',str(uuid.uuid4()),'counterexample',0)
+    config=reviewer.read_config(home); packet=reviewer.select_packet(home,cutoff=time.time())
+    instruction=Path('config/reviewer-instruction.txt').read_bytes()
+    return reviewer.begin_run(home,packet,reviewer.enqueue_intent(home,kind='default'),model='openai/reviewer-fixture',config_snapshot=config,instruction_snapshot=instruction,started_at=started,deadline_epoch_ms=int((started+config['limits']['max_runtime_seconds'])*1000)),packet
 def build_report(packet):
-    first, second=(s['source_id'] for s in packet['sources'][:2])
-    return {'schema':1,'summary':'native fixture','findings':[{'kind':'new-skill','target':None,'finding':'failure','applicability':'all','citations':[first],'counterexamples':[second],'uncertainty':'low','resolution':'draft','validation':'curated resolve','new_skill':{'id':'agd-review-draft','draft':'# Draft\n','triggers':['review'],'scope':'review','prerequisites':[]}}]}
-
-def test_new_skill_acceptance_is_inert_and_event_is_once():
-    with lab() as (home, _):
-        before_catalog, before_selection = worker_skills.catalog(home), worker_skills.resolve(home)
-        before_bytes = {p.relative_to(home):p.read_bytes() for p in (home/'config'/'worker-skills').rglob('*') if p.is_file()}
-        run, packet = produced_run(home); ids = [s['source_id'] for s in packet['sources']]
-        report = {'schema':1,'summary':'x','findings':[{'kind':'new-skill','target':None,'finding':'gap','applicability':'all',
-          'citations':[ids[0]],'counterexamples':[ids[1]],'uncertainty':'low','resolution':'draft','validation':'curated resolve',
-          'new_skill':{'id':'agd-review-draft','draft':'# Draft\n','triggers':['review'],'scope':'review','prerequisites':[]}}]}
-        result = reviewer.submit_report(home, run['review_run_id'], '00000000-0000-4000-8000-000000000020', report)
-        reviewer.dispose(home, result['proposal_ids'][0], 'accepted', None, None, {'uid':os.getuid(),'identity':str(os.getuid())})
-        assert worker_skills.catalog(home) == before_catalog
-        assert worker_skills.resolve(home) == before_selection
-        assert {p.relative_to(home):p.read_bytes() for p in (home/'config'/'worker-skills').rglob('*') if p.is_file()} == before_bytes
-        with pytest.raises(store.Refusal): worker_skills.resolve(home, skill_mode='curated', skills=('agd-review-draft',))
-        event = [e for e in supervision.pending(home) if e.get('review_run_id') == run['review_run_id']]
-        assert len(event) == 1
+    failed=next(s['source_id'] for s in packet['sources'] if s['task_id']=='failed'); success=next(s['source_id'] for s in packet['sources'] if s['task_id']=='success')
+    return {'schema':1,'summary':'native fixture','findings':[{'kind':'new-skill','target':'bounded-review','finding':'failure','applicability':'all','citations':[failed],'counterexamples':[success],'uncertainty':'low','resolution':'draft','validation':'curated resolve','validation_limits':['Requires human verification; not proof of causality'],'new_skill':{'id':'agd-review-draft','draft':'---\nname: AGD review draft\ndescription: Review bounded evidence\n---\n# Draft\n','triggers':['review'],'scope':'review','prerequisites':[]}}]}
+def test_revisions_and_finalization_are_inert():
+    with lab() as (home,_):
+        before=worker_skills.catalog(home); run,packet=produced_run(home); report=build_report(packet)
+        first=reviewer.submit_report(home,run['review_run_id'],str(uuid.uuid4()),report); reviewer.dispose(home,first['proposal_ids'][0],'rejected','insufficient',None,{'uid':os.getuid(),'identity':str(os.getuid())})
+        report['findings'][0]['citations'].append('new-material-source'); second=reviewer.submit_report(home,run['review_run_id'],str(uuid.uuid4()),report)
+        assert second['proposal_ids']==first['proposal_ids']; assert len(reviewer.read_triage(home,first['proposal_ids'][0])['history'])==1
+        reviewer.finalize_run(home,run['review_run_id'],'exited'); assert worker_skills.catalog(home)==before
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py::test_new_skill_acceptance_is_inert_and_event_is_once -q`
+Run: `PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py -q`
 
-Expected: FAIL because report/event functions are absent.
+Expected: FAIL because report/revision/finalization functions are absent.
 
-- [ ] **Step 3: Implement report/disposition/event kernel**
+- [ ] **Step 3: Implement report, revision, triage, and finalization kernels**
 
 ```python
-def dispose(home, proposal_id, status, reason, replacement_proposal_id, operator):
-    proposal_id = str(uuid.UUID(proposal_id))
-    replacement = None if replacement_proposal_id is None else str(uuid.UUID(replacement_proposal_id))
-    if status not in {'accepted','rejected','deferred','superseded'}: raise store.Refusal('invalid disposition')
-    if (status == 'superseded') != (replacement is not None): raise store.Refusal('invalid replacement')
-    if replacement and not proposal_path(home,replacement).is_file(): raise store.Refusal('unknown replacement')
-    with store.lock(home):
-        prior = read_triage(home, proposal_id)
-        store.atomic_json(triage_path(home,proposal_id), {'schema':1,'proposal_id':proposal_id,'current':status,
-          'history':[*prior['history'],{'status':status,'reason':reason,'replacement':replacement,'operator':operator,'at':time.time()}]})
+def proposal_path(home,proposal_id): return paths(home)['proposals']/f'{proposal_id}.json'
+def triage_path(home,proposal_id): return paths(home)['triage']/f'{proposal_id}.json'
+def read_triage(home,proposal_id):
+    p=triage_path(home,proposal_id)
+    if not proposal_path(home,proposal_id).is_file(): raise store.Refusal('unknown proposal')
+    return json.loads(p.read_text()) if p.is_file() else {'schema':1,'proposal_id':proposal_id,'current':'pending','history':[]}
+def fingerprint(f): return _digest([f['schema'],f['kind'],normalize_target(f['target']),normalize(f['finding']),normalize(f['applicability'])])
+def revision_hash(proposal_id,finding): return _digest([proposal_id,sorted(finding['citations']),sorted(finding.get('counterexamples',[])),finding['resolution'],finding.get('new_skill')])
+def dispose(home,proposal_id,status,reason,replacement_proposal_id,operator):
+    if status not in {'accepted','rejected','deferred','superseded'} or not isinstance(operator,dict): raise store.Refusal('disposition')
+    prior=read_triage(home,proposal_id); replacement=None if replacement_proposal_id is None else parse_existing_proposal_or_revision(home,replacement_proposal_id)
+    if (status=='superseded') != bool(replacement): raise store.Refusal('replacement')
+    row={'status':status,'reason':reason,'replacement':replacement,'operator':operator,'at':time.time(),'basis_revision':read_proposal(home,proposal_id)['head_revision']}
+    with store.lock(home): store.atomic_json(triage_path(home,proposal_id),{'schema':1,'proposal_id':proposal_id,'current':status,'history':[ *prior['history'],row]})
     return read_triage(home,proposal_id)
-
-def reviewer_event_id(review_run_id):
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, 'reviewer-batch:'+review_run_id))
 ```
 
-Validate canonical UTF-8 report size, UUID request ID, frozen source IDs, required finding fields, distinct citations/counterexamples, and draft schema. Content-address immutable report/revision blobs; under short `store.lock`, publish index, then reviewer-purpose event file using the existing `state/events/<uuid>.json` pattern, then mark receipt final. Recovery preserves blobs and recreates event only when neither pending nor handled event path exists. Existing `supervision.pending/acknowledge` already load/move arbitrary UUID envelopes unchanged.
+Validate report schema, UTF-8 bound, UUID request ID, source IDs against the frozen packet, required fields, and draft front matter; counterexamples may be empty only with stated uncertainty. Existing-skill findings require an actual packet inventory target/version. A proposal has `{proposal_id,fingerprint,head_revision,revisions,uncertain_distinct}` and revisions have `{revision_hash,basis_source_ids,proposed_change,resurfaced}`. Scan proposal headers once per batch: exact fingerprint plus exact basis reuses UUID/revision idempotently; material new basis creates a new immutable revision with `resurfaced:true` without changing triage; uncertain/collision basis gets a distinct UUID marked `uncertain_distinct`. Never auto-accept or erase history.
+
+`submit_report` only creates immutable `reports/<64hex>.json`, revisions, and mutable receipt state `report-committed`; it does not finalize. `finalize_run` runs after native disposal/child exit, unions receipt report/proposal IDs, creates one deterministic UUID5 batch event only if proposal IDs exist, checks both pending and handled paths, and atomically marks the receipt final. Recovery recreates a missing event from committed reports. Empty findings are valid coverage and emit no event. Bridge `finish` maps to `finalize_run` after `runReviewer` returns; production parent does the same after child exit; broker `finalResult` only reads committed report state.
 
 - [ ] **Step 4: Run report tests to verify pass**
 
