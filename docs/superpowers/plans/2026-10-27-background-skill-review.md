@@ -36,7 +36,7 @@
 | `bin/agd_lib/observability.py` | reviewer native-session binding after merged module reconciliation |
 | `bin/agd_lib/reviewer.py` | writes reviewer-purpose events using existing pending/handled atomic-file pattern; no supervision source change |
 | `bin/agd`, `.omp/extensions/agd-primary.ts` | complete backed CLI and neutral durable-event presentation |
-| `tests/test_reviewer.py`, `tests/reviewer_bridge.py`, `tests/test_reviewer_timer.py`, `tests/reviewer.test.ts`, `tests/primary.test.ts` | behavior proof |
+| `lib/agd-reviewer-instructions.md`, `tests/test_reviewer.py`, `tests/reviewer_bridge.py`, `tests/reviewer-fixture.ts`, `tests/test_reviewer_timer.py`, `tests/reviewer.test.ts`, `tests/primary.test.ts` | behavior proof |
 | `README.md`, `docs/operations.md`, `docs/compatibility.md`, `CHANGELOG.md` | user contract |
 
 ```python
@@ -45,8 +45,8 @@ DEFAULT_LIMITS = {'max_candidates':20,'max_input_bytes':262144,'max_model_calls'
                   'max_output_bytes':65536,'max_runtime_seconds':1800}
 def select_packet(home: Path, *, cutoff: float, retrospective_review_run_ids: tuple[str,...]=()) -> dict: ...
 def enqueue_intent(home: Path, *, kind: str, retrospective_review_run_ids: tuple[str,...]=()) -> dict: ...
-def begin_run(home: Path, packet: dict, intent: dict, *, model: str, config_digest: str,
-              instruction_digest: str, started_at: float, deadline_epoch_ms: int) -> dict: ...
+def begin_run(home: Path, packet: dict, intent: dict, *, model: str, config_snapshot: dict,
+              instruction_snapshot: bytes, started_at: float, deadline_epoch_ms: int) -> dict: ...
 def submit_report(home: Path, review_run_id: str, request_id: str, report: dict) -> dict: ...
 def dispose(home: Path, proposal_id: str, status: str, reason: str|None,
             replacement_proposal_id: str|None, operator: dict) -> dict: ...
@@ -97,7 +97,8 @@ def ended_worker(home, task_id, incarnation, text, status):
     binding=observability.worker_binding(home,task_id,incarnation); sid=str(uuid.uuid4()); iso='2026-01-01T00:00:00.000Z'
     rows=[{'type':'session','version':3,'id':sid,'timestamp':iso,'cwd':str(home)},{'type':'message','id':str(uuid.uuid4()),'parentId':None,'timestamp':iso,'message':{'role':'user','content':text,'timestamp':1767225600000}}]
     Path(binding['session_dir'],f'{sid}.jsonl').write_text(''.join(json.dumps(x)+'\n' for x in rows))
-    workers.event(home,task,'failed' if status else 'idle','runner-exit',key='runner-exit',message=f'exit {status}',incarnation=incarnation)
+    note=tasks.task_file(home,task_id).parent/'runner-exit.txt'; note.write_text(f'worker process exited {status}')
+    workers.event(home,task_id,incarnation,'failed' if status else 'idle','runner-exit',note)
     return task
 def test_packet_has_distinct_failure_and_counterexample_sources():
     with lab() as (home,_):
@@ -116,6 +117,10 @@ Expected: FAIL because `agd_lib.reviewer` does not exist.
 - [ ] **Step 4: Implement packet/intent/run kernel**
 
 ```python
+import hashlib, json, os, re, tempfile, uuid
+from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from agd_lib import store
 def paths(home):
     root=store.home(home); return {'config':root/'data/reviewer/config.json','packets':root/'data/reviewer/packets','reports':root/'data/reviewer/reports','proposals':root/'data/reviewer/proposals','manifests':root/'data/reviewer/manifests','triage':root/'data/reviewer/triage','receipts':root/'state/reviewer/receipts','pending':root/'state/reviewer/pending','checkpoint':root/'state/reviewer/checkpoint.json','lock':root/'state/reviewer/run.lock'}
 def publish_immutable(path, value):
@@ -539,32 +544,34 @@ git commit -m "feat: expose reviewer inbox"
 
 **Files:** Modify `README.md`, `docs/operations.md`, `docs/compatibility.md`, `CHANGELOG.md`, `tests/test_reviewer.py`, `tests/reviewer.test.ts`.
 
-- [ ] **Step 1: Write failing end-to-end bridge test**
+- [ ] **Step 1: Run a throwaway native bridge/CLI smoke**
 
-```python
-def test_bridge_report_can_be_triaged_without_skill_mutation():
-    with bridge_fixture() as result:
-        assert reviewer.read_report(result['home'],result['report_id'])['review_run_id']==result['review_run_id']
-        command(result['home'],'reviewer','proposals','dispose',result['proposal_id'],'--status','accepted')
-        with pytest.raises(store.Refusal): worker_skills.resolve(result['home'],skill_mode='curated',skills=('agd-review-draft',))
-```
+Move/export `startBridge` (Node imports only; no `bun:test`) into `tests/reviewer-fixture.ts`; reviewer tests import it. Generate `tests/.reviewer-smoke.ts` by here-doc, run it with `PATH=/tmp/agd-treehouse-v3.1.6:$PATH bun tests/.reviewer-smoke.ts`, and delete it in `finally`. It uses real `startBridge`, `runReviewer`, `scriptedStream`, three tool calls, then `broker.rpc('finish',{})` after host disposal; actual returned IDs drive `bin/agd --home H reviewer reports show`, proposals show/dispose, events list/ack, worker skills/profile/task list. It snapshots catalog/profile/task/skill bytes, asserts accepted proposal and acknowledged event do not change them, acknowledgement leaves triage pending, receipt session ID equals native JSONL v3 header ID, event purpose/run match, three runtime tools exactly, and first model context includes authorized packet citation/inventory but not sentinel. No model HTTP, user unit, fixed IDs, handwritten report, or undefined helper.
 
-- [ ] **Step 2: Run test to verify it fails before final wiring**
+- [ ] **Step 2: Add acceptance/docs matrix**
 
-Run: `PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py::test_bridge_report_can_be_triaged_without_skill_mutation -q`
+| Case | Action | Observable |
+|---|---|---|
+| inventory/denial/injection | packet with sentinel | three tools, authorized evidence only |
+| LF native-only | LF available/unavailable | no query client, same result |
+| late feedback | one linked span | one follow-up only |
+| crash budget | reserve/kill | unknown outcome/no resume |
+| foreign owner | CLI triage | owner/task unchanged |
+| event lifecycle | finalize/ack | pending→handled; triage unchanged |
+| dedup | exact/material/uncertain basis | reuse/revision/distinct |
+| proposals | existing/new high-impact | validation schema |
+| skills | assigned not loaded | unknown provenance |
+| self review | closed/current/later IDs | only closed/no recursion |
+| links | explicit/unrelated | explicit only |
 
-Expected: FAIL until Task 3 bridge and Task 5 CLI are wired.
+Document defaults `262144/65536/20/1800/20`, null model inheritance, IANA/DST/UTC-hour anchor, frozen evidence privacy/retention/no pruning, triage/recovery/no USD budgets, native private metadata, inert drafts, explicit timer approval/no autostart/no OS sandbox. Record OMP 18.3.2 and readonly systemd 255 DST evidence; separately approved disposable systemd activation is never pytest and unavailable prerequisite is reported.
 
-- [ ] **Step 3: Write operator documentation**
-
-`README.md`: reviewer is opt-in and never auto-applies. `docs/operations.md`: commands, explicit timer enable, all five bounds, native JSONL authority, sensitive evidence, manual recovery, no task ownership. `docs/compatibility.md`: OMP 18.3.2 gate, systemd user requirements, unexercised prerequisites. `CHANGELOG.md`: bounded reviewer, purpose events, no Langfuse query API.
-
-- [ ] **Step 4: Run final verification**
+- [ ] **Step 3: Run final verification**
 
 ```bash
-PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py tests/reviewer_bridge.py tests/test_reviewer_timer.py tests/test_supervision.py -q
-bun test tests/reviewer.test.ts tests/primary.test.ts
-PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests -q
+PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py tests/test_reviewer_timer.py tests/test_supervision.py -q
+PATH=/tmp/agd-treehouse-v3.1.6:$PATH bun test tests/reviewer.test.ts tests/primary.test.ts
+git diff --check
 ```
 
 Expected: PASS. Record native-only online/offline optional index behavior, linked-vs-heuristic feedback, assigned-vs-loaded skill provenance, late follow-up, self-review boundaries, crash budgets, broker recovery, dedup bases, inert new draft, owner variants, DST/boot/manual timer paths, and acknowledgement inertness. Report unavailable user-systemd as unexercised.
