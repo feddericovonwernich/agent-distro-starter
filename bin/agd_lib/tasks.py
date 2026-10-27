@@ -282,19 +282,19 @@ def grant_pr_publish(home, task_id, target, instruction):
         return grant
 
 
-def _authorize_pr_publish_locked(home, task, grant_id):
+def _authorize_pr_publish_locked(home, task, grant_id, require_clean=True):
     task = read(home, task['id'])
     try:
         grant_id = str(uuid.UUID(grant_id))
         grant = json.loads((task_file(home, task['id']).parent/'approvals'/f'{grant_id}.json').read_text())
     except (ValueError, FileNotFoundError, json.JSONDecodeError) as error:
         raise store.Refusal('PR publication grant missing or invalid') from error
-    if (grant.get('task') != task['id'] or grant.get('action') != 'pr-publish' or
-            grant.get('branch') != task['branch'] or grant.get('base') != task['base'] or
-            grant.get('target') != f'{grant.get("remote")}:{task["branch"]}'):
+    if (not isinstance(grant, dict) or grant.get('id') != grant_id or grant.get('task') != task['id'] or
+            grant.get('action') != 'pr-publish' or grant.get('branch') != task['branch'] or
+            grant.get('base') != task['base'] or grant.get('target') != f'{grant.get("remote")}:{task["branch"]}'):
         raise store.Refusal('PR publication grant does not match task target')
     work = verify_workspace(home, task)
-    if not store.clean(work):
+    if require_clean and not store.clean(work):
         raise store.Refusal('task workspace has uncommitted or untracked changes')
     if store.git(work, 'remote', 'get-url', grant['remote'], check=False) != grant.get('remote_url'):
         raise store.Refusal('PR publication remote changed')
@@ -307,6 +307,11 @@ def _authorize_pr_publish_locked(home, task, grant_id):
 def authorize_pr_publish(home, task, grant_id):
     with store.lock(home):
         return _authorize_pr_publish_locked(home, task, grant_id)
+
+
+def authorize_pr_feedback(home, task, grant_id):
+    with store.lock(home):
+        return _authorize_pr_publish_locked(home, task, grant_id, require_clean=False)
 
 
 def approve(home, task_id, action, target, instruction):

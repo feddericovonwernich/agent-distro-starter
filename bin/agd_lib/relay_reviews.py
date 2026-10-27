@@ -116,19 +116,6 @@ def _block(home, task_id, reason, shared=False):
         pass
 
 
-def _feedback_grant(home, task, grant_id):
-    with store.lock(home):
-        try:
-            grant = json.loads((tasks.task_file(home, task['id']).parent/'approvals'/
-                                f'{uuid.UUID(grant_id)}.json').read_text())
-        except (ValueError, OSError, json.JSONDecodeError) as error:
-            raise ReviewTickError('PR review grant is unavailable') from error
-        if (grant.get('id') != grant_id or grant.get('task') != task['id'] or
-                grant.get('action') != 'pr-publish' or grant.get('remote') is None or
-                grant.get('branch') != task.get('branch') or grant.get('base') != task.get('base')):
-            raise ReviewTickError('PR review grant is unavailable')
-        return grant
-
 
 def _candidates(home):
     for path in sorted((Path(home) / 'data' / 'tasks').glob('*/task.json')):
@@ -140,13 +127,15 @@ def _candidates(home):
         if task.get('phase') != 'running' or task.get('executor') != 'worker' or not isinstance(grant_id, str):
             continue
         try:
-            grant = _feedback_grant(home, task, grant_id)
+            grant = tasks.authorize_pr_feedback(home, task, grant_id)
             receipt = tasks.read_pr_receipt(home, task['id'])
             if receipt is None:
                 continue
             pull = receipt.get('pr')
-            if (receipt.get('grant_id') != grant['id'] or not isinstance(receipt.get('repository'), str) or
-                    not isinstance(pull, dict) or not isinstance(pull.get('number'), int) or pull['number'] < 1 or
+            if (receipt.get('grant_id') != grant['id'] or receipt.get('remote') != grant['remote'] or
+                    receipt.get('branch') != task['branch'] or receipt.get('base') != task['base'] or
+                    not isinstance(receipt.get('repository'), str) or not isinstance(pull, dict) or
+                    not isinstance(pull.get('number'), int) or pull['number'] < 1 or
                     not isinstance(receipt.get('local_head'), str) or not isinstance(receipt.get('remote_head'), str)):
                 raise ReviewTickError('PR review receipt is unavailable')
             yield task, receipt, None
