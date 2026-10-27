@@ -13,8 +13,8 @@
 ## Global Constraints
 
 - Before source edits, reconcile the isolated implementation worktree with current `origin/main` using a normal merge; never reset, rebase, force-checkout, clean, drop documentation, or modify the stable checkout. `PLAN_BASE` must remain an ancestor of the resulting `HEAD`. Treat user-confirmed merged PR 5 as ground truth even when squash merge makes `68c3a8cba5007419a467516b792d0df6716ace9a` non-ancestral: verify its merged status/merge SHA through the forge, then verify the expected `bin/agd_lib/observability.py` tree paths and patch behavior in the reconciled tree rather than requiring that feature object as an ancestor.
-- Reuse `store.home`, `store.lock`, `store.atomic_json`, `supervision.emit`, `supervision.pending`, and `supervision.acknowledge`; do not change their existing task semantics. Reviewer mutations deliberately do **not** claim or replace `state/owner.json`, set `AGD_TASK_ID`, or take `store.lock(home)`. They use a reviewer-only UID/home-bound private path, run lock, and atomic files; ordinary task commands retain `store.require_owner`.
-- Native OMP JSONL is authoritative. Langfuse is optional span discovery only. The existing OpenTelemetry Collector remains an observability transport and never reads JSONL or runs review logic; do not deploy a new Collector, index, provider, SDK, or generic query API.
+- Reuse `store.home`, `store.lock`, `store.atomic_json`, `supervision.pending`, and `supervision.acknowledge`; do not change ordinary-task semantics. Reviewer code never claims/replaces `state/owner.json` or sets worker identity, but uses `store.lock(home)` only for short reviewer publication/reservation/triage/intent transactions and a separate nonblocking reviewer `run.lock` for one live runner. It never holds either while waiting on OMP, provider, systemd, or network.
+- Native OMP JSONL is authoritative. Design choice: do not add a Langfuse query client, credentials, index, or API. If the reconciled repository already exposes an indexed span-discovery reader, call it only as optional discovery and record its exact source/version; otherwise record `langfuse_index: "unused"` and collect identically from native bindings whether Langfuse is online or offline. A consumed late external discovery is a separately bounded stable-source-version follow-up keyed by its source hash, never a heuristic task match. The existing OpenTelemetry Collector remains transport only and never reads JSONL or runs review logic.
 - The reviewer never changes reviewed skills/sources/profiles/task lifecycle records. It writes only its private config, reviewer native output/artifacts, immutable evidence/review/proposal revisions, mutable human triage, scheduler checkpoints/receipts, and existing event receipts.
 - Default limits are user-approved: 20 distinct episode candidates/run, 262144 UTF-8 broker-input bytes/run, 20 native reviewer model invocations including tool continuations/run, 65536 UTF-8 persisted report bytes/run, and a 1800-second wall-clock runner deadline. They do not promise a USD ceiling or bound hidden provider transport retries.
 - Freeze validated configuration, resolved model, instruction-bundle hash, packet ID, source versions, and cutoff in each run record before the first model call. Later model/schedule/configuration changes apply only to later runs.
@@ -33,9 +33,9 @@
 
 | Path | Change and responsibility |
 |---|---|
-| `bin/agd` | Add complete `reviewer` command group only after backing operations exist; keep read-only operations outside current mutation gate and route reviewer mutators through normal owner protection. |
-| `bin/agd_lib/reviewer.py` | Private-path safety, strict config, deterministic episode selection/packet records, immutable evidence/review/proposal revision persistence, triage, dedicated lock/checkpoint, and durable batch-event emission. |
-| `bin/agd_lib/reviewer_runner.py` | Owns one bounded reviewer run: freezes the run receipt, resolves model, creates native OMP reviewer session binding, invokes the verified native reviewer bootstrap, and records retryable receipts outside the home lock. |
+| `bin/agd` | Add complete `reviewer` command group only after backing operations exist; reviewer mutators use scoped reviewer authority, never ordinary task-owner takeover. |
+| `bin/agd_lib/reviewer.py` | Private-path safety, strict config, deterministic packet/intent records, short home-lock publication transactions, immutable evidence/review/proposal revisions, triage, and durable reviewer-purpose events. |
+| `bin/agd_lib/reviewer_runner.py` | Owns one bounded reviewer run under nonblocking reviewer `run.lock`; freezes receipt, resolves model before receipt creation, invokes native bootstrap, and uses only short home-lock receipt transitions. |
 | `lib/agd-reviewer.ts` | Trusted native OMP bootstrap/extension module. It constructs the restricted `Agent`/`AgentSession` from the installed OMP package, registers only broker tools, wraps native `streamSimple` through `streamFn` for run-wide call/deadline enforcement, and writes only via trusted runner IPC. |
 | `bin/agd_lib/reviewer_timer.py` | Renders/installs/removes the private systemd user unit files, parses native `systemd-analyze calendar` output for calendar validation, and computes checkpointed catch-up/no-drift eligibility. |
 | `tests/test_reviewer.py` | Core packet, provenance, proposal/triage/deduplication, lock/checkpoint/recovery, event, and CLI behavior. |
@@ -57,9 +57,12 @@ def read_config(home: Path) -> dict: ...
 def save_config(home: Path, config: dict) -> dict: ...
 def select_packet(home: Path, *, cutoff: float, retrospective_run_ids: tuple[str, ...] = ()) -> dict: ...
 def enqueue_intent(home: Path, *, kind: str, retrospective_run_ids: tuple[str, ...] = ()) -> dict: ...
-def begin_run(home: Path, packet: dict, intent: dict) -> dict: ...
+def begin_run(home: Path, packet: dict, intent: dict, *, model: str,
+              config_digest: str, instruction_digest: str) -> dict: ...
 def read_packet(home: Path, packet_id: str) -> dict: ...
 def read_report(home: Path, report_id: str) -> dict: ...
+def read_triage(home: Path, proposal_id: str) -> dict: ...
+def list_proposals(home: Path) -> list[dict]: ...
 def dispose(home: Path, proposal_id: str, status: str, reason: str | None,
             replacement: str | None, operator: dict) -> dict: ...
 def recover(home: Path) -> dict: ...
@@ -67,7 +70,7 @@ def recover(home: Path) -> dict: ...
 # reviewer_runner.py
 def assert_runtime_capability() -> dict: ...
 def resolve_model(config: dict, omp_binary: str) -> str: ...
-def launch(home: Path, run_id: str, packet: dict, model: str) -> dict: ...
+def launch(home: Path, review_run_id: str, packet: dict, model: str) -> dict: ...
 
 # reviewer_timer.py
 def validate_schedule(schedule: dict) -> dict: ...
@@ -143,17 +146,17 @@ def test_active_and_reviewer_runs_are_excluded_without_incidental_wording():
         assert packet['coverage']['excluded']['active'] == [active['incarnation']]
 ```
 
-- [ ] **Step 3: Run the focused failing tests, including the native runtime capability gate**
+- [ ] **Step 3: Run focused tests to prove absence**
 
 Run: `PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py -q && bun test tests/reviewer.test.ts`
 
-Expected: FAIL because `agd_lib.reviewer` and the reviewer native bootstrap do not exist.
+Expected: FAIL because reviewer modules/bootstrap do not exist.
 
 - [ ] **Step 4: Establish the exact installed-OMP capability gate before any review is admissible**
 
-`assert_runtime_capability()` resolves `omp` with `shutil.which`, takes its real path, walks only its real parent chain to the package `package.json`, and accepts exactly name `@oh-my-pi/pi-coding-agent` and version `18.3.2`. It parses `exports["./sdk"].import` and `exports["."].import`, rejects missing/non-file/escaping export paths, and returns immutable executable, package root, SDK/core file URLs, and version; it never imports a hard-coded `/home/...` path or adds an SDK dependency. It rejects another version or absent verified exports for `SessionManager`, `AgentSession`, `Settings`, `discoverAuthStorage`, `ModelRegistry`, `streamSimple`, and direct native `Agent` before creating a run.
+`assert_runtime_capability()` resolves `omp` with `shutil.which`, takes its real path, walks only its real parent chain to `@oh-my-pi/pi-coding-agent/package.json`, and accepts version `18.3.2`. It does **not** invent `exports["./sdk"]`: it creates a Bun resolver rooted at the verified package entry, resolves the package's exported wildcard subpath `@oh-my-pi/pi-coding-agent/sdk`, then separately resolves `@oh-my-pi/pi-agent-core` and `@oh-my-pi/pi-ai`. Each resolved real path must be below the installed package/dependency roots named in the verified lock/package metadata. The gate returns those three file URLs plus executable/root/version and rejects any missing/escaping/mismatched target.
 
-The offline Bun test imports only those returned URLs rather than a repository dependency, then asserts the precise exports, positional `SessionManager.create(cwd, sessionDir)`, `AgentSession` constructor/prompt/flush-dispose lifecycle, `ModelRegistry.getApiKey`, and `Agent` `streamFn` constructor path. An unsupported runtime fails closed; this is never a fallback to CLI `--tools`, `setActiveToolNames`, ambient extension discovery, or a provider/event hook.
+The offline Bun test imports those exact URLs and asserts SDK exports `SessionManager`, `AgentSession`, `Settings`, `discoverAuthStorage`, and `ModelRegistry`; core exports `Agent`; AI exports `streamSimple`. It proves positional `SessionManager.create(cwd, sessionDir)`, `AgentSession` prompt/flush-dispose lifecycle, `ModelRegistry.getApiKey`, and Agent `streamFn`/`sessionId`/`deadline`/`telemetry` option fields. Unsupported runtime fails closed; it never falls back to CLI `--tools`, `setActiveToolNames`, ambient extension discovery, or provider/event hooks.
 
 - [ ] **Step 5: Implement private records and deterministic packet construction**
 
@@ -194,8 +197,8 @@ git commit -m "feat: add reviewer evidence packets"
 ### Task 2: Add immutable proposal lifecycle, human triage, and durable batch notification
 
 **Files:**
-- Modify: `bin/agd_lib/reviewer.py`
-- Modify: `tests/test_reviewer.py`
+- Modify: `bin/agd_lib/reviewer.py`, `bin/agd_lib/supervision.py`
+- Modify: `tests/test_reviewer.py`, `tests/test_supervision.py`
 
 **Consumes:** Task 1 packet/run records and `supervision.emit`.
 
@@ -207,14 +210,19 @@ git commit -m "feat: add reviewer evidence packets"
 def packet_run(home):
     packet = {'schema': 1, 'packet_id': 'p1', 'cutoff': 1.0, 'limits': reviewer.DEFAULT_LIMITS,
               'sources': [{'source_id': 'e1', 'kind': 'native-jsonl', 'version': 'v1',
-                           'sha256': '0' * 64, 'span': {'start': 0, 'bytes': 1}}],
+                           'sha256': '0' * 64, 'span': {'start': 0, 'bytes': 1}},
+                          {'source_id': 'e2', 'kind': 'native-jsonl', 'version': 'v2',
+                           'sha256': '1' * 64, 'span': {'start': 1, 'bytes': 1}}],
               'episodes': [], 'coverage': {}, 'skill_inventory': []}
-    return reviewer.begin_run(home, packet, reviewer.enqueue_intent(home, kind='default'))
+    return reviewer.begin_run(home, packet, reviewer.enqueue_intent(home, kind='default'),
+                              model='fixture/model', config_digest='fixture-config',
+                              instruction_digest='fixture-instructions')
 
 def report():
     return {'schema': 1, 'findings': [{'kind': 'existing-skill', 'target': 'agd-review',
-        'finding': 'missing boundary check', 'citations': ['e1'], 'counterexamples': ['e1'],
-        'uncertainty': 'low', 'resolution': 'add bound', 'validation': 'exercise bound'}]}
+        'finding': 'missing boundary check', 'citations': ['e1'], 'counterexamples': ['e2'],
+        'uncertainty': 'low', 'resolution': 'add bound', 'validation': 'exercise bound',
+        'applicability': 'all matching reviewer packets'}]}
 
 def test_report_revision_and_disposition_are_private_and_immutable():
     with lab() as (home, _):
@@ -250,10 +258,17 @@ def _revision_id(proposal_id, evidence_ids, change):
                                      separators=(',', ':')).encode()).hexdigest()
 
 def dispose(home, proposal_id, status, reason, replacement, operator):
+    try:
+        proposal_id = str(uuid.UUID(proposal_id))
+        replacement = None if replacement is None else str(uuid.UUID(replacement))
+    except (TypeError, ValueError) as error:
+        raise store.Refusal('invalid proposal reference') from error
     if status not in {'accepted', 'rejected', 'deferred', 'superseded'}:
         raise store.Refusal('invalid reviewer disposition')
-    if replacement is not None and status != 'superseded':
-        raise store.Refusal('replacement requires superseded disposition')
+    if (status == 'superseded') != (replacement is not None):
+        raise store.Refusal('superseded requires one replacement reference')
+    if replacement is not None and not proposal_path(home, replacement).is_file():
+        raise store.Refusal('replacement proposal does not exist')
     if not isinstance(reason, (str, type(None))) or type(operator.get('uid')) is not int:
         raise store.Refusal('local operator identity is required')
     with reviewer_lock(home):
@@ -266,9 +281,9 @@ def dispose(home, proposal_id, status, reason, replacement, operator):
     return read_triage(home, proposal_id)
 ```
 
-`submit_report` first reloads the frozen run/packet receipt under `reviewer_lock`, rejects wrong run state, schema, unknown citations, excess UTF-8 serialized report, invalid proposal/counterexample/uncertainty/resolution/validation fields, and duplicate broker request ID. It writes content-addressed evidence/review/revision candidates with `O_CREAT|O_EXCL`, fsyncs them, then atomically publishes the report index/receipt and one reviewer-purpose event. Existing matching `run_id + report_hash` returns the already published report; an incomplete candidate is ignored/reclaimed only after its receipt proves no published index. Dedup fingerprint is schema/kind/target/normalized finding/applicability; certain match reuses proposal UUID, uncertain match creates distinct UUID marked `uncertain-distinct`. Triage is the separate atomic append-only history above. `accepted` writes no source/config/profile/task record and invokes no task command.
+`submit_report` first reloads the frozen run/packet receipt under short `store.lock`, rejects wrong run state, schema, unknown citations, excess UTF-8 serialized report, invalid proposal/counterexample/uncertainty/resolution/validation fields, and duplicate broker request ID. It writes content-addressed evidence/review/revision candidates with `O_CREAT|O_EXCL`, fsyncs them, then atomically publishes the report index/receipt. Existing matching `review_run_id + report_hash` returns the already published report; an incomplete candidate is retained and recovery decides its state from the receipt. Dedup fingerprint is schema/kind/target/normalized finding/applicability; certain match reuses proposal UUID, uncertain match creates distinct UUID marked `uncertain-distinct`. Triage is the separate atomic append-only history above. `accepted` writes no source/config/profile/task record and invokes no task command.
 
-`emit_batch` adapts the existing event storage without task identity: envelope `{id, purpose:'background-skill-review', review_run_id, kind:'reviewer-batch', details:{proposal_ids, report_id}}`. Update `supervision.pending`/primary rendering to accept this shape alongside unchanged task events, and make `acknowledge` mark only the event receipt. It must not route through `supervision.emit(home, 'reviewer', run_id, ...)` if that function requires a task/incarnation.
+`emit_batch` writes one deterministic envelope per finalized `review_run_id` (`uuid5("reviewer-batch:"+run_id)`), never per broker retry/report re-read: `{schema:1,id,purpose:'background-skill-review',review_run_id,kind:'reviewer-batch',details:{report_id,proposal_ids}}`. Its authoritative commit point is the final run receipt: under short `store.lock`, atomically write report index then event; mark receipt `final` only after event exists. `recover` retains all immutable evidence and, when it finds published report/no event, recreates that deterministic event before finalizing. `supervision.pending`/acknowledge accept this purpose envelope alongside unchanged task envelopes; it must not call task-only `supervision.emit`.
 
 - [ ] **Step 4: Verify lifecycle behavior and commit**
 
@@ -277,7 +292,7 @@ Run: `PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest py
 Expected: PASS; an acknowledged event leaves proposal state unchanged and no skill/task is created.
 
 ```sh
-git add bin/agd_lib/reviewer.py tests/test_reviewer.py
+git add bin/agd_lib/reviewer.py bin/agd_lib/supervision.py tests/test_reviewer.py tests/test_supervision.py
 git commit -m "feat: persist reviewer proposals"
 ```
 
@@ -304,29 +319,34 @@ Expected: FAIL because reviewer runner/bootstrap does not exist.
 
 - [ ] **Step 3: Implement the verified direct native bootstrap and broker**
 
-`lib/agd-reviewer.ts` receives only the capability-gated package root, private session directory, frozen run receipt path, and private broker file descriptors. The gate reads the installed package's `exports["./sdk"].import` and `exports["."].import` fields, resolves those paths below that verified real package root, and passes their file URLs to the host; it never guesses `dist/sdk.js`, imports a machine-specific path, or adds a repository SDK dependency.
-
-The host dynamically imports the verified SDK/core exports and uses their actual 18.3.2 contracts:
+`lib/agd-reviewer.ts` receives only the three capability-gated package URLs, private session directory, frozen receipt, and broker descriptors. Bun resolves `@oh-my-pi/pi-coding-agent/sdk`, `@oh-my-pi/pi-agent-core`, and `@oh-my-pi/pi-ai` through the verified installed package resolver; it never reads a guessed SDK export/path or repository dependency.
 
 ```ts
 const settings = await Settings.init({ cwd: reviewCwd, agentDir });
 const authStorage = await discoverAuthStorage(agentDir, { cwd: reviewCwd, settings });
 const modelRegistry = new ModelRegistry(authStorage, undefined, { settings });
 const sessionManager = SessionManager.create(reviewCwd, sessionDir);
+const telemetry = await nativeTelemetryFor(receipt); // initTelemetryExport first, then enabled/config
 const agent = new Agent({
-  initialState: { model, tools: [...toolRegistry.values()] },
-  getApiKey: (requested, sessionId, options) => modelRegistry.getApiKey(requested, sessionId, options),
-  streamFn: cappedStreamFn(streamSimple, deadline, maxModelCalls),
-  captureContext: true,
+  initialState: { model, tools: [...toolRegistry.values()], systemPrompt: [reviewPrompt] },
+  sessionId: receipt.native_session_id,
+  deadline: receipt.deadline_epoch_ms,
+  getApiKey: (requested, id, options) => modelRegistry.getApiKey(requested, id, options),
+  streamFn: cappedStreamFn(streamSimple, receipt),
+  telemetry,
 });
-const session = new AgentSession({ agent, sessionManager, settings, modelRegistry, toolRegistry });
+const session = new AgentSession({
+  agent, sessionManager, settings, modelRegistry, toolRegistry,
+  memoryEnabled: false, skills: [], skillsReloadable: false, disableExtensionDiscovery: true,
+  scoutAllowedBySpawnPolicy: false,
+});
 ```
 
 Tool exclusion is direct: the initial `Agent` tools and `AgentSession` `toolRegistry` are the same three-entry map; no `ExtensionRunner`, extension-path discovery, MCP/LSP/IRC, skills, rules, context files, slash commands, spawn policy, or ambient tool registry is constructed. The known `createAgentSession` options (`disableExtensionDiscovery`, `enableMCP`, `enableLsp`, `enableIrc`, `toolNames`, `restrictToolNames`, and `allowRestrictedCustomTools`) are deliberately not treated as access control because this bounded direct bootstrap does not invoke that factory. `setActiveToolNames` is status presentation only, never access control.
 
 `cappedStreamFn(native, deadline, limit)` is the only provider boundary: before forwarding each request to native `streamSimple`, it checks absolute deadline and increments/persists the run receipt counter; call 21/expiry is rejected without calling the provider. It includes continuations and uses no extension event, custom tracing/span, prompt alteration, or provider hook. It does not scrub provider request options required by the transport; tests assert credentials cannot appear in prompt, tool arguments/results, JSONL report, or broker protocol. `session.prompt`, `sessionManager.flush`, `session.beginDispose()`, `session.dispose()`, and `sessionManager.close()` form native lifecycle. The direct `AgentSession` receives `memoryEnabled:false`, `skills:[]`, `skillsReloadable:false`, and `disableExtensionDiscovery:true`. Native storage persists independently of telemetry: use `initTelemetryExport`, `createTelemetryExportConfig` and `flushTelemetryExport` only when the installed exporter reports enabled; pass native Agent telemetry `attributes:{purpose:'background-skill-review',review_run_id}` and capture policy, never a custom SDK/span/exporter.
 
-Python creates the binding/frozen receipt first, sanitizes the child environment, and runs the Bun host. Private JSONL broker requests are `{id, op, args}` and responses `{id, ok, value|error}`. Each request has a UUID, one response, 64 KiB max serialized request/response, schema-checked args, and a broker-side error code; the host rejects duplicate/unknown IDs. Excerpt accepts only cited source ID; search scans packeted UTF-8 excerpts within remaining byte budget; submit validates citation IDs and report/output limit, atomically calls `submit_report`, then returns only `report_id`, proposal IDs, and revision IDs. On crash before atomic publication the receipt remains `running` and recovery marks it retryable; after publication repeated submit returns the existing immutable report by packet/run fingerprint. No fallback tool map, shell, generic file/network/MCP, or CLI `--tools` capability claim exists.
+Python creates the binding/frozen receipt first, sanitizes the child environment, and runs the Bun host. Private JSONL broker requests are `{id, op, args}` and responses `{id, ok, value|error}`. Each request has a UUID, one response, schema-checked args, and a broker-side error code; duplicate/unknown IDs are rejected. Frame size is `frozen max_output_bytes + fixed 4096-byte envelope allowance`, measured as UTF-8 bytes before write—never a hidden 64 KiB ceiling—and excerpts/search replies consume the persisted input-byte budget before framing. Excerpt accepts only cited source ID; search scans packeted UTF-8 excerpts within remaining budget; submit validates citation IDs and frozen output limit, atomically calls `submit_report`, then returns report/proposal/revision IDs. On crash before publication receipt remains recoverable; after publication repeat submit returns the existing immutable report by review-run/report fingerprint. No fallback tool map, shell, generic file/network/MCP, or CLI `--tools` capability claim exists.
 
 - [ ] **Step 4: Verify real OMP boundaries and commit**
 
@@ -354,40 +374,33 @@ git commit -m "feat: run restricted native reviewers"
 - [ ] **Step 1: Write failing timer tests**
 
 ```python
-def test_calendar_deadlines_handle_gap_fold_and_manual_runs_do_not_move_anchor():
-    berlin = {'mode': 'calendar', 'timezone': 'Europe/Berlin', 'calendar': '02:00', 'interval_hours': None}
-    assert reviewer_timer.next_due(berlin, utc('2027-03-28T00:30:00Z')) == utc('2027-03-29T00:00:00Z')
-    assert reviewer_timer.next_due(berlin, utc('2027-10-31T00:30:00Z')) == utc('2027-11-01T01:00:00Z')
-    checkpoint = {'periodic_anchor': utc('2027-01-01T00:00:00Z'), 'last_periodic_due': None}
-    assert reviewer_timer.record_start(checkpoint, utc('2027-01-01T05:00:00Z'), trigger='manual') == checkpoint
+def test_calculate_due_has_one_signature_and_dst_rules():
+    schedule = {'mode': 'calendar', 'timezone': 'Europe/Berlin', 'calendar': '02:00', 'interval_hours': None}
+    checkpoint = {'periodic_anchor': None, 'last_periodic_due': None}
+    gap = reviewer_timer.calculate_due(schedule, checkpoint, utc('2027-03-28T00:30:00Z'))
+    fold = reviewer_timer.calculate_due(schedule, checkpoint, utc('2027-10-31T00:30:00Z'))
+    assert gap.due_at == utc('2027-03-29T00:00:00Z')  # nonexistent local 02:00 is skipped
+    assert fold.due_at == utc('2027-11-01T01:00:00Z') # next first valid occurrence after now
 
-def test_interval_tick_uses_fixed_anchor_and_catches_up_once():
+def test_interval_rearms_exact_absolute_deadline_and_manual_does_not_move_anchor():
     schedule = {'mode': 'interval', 'timezone': None, 'calendar': None, 'interval_hours': 12}
     checkpoint = {'periodic_anchor': 0.0, 'last_periodic_due': 0.0}
-    assert reviewer_timer.due(checkpoint, 36 * 3600 + 1, schedule)
-    assert reviewer_timer.next_due(schedule, checkpoint) == 48 * 3600
+    decision = reviewer_timer.calculate_due(schedule, checkpoint, 36 * 3600 + 1)
+    assert (decision.due_at, decision.next_due, decision.checkpoint['last_periodic_due']) == (12*3600, 48*3600, 36*3600)
+    assert reviewer_timer.record_start(checkpoint, 5.0, trigger='manual') == checkpoint
 
-def test_validate_schedule_rejects_bool_bad_clock_and_zone_injection():
+def test_validate_schedule_rejects_missing_unknown_bool_clock_and_zone_injection():
     for invalid in ({'mode':'interval','timezone':None,'calendar':None,'interval_hours':True},
+                    {'mode':'other','timezone':None,'calendar':None,'interval_hours':1},
                     {'mode':'calendar','timezone':'Europe/Berlin;bad','calendar':'25:00','interval_hours':None}):
         with pytest.raises(store.Refusal): reviewer_timer.validate_schedule(invalid)
 ```
 
-The pure timer tests assert `unit_spec(home_id, schedule)` semantic fields—unique `agd-reviewer-<home_id>.service/.timer`, `TimeoutStartSec=1800`, generated `reviewer run --timer`, calendar expression/Persistent only for calendar, and hourly tick only for interval—rather than raw text copies. A disposable acceptance calls `systemd-analyze calendar` on the emitted calendar expression and parses its next-elapse result.
+`calculate_due(schedule, checkpoint, now_utc)` is the sole pure scheduling contract and returns `{due_at|None, next_due, checkpoint}`; its transaction caller persists that checkpoint and creates at most one intent. It treats missing local calendar times as skipped (does not shift to 03:00) and only chooses a fold occurrence that is still future. Calendar validation includes `zoneinfo.ZoneInfo` plus `systemd-analyze calendar` on the exact emitted expression at enable time.
 
-- [ ] **Step 2: Run timer tests to prove absence**
+For interval mode the timer is not `OnUnitActiveSec`: enable writes one owned absolute UTC `OnCalendar=<next_due>` timer with `Persistent=true`. Each successful/recovered timer service transaction recalculates and atomically rewrites/reloads/restarts that one timer for the next integral anchor; a boot-missed absolute time fires once then re-arms future cadence, without completion drift or hourly lateness. The service `TimeoutStartSec` is rendered from the frozen/validated runtime limit, not literal 1800; the host receipt deadline remains inner authority. Units live in `$XDG_CONFIG_HOME/systemd/user` under UUID-derived names and marker, as previously specified.
 
-Run: `uv run --python 3.12 --with pytest pytest tests/test_reviewer_timer.py -q`
-
-Expected: FAIL because `agd_lib.reviewer_timer` does not exist.
-
-- [ ] **Step 3: Implement strict schedule and explicit installation**
-
-`validate_schedule` accepts only exact keys and real `int` interval hours (not `bool`), `00:00`–`23:59`, IANA-zone syntax without whitespace/control/semicolon, and `manual-only`. Calendar computation uses `zoneinfo.ZoneInfo`, chooses systemd's next valid local occurrence after a DST gap and the first future UTC occurrence during a fold, and stores due times in UTC. Interval mode is a bounded hourly systemd tick; every tick evaluates `periodic_anchor + n*interval` and enqueues at most one compatible overdue periodic intent, advancing the checkpoint to the next integral deadline. Thus it catches up after reboot/offline without tying cadence to completion, while a manual run never changes the periodic anchor.
-
-Install under `$XDG_CONFIG_HOME/systemd/user` (default `~/.config/systemd/user`), not the private AGD home, using a name containing the persisted canonical home UUID; write only files whose content marker has that UUID. Then call `systemctl --user daemon-reload` and explicit `systemctl --user enable --now agd-reviewer-<home-id>.timer`. Disable uses that same owned name then removes only matching marked unit files. Calendar units use `Persistent=true`; interval units do not claim it. The oneshot service uses `Type=oneshot` and `TimeoutStartSec=1800`; runner absolute deadline remains the authoritative inner limit.
-
-Timer/manual collisions use a reviewer-only `fcntl.LOCK_EX|LOCK_NB` and the scoped private intent algorithm: default/periodic equal frozen-scope fingerprints may deduplicate, while every normalized explicit retrospective selection has its own record. No active run is widened; after completion recovery/runner drains one intent into a separately frozen receipt.
+Unit tests parse the emitted semantic `TimerSpec`/`ServiceSpec`, then hand the rendered calendar expression to `systemd-analyze calendar`; they do not assert copied unit substrings. Timer/manual collisions use reviewer `run.lock` and private scope-compatible intents; manual runs never move periodic anchor.
 
 - [ ] **Step 4: Verify pure and native-timer boundaries, then commit**
 
@@ -540,6 +553,20 @@ Expected: PASS. If Docker/user-systemd or another external prerequisite is unava
 
 The final acceptance matrix must exercise: native JSONL selected with Langfuse unavailable and enabled-export metadata; explicit prior self-review versus default exclusion; no UI/no/dead/live-foreign central owner; report dedup/revision and uncertain distinct findings; broker invalid ID/oversize/duplicate request/submit-crash recovery; 20-call and whole-run persisted byte/deadline budgets across restart; timer gap/fold/reboot catch-up/manual-anchor invariants; and acknowledgement/accepted-proposal/new-skill inertness. Record the exact command and observable artifact for each row; unavailable user-systemd is reported as unexercised, not passed.
 
+| Scenario | Input/action | Observable proof |
+|---|---|---|
+| Native source and optional Langfuse | Recorded JSONL binding with Langfuse unavailable; then enabled native export | Same packet provenance; only exporter attributes differ |
+| Linked feedback/history | Immutable feedback link plus unrelated same-named task | Only linked source ID enters packet |
+| Skill provenance | Assigned manifest skill and separately loaded catalog skill | Packet records source/version/assignment distinctly |
+| Counterexample and late feedback | Failure + counterexample; append linked feedback after cutoff | Finding cites both first two; late item appears only next run |
+| Self-review scope | Prior closed reviewer ID; current/later IDs | Only explicit prior ID eligible |
+| Frozen retry limits | Crash after 20th call/input reservation | Recovery preserves counters and refuses 21st/over-limit resume |
+| Broker failure | Invalid ID, oversized report, duplicate submit, crash after index | Refusal; deterministic report; recovery emits missing batch once |
+| Proposal basis | Certain, uncertain, and changed applicability findings | Reused UUID, `uncertain-distinct`, and new basis respectively |
+| Inert new skill | Accepted new-skill proposal with real catalog resolver before/after | Resolver output unchanged; draft exists only reviewer data |
+| Scoped authority | No owner, dead owner, live foreign owner | Reviewer records/event mutate; owner/task bytes unchanged |
+| Timer | Calendar gap/fold, missed absolute interval, manual run | `calculate_due`/systemd command proof of skip/fold/rearm/unchanged anchor |
+
 ```sh
 git add README.md docs/operations.md docs/compatibility.md CHANGELOG.md tests/test_reviewer.py tests/reviewer.test.ts
 git commit -m "docs: describe bounded skill review"
@@ -547,9 +574,9 @@ git commit -m "docs: describe bounded skill review"
 
 ## Plan self-review
 
-- **Spec coverage:** Task 1 covers authoritative JSONL, ended/failure candidates, bounded cross-episode packets, source/version/counterexample provenance, excluded active/reviewer runs, optional Langfuse, frozen provenance, and fail-closed OMP 18.3.2 capability discovery. Task 2 covers immutable evidence/revisions, UUID/fingerprint deduplication, uncertain-distinct proposals, human triage, optional reasons, and acknowledgement separation. Task 3 covers the actual native `Agent`/`AgentSession` constructor APIs, installed-package resolution, `streamFn` call/deadline cap, native persistence, isolated tools, credential boundary, model resolution, and no fallback inventory. Task 4 covers private timer state, explicit approval/activation, calendar/interval limitations, checkpoint catch-up/no drift, scoped coalescing, and recovery. Task 5 covers central-owner protection and durable central-offline notification presentation. Task 6 covers explicit user documentation and a no-paid-model end-to-end path.
-- **Capability audit:** CLI `--tools`, `--no-extensions`, extension tool events, and `setActiveToolNames` are never represented as enforcement. The plan uses the installed direct `Agent` `streamFn` boundary and three-entry tool map, and fails unsupported runtime versions rather than loosening constraints.
-- **Placeholder scan:** Every declared interface has a producing task and focused behavioral test/command. Pending intents are deliberately minimal private records, not a generic queue; configuration/model/instruction/cutoff are frozen before a run begins.
+- **Runtime audit:** This revision uses verified OMP 18.3.2 wildcard/package dependency resolution, positional `SessionManager.create`, direct Agent deadline/session/telemetry options, ModelRegistry key lookup, and native exporter lifecycle; it does not claim CLI tool flags or extension events enforce limits.
+- **Transaction audit:** Long runner lock and short `store.lock` scopes are separated; receipts persist whole-run budgets, event recovery has a deterministic per-run identity, and reviewer scope never claims central/task ownership.
+- **Test audit:** Examples use `lab`, `command`, task persistence, real event storage, actual systemd consumption, and producer-defined packet/report helpers. The explicit acceptance matrix remains the implementation completion checklist rather than a passing claim.
 
 ## Execution handoff
 
