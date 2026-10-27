@@ -204,13 +204,13 @@ def produced_run(home):
     config=reviewer.read_config(home); packet=reviewer.select_packet(home,cutoff=time.time()); instruction=reviewer.INSTRUCTION_FILE.read_bytes()
     return reviewer.begin_run(home,packet,reviewer.enqueue_intent(home,kind='default'),model='openai/reviewer-fixture',config_snapshot=config,instruction_snapshot=instruction,started_at=started,deadline_epoch_ms=int((started+config['limits']['max_runtime_seconds'])*1000)),packet
 def build_report(packet):
-    failed=next(s['source_id'] for s in packet['sources'] if s['task_id']=='failed'); success=next(s['source_id'] for s in packet['sources'] if s['task_id']=='success')
-    return {'schema':1,'summary':'native fixture','findings':[{'kind':'new-skill','target':'bounded-review','finding':'failure','applicability':'all','citations':[failed],'counterexamples':[success],'uncertainty':'low','resolution':'draft','validation':'curated resolve','validation_limits':['Requires human verification; not proof of causality'],'new_skill':{'id':'agd-review-draft','draft':'---\nname: AGD review draft\ndescription: Review bounded evidence\n---\n# Draft\n','triggers':['review'],'scope':'review','prerequisites':[]}}]}
+    failed=next(s['source_id'] for s in packet['sources'] if s['kind']=='native-jsonl' and s['task_id']=='failed'); success=next(s['source_id'] for s in packet['sources'] if s['kind']=='native-jsonl' and s['task_id']=='success')
+    return {'schema':1,'summary':'native fixture','findings':[{'kind':'new-skill','target':'bounded-review','finding':'failure','applicability':'all','citations':[failed],'counterexamples':[success],'uncertainty':'low','resolution':'draft','validation':'curated resolve','validation_limits':['Requires human verification; not proof of causality'],'new_skill':{'id':'agd-review-draft','draft':'---\nname: agd-review-draft\ndescription: Review bounded evidence\n---\n# Draft\n','triggers':['review'],'scope':'review','prerequisites':[]}}]}
 def test_revisions_and_finalization_are_inert():
     with lab() as (home,_):
         before=worker_skills.catalog(home); run,packet=produced_run(home); report=build_report(packet); first=reviewer.submit_report(home,run['review_run_id'],str(uuid.uuid4()),report); proposal=first['proposal_ids'][0]
         reviewer.dispose(home,proposal,'rejected','insufficient',None,{'uid':os.getuid(),'identity':str(os.getuid())}); rejected=reviewer.read_triage(home,proposal)
-        report['findings'][0]['citations'].append(next(s['source_id'] for s in packet['sources'] if s['task_id']=='additional')); second=reviewer.submit_report(home,run['review_run_id'],str(uuid.uuid4()),report)
+        report['findings'][0]['citations'].append(next(s['source_id'] for s in packet['sources'] if s['kind']=='native-jsonl' and s['task_id']=='additional')); second=reviewer.submit_report(home,run['review_run_id'],str(uuid.uuid4()),report)
         assert second['proposal_ids']==[proposal]; assert reviewer.read_triage(home,proposal)==rejected; assert reviewer.read_proposal(home,proposal)['head_revision'] != reviewer.read_proposal(home,proposal)['revisions'][0]['revision_hash']
         bad=build_report(packet); bad['findings'][0]['citations']=['unknown-source']
         with pytest.raises(store.Refusal): reviewer.submit_report(home,run['review_run_id'],str(uuid.uuid4()),bad)
@@ -228,22 +228,26 @@ Expected: FAIL because report/revision/finalization functions are absent.
 ```python
 def _digest(v): return hashlib.sha256(json.dumps(v,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
 def normalize(value): return ' '.join(value.split()).casefold()
-def normalize_target(value): return normalize(value) if value else 'new-workflow'
-def proposal_path(home,proposal_id): uuid.UUID(proposal_id); return paths(home)['proposals']/f'{proposal_id}.json'
-def triage_path(home,proposal_id): uuid.UUID(proposal_id); return paths(home)['triage']/f'{proposal_id}.json'
+def normalize_target(value):
+    if not isinstance(value,str) or not value.strip(): raise store.Refusal('target')
+    return normalize(value)
+def proposal_path(home,proposal_id):
+    proposal_id=str(uuid.UUID(proposal_id)); return paths(home)['proposals']/f'{proposal_id}.json'
+def triage_path(home,proposal_id):
+    proposal_id=str(uuid.UUID(proposal_id)); return paths(home)['triage']/f'{proposal_id}.json'
 def read_proposal(home,proposal_id):
     p=proposal_path(home,proposal_id)
     if not p.is_file(): raise store.Refusal('unknown proposal')
     return json.loads(p.read_text())
 def read_triage(home,proposal_id):
-    proposal_path(home,proposal_id); p=triage_path(home,proposal_id)
-    return json.loads(p.read_text()) if p.is_file() else {'schema':1,'proposal_id':proposal_id,'current':'pending','history':[]}
+    proposal=read_proposal(home,proposal_id); p=triage_path(home,proposal['proposal_id'])
+    return json.loads(p.read_text()) if p.is_file() else {'schema':1,'proposal_id':proposal['proposal_id'],'current':'pending','history':[]}
 def parse_existing_proposal_or_revision(home,value):
     proposal,sep,revision=value.partition('@'); row=read_proposal(home,proposal)
     if sep and revision not in {r['revision_hash'] for r in row['revisions']}: raise store.Refusal('unknown revision')
     return value
 def fingerprint(f): return _digest([1,f['kind'],normalize_target(f['target']),normalize(f['finding']),normalize(f['applicability'])])
-def revision_hash(proposal_id,finding): return _digest([proposal_id,sorted(finding['citations']),sorted(finding.get('counterexamples',[])),finding['resolution'],finding['validation'],finding.get('validation_limits',[]),finding.get('new_skill'),finding['uncertainty']])
+def revision_hash(proposal_id,finding): return _digest([proposal_id,sorted(finding['citations']),sorted(finding.get('counterexamples',[])),finding['resolution'],finding['validation'],finding.get('validation_limits',[]),finding.get('new_skill'),finding['uncertainty'],finding.get('target_source_version')])
 def dispose(home,proposal_id,status,reason,replacement_proposal_id,operator):
     uuid.UUID(proposal_id)
     if status not in {'accepted','rejected','deferred','superseded'} or (reason is not None and not isinstance(reason,str)) or not isinstance(operator,dict) or type(operator.get('uid')) is not int or not isinstance(operator.get('identity'),str): raise store.Refusal('disposition')
