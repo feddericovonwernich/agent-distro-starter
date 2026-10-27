@@ -97,6 +97,48 @@ def test_relaunch_keeps_prior_native_data_when_final_executable_is_true(monkeypa
         assert (first_dir / 'native.jsonl').read_bytes() == b'old transcript\n'
         assert (artifact / 'blob').read_bytes() == b'old artifact'
 
+
+def test_two_live_worker_launches_keep_stale_receipts_per_task_incarnation():
+    import subprocess
+    import time
+    from test_projects import CLI
+    from agd_lib import observability
+
+    with lab() as (home, _):
+        executable = home / 'omp'
+        executable.write_text('#!/bin/sh\nsleep 3\n')
+        executable.chmod(0o755)
+        launched = []
+        for task_id in ('first', 'second'):
+            brief = home / f'{task_id}.md'
+            brief.write_text('Inspect value.txt.\n')
+            task = command(home, 'task', 'create', task_id, '--project', 'sample', '--brief', str(brief),
+                           '--kind', 'scout')
+            incarnation = str(uuid.uuid4())
+            task.update(executor='worker', incarnation=incarnation, harness='omp', backend='tmux',
+                        phase='running', worker_alive=None, unattended=False, endpoint={'incarnation': incarnation},
+                        observability=observability.worker_binding(home, task_id, incarnation))
+            tasks.save(home, task)
+            env = dict(os.environ, PATH=f'{home}:{os.environ["PATH"]}', AGD_TASK_ID=task_id,
+                       AGD_INCARNATION=incarnation)
+            launched.append(subprocess.Popen(
+                [str(CLI), '--home', str(home), 'worker', 'run', task_id, '--incarnation', incarnation],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env))
+        try:
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if len(observability.status(home)['workers']) == 2:
+                    break
+                time.sleep(.05)
+            observability.record_desired_generation(home, '1', 'enabled')
+            receipts = observability.status(home)['workers']
+            assert {(row['task_id'], row['incarnation']) for row in receipts} == {
+                (task_id, tasks.read(home, task_id)['incarnation']) for task_id in ('first', 'second')}
+            assert {row['state'] for row in receipts} == {'stale-restart-required'}
+        finally:
+            for process in launched:
+                assert process.wait(timeout=5) == 0, process.stderr.read()
+
 def test_relaunch_refuses_unknown_prior_process():
     with lab() as (home, project):
         brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')

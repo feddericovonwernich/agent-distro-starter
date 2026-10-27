@@ -57,7 +57,7 @@ OMP worker launch and relaunch reserve a fresh, owner-only task/incarnation sess
 
 `observability enable`, `status`, `stop`, `start`, and `disable` own one private, pinned loopback-only Langfuse/Collector stack; stop and disable preserve its volumes, archives, queue, and credentials. A mode toggle advances the desired generation. Launch receipts retain each central process identity and each worker `(task, incarnation)` environment generation; a live receipt from an older generation is `stale-restart-required`, while an exited receipt remains `stopped`.
 
-Status exposes Collector queue and failure counters only from its local detailed Prometheus endpoint. `queue_batches` is post-`file_storage` backlog evidence; receiver, processor, archive, and in-flight data are never called queued or delivered. Enqueue/send counters are historical, `sent_spans` is not per-item delivery proof, unavailable diagnostics remain `unknown`, and disk-full stays `unknown` unless actual sanitized storage evidence is available.
+Status exposes Collector queue and failure counters only from its local detailed Prometheus endpoint. `queue_batches` is post-`file_storage` backlog evidence; `queue_full` is only the current queue gauge comparison, separate from historical admission failures. Receiver, processor, archive, and in-flight data are never called queued or delivered. Enqueue/send counters are historical, `sent_spans` is not per-item delivery proof, and `storage_failure` is `host-disk-full` or `file-storage-full` only after bounded Collector-log classification; unavailable diagnostics stay `unknown`.
 
 ## Landing, publication, and retention
 

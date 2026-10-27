@@ -447,26 +447,49 @@ def _with_process_status(home, config, observed):
     result['central'] = (next((item for item in reversed(central)
                                if item['state'] != 'stopped'), central[-1] if central else {'state': 'unknown'}))
     result['workers'] = workers
-    result['delivery'] = (_collector_diagnostics(config) if config['mode'] == 'enabled' and
+    result['delivery'] = (_collector_diagnostics(home, config) if config['mode'] == 'enabled' and
                           observed['runtime'] in ('healthy', 'degraded') else {'state': 'unknown'})
     return result
 
 
-def _collector_diagnostics(config):
+def _collector_diagnostics(home, config):
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{config['ports']['collector_metrics_port']}/metrics",
                                     timeout=3) as response:
             if response.status != 200:
                 return {'state': 'unknown'}
-            return _parse_collector_metrics(response.read().decode('utf-8', 'replace'))
+            result = _parse_collector_metrics(response.read().decode('utf-8', 'replace'))
     except (KeyError, OSError, UnicodeError, urllib.error.URLError):
         return {'state': 'unknown'}
+    result['storage_failure'] = _collector_storage_failure(home, config)
+    return result
+
+
+def _collector_storage_failure(home, config):
+    try:
+        output = subprocess.run(['docker', 'compose', '-p', config['project'], '-f',
+                                 str(paths(home)['compose'] / 'compose.yaml'),
+                                 'logs', '--tail', '100', 'collector'], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=3,
+                                check=False).stdout
+    except (KeyError, OSError, subprocess.SubprocessError):
+        return 'unknown'
+    return _classify_collector_errors(output[-65536:])
+
+
+def _classify_collector_errors(text):
+    text = text.lower()
+    if 'enospc' in text or 'no space left on device' in text:
+        return 'host-disk-full'
+    if ('max_size' in text or 'max size' in text) and 'storage' in text:
+        return 'file-storage-full'
+    return 'unknown'
 
 
 def _parse_collector_metrics(text):
-    values = {'queue_batches': None, 'queue_capacity_batches': None, 'enqueue_failed_spans': None,
-              'retryable_send_failed_spans': 0, 'permanent_send_failed_spans': 0,
-              'unclassified_send_failed_spans': 0, 'sent_spans': None, 'disk_full': 'unknown'}
+    values = {'queue_batches': None, 'queue_capacity_batches': None, 'queue_full': 'unknown',
+              'enqueue_failed_spans': None, 'retryable_send_failed_spans': 0, 'permanent_send_failed_spans': 0,
+              'unclassified_send_failed_spans': 0, 'sent_spans': None}
     names = {
         'otelcol_exporter_queue_size': 'queue_batches',
         'otelcol_exporter_queue_capacity': 'queue_capacity_batches',
@@ -494,7 +517,9 @@ def _parse_collector_metrics(text):
                 values['retryable_send_failed_spans'] += value
             else:
                 values['unclassified_send_failed_spans'] += value
-    return dict(state='known', **values) if found else {'state': 'unknown'}
+    if values['queue_batches'] is not None and values['queue_capacity_batches'] is not None:
+        values['queue_full'] = 'full' if values['queue_batches'] == values['queue_capacity_batches'] else 'not-full'
+    return dict(state='known', storage_failure='unknown', **values) if found else {'state': 'unknown'}
 
 
 def _lifecycle(home, action):

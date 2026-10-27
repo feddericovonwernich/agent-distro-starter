@@ -280,11 +280,16 @@ otelcol_exporter_send_failed_spans{exporter="otlphttp/langfuse",error_permanent=
 otelcol_exporter_sent_spans{exporter="otlphttp/langfuse"} 11
 ''')
     assert diagnostics == {
-        'state': 'known', 'queue_batches': 7, 'queue_capacity_batches': 1000,
+        'state': 'known', 'queue_batches': 7, 'queue_capacity_batches': 1000, 'queue_full': 'not-full',
         'enqueue_failed_spans': 2, 'retryable_send_failed_spans': 3,
         'permanent_send_failed_spans': 5, 'unclassified_send_failed_spans': 0,
-        'sent_spans': 11, 'disk_full': 'unknown',
+        'sent_spans': 11, 'storage_failure': 'unknown',
     }
+
+
+def test_collector_error_classification_keeps_disk_and_file_storage_full_distinct():
+    assert observability._classify_collector_errors('write queue: no space left on device') == 'host-disk-full'
+    assert observability._classify_collector_errors('file_storage: max_size exceeded') == 'file-storage-full'
 
 
 def test_scout_cleanup_preserves_native_binding_queue_and_archive_bytes():
