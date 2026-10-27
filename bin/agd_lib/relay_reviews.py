@@ -1,6 +1,7 @@
 """Central-only Relay producer for continuous human PR review feedback."""
 import json
 import stat
+import time
 import uuid
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -92,8 +93,13 @@ def _block(home, task_id, reason, shared=False):
     safe = f'human-review-producer: {str(reason)[:400]}'
     folder = tasks.task_file(home, task_id).parent
     try:
-        (folder / 'observations').mkdir(mode=0o700, exist_ok=True)
-        store.atomic_json(folder / 'observations' / 'human-review-blocked.json', {'reason': safe})
+        observations = folder / 'observations'
+        observations.mkdir(mode=0o700, exist_ok=True)
+        task = tasks.read(home, task_id)
+        observation = {'id': str(uuid.uuid5(uuid.NAMESPACE_URL, f'agd:human-review:{task_id}')),
+                       'task': task_id, 'incarnation': task.get('incarnation', 'central'),
+                       'kind': 'blocked', 'key': 'human-review', 'message': safe, 'observed_at': time.time()}
+        store.atomic_json(observations / f'{observation["id"]}.json', observation)
         receipt = tasks.read_pr_receipt(home, task_id)
         if receipt:
             receipt['blocked_reason'] = safe

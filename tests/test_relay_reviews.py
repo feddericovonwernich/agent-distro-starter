@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
-from agd_lib import relay_reviews, tasks
+from agd_lib import relay_reviews, supervision, tasks
 from support import command, lab
 
 
@@ -127,5 +127,8 @@ def test_malformed_scoped_receipt_is_a_durable_task_block(monkeypatch):
         tasks.pr_receipt_file(home, task['id']).write_text('{}')
 
         assert relay_reviews.tick(home) == {'checked': 1, 'emitted': 0, 'blocked': 1}
-        observation = tasks.task_file(home, task['id']).parent / 'observations' / 'human-review-blocked.json'
-        assert json.loads(observation.read_text())['reason'] == 'human-review-producer: PR review receipt is unavailable'
+        observations = list((tasks.task_file(home, task['id']).parent / 'observations').glob('*.json'))
+        observation = json.loads(observations[0].read_text())
+        assert observation['message'] == 'human-review-producer: PR review receipt is unavailable'
+        assert any(event['kind'] == 'blocked' and event['task'] == task['id']
+                   for event in supervision.reconcile(home)['pending'])
