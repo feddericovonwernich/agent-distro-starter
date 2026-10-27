@@ -315,8 +315,21 @@ def ensure_project_service(home, project_id, repository, run=store.run):
             if (not isinstance(record, dict) or record.get('schema') != 1 or
                     record.get('project') != project_id or record.get('repository') != repository or
                     record.get('runtime') != str(runtime) or record.get('root') != str(root) or
-                    record.get('health') not in ('starting', 'healthy')):
+                    record.get('health') not in ('starting', 'healthy', 'unhealthy', 'stopped')):
                 raise store.Refusal('Relay project service identity changed')
+            if record['health'] in ('unhealthy', 'stopped'):
+                from . import supervision
+                for name in ('connector', 'server'):
+                    process = record.get(name)
+                    if _owned(record, name, supervision):
+                        try:
+                            os.kill(process['pid'], 15)
+                        except ProcessLookupError:
+                            pass
+                    record.pop(name, None)
+                record.pop('blocked_reason', None)
+                record['health'] = 'starting'
+                store.atomic_json(path, record)
             _install_review_definition(root)
             _configure_connector(root, repository)
             return record

@@ -221,11 +221,13 @@ def test_granted_launch_uses_frozen_private_scoped_skill_and_prompt():
         assert (Path(manifest['skills'][0]['snapshot'])/'SKILL.md').is_file()
         scoped = dict(launched, worker_skills=manifest, pr_grant=grant['id'])
         scoped['incarnation'] = 'worker-incarnation'
-        argv = __import__('agd_lib.harnesses', fromlist=['launch_argv']).launch_argv(scoped, brief)
+        argv = __import__('agd_lib.harnesses', fromlist=['launch_argv']).launch_argv(
+            scoped, tasks.task_file(home, 'granted').parent/'brief.md')
         text = argv[-1]
         assert grant['id'] in text and '--incarnation $AGD_INCARNATION' in text
         assert f'worker verify-pr granted' in text and str(home) in text
-        reply_path = home/'state'/'tasks'/'granted'/'relay-reply.json'
+        reply_path = tasks.task_file(home, 'granted').parent/'relay-reply.json'
+        assert reply_path == home/'data'/'tasks'/'granted'/'relay-reply.json'
         assert '--action start' in text and '--action complete' in text and '--action cancelled' in text
         assert 'start|complete|cancelled' not in text
         assert f'--payload {reply_path}' in text

@@ -15,7 +15,7 @@ def launch_argv(task, brief_path, unattended=False):
     if task.get('pr_grant'):
         agd = f'{code_root / "bin" / "agd"} --home {brief_path.parents[3]}'
         grant = task['pr_grant']
-        reply = brief_path.parent/'state'/'tasks'/task['id']/'relay-reply.json'
+        reply = brief_path.parent/'relay-reply.json'
         poll = f'{agd} worker relay-poll {task["id"]} --incarnation $AGD_INCARNATION --grant {grant}'
         reply_prefix = (f'{agd} worker relay-reply {task["id"]} --incarnation $AGD_INCARNATION '
                         f'--grant {grant} --lease LEASE')

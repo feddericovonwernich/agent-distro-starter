@@ -227,6 +227,30 @@ def test_start_project_service_marks_exact_timed_out_server_unhealthy(tmp_path, 
     assert state['health'] == 'unhealthy'
     assert state['server'] == {'pid': 99, 'start': 'identity', 'status': 'starting'}
 
+def test_terminal_service_restarts_only_the_recorded_owned_process(tmp_path, monkeypatch):
+    home = tmp_path/'home'
+    root = home/'state'/'relay'/'projects'/'sample'
+    (root/'.relay'/'connectors').mkdir(parents=True)
+    (root/'.relay'/'connectors'/'github.json').write_text('{}')
+    runtime = tmp_path/'runtime'; (runtime/'bin').mkdir(parents=True)
+    record = {'schema': 1, 'project': 'sample', 'repository': 'owner/repo',
+              'runtime': str(runtime), 'root': str(root), 'health': 'unhealthy',
+              'server': {'pid': 11, 'start': 'server'}, 'connector': {'pid': 12, 'start': 'connector'}}
+    (root/'service.json').write_text(json.dumps(record))
+    monkeypatch.setenv('AGD_RELAY_GITHUB_READ_TOKEN', 'read-only')
+    monkeypatch.setattr(relay, 'ensure_runtime', lambda *_args: runtime)
+    monkeypatch.setattr(relay, '_install_review_definition', lambda *_args: None)
+    monkeypatch.setattr(relay, '_configure_connector', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr('agd_lib.supervision.gone', lambda pid, start: pid == 12)
+    stopped = []
+    monkeypatch.setattr(relay.os, 'kill', lambda pid, signal: stopped.append((pid, signal)))
+
+    restarted = relay.ensure_project_service(home, 'sample', 'owner/repo')
+
+    assert restarted['health'] == 'starting'
+    assert 'server' not in restarted and 'connector' not in restarted
+    assert stopped == [(11, 15)]
+
 
 def test_poll_and_reply_accept_pinned_delivery_shape(tmp_path, monkeypatch):
     from support import command, lab
@@ -257,9 +281,11 @@ def test_poll_and_reply_accept_pinned_delivery_shape(tmp_path, monkeypatch):
         def run(argv, **_kwargs):
             return subprocess.CompletedProcess(argv, 0, json.dumps(delivery if 'poll' in argv else {'ok': True}), '')
         assert relay.poll(home, task, grant, 'worker-1', run=run)['lease_id'] == 'lease-1'
-        assert relay.reply(home, task, grant, 'worker-1', 'lease-1', 'start', None, run=run)['status'] == 'started'
-        assert relay.reply(home, task, grant, 'worker-1', 'lease-1', 'complete',
-                           {'result': {'summary': 'received'}, 'effects': []}, run=run)['status'] == 'settled'
+        assert relay.reply_file(home, task, grant, 'worker-1', 'lease-1', 'start', None, run=run)['status'] == 'started'
+        reply = tasks.task_file(home, 'relaypoll').parent/'relay-reply.json'
+        assert reply == home/'data'/'tasks'/'relaypoll'/'relay-reply.json'
+        reply.write_text('{"result":{"summary":"received"},"effects":[]}')
+        assert relay.reply_file(home, task, grant, 'worker-1', 'lease-1', 'complete', reply, run=run)['status'] == 'settled'
         stale = {'event': {'id': 'event-2', 'type': 'pr.ci.settled', 'version': 1,
                  'correlationId': 'github:owner/repo:pull-request:7',
                  'payload': {'repository': {'fullName': 'owner/repo'},
