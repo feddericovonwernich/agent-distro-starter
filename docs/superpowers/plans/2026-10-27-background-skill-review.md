@@ -350,48 +350,70 @@ git commit -m "feat: run restricted native reviewers"
 
 **Files:**
 - Create: `bin/agd_lib/reviewer_timer.py`, `tests/test_reviewer_timer.py`
-- Modify: `bin/agd_lib/reviewer.py`, `bin/agd_lib/reviewer_runner.py`
+- Modify: `bin/agd_lib/reviewer.py`, `bin/agd_lib/reviewer_runner.py`, `bin/agd`
 
-**Interfaces:** `calculate_due(schedule,checkpoint,now_utc)->{'due_at':float|None,'next_due':float,'checkpoint':dict}`. Interval anchor is `floor(enable_time/3600)*3600`; valid interval is positive integer hours and each due is anchor + N*3600.
+**Interfaces:** `calculate_due(schedule,checkpoint,now_utc)->{'due_at':float|None,'next_due':float|None,'checkpoint':dict}`. Config defaults to `{'mode':'calendar','timezone':'UTC','calendar':'02:00','interval_hours':None}`; config alone is inert.
 
-- [ ] **Step 1: Write failing schedule tests**
+- [ ] **Step 1: Write failing schedule and manual-path tests**
 
 ```python
-def test_hour_anchor_catches_up_once_without_manual_drift():
-    schedule={'mode':'interval','timezone':None,'calendar':None,'interval_hours':12}
-    d=reviewer_timer.calculate_due(schedule,{'anchor':0.0,'last_due':0.0},36*3600+1)
-    assert d == {'due_at':12*3600,'next_due':48*3600,'checkpoint':{'anchor':0.0,'last_due':36*3600}}
-    assert reviewer_timer.record_manual({'anchor':0.0,'last_due':0.0}) == {'anchor':0.0,'last_due':0.0}
-def test_calendar_gap_skips_and_fold_zero_is_verified():
-    schedule={'mode':'calendar','timezone':'Europe/Berlin','calendar':'02:00','interval_hours':None}
-    assert reviewer_timer.calendar_expression(schedule) == '*-*-* 02:00:00 Europe/Berlin'
-    assert reviewer_timer.native_calendar_ok(schedule)
-def test_schedule_rejects_bad_types():
-    for x in ({'mode':'interval','timezone':None,'calendar':None,'interval_hours':True},
-              {'mode':'calendar','timezone':'Europe/Berlin;bad','calendar':'25:00','interval_hours':None}):
-        with pytest.raises(store.Refusal): reviewer_timer.validate_schedule(x)
+def utc(s): return datetime.fromisoformat(s.replace('Z','+00:00')).timestamp()
+def test_interval_hour_anchor_catches_up_once():
+    s={'mode':'interval','timezone':None,'calendar':None,'interval_hours':12}
+    assert reviewer_timer.calculate_due(s,{'anchor':0.,'last_due':0.},36*3600+1)=={'due_at':12*3600,'next_due':48*3600,'checkpoint':{'anchor':0.,'last_due':36*3600}}
+def test_native_calendar_gap_and_fold():
+    s={'mode':'calendar','timezone':'Europe/Berlin','calendar':'02:00','interval_hours':None}
+    assert reviewer_timer.native_next_calendar(s,utc('2027-03-28T00:59Z'))==utc('2027-03-29T00:00Z')
+    assert reviewer_timer.native_next_calendar(s,utc('2027-10-30T00:00Z'))==utc('2027-10-31T00:00Z')
+    assert reviewer_timer.native_next_calendar(s,utc('2027-10-31T00:15Z'))==utc('2027-11-01T01:00Z')
+    assert ZoneInfo('Europe/Berlin').utcoffset(datetime(2027,10,31,2,0,fold=0)) is not None
+def test_manual_cli_does_not_mutate_checkpoint():
+    with lab() as (home,_):
+        reviewer_timer.enable(home); before=reviewer_timer.checkpoint_path(home).read_bytes()
+        command(home,'reviewer','run'); assert reviewer_timer.checkpoint_path(home).read_bytes()==before
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `uv run --python 3.12 --with pytest pytest tests/test_reviewer_timer.py -q`
 
-Expected: FAIL because `agd_lib.reviewer_timer` does not exist.
+Expected: FAIL because the timer kernel does not exist.
 
-- [ ] **Step 3: Implement timer kernel**
+- [ ] **Step 3: Implement timer kernel and explicit enablement**
 
 ```python
-def calculate_due(schedule, checkpoint, now_utc):
-    if schedule['mode'] == 'interval':
-        step=3600*schedule['interval_hours']; anchor=checkpoint['anchor']; due=anchor+step
-        while due <= now_utc: due += step
-        previous=due-step
-        return {'due_at':previous if previous>checkpoint['last_due'] else None,'next_due':due,
-                'checkpoint':{'anchor':anchor,'last_due':max(checkpoint['last_due'],previous)}}
-    return _calendar_due(schedule, checkpoint, now_utc)
+def validate_schedule(s):
+    if set(s)!={'mode','timezone','calendar','interval_hours'}: raise store.Refusal('schedule keys')
+    if s['mode']=='manual-only':
+        if s['timezone'] is not None or s['calendar'] is not None or s['interval_hours'] is not None: raise store.Refusal('manual fields')
+    elif s['mode']=='interval':
+        if s['timezone'] is not None or s['calendar'] is not None or isinstance(s['interval_hours'],bool) or not isinstance(s['interval_hours'],int) or s['interval_hours']<=0: raise store.Refusal('interval')
+    elif s['mode']=='calendar':
+        if s['interval_hours'] is not None or not isinstance(s['calendar'],str) or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',s['calendar']): raise store.Refusal('calendar')
+        try: ZoneInfo(s['timezone'])
+        except Exception as e: raise store.Refusal('timezone') from e
+    else: raise store.Refusal('mode')
+    return s
+def native_next_calendar(s,base):
+    text=subprocess.run(['systemd-analyze','calendar',f"*-*-* {s['calendar']}:00 {s['timezone']}",'--base-time',datetime.fromtimestamp(base,timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),'--iterations=1'],env={**os.environ,'LC_ALL':'C','TZ':'UTC'},timeout=10,check=True,capture_output=True,text=True).stdout
+    m=re.search(r'^Next elapse:\s*(.+)$',text,re.M)
+    if not m: raise store.Refusal('native calendar unavailable')
+    try: return datetime.strptime(m.group(1).replace(' UTC',''),'%a %Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc).timestamp()
+    except ValueError as e: raise store.Refusal('native calendar invalid') from e
+def calculate_due(schedule,checkpoint,now_utc):
+    if schedule['mode']=='manual-only': return {'due_at':None,'next_due':None,'checkpoint':checkpoint}
+    if schedule['mode']=='interval':
+        step=3600*schedule['interval_hours']; anchor=checkpoint['anchor']; last=checkpoint['last_due']; latest=anchor+max(0,int((now_utc-anchor)//step))*step; next_due=latest+step
+        return {'due_at':last+step if latest>last else None,'next_due':next_due,'checkpoint':{'anchor':anchor,'last_due':max(last,latest)}}
+    old=checkpoint['next_due']
+    if now_utc<old:return {'due_at':None,'next_due':old,'checkpoint':checkpoint}
+    future=native_next_calendar(schedule,now_utc)
+    return {'due_at':old,'next_due':future,'checkpoint':{'next_due':future}}
 ```
 
-Interval unit is `OnCalendar=hourly` with `Persistent=true`; eligibility is fixed UTC-hour anchored, not activation-relative, and each tick uses `calculate_due`. Calendar uses emitted IANA expression plus `systemd-analyze calendar --base-time=<before transition> --iterations=2`; fold=0 is accepted only if native parser output matches it, nonexistent gap day is skipped. Persist arm-intent under short home lock, release it, enable/verify systemd, then short-lock mark armed; boot recovery sees unarmed/spent receipt and enables hourly timer before any reviewer run. Render `TimeoutStartSec` from frozen runtime limit. Unit names include canonical home UUID and live only in `$XDG_CONFIG_HOME/systemd/user` with UUID marker.
+`enable` alone writes an intent/owned-unit receipt under the brief home transaction, releases it, runs `daemon-reload` then enable/start, and records success or exposed failure in a new brief transaction—never under the home lock. It is idempotent and preserves the UTC-hour `floor(enable_time/3600)*3600` anchor unless the operator changes schedule and explicitly re-enables. It installs only marked owned names; disable removes only those names. No run, startup, boot, or config edit auto-enables.
+
+Render the interval timer as `OnCalendar=*-*-* *:00:00 UTC` and `Persistent=true`; docs state the first period is hour-aligned and the global hourly wake is eligible only at its N-hour deadline. The service has trusted absolute home/source-CLI argv, home UUID unit name/marker, `TimeoutStartSec` from configured runtime, and exits before collection on an ineligible interval tick. Persistent native hourly scheduling provides one reboot catch-up. Calendar checkpoints store `next_due`; a not-due check remains unchanged, while overdue emits one old `next_due` and stores `native_next_calendar(schedule,now_utc)`. Native-enable validation requires systemd's selected zone/expression to agree with `ZoneInfo` gap/fold-0 behavior; otherwise refuse and honestly report user-systemd integration unavailable. Schedule changes require operator re-enable; later run receipts remain frozen.
 
 - [ ] **Step 4: Run timer tests to verify pass**
 
@@ -402,7 +424,7 @@ Expected: PASS; no real unit enabled except separately approved disposable user-
 - [ ] **Step 5: Commit Task 4**
 
 ```bash
-git add bin/agd_lib/reviewer_timer.py bin/agd_lib/reviewer.py bin/agd_lib/reviewer_runner.py tests/test_reviewer_timer.py tests/test_reviewer.py
+git add bin/agd_lib/reviewer_timer.py bin/agd_lib/reviewer.py bin/agd_lib/reviewer_runner.py bin/agd tests/test_reviewer_timer.py tests/test_reviewer.py
 git commit -m "feat: schedule bounded reviewer runs"
 ```
 
