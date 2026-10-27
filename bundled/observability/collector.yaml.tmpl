@@ -1,6 +1,8 @@
 extensions:
   file_storage/trace_queue:
     directory: "{{QUEUE}}"
+  health_check:
+    endpoint: "0.0.0.0:13133"
 receivers:
   otlp:
     protocols:
@@ -27,7 +29,7 @@ exporters:
     sending_queue: {enabled: true, storage: file_storage/trace_queue, queue_size: 1000}
     retry_on_failure: {enabled: true, initial_interval: 1s, max_interval: 30s, max_elapsed_time: 5m}
 service:
-  extensions: [file_storage/trace_queue]
+  extensions: [file_storage/trace_queue, health_check]
   pipelines:
     traces: {receivers: [otlp], processors: [transform/langfuse], exporters: [file/traces, otlphttp/langfuse]}
     logs: {receivers: [otlp], exporters: [file/logs]}

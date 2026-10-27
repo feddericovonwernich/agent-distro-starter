@@ -96,19 +96,7 @@ def test_disabled_environment_removes_only_ambient_otel_controls(monkeypatch):
 
 def test_rendered_stack_keeps_only_browser_collector_and_media_ports_on_loopback():
     with lab() as (home, _):
-        lock = {
-            'schema': 1,
-            'images': {
-                'collector': 'example.invalid/collector@sha256:' + '0' * 64,
-                'langfuse': 'example.invalid/langfuse@sha256:' + '1' * 64,
-                'langfuse_worker': 'example.invalid/worker@sha256:' + '2' * 64,
-                'postgres': 'example.invalid/postgres@sha256:' + '3' * 64,
-                'clickhouse': 'example.invalid/clickhouse@sha256:' + '4' * 64,
-                'minio': 'example.invalid/minio@sha256:' + '5' * 64,
-                'redis': 'example.invalid/redis@sha256:' + '6' * 64,
-            },
-        }
-        rendered = observability.render_stack(home, lock)
+        rendered = observability.render_stack(home)
         model = json.loads(subprocess.check_output(
             ['docker', 'compose', '-f', str(rendered['compose']), 'config', '--format', 'json'],
             text=True, stderr=subprocess.DEVNULL))
@@ -118,6 +106,15 @@ def test_rendered_stack_keeps_only_browser_collector_and_media_ports_on_loopback
     assert set(published) <= {'langfuse-web', 'collector', 'minio'}
     assert all(port['host_ip'] == '127.0.0.1'
                for ports in published.values() for port in ports)
+
+
+def test_render_stack_rejects_an_unpinned_injected_lock():
+    with lab() as (home, _):
+        lock = observability._load_lock()
+        lock['images']['collector'] = 'example.invalid/collector@sha256:' + '0' * 64
+
+        with pytest.raises(store.Refusal):
+            observability.render_stack(home, lock)
 
 
 def test_control_failure_is_sanitized_not_child_output():
@@ -182,3 +179,44 @@ def test_disable_unconfigured_home_is_idempotent():
     with lab() as (home, _):
         assert observability.disable(home)['runtime'] == 'disabled'
         assert observability.disable(home)['runtime'] == 'disabled'
+
+
+def test_status_requires_collector_and_generated_project_readiness(monkeypatch):
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self):
+            return b'{"data":[]}'
+
+    with lab() as (home, _):
+        rendered = observability.render_stack(home)
+        observability._save_state(home, 'enabled', 'healthy', rendered)
+        monkeypatch.setattr(
+            observability.subprocess, 'run',
+            lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                [], 0, '[{"Service":"collector","State":"running"}]', ''))
+        monkeypatch.setattr(observability.urllib.request, 'urlopen', lambda *_args, **_kwargs: Response())
+
+        assert observability.status(home)['runtime'] == 'degraded'
+
+
+def test_disable_persists_disabled_state_when_stop_fails(monkeypatch):
+    with lab() as (home, _):
+        rendered = observability.render_stack(home)
+        observability._save_state(home, 'enabled', 'healthy', rendered)
+        monkeypatch.setattr(
+            observability, '_compose',
+            lambda *_args: (_ for _ in ()).throw(store.Refusal('stop failed: command failed')))
+
+        with pytest.raises(store.Refusal):
+            observability.disable(home)
+
+        assert observability.read_config(home)['mode'] == 'disabled'
+        assert observability.read_status(home)['desired'] == 'disabled'
+        assert observability.read_status(home)['runtime'] == 'degraded'

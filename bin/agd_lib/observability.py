@@ -80,7 +80,7 @@ def render_stack(home, lock=None):
     mapping.update({
         'PROJECT': allocation['project'], 'WEB_PORT': allocation['web_port'],
         'MINIO_PORT': allocation['minio_port'], 'OTLP_HTTP_PORT': allocation['otlp_http_port'],
-        'OTLP_GRPC_PORT': allocation['otlp_grpc_port'], 'COLLECTOR_CONFIG': collector,
+        'OTLP_GRPC_PORT': allocation['otlp_grpc_port'], 'COLLECTOR_HEALTH_PORT': allocation['collector_health_port'], 'COLLECTOR_CONFIG': collector,
         'QUEUE': locations['queue'], 'TRACE_ARCHIVE': locations['trace_archive'],
         'LOG_ARCHIVE': locations['log_archive'], 'METRIC_ARCHIVE': locations['metric_archive'],
         'UID': os.getuid(), 'GID': os.getgid(), 'ORG_ID': values['org_id'],
@@ -291,9 +291,11 @@ def status(home):
         rows = json.loads(output) if output.strip().startswith('[') else [json.loads(line) for line in output.splitlines() if line]
         if not any(row.get('Service') == 'collector' and row.get('State') == 'running' for row in rows):
             return dict(observed, runtime='degraded')
-        with urllib.request.urlopen(
-                f"http://127.0.0.1:{config['ports']['web_port']}/api/public/health", timeout=3) as response:
-            return dict(observed, runtime='healthy' if response.status == 200 else 'degraded')
+        rendered = dict(config['ports'])
+        rendered['project'] = config['project']
+        if not _ready(rendered, _secrets(home, rendered)):
+            return dict(observed, runtime='degraded')
+        return dict(observed, runtime='healthy')
     except (KeyError, OSError, ValueError, subprocess.SubprocessError, urllib.error.URLError):
         return dict(observed, runtime='degraded')
 
@@ -328,6 +330,8 @@ def _lifecycle(home, action):
                 _save_state(home, desired, 'disabled' if action == 'disable' else 'stopped', _allocation(home))
                 return read_status(home)
             rendered = dict(_allocation(home), compose=locations['compose'] / 'compose.yaml')
+            if action == 'disable':
+                _save_state(home, 'disabled', 'unknown', rendered)
             _compose(rendered, 'stop'); _save_state(home, desired, 'stopped', rendered)
             return read_status(home)
     except store.Refusal:
@@ -345,29 +349,36 @@ def _compose(rendered, *command):
         raise store.Refusal(result['message'])
 
 
+def _ready(rendered, value):
+    with urllib.request.urlopen(
+            f"http://127.0.0.1:{rendered['collector_health_port']}/", timeout=3) as collector:
+        if collector.status != 200:
+            return False
+    with urllib.request.urlopen(
+            f"http://127.0.0.1:{rendered['web_port']}/api/public/health", timeout=3) as response:
+        if response.status != 200:
+            return False
+    auth = base64.b64encode(f"{value['public_key']}:{value['secret_key']}".encode()).decode()
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{rendered['web_port']}/api/public/projects",
+        headers={'Authorization': 'Basic ' + auth})
+    with urllib.request.urlopen(request, timeout=5) as project_response:
+        payload = json.loads(project_response.read())
+    projects = payload.get('data', payload) if isinstance(payload, dict) else payload
+    return isinstance(projects, list) and any(
+        isinstance(project, dict) and project.get('id') == value['project_id'] for project in projects)
+
+
 def _wait_ready(rendered, value):
-    url = f"http://127.0.0.1:{rendered['web_port']}/api/public/health"
     deadline = time.monotonic() + 420
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(url, timeout=3) as response:
-                if response.status != 200:
-                    continue
-            auth = base64.b64encode(f"{value['public_key']}:{value['secret_key']}".encode()).decode()
-            request = urllib.request.Request(
-                f"http://127.0.0.1:{rendered['web_port']}/api/public/projects",
-                headers={'Authorization': 'Basic ' + auth})
-            with urllib.request.urlopen(request, timeout=5) as project_response:
-                payload = json.loads(project_response.read())
-            projects = payload.get('data', payload) if isinstance(payload, dict) else payload
-            if isinstance(projects, list) and any(
-                    isinstance(project, dict) and project.get('id') == value['project_id'] for project in projects):
+            if _ready(rendered, value):
                 return
         except (OSError, ValueError, urllib.error.URLError):
             pass
         time.sleep(2)
     raise store.Refusal('observability start failed: stack did not become ready')
-
 
 def _save_state(home, desired, runtime, allocation):
     with store.lock(home):
@@ -412,12 +423,12 @@ def _allocation(home):
     token = _home_id(home).replace('-', '')[:12]
     base = 20000 + int(token[:4], 16) % 20000
     if not (paths(home)['compose'] / 'release-lock.json').exists():
-        for port in range(base, base + 4):
+        for port in range(base, base + 5):
             with socket.socket() as probe:
                 if probe.connect_ex(('127.0.0.1', port)) == 0:
                     raise store.Refusal('observability loopback port is unavailable')
     return {'project': f'agdobs{token}', 'web_port': base, 'minio_port': base + 1,
-            'otlp_http_port': base + 2, 'otlp_grpc_port': base + 3}
+            'otlp_http_port': base + 2, 'otlp_grpc_port': base + 3, 'collector_health_port': base + 4}
 
 
 def _secrets(home, allocation):
@@ -453,6 +464,8 @@ def _validate_lock(lock):
         raise store.Refusal('observability release lock is unsupported')
     if any(not isinstance(image, str) or '@sha256:' not in image or len(image.rsplit('@sha256:', 1)[1]) != 64
            for image in lock['images'].values()):
+        raise store.Refusal('observability release lock is unsupported')
+    if lock != _load_lock():
         raise store.Refusal('observability release lock is unsupported')
 
 
