@@ -520,12 +520,12 @@ def _summary_schema(schema):
             properties['summary'].get('type') == 'string')
 
 def _cancel_delivery(service, root, lease, run):
-    result = run([str(Path(service['runtime'])/'bin'/'relay'), 'agent', 'reply', lease, 'cancelled',
-                  '--project-root', str(root), '--json', '{"effects":[]}'], timeout=30)
     try:
+        result = run([str(Path(service['runtime'])/'bin'/'relay'), 'agent', 'reply', lease, 'cancelled',
+                      '--project-root', str(root), '--json', '{"effects":[]}'], timeout=30)
         if json.loads(result.stdout) != {'ok': True}:
             raise store.Refusal('Relay cancellation was rejected')
-    except json.JSONDecodeError as error:
+    except (json.JSONDecodeError, subprocess.SubprocessError, OSError, store.DependencyError, store.Refusal) as error:
         raise store.Refusal('Relay cancellation authority is uncertain') from error
 
 def _same_pr(receipt, current):
@@ -550,7 +550,11 @@ def poll(home, task, grant, incarnation, run=store.run):
     if not _same_pr(receipt, current):
         lease = delivery.get('leaseId')
         if isinstance(lease, str) and lease:
-            _cancel_delivery(service, root, lease, run)
+            try:
+                _cancel_delivery(service, root, lease, run)
+            except store.Refusal:
+                _block_receipt(home, current_task['id'], current, 'Relay cancellation authority is uncertain')
+                raise
         raise store.Refusal('PR changed during Relay poll')
     if delivery.get('type') == 'timeout':
         current['relay'] = {**current.get('relay', {}), 'idle_at': time.time()}
@@ -573,7 +577,11 @@ def poll(home, task, grant, incarnation, run=store.run):
                            pull.get('headSha') == current['local_head'] and pull.get('baseRef') == current['base'])
     if not valid:
         if isinstance(lease, str) and lease:
-            _cancel_delivery(service, root, lease, run)
+            try:
+                _cancel_delivery(service, root, lease, run)
+            except store.Refusal:
+                _block_receipt(home, current_task['id'], current, 'Relay cancellation authority is uncertain')
+                raise
         else:
             _block_receipt(home, current_task['id'], current, 'Relay delivery has no cancellable lease')
         raise store.Refusal('Relay delivery identity is invalid')
@@ -639,11 +647,21 @@ def reply(home, task, grant, incarnation, lease_id, action, payload, run=store.r
     except (json.JSONDecodeError, subprocess.SubprocessError, OSError, store.DependencyError, store.Refusal) as error:
         _block_receipt(home, task['id'], receipt, 'Relay reply authority is uncertain')
         raise store.Refusal('Relay reply authority is uncertain') from error
-    if action == 'start':
-        lease['status'] = 'started'
-    else:
-        lease['status'] = 'settled'
-        relay_state.setdefault('pending_feedback', {})['status'] = 'acknowledged' if action == 'complete' else 'cancelled'
-    receipt['relay'] = relay_state
-    tasks.write_pr_receipt(home, task['id'], receipt)
+    with store.lock(home):
+        current = tasks.read_pr_receipt(home, task['id'])
+        if not _same_pr(receipt, current):
+            raise store.Refusal('PR changed during Relay reply')
+        relay_state = current.get('relay', {})
+        lease = relay_state.get('lease', {})
+        expected = 'started' if action == 'complete' else 'active'
+        if lease.get('id') != lease_id or lease.get('status') != expected:
+            raise store.Refusal('Relay lease changed during reply')
+        if action == 'start':
+            lease['status'] = 'started'
+        else:
+            lease['status'] = 'settled'
+            relay_state.setdefault('pending_feedback', {})['status'] = (
+                'acknowledged' if action == 'complete' else 'cancelled')
+        current['relay'] = relay_state
+        tasks._write_pr_receipt_locked(home, task['id'], current)
     return {'status': lease['status']}
