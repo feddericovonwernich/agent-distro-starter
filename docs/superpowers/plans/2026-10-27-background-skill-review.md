@@ -170,9 +170,13 @@ def produced_run(home):
     ended_worker(home,'failed',str(uuid.uuid4()),'failure'); ended_worker(home,'success',str(uuid.uuid4()),'counterexample')
     packet=reviewer.select_packet(home,cutoff=time.time()); config=reviewer.read_config(home); started=time.time()
     instruction=b'Review only supplied evidence.'
-    return reviewer.begin_run(home,packet,reviewer.enqueue_intent(home,kind='default'),model='native/default',
+    return reviewer.begin_run(home,packet,reviewer.enqueue_intent(home,kind='default'),model='openai/reviewer-fixture',
       config_digest=hashlib.sha256(json.dumps(config,sort_keys=True).encode()).hexdigest(),instruction_digest=hashlib.sha256(instruction).hexdigest(),
       started_at=started,deadline_epoch_ms=int((started+packet['limits']['max_runtime_seconds'])*1000)),packet
+
+def build_report(packet):
+    first, second=(s['source_id'] for s in packet['sources'][:2])
+    return {'schema':1,'summary':'native fixture','findings':[{'kind':'new-skill','target':None,'finding':'failure','applicability':'all','citations':[first],'counterexamples':[second],'uncertainty':'low','resolution':'draft','validation':'curated resolve','new_skill':{'id':'agd-review-draft','draft':'# Draft\n','triggers':['review'],'scope':'review','prerequisites':[]}}]}
 
 def test_new_skill_acceptance_is_inert_and_event_is_once():
     with lab() as (home, _):
@@ -241,9 +245,9 @@ git commit -m "feat: persist reviewer proposals"
 **Interfaces:**
 
 ```ts
-export type Native = { ai:any; core:any; sdk:any };
+export type Native = { ai:any; core:any; sdk:any; telemetry:any };
 export interface Broker { rpc(op:string,args:unknown):Promise<unknown>; reserveModelCall():Promise<void>; settleModelCall():Promise<void>; persistNativeSessionId(id:string):Promise<void>; finalResult():Promise<{reportId:string}>; }
-export interface ReviewerInput { cwd:string; agentDir:string; sessionDir:string; reviewRunId:string; receipt:{deadline_epoch_ms:number}; model:any; reviewPrompt:string; broker:Broker; native:Native; onRuntimeTools?:(names:string[])=>void; }
+export interface ReviewerInput { cwd:string; agentDir:string; sessionDir:string; reviewRunId:string; receipt:{deadline_epoch_ms:number}; model:any; reviewPrompt:string; broker:Broker; native:Native; }
 export function runReviewer(input:ReviewerInput, streamFn?:any):Promise<{reportId:string}>;
 ```
 
@@ -291,16 +295,16 @@ function cappedStreamFn(native:any,broker:Broker,ai:any) {
   };
 }
 export async function runReviewer(input:ReviewerInput,streamFn:any=input.native.ai.streamSimple) {
-  const {sdk,core,ai}=input.native; await sdk.initTelemetryExport();
+  const {sdk,core,ai,telemetry:exporter}=input.native; await exporter.initTelemetryExport();
   const settings=await sdk.Settings.init({cwd:input.cwd,agentDir:input.agentDir}), auth=await sdk.discoverAuthStorage(input.agentDir,{cwd:input.cwd,settings}), registry=new sdk.ModelRegistry(auth,undefined,{settings}), manager=sdk.SessionManager.create(input.cwd,input.sessionDir);
   await input.broker.persistNativeSessionId(manager.getSessionId());
-  const tools=reviewerTools(input.broker); input.onRuntimeTools?.([...tools.keys()]);
-  const telemetry=sdk.isTelemetryExportEnabled()?sdk.createTelemetryExportConfig({attributes:{purpose:'background-skill-review',review_run_id:input.reviewRunId},captureMessageContent:'full'}):undefined;
+  const tools=reviewerTools(input.broker);
+  const telemetry=exporter.isTelemetryExportEnabled()?exporter.createTelemetryExportConfig({attributes:{purpose:'background-skill-review',review_run_id:input.reviewRunId},captureMessageContent:'full'}):undefined;
   const agent=new core.Agent({initialState:{model:input.model,tools:[...tools.values()],systemPrompt:[input.reviewPrompt]},sessionId:manager.getSessionId(),deadline:input.receipt.deadline_epoch_ms,telemetry,getApiKey:(m:any,id:any,opt:any)=>registry.getApiKey(m,id,opt),streamFn:cappedStreamFn(streamFn,input.broker,ai)});
   const session=new sdk.AgentSession({agent,sessionManager:manager,settings,modelRegistry:registry,toolRegistry:tools,memoryEnabled:false,skills:[],skillsReloadable:false,disableExtensionDiscovery:true,scoutAllowedBySpawnPolicy:false});
-  try {await session.prompt(input.reviewPrompt);await manager.flush();return await input.broker.finalResult();} finally {session.beginDispose();await session.dispose();await manager.close();await sdk.flushTelemetryExport();}
+  try {await session.prompt(input.reviewPrompt);await manager.flush();return await input.broker.finalResult();} finally {session.beginDispose();await session.dispose();await manager.close();await exporter.flushTelemetryExport();}
 }
-function reviewerTools(broker:Broker) { return new Map(['reviewer_excerpt','reviewer_search','reviewer_submit'].map(name=>[name,{name,label:name,description:name,parameters:{type:'object',properties:name==='reviewer_search'?{query:{type:'string'}}:name==='reviewer_excerpt'?{source_id:{type:'string'}}:{report:{type:'object'}},required:name==='reviewer_search'?['query']:name==='reviewer_excerpt'?['source_id']:['report'],additionalProperties:false},execute:async(_id:string,args:any)=>({content:[{type:'text',text:JSON.stringify(await broker.rpc(name,args))}],details:{}})}]));}
+function reviewerTools(broker:Broker) { return new Map(['reviewer_excerpt','reviewer_search','reviewer_submit'].map(name=>[name,{name,label:name,description:name,parameters:{type:'object',properties:name==='reviewer_search'?{query:{type:'string'}}:name==='reviewer_excerpt'?{source_id:{type:'string'}}:{report:{type:'object'}},required:name==='reviewer_search'?['query']:name==='reviewer_excerpt'?['source_id']:['report'],additionalProperties:false},execute:async(_id:string,args:any)=>{const text=await broker.rpc(name,args);if(typeof text!=='string')throw new Error('invalid broker text');return {content:[{type:'text',text}],details:{}};}}]));}
 ```
 
 `serve_broker` reads one JSONL request at a time, validates UUID `id`, invokes packet excerpt/search/submit, and writes `{id,ok,value|error}` with the same ID. Python receipt reservation checks absolute deadline/counter before returning; settlement writes `dispatch:'settled'`. If the host dies after reservation, recovery leaves `unknown-provider-outcome` and rejects resume.
