@@ -233,8 +233,9 @@ def main(args):
             return workers.launch(home, args.id, args.harness, args.backend, args.unattended,
                                   args.approval, args.profile, args.skill_mode, tuple(args.skill), args.pr_grant)
         if args.operation == 'publish-pr':
-            return pr.publish(home, args.id, args.incarnation, args.grant,
-                              Path(args.title).read_text(), Path(args.body).read_text())
+            title, body = pr.publication_texts(home, args.id, args.incarnation, args.grant,
+                                               args.title, args.body)
+            return pr.publish(home, args.id, args.incarnation, args.grant, title, body)
         if args.operation == 'verify-pr':
             return pr.verify_and_ready(home, args.id, args.incarnation, args.grant, Path(args.report))
         if args.operation == 'relay-poll':

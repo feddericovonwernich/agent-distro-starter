@@ -30,6 +30,25 @@ class FakeGitHub:
         return pr
 
 
+def test_publish_files_authenticate_before_reading_and_reject_symlinks(monkeypatch):
+    from agd_lib import store
+    with lab() as (home, _):
+        brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
+        task = command(home, 'task', 'create', 'publish-files', '--project', 'sample', '--brief', str(brief))
+        instruction = home/'instruction.txt'
+        instruction.write_text('Authorize publish-files to publish origin:agd/publish-files.\n')
+        grant = tasks.grant_pr_publish(home, task['id'], 'origin:agd/publish-files', instruction)
+        folder = tasks.task_file(home, task['id']).parent
+        title, body = folder/'pr-title.txt', folder/'pr-body.md'
+        title.symlink_to(home/'not-readable')
+        with pytest.raises(store.Refusal, match='current worker'):
+            pr.publication_texts(home, task['id'], 'wrong-worker', grant['id'], title, body)
+        task.update(phase='running', executor='worker', incarnation='worker-inc'); tasks.save(home, task)
+        monkeypatch.setenv('AGD_TASK_ID', task['id'])
+        monkeypatch.setenv('AGD_INCARNATION', 'worker-inc')
+        with pytest.raises(store.Refusal, match='unsafe'):
+            pr.publication_texts(home, task['id'], 'worker-inc', grant['id'], title, body)
+
 def test_verify_and_ready_requires_current_final_github_evidence(monkeypatch):
     with lab() as (home, _):
         brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
