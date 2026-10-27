@@ -637,8 +637,7 @@ def _require_owned_resources(rendered):
     names = [('network', rendered['project'] + '_network'),
              *[('volume', rendered['project'] + suffix) for suffix in ('_postgres', '_clickhouse', '_redis', '_minio')]]
     for kind, name in names:
-        inspected = subprocess.run(['docker', kind, 'inspect', name], stdin=subprocess.DEVNULL,
-                                   capture_output=True, text=True, timeout=10)
+        inspected = _ownership_command(['docker', kind, 'inspect', name])
         if inspected.returncode:
             continue
         try:
@@ -647,20 +646,24 @@ def _require_owned_resources(rendered):
             raise store.Refusal('observability ownership is uncertain')
         if value.get('Labels', {}).get('agd.home_id') != home_id:
             raise store.Refusal('observability resource belongs to another home')
-    containers = subprocess.run(['docker', 'ps', '-aq', '--filter',
-                                 f'label=com.docker.compose.project={rendered["project"]}'],
-                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+    containers = _ownership_command(['docker', 'ps', '-aq', '--filter',
+                                     f'label=com.docker.compose.project={rendered["project"]}'])
     if containers.returncode:
         raise store.Refusal('observability container ownership is uncertain')
     for container_id in containers.stdout.split():
-        inspected = subprocess.run(['docker', 'container', 'inspect', container_id], stdin=subprocess.DEVNULL,
-                                   capture_output=True, text=True, timeout=10)
+        inspected = _ownership_command(['docker', 'container', 'inspect', container_id])
         try:
             value = json.loads(inspected.stdout)[0]
         except (IndexError, ValueError, TypeError):
             raise store.Refusal('observability container ownership is uncertain')
         if value.get('Config', {}).get('Labels', {}).get('agd.home_id') != home_id:
             raise store.Refusal('observability resource belongs to another home')
+
+def _ownership_command(command):
+    try:
+        return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise store.Refusal('observability ownership inspection is unavailable') from error
 
 
 def _ready(rendered, value):
