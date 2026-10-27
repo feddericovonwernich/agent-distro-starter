@@ -81,7 +81,7 @@ def render_stack(home, lock=None):
     collector = render_collector(home, lock, values)
     mapping = dict(lock['images'])
     mapping.update({
-        'PROJECT': allocation['project'], 'WEB_PORT': allocation['web_port'],
+        'PROJECT': allocation['project'], 'HOME_ID': _home_id(home), 'WEB_PORT': allocation['web_port'],
         'MINIO_PORT': allocation['minio_port'], 'OTLP_HTTP_PORT': allocation['otlp_http_port'],
         'OTLP_GRPC_PORT': allocation['otlp_grpc_port'], 'COLLECTOR_HEALTH_PORT': allocation['collector_health_port'],
         'COLLECTOR_METRICS_PORT': allocation['collector_metrics_port'], 'COLLECTOR_CONFIG': collector,
@@ -101,7 +101,8 @@ def render_stack(home, lock=None):
     compose = locations['compose'] / 'compose.yaml'
     _private_write(compose, _render(_template('compose.yaml.tmpl'), mapping))
     _private_write(locations['compose'] / 'release-lock.json', json.dumps(lock, sort_keys=True) + '\n')
-    return dict(allocation, compose=compose, collector=collector)
+    return dict(allocation, compose=compose, collector=collector, lock=lock, project_id=values['project_id'],
+                home_id=_home_id(home))
 
 
 def read_config(home):
@@ -111,6 +112,10 @@ def read_config(home):
     if value is None:
         return {'schema': 1, 'home_id': _home_id(home), 'mode': 'disabled', 'generation': '0'}
     _validate_record(value, home, 'config', 'mode')
+    if 'project' in value:
+        if not isinstance(value.get('project_id'), str) or not value['project_id']:
+            raise store.Refusal('observability configuration is malformed')
+        _validate_lock(value.get('lock'))
     return value
 
 
@@ -171,10 +176,12 @@ def managed_environment(home, role, task, incarnation):
     allocation = config.get('ports')
     if not isinstance(allocation, dict) or not isinstance(allocation.get('otlp_http_port'), int):
         raise store.Refusal('observability configuration is malformed')
-    project_id = _secrets(home, _allocation(home))['project_id']
+    project_id = config.get('project_id')
+    if not isinstance(project_id, str) or not project_id:
+        raise store.Refusal('observability configuration is malformed')
     attributes = {
         'service.name': 'agent-distro', 'agd.home_id': config['home_id'],
-        'agd.langfuse_project': project_id, 'agd.role': role,
+        'agd.distro_id': config['home_id'], 'agd.langfuse_project': project_id, 'agd.role': role,
         'agd.session_scope': 'central' if role == 'central' else 'task-incarnation',
     }
     if role == 'worker':
@@ -253,14 +260,6 @@ def _incarnation(value):
         raise ValueError('invalid worker incarnation')
     return parsed
 
-
-def _ambient_otel(key):
-    if not key.startswith('OTEL_'):
-        return False
-    return (key.startswith('OTEL_EXPORTER_') or key in {
-        'OTEL_TRACES_EXPORTER', 'OTEL_LOGS_EXPORTER', 'OTEL_METRICS_EXPORTER',
-        'OTEL_RESOURCE_ATTRIBUTES', 'OTEL_SERVICE_NAME',
-    } or 'PROTOCOL' in key or 'HEADER' in key or 'CONTENT' in key)
 
 
 def _private_directory(home, *parts):
@@ -349,7 +348,8 @@ def record_desired_generation(home, generation, mode):
         allocation = _allocation(home)
         config = {'schema': 1, 'home_id': _home_id(home), 'mode': mode, 'generation': actual_generation,
                   'project': allocation['project'],
-                  'ports': {key: allocation[key] for key in allocation if key.endswith('_port')}}
+                  'ports': {key: allocation[key] for key in allocation if key.endswith('_port')},
+                  'lock': _load_lock(), 'project_id': str(uuid.uuid4())}
         _private_directory(home, 'data', 'observability')
         _private_directory(home, 'state', 'observability')
         store.atomic_json(paths(home)['config'], config)
@@ -396,25 +396,26 @@ def _process_gone(pid, start):
 def status(home):
     home = _home(home)
     config, observed = read_config(home), read_status(home)
-    if observed['runtime'] in ('disabled', 'stopped'):
-        return _with_process_status(home, config, observed)
     compose = paths(home)['compose'] / 'compose.yaml'
+    if 'project' not in config:
+        return _with_process_status(home, config, observed)
     if not compose.exists():
         return _with_process_status(home, config, dict(observed, runtime='unknown'))
     try:
-        output = subprocess.run(['docker', 'compose', '-p', config.get('project', ''), '-f', str(compose),
+        _require_owned_resources({'project': config['project'], 'home_id': config['home_id']})
+        output = subprocess.run(['docker', 'compose', '-p', config['project'], '-f', str(compose),
                                  'ps', '--format', 'json'], stdin=subprocess.DEVNULL, capture_output=True,
                                 text=True, timeout=20, check=True).stdout
         rows = json.loads(output) if output.strip().startswith('[') else [
             json.loads(line) for line in output.splitlines() if line]
         if not any(row.get('Service') == 'collector' and row.get('State') == 'running' for row in rows):
-            return _with_process_status(home, config, dict(observed, runtime='degraded'))
+            return _with_process_status(home, config, dict(observed, runtime='stopped'))
         rendered = dict(config['ports'])
         rendered['project'] = config['project']
-        if not _ready(rendered, _secrets(home, rendered)):
+        if not _ready(rendered, _read_secrets(home)):
             return _with_process_status(home, config, dict(observed, runtime='degraded'))
         return _with_process_status(home, config, dict(observed, runtime='healthy'))
-    except (KeyError, OSError, ValueError, subprocess.SubprocessError, urllib.error.URLError):
+    except (KeyError, OSError, ValueError, subprocess.SubprocessError, urllib.error.URLError, store.Refusal):
         return _with_process_status(home, config, dict(observed, runtime='degraded'))
 
 
@@ -424,12 +425,13 @@ def _with_process_status(home, config, observed):
     central = []
     workers = []
     for receipt in receipts:
-        if not isinstance(receipt, dict) or receipt.get('schema') != 1:
+        if (not isinstance(receipt, dict) or receipt.get('schema') != 1 or
+                not isinstance(receipt.get('recorded_at'), (int, float))):
             raise store.Refusal('observability process receipt is malformed')
         role = receipt.get('role')
         if role not in ('central', 'worker') or not isinstance(receipt.get('generation'), str):
             raise store.Refusal('observability process receipt is malformed')
-        value = {key: receipt[key] for key in ('generation', 'pid', 'start') if key in receipt}
+        value = {key: receipt[key] for key in ('generation', 'pid', 'start', 'recorded_at') if key in receipt}
         try:
             exited = _process_gone(receipt['pid'], receipt['start'])
         except (OSError, ValueError, TypeError):
@@ -443,16 +445,58 @@ def _with_process_status(home, config, observed):
             if not isinstance(receipt.get('task_id'), str) or not isinstance(receipt.get('incarnation'), str):
                 raise store.Refusal('observability worker process receipt is malformed')
             workers.append(dict(value, task_id=receipt['task_id'], incarnation=receipt['incarnation']))
+    bindings = _worker_bindings(home)
+    by_identity = {(row['task_id'], row['incarnation']): row for row in bindings}
+    for worker in workers:
+        binding = by_identity.get((worker['task_id'], worker['incarnation']))
+        if binding:
+            worker.update({key: value for key, value in binding.items() if key != 'state'})
+            worker['native_state'] = binding['state']
     result = dict(observed)
-    result['central'] = (next((item for item in reversed(central)
-                               if item['state'] != 'stopped'), central[-1] if central else {'state': 'unknown'}))
+    live = [item for item in central if item['state'] != 'stopped']
+    result['central'] = max(live, key=lambda item: item['recorded_at']) if live else (
+        max(central, key=lambda item: item['recorded_at']) if central else {'state': 'unknown'})
+    result['central_history'] = sorted(central, key=lambda item: item['recorded_at'])
     result['workers'] = workers
+    result['bindings'] = bindings
+    result['durable'] = _durable_status(home)
     delivery = (_collector_diagnostics(home, config) if config['mode'] == 'enabled' and
-                observed['runtime'] in ('healthy', 'degraded') else {'state': 'unknown'})
-    if observed['runtime'] == 'healthy' and delivery.get('permanent_failure') == 'observed':
+                result['runtime'] in ('healthy', 'degraded') else {'state': 'unknown'})
+    if result['runtime'] == 'healthy' and delivery.get('permanent_failure') == 'observed':
         result['runtime'] = 'degraded'
     result['delivery'] = delivery
     return result
+
+
+def _worker_bindings(home):
+    root = _existing_private_directory(home, 'data', 'observability', 'tasks')
+    if root is None:
+        return []
+    bindings = []
+    for receipt in root.glob('*/omp/*/binding.json'):
+        value = _read_json(receipt)
+        if not isinstance(value, dict) or value.get('session_dir') != str(receipt.parent):
+            raise store.Refusal('observability binding is malformed')
+        files = [path for path in receipt.parent.iterdir() if path.name != 'binding.json']
+        state = 'native files present' if files else 'native session not materialized'
+        bindings.append(dict(task_id=value['task_id'], incarnation=value['incarnation'],
+                             session_dir=value['session_dir'], binding_state='directory allocated', state=state))
+    return sorted(bindings, key=lambda item: (item['task_id'], item['incarnation']))
+
+
+def _durable_status(home):
+    locations = paths(home)
+    entries = {'queue': locations['queue'], 'trace_archive': locations['trace_archive'],
+               'log_archive': locations['log_archive'], 'metric_archive': locations['metric_archive']}
+    return {name: {'path': str(path), 'bytes': _tree_bytes(path)} for name, path in entries.items()}
+
+
+def _tree_bytes(path):
+    if not path.exists():
+        return 0
+    if path.is_file():
+        return path.stat().st_size
+    return sum(item.stat().st_size for item in path.rglob('*') if item.is_file())
 
 
 def _collector_diagnostics(home, config):
@@ -555,15 +599,17 @@ def _lifecycle(home, action):
         if action == 'start':
             if config['mode'] != 'enabled' or not (locations['compose'] / 'compose.yaml').exists():
                 raise store.Refusal('observability is not enabled')
-            rendered = dict(_allocation(home), compose=locations['compose'] / 'compose.yaml')
-            _compose(rendered, 'up', '-d'); _wait_ready(rendered, _secrets(home, rendered))
+            rendered = dict(_allocation(home), compose=locations['compose'] / 'compose.yaml',
+                            home_id=config['home_id'], lock=config['lock'], project_id=config['project_id'])
+            _compose(rendered, 'up', '-d'); _wait_ready(rendered, _read_secrets(home))
             _save_state(home, 'enabled', 'healthy', rendered); return status(home)
         if action in ('stop', 'disable'):
             desired = 'disabled' if action == 'disable' else config['mode']
             if not (locations['compose'] / 'compose.yaml').exists():
                 _save_state(home, desired, 'disabled' if action == 'disable' else 'stopped', _allocation(home))
                 return read_status(home)
-            rendered = dict(_allocation(home), compose=locations['compose'] / 'compose.yaml')
+            rendered = dict(_allocation(home), compose=locations['compose'] / 'compose.yaml',
+                            home_id=config['home_id'], lock=config['lock'], project_id=config['project_id'])
             if action == 'disable':
                 _save_state(home, 'disabled', 'unknown', rendered)
             _compose(rendered, 'stop'); _save_state(home, desired, 'stopped', rendered)
@@ -577,10 +623,30 @@ def _lifecycle(home, action):
 
 
 def _compose(rendered, *command):
+    _require_owned_resources(rendered)
     result = run_control(['docker', 'compose', '-p', rendered['project'], '-f', str(rendered['compose']), *command],
                          command[0])
     if result:
         raise store.Refusal(result['message'])
+
+
+def _require_owned_resources(rendered):
+    home_id = rendered.get('home_id')
+    if not home_id:
+        return
+    names = [('network', rendered['project'] + '_network'),
+             *[('volume', rendered['project'] + suffix) for suffix in ('_postgres', '_clickhouse', '_redis', '_minio')]]
+    for kind, name in names:
+        inspected = subprocess.run(['docker', kind, 'inspect', name], stdin=subprocess.DEVNULL,
+                                   capture_output=True, text=True, timeout=10)
+        if inspected.returncode:
+            continue
+        try:
+            value = json.loads(inspected.stdout)[0]
+        except (IndexError, ValueError, TypeError):
+            raise store.Refusal('observability ownership is uncertain')
+        if value.get('Labels', {}).get('agd.home_id') != home_id:
+            raise store.Refusal('observability resource belongs to another home')
 
 
 def _ready(rendered, value):
@@ -618,8 +684,16 @@ def _save_state(home, desired, runtime, allocation):
     with store.lock(home):
         current = read_config(home)
         generation = str(int(current['generation']) + (current['mode'] != desired))
+        lock = allocation.get('lock')
+        if not isinstance(lock, dict):
+            lock = _load_lock()
+        _validate_lock(lock)
+        project_id = allocation.get('project_id')
+        if not isinstance(project_id, str):
+            project_id = _secrets(home, allocation)['project_id']
         config = {'schema': 1, 'home_id': _home_id(home), 'mode': desired, 'generation': generation,
-                  'project': allocation['project'], 'ports': {k: allocation[k] for k in allocation if k.endswith('_port')}}
+                  'project': allocation['project'], 'ports': {k: allocation[k] for k in allocation if k.endswith('_port')},
+                  'lock': lock, 'project_id': project_id}
         status_value = {'schema': 1, 'home_id': _home_id(home), 'desired': desired,
                         'runtime': runtime, 'generation': generation}
         _private_directory(home, 'data', 'observability')
@@ -684,6 +758,13 @@ def _secrets(home, allocation):
     _private_directory(home, 'data', 'observability')
     store.atomic_json(path, value)
     os.chmod(path, 0o600)
+    return value
+
+
+def _read_secrets(home):
+    value = _read_json(paths(home)['secrets'])
+    if not isinstance(value, dict) or value.get('home_id') != _home_id(home):
+        raise store.Refusal('observability secrets are unavailable')
     return value
 
 

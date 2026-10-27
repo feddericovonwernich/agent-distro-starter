@@ -357,3 +357,43 @@ def test_scout_cleanup_preserves_native_binding_queue_and_archive_bytes():
         assert (artifact / 'blob').read_bytes() == b'old artifact'
         assert (queue / 'item').read_bytes() == b'queued'
         assert archive.read_bytes() == b'archive'
+
+
+def test_enabled_environment_uses_configured_project_and_distro_identity_without_secrets():
+    with lab() as (home, _):
+        rendered = observability.render_stack(home)
+        observability._save_state(home, 'enabled', 'healthy', rendered)
+        observability.paths(home)['secrets'].unlink()
+        env, _generation, _warning = observability.managed_environment(home, 'worker', {'id': 'task-a'}, INCARNATION)
+        assert env['OTEL_TRACES_EXPORTER'] == 'otlp'
+        assert not observability.paths(home)['secrets'].exists()
+        rendered = observability.render_stack(home)
+        observability._save_state(home, 'enabled', 'healthy', rendered)
+        project_id = observability.read_config(home)['project_id']
+        env, _generation, _warning = observability.managed_environment(home, 'worker', {'id': 'task-a'}, INCARNATION)
+        attributes = dict(item.split('=', 1) for item in env['OTEL_RESOURCE_ATTRIBUTES'].split(','))
+        assert attributes['agd.distro_id'] == attributes['agd.home_id']
+        assert attributes['agd.langfuse_project'] == project_id
+
+
+def test_status_reports_binding_materialization_and_durable_bytes():
+    with lab() as (home, _):
+        binding = observability.worker_binding(home, 'task-a', INCARNATION)
+        session = Path(binding['session_dir'])
+        queue = observability.paths(home)['queue']; queue.mkdir(parents=True); (queue/'item').write_bytes(b'abc')
+        status = observability.status(home)
+        assert status['bindings'][0]['state'] == 'native session not materialized'
+        assert status['bindings'][0]['session_dir'] == str(session)
+        assert status['durable']['queue']['bytes'] == 3
+        (session/'native.jsonl').write_bytes(b'{}')
+        assert observability.status(home)['bindings'][0]['state'] == 'native files present'
+
+
+def test_newest_live_central_receipt_wins_over_filename_order(monkeypatch):
+    with lab() as (home, _):
+        monkeypatch.setattr(observability, '_process_gone', lambda *_: False)
+        values = iter((1.0, 2.0))
+        monkeypatch.setattr(observability.time, 'time', lambda: next(values))
+        observability.record_process_generation(home, 'central', '0', pid=11, start='one')
+        observability.record_process_generation(home, 'central', '0', pid=12, start='two')
+        assert observability.status(home)['central']['pid'] == 12
