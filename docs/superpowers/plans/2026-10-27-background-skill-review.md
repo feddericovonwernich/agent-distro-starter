@@ -235,71 +235,95 @@ git commit -m "feat: persist reviewer proposals"
 ### Task 3: Restricted native OMP host and bridge proof
 
 **Files:**
-- Create: `lib/agd-reviewer.ts`
-- Modify: `bin/agd_lib/reviewer_runner.py`, `tests/reviewer.test.ts`, `tests/reviewer_bridge.py`, `tests/test_reviewer.py`
+- Create: `lib/agd-reviewer.ts`, `tests/reviewer.test.ts`, `tests/reviewer-fixture.ts`, `tests/reviewer_bridge.py`
+- Modify: `bin/agd_lib/reviewer_runner.py`, `tests/test_reviewer.py`
 
-**Interfaces:** `runReviewer({cwd,agentDir,sessionDir,receipt,broker,model,reviewPrompt}, streamFn = streamSimple): Promise<{reportId:string}>`; production entry invokes it without second argument. `serve_broker(home, review_run_id, stdin, stdout)` processes real broker frames.
-
-- [ ] **Step 1: Write failing bridge/native-loop test**
+**Interfaces:**
 
 ```ts
-import { test, expect } from 'bun:test';
-import { runReviewer } from '../lib/agd-reviewer';
-import { scriptedStream } from './reviewer-fixture';
-test('native loop calls actual bridge then persists report', async () => {
-  const bridge = await startPythonBridge(); // tests/reviewer_bridge.py fixture, disposable AGD_HOME/run
-  const result = await runReviewer(bridge.options, scriptedStream([
-    toolCall('reviewer_search', {query:'failure'}), toolCall('reviewer_submit', bridge.report)
-  ]));
-  expect(result.reportId).toBe(bridge.reportId);
-  expect(bridge.readReport().review_run_id).toBe(bridge.runId);
-  expect(bridge.toolNames()).toEqual(['reviewer_excerpt','reviewer_search','reviewer_submit']);
+export interface Broker { rpc(op:string,args:unknown):Promise<unknown>; reserveModelCall():Promise<void>; settleModelCall():Promise<void>; persistNativeSessionId(id:string):Promise<void>; finalResult():Promise<{reportId:string; toolNames:string[]}>; }
+export interface ReviewerInput { cwd:string; agentDir:string; sessionDir:string; reviewRunId:string; receipt:{deadline_epoch_ms:number}; model:Model; reviewPrompt:string; broker:Broker; onTools?:(names:string[])=>void; }
+export function runReviewer(input:ReviewerInput, streamFn:StreamFn=streamSimple):Promise<{reportId:string;toolNames:string[]}>;
+```
+
+- [ ] **Step 1: Write the actual native-loop fixture and failing test**
+
+```ts
+// tests/reviewer-fixture.ts
+import { AssistantMessageEventStream, type AssistantMessage, type ToolCall } from '@oh-my-pi/pi-ai';
+import type { StreamFn } from '@oh-my-pi/pi-agent-core';
+export const toolCall=(name:string,arguments_:unknown):ToolCall=>({type:'toolCall',id:crypto.randomUUID(),name,arguments:arguments_});
+export const scriptedStream=(calls:ToolCall[]):StreamFn => () => {
+  const stream=new AssistantMessageEventStream();
+  const message:AssistantMessage={role:'assistant',content:calls,api:'openai-completions',provider:'test',model:'test',usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},stopReason:'toolUse',timestamp:Date.now()};
+  queueMicrotask(()=>{stream.push({type:'done',reason:'toolUse',message}); stream.end();});
+  return stream;
+};
+```
+
+```ts
+// tests/reviewer.test.ts
+import {expect,test} from 'bun:test'; import {runReviewer} from '../lib/agd-reviewer'; import {scriptedStream,toolCall} from './reviewer-fixture';
+test('native loop uses real bridge and persists returned report',async()=> {
+  const bridge=await startBridge(); try {
+    const seen:string[]=[]; const result=await runReviewer({...bridge.input,onTools:n=>seen.push(...n)},scriptedStream([toolCall('reviewer_search',{query:'failure'}),toolCall('reviewer_submit',bridge.report)]));
+    expect(seen.sort()).toEqual(['reviewer_excerpt','reviewer_search','reviewer_submit']);
+    expect(result.reportId).toBeTruthy(); expect(bridge.readReport(result.reportId).citations).toEqual(bridge.report.findings[0].citations);
+  } finally { await bridge.close(); }
 });
 ```
 
-`tests/reviewer_bridge.py` creates sources through `ended_worker`/`select_packet`/`begin_run`, starts `serve_broker` on stdin/stdout, and exposes `{options,runId,reportId,report}` JSON. `scriptedStream` returns an actual `AssistantMessageEventStream` built with pi-ai’s installed event constructors/types; it is passed only as `runReviewer`’s second argument, never through CLI/config/model name.
+`startBridge()` is defined in this test file: it uses `Bun.spawn(['uv','run','--python','3.12','tests/reviewer_bridge.py'],{stdin:'pipe',stdout:'pipe',stderr:'pipe'})`, reads one JSON handshake line, returns `{input,report,readReport,close}`, closes stdin, awaits process exit, and removes its temporary home. `reviewer_bridge.py` creates Task-1 packet/run inside `with lab()`, emits handshake `{input,report}`, then calls `reviewer_runner.serve_broker(home,run_id,sys.stdin,sys.stdout)`; it does not precompute report IDs.
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `bun test tests/reviewer.test.ts`
 
-Expected: FAIL because host/bridge are absent.
+Expected: FAIL because host, fixture, and bridge do not exist.
 
-- [ ] **Step 3: Implement native host and cap**
+- [ ] **Step 3: Implement host, RPC tools, and awaited cap**
 
 ```ts
-export async function runReviewer(input: ReviewerInput, streamFn: StreamFn = streamSimple) {
+function cappedStreamFn(native:StreamFn, broker:Broker):StreamFn {
+  return async (...args) => {
+    await broker.reserveModelCall();             // durable reservation precedes dispatch
+    const stream=await native(...args);
+    const settle=async(event:any)=>{ if(event.type==='done'||event.type==='error') await broker.settleModelCall(); };
+    stream.on('event',settle);                   // terminal native event settles durable receipt
+    return stream;
+  };
+}
+export async function runReviewer(input:ReviewerInput,streamFn:StreamFn=streamSimple) {
   await initTelemetryExport();
-  const settings = await Settings.init({cwd:input.cwd, agentDir:input.agentDir});
-  const auth = await discoverAuthStorage(input.agentDir,{cwd:input.cwd,settings});
-  const registry = new ModelRegistry(auth,undefined,{settings});
-  const manager = SessionManager.create(input.cwd,input.sessionDir);
+  const settings=await Settings.init({cwd:input.cwd,agentDir:input.agentDir});
+  const auth=await discoverAuthStorage(input.agentDir,{cwd:input.cwd,settings});
+  const registry=new ModelRegistry(auth,undefined,{settings}), manager=SessionManager.create(input.cwd,input.sessionDir);
   await input.broker.persistNativeSessionId(manager.getSessionId()!);
-  const agent = new Agent({initialState:{model:input.model,tools:[...input.tools.values()],systemPrompt:[input.reviewPrompt]},
-    sessionId:manager.getSessionId(),deadline:input.receipt.deadline_epoch_ms,
-    getApiKey:(m,id,opt)=>registry.getApiKey(m,id,opt),streamFn:cappedStreamFn(streamFn,input.broker)});
-  const session = new AgentSession({agent,sessionManager:manager,settings,modelRegistry:registry,toolRegistry:input.tools,
-    memoryEnabled:false,skills:[],skillsReloadable:false,disableExtensionDiscovery:true,scoutAllowedBySpawnPolicy:false});
-  try { await session.prompt(input.reviewPrompt); await manager.flush(); return input.broker.finalResult(); }
+  const tools=new Map<string,AgentTool>(reviewerTools(input.broker));
+  input.onTools?.([...tools.keys()]);
+  const telemetry=createTelemetryExportConfig({attributes:{purpose:'background-skill-review',review_run_id:input.reviewRunId}});
+  const agent=new Agent({initialState:{model:input.model,tools:[...tools.values()],systemPrompt:[input.reviewPrompt]},sessionId:manager.getSessionId(),deadline:input.receipt.deadline_epoch_ms,telemetry,getApiKey:(m,id,opt)=>registry.getApiKey(m,id,opt),streamFn:cappedStreamFn(streamFn,input.broker)});
+  const session=new AgentSession({agent,sessionManager:manager,settings,modelRegistry:registry,toolRegistry:tools,memoryEnabled:false,skills:[],skillsReloadable:false,disableExtensionDiscovery:true,scoutAllowedBySpawnPolicy:false});
+  try { await session.prompt(input.reviewPrompt); await manager.flush(); return await input.broker.finalResult(); }
   finally { session.beginDispose(); await session.dispose(); await manager.close(); await flushTelemetryExport(); }
 }
-function cappedStreamFn(native: StreamFn, broker: Broker): StreamFn {
-  return (...args) => { broker.reserveModelCall(); return native(...args); };
+function reviewerTools(broker:Broker):Map<string,AgentTool> {
+  return new Map(['reviewer_excerpt','reviewer_search','reviewer_submit'].map(name=>[name,{name,label:name,description:name,parameters:{type:'object'},execute:async(_id,args)=>broker.rpc(name,args)} as AgentTool]));
 }
 ```
 
-`reserveModelCall` runs short receipt transaction before native call, rejects deadline/call 21, marks dispatch sent, and stream settlement marks it settled. Broker measures actual UTF-8 JSONL frame bytes: excerpt/search reserve remaining input, submit reserves remaining output; no fixed 64 KiB cap. Configure native telemetry via installed `createTelemetryExportConfig` after `initTelemetryExport`, retaining existing exporter capture policy plus attributes purpose/run ID.
+`serve_broker` reads one JSONL request at a time, validates UUID `id`, invokes packet excerpt/search/submit, and writes `{id,ok,value|error}` with the same ID. Python receipt reservation checks absolute deadline/counter before returning; settlement writes `dispatch:'settled'`. If the host dies after reservation, recovery leaves `unknown-provider-outcome` and rejects resume.
 
-- [ ] **Step 4: Run bridge/native tests to verify pass**
+- [ ] **Step 4: Run tests to verify pass**
 
 Run: `bun test tests/reviewer.test.ts && PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/reviewer_bridge.py tests/test_reviewer.py -q`
 
-Expected: PASS without paid provider calls; invalid source, `bash`, `write`, 21st call, expired deadline, duplicate frame, and oversized report all refuse.
+Expected: PASS; actual runtime inventory denies `bash`/`write`, returned report ID reads persisted report, bridge closes cleanly, and no production CLI/config offline hook exists.
 
 - [ ] **Step 5: Commit Task 3**
 
 ```bash
-git add lib/agd-reviewer.ts bin/agd_lib/reviewer_runner.py tests/reviewer.test.ts tests/reviewer_bridge.py tests/test_reviewer.py
+git add lib/agd-reviewer.ts bin/agd_lib/reviewer_runner.py tests/reviewer.test.ts tests/reviewer-fixture.ts tests/reviewer_bridge.py tests/test_reviewer.py
 git commit -m "feat: run restricted native reviewers"
 ```
 
