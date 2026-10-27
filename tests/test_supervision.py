@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 import pytest
 from test_projects import CLI, run
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'bin'))
 from agd_lib.supervision import process_start
 from agd_lib import supervision
 
@@ -166,18 +167,19 @@ def test_watcher_runs_central_review_tick_after_reconcile(monkeypatch, tmp_path)
     calls = []
     monkeypatch.setattr(supervision, 'reconcile', lambda _home: calls.append('reconcile') or {'pending': []})
     monkeypatch.setattr('agd_lib.relay_reviews.tick', lambda _home: calls.append('tick'))
+    monkeypatch.setattr('agd_lib.supervision._stop_owned_relay_services', lambda _home: calls.append('stop'))
     monkeypatch.setattr(supervision.time, 'sleep',
                         lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt()))
     with pytest.raises(KeyboardInterrupt):
         supervision.watch(home, 1, 'start', 'generation')
-    assert calls == ['reconcile', 'tick']
+    assert calls == ['reconcile', 'tick', 'stop']
 
 
 def test_owner_exit_stops_only_regular_owned_relay_service(monkeypatch, tmp_path):
     home = tmp_path / 'home'
     good = home / 'state' / 'relay' / 'projects' / 'sample'
     good.mkdir(parents=True)
-    (good / 'service.json').write_text('{}')
+    (good / 'service.json').write_text(json.dumps({'schema': 1, 'project': 'sample', 'root': str(good)}))
     unsafe = home / 'state' / 'relay' / 'projects' / 'unsafe'
     unsafe.mkdir()
     (unsafe / 'service.json').symlink_to(tmp_path / 'outside.json')
