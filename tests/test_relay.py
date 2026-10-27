@@ -226,3 +226,54 @@ def test_start_project_service_marks_exact_timed_out_server_unhealthy(tmp_path, 
     state = json.loads((root/'service.json').read_text())
     assert state['health'] == 'unhealthy'
     assert state['server'] == {'pid': 99, 'start': 'identity', 'status': 'starting'}
+
+
+def test_poll_and_reply_accept_pinned_delivery_shape(tmp_path, monkeypatch):
+    from support import command, lab
+    from agd_lib import tasks
+    with lab() as (home, _project):
+        brief = home/'brief.md'; brief.write_text('Change value.\n')
+        command(home, 'task', 'create', 'relaypoll', '--project', 'sample', '--brief', str(brief), '--kind', 'ship')
+        instruction = home/'grant.md'; instruction.write_text('Task relaypoll targets origin:agd/relaypoll.\n')
+        grant = tasks.grant_pr_publish(home, 'relaypoll', 'origin:agd/relaypoll', instruction)
+        task = tasks.read(home, 'relaypoll')
+        task.update(phase='running', executor='worker', incarnation='worker-1')
+        tasks.save(home, task)
+        head = __import__('agd_lib.store', fromlist=['git']).git(Path(task['worktree']), 'rev-parse', 'HEAD')
+        tasks.write_pr_receipt(home, 'relaypoll', {'schema': 1, 'grant_id': grant['id'], 'remote': 'origin',
+                              'repository': 'owner/repo', 'branch': task['branch'], 'base': task['base'],
+                              'local_head': head, 'remote_head': head, 'pr': {'number': 7, 'url': 'https://example.test/pr/7', 'id': 'P7'}})
+        root, runtime = home/'state'/'relay'/'projects'/'sample', tmp_path/'runtime'
+        (runtime/'bin').mkdir(parents=True); root.mkdir(parents=True)
+        (root/'service.json').write_text(json.dumps({'runtime': str(runtime), 'root': str(root)}))
+        monkeypatch.setenv('AGD_TASK_ID', 'relaypoll'); monkeypatch.setenv('AGD_INCARNATION', 'worker-1')
+        delivery = {'event': {'id': 'event-1', 'type': 'agd.pr.review', 'version': 1,
+                    'correlationId': 'github:owner/repo:pull-request:7',
+                    'payload': {'repository': 'owner/repo', 'pullRequest': 7, 'headSha': head}},
+                    'outputSchema': {'type': 'object', 'required': ['summary'], 'additionalProperties': False,
+                                     'properties': {'summary': {'type': 'string', 'minLength': 1}}},
+                    'attempt': 1, 'workerId': 'worker-1', 'leaseId': 'lease-1',
+                    'leaseExpiresAt': 'x', 'hardDeadlineAt': 'y'}
+        def run(argv, **_kwargs):
+            return subprocess.CompletedProcess(argv, 0, json.dumps(delivery if 'poll' in argv else {'ok': True}), '')
+        assert relay.poll(home, task, grant, 'worker-1', run=run)['lease_id'] == 'lease-1'
+        assert relay.reply(home, task, grant, 'worker-1', 'lease-1', 'start', None, run=run)['status'] == 'started'
+        assert relay.reply(home, task, grant, 'worker-1', 'lease-1', 'complete',
+                           {'result': {'summary': 'received'}, 'effects': []}, run=run)['status'] == 'settled'
+
+
+def test_poll_rejects_prepared_or_stale_worker_without_subprocess(tmp_path, monkeypatch):
+    from support import command, lab
+    from agd_lib import tasks
+    with lab() as (home, _project):
+        brief = home/'brief.md'; brief.write_text('Change value.\n')
+        command(home, 'task', 'create', 'notrunning', '--project', 'sample', '--brief', str(brief), '--kind', 'ship')
+        task = tasks.read(home, 'notrunning')
+        monkeypatch.setenv('AGD_TASK_ID', 'notrunning'); monkeypatch.setenv('AGD_INCARNATION', 'stale')
+        called = False
+        def run(*_args, **_kwargs):
+            nonlocal called
+            called = True
+        with pytest.raises(store.Refusal, match='current worker'):
+            relay.poll(home, task, {'id': 'grant'}, 'stale', run=run)
+        assert not called
