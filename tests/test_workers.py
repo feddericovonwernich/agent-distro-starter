@@ -241,7 +241,7 @@ def test_granted_launch_refuses_non_github_remote_before_worker_creation():
     with lab() as (home, _project):
         brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
         command(home, 'task', 'create', 'nongithub', '--project', 'sample', '--brief', str(brief), '--kind', 'ship')
-        instruction = home/'grant.md'; instruction.write_text('Task grant.\n')
+        instruction = home/'grant.md'; instruction.write_text('Task nongithub grant origin:agd/nongithub.\n')
         grant = tasks.grant_pr_publish(home, 'nongithub', 'origin:agd/nongithub', instruction)
         with pytest.raises(store.Refusal, match='GitHub'):
             workers.launch(home, 'nongithub', pr_grant=grant['id'])
