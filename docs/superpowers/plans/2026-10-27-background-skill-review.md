@@ -63,7 +63,7 @@ The run lease is acquired before packet collection; it persists `started_at` and
 ### Task 1: Reconcile source and create authoritative reviewer packets
 
 **Files:**
-- Create: `bin/agd_lib/reviewer.py`, `bin/agd_lib/reviewer_runner.py`, `tests/test_reviewer.py`, `tests/reviewer_bridge.py`
+- Create: `bin/agd_lib/reviewer.py`, `bin/agd_lib/reviewer_runner.py`, `tests/test_reviewer.py`, `tests/reviewer_bridge.py`, `config/reviewer-instruction.txt`
 - Modify: `bin/agd_lib/observability.py`
 
 **Interfaces:** Consumes merged `observability.worker_binding(home, task_id, incarnation)`. Produces `select_packet`, `enqueue_intent`, `begin_run`, and reviewer binding.
@@ -118,25 +118,49 @@ Expected: FAIL because `agd_lib.reviewer` does not exist.
 ```python
 def paths(home):
     root=store.home(home); return {'config':root/'data/reviewer/config.json','packets':root/'data/reviewer/packets','reports':root/'data/reviewer/reports','proposals':root/'data/reviewer/proposals','manifests':root/'data/reviewer/manifests','triage':root/'data/reviewer/triage','receipts':root/'state/reviewer/receipts','pending':root/'state/reviewer/pending','checkpoint':root/'state/reviewer/checkpoint.json','lock':root/'state/reviewer/run.lock'}
-def publish_immutable(path,value):
-    body=json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode(); digest=hashlib.sha256(body).hexdigest(); target=path/digest
-    path.mkdir(parents=True,exist_ok=True)
-    if target.exists():
-        if target.read_bytes()!=body: raise store.Refusal('immutable collision')
-    else: store._create_json(target,value)  # create-only; never exposes partial files
-    return digest
+def publish_immutable(path, value):
+    body = json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(prefix='.write-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(body); stream.flush(); os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if path.read_bytes() != body: raise store.Refusal('immutable collision')
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try: os.fsync(directory_fd)
+        finally: os.close(directory_fd)
+    finally:
+        os.unlink(temporary)
+DEFAULT_LIMITS={'max_input_bytes':65536,'max_output_bytes':16384,'max_model_calls':8,'max_runtime_seconds':900,'max_candidates':20}
+DEFAULT_CONFIG={'schema':1,'schedule':{'mode':'calendar','timezone':'UTC','calendar':'02:00','interval_hours':None},'limits':DEFAULT_LIMITS,'review_model':None}
+def validate_schedule(s):
+    if not isinstance(s,dict) or set(s)!={'mode','timezone','calendar','interval_hours'}: raise store.Refusal('schedule schema')
+    if s['mode']=='calendar':
+        if not isinstance(s['timezone'],str) or not isinstance(s['calendar'],str) or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',s['calendar']) or s['interval_hours'] is not None: raise store.Refusal('calendar schedule')
+        try: ZoneInfo(s['timezone'])
+        except ZoneInfoNotFoundError as e: raise store.Refusal('timezone') from e
+    elif s['mode']=='interval':
+        if type(s['interval_hours']) is not int or s['interval_hours']<=0 or s['timezone'] is not None or s['calendar'] is not None: raise store.Refusal('interval schedule')
+    elif s['mode']=='manual-only':
+        if any(s[k] is not None for k in ('timezone','calendar','interval_hours')): raise store.Refusal('manual schedule')
+    else: raise store.Refusal('schedule mode')
+    return s
 def validate_config(v):
-    if not isinstance(v,dict) or set(v)!={'schedule','limits','review_model'}: raise store.Refusal('config schema')
-    s=v['schedule']; required={'mode','timezone','calendar','interval_hours'}
-    if not isinstance(s,dict) or set(s)!=required: raise store.Refusal('schedule schema')
-    if s['mode']=='calendar' and (not isinstance(s['timezone'],str) or not isinstance(s['calendar'],str) or s['interval_hours'] is not None): raise store.Refusal('calendar schedule')
-    if s['mode']=='interval' and (isinstance(s['interval_hours'],bool) or not isinstance(s['interval_hours'],int) or s['interval_hours']<=0 or s['timezone'] is not None or s['calendar'] is not None): raise store.Refusal('interval schedule')
-    if s['mode']=='manual-only' and any(s[k] is not None for k in ('timezone','calendar','interval_hours')): raise store.Refusal('manual schedule')
-    if s['mode'] not in {'calendar','interval','manual-only'} or not isinstance(v['limits'],dict) or set(v['limits'])!={'max_input_bytes','max_output_bytes','max_model_calls','max_runtime_seconds','max_candidates'} or any(isinstance(n,bool) or not isinstance(n,int) or n<=0 for n in v['limits'].values()) or v['review_model'] is not None and not isinstance(v['review_model'],str): raise store.Refusal('config values')
-    return v
-def read_config(home): return validate_config(json.loads(paths(home)['config'].read_text()))
-def read_packet(home,packet_id): return json.loads((paths(home)['packets']/packet_id).read_text())
-def read_report(home,report_id): return json.loads((paths(home)['reports']/report_id).read_text())
+    if not isinstance(v,dict) or set(v)!={'schema','schedule','limits','review_model'} or type(v['schema']) is not int or v['schema']!=1: raise store.Refusal('config schema')
+    if not isinstance(v['limits'],dict) or set(v['limits'])!=set(DEFAULT_LIMITS) or any(type(n) is not int or n<=0 for n in v['limits'].values()) or (v['review_model'] is not None and (not isinstance(v['review_model'],str) or not v['review_model'].strip())): raise store.Refusal('config values')
+    validate_schedule(v['schedule']); return v
+def read_config(home):
+    p=paths(home)['config']
+    if not p.exists(): return {'schema':1,'schedule':dict(DEFAULT_CONFIG['schedule']),'limits':dict(DEFAULT_LIMITS),'review_model':None}
+    try: return validate_config(json.loads(p.read_text()))
+    except json.JSONDecodeError as e: raise store.Refusal('invalid config JSON') from e
+def _hex_id(value):
+    if not isinstance(value,str) or not re.fullmatch(r'[0-9a-f]{64}',value): raise store.Refusal('invalid content id')
+def read_packet(home,packet_id): _hex_id(packet_id); row=json.loads((paths(home)['packets']/f'{packet_id}.json').read_text()); row['packet_id']=packet_id; return row
+def read_report(home,report_id): _hex_id(report_id); row=json.loads((paths(home)['reports']/f'{report_id}.json').read_text()); row['report_id']=report_id; return row
 # Public contracts implemented by the seven-stage algorithm below:
 # assert_runtime_capability() -> {'ai_url':str,'core_url':str,'sdk_url':str,'telemetry_url':str}
 # select_packet(home,*,cutoff:float,retrospective_review_run_ids:tuple[str,...]=()) -> dict; begin_run(home,packet,intent,*,model,config_snapshot,instruction_snapshot,started_at:float,deadline_epoch_ms:int) -> dict
