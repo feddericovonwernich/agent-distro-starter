@@ -251,6 +251,21 @@ def test_terminal_service_restarts_only_the_recorded_owned_process(tmp_path, mon
     assert 'server' not in restarted and 'connector' not in restarted
     assert stopped == [(11, 15)]
 
+def test_stop_service_waits_for_owned_process_and_retains_unrelated_identity(tmp_path, monkeypatch):
+    home = tmp_path/'home'
+    root = home/'state'/'relay'/'projects'/'sample'; root.mkdir(parents=True)
+    (root/'service.json').write_text(json.dumps({'server': {'pid': 11, 'start': 'owned'},
+                                                  'connector': {'pid': 12, 'start': 'other'}}))
+    killed = []
+    monkeypatch.setattr(relay.os, 'kill', lambda pid, signal: killed.append(pid))
+    monkeypatch.setattr('agd_lib.supervision.gone', lambda pid, start: pid == 12 or (pid == 11 and bool(killed)))
+
+    stopped = relay.stop_project_service(home, 'sample')
+
+    assert killed == [11]
+    assert stopped['health'] == 'stopped'
+    assert 'server' not in stopped and 'connector' not in stopped
+
 
 def test_connector_spawn_failure_marks_owned_service_unhealthy(tmp_path, monkeypatch):
     home = tmp_path/'home'
