@@ -43,10 +43,13 @@
 # reviewer.py
 DEFAULT_LIMITS = {'max_candidates':20,'max_input_bytes':262144,'max_model_calls':20,
                   'max_output_bytes':65536,'max_runtime_seconds':1800}
-def select_packet(home: Path, *, cutoff: float, retrospective_review_run_ids: tuple[str,...]=()) -> dict: ...
+def select_packet(home: Path, *, cutoff: float, config_snapshot: dict, retrospective_review_run_ids: tuple[str,...]=()) -> dict: ...
 def enqueue_intent(home: Path, *, kind: str, retrospective_review_run_ids: tuple[str,...]=()) -> dict: ...
-def begin_run(home: Path, packet: dict, intent: dict, *, model: str, config_snapshot: dict,
-              instruction_snapshot: bytes, started_at: float, deadline_epoch_ms: int) -> dict: ...
+@contextmanager
+def run_lease(home: Path) -> Iterator[None]: ...  # nonblocking flock for the full runner/child lifetime
+def reserve_run(home: Path, intent: dict, *, config_snapshot: dict, instruction_snapshot: bytes,
+                started_at: float, deadline_epoch_ms: int) -> dict: ...
+def begin_run(home: Path, run: dict, packet: dict, *, model: str) -> dict: ...
 def submit_report(home: Path, review_run_id: str, request_id: str, report: dict) -> dict: ...
 def dispose(home: Path, proposal_id: str, status: str, reason: str|None,
             replacement_proposal_id: str|None, operator: dict) -> dict: ...
@@ -58,7 +61,7 @@ def serve_broker(home: Path, review_run_id: str, stdin, stdout) -> None: ...
 def calculate_due(schedule: dict, checkpoint: dict, now_utc: float) -> dict: ...
 ```
 
-The run lease is acquired before packet collection; it persists `started_at` and absolute `deadline_epoch_ms` before collection/model resolution. Every collector, resolver, broker, and child uses that same deadline. Parent waits with monotonic remaining time, kills the child process group at expiry, and records coverage/state. Recovery never resets deadline/counters; pending-intent waiting occurs before a lease and does not consume active budget.
+The actual runner holds the dedicated nonblocking-`flock` `run_lease(home)` from intent reservation through collection, model resolution, child lifetime, and receipt finalization. Inside that lease, `reserve_run` persists the one run/intent receipt with `started_at`, absolute `deadline_epoch_ms`, frozen `config_snapshot`, and frozen instruction bytes before collection/model resolution. `begin_run` only completes that passed reserved receipt with packet/model dispatch state; it never allocates a second run or resets deadline/counters after collection. Every collector, resolver, broker, and child uses that same deadline. Parent waits with monotonic remaining time, kills the child process group at expiry, and records coverage/state. Recovery never resets the initial receipt deadline/counters; pending-intent waiting occurs before a lease and does not consume active budget.
 
 ### Task 1: Reconcile source and create authoritative reviewer packets
 
@@ -66,7 +69,7 @@ The run lease is acquired before packet collection; it persists `started_at` and
 - Create: `bin/agd_lib/reviewer.py`, `bin/agd_lib/reviewer_runner.py`, `tests/test_reviewer.py`, `tests/reviewer_bridge.py`, `lib/agd-reviewer-instructions.md`
 - Modify: `bin/agd_lib/observability.py`
 
-**Interfaces:** Consumes merged `observability.worker_binding(home, task_id, incarnation)`. Produces `select_packet`, `enqueue_intent`, `begin_run`, and reviewer binding `data/observability/reviewer/<review_run_id>/binding.json`: `{schema:1,purpose:'background-skill-review',review_run_id,native_session_id,session_dir}`. `session_dir` is the fixed sibling `omp` path used by the bridge; trusted broker `session` validates run ownership/path and persists this record when the manager ID arrives before first call.
+**Interfaces:** Consumes merged `observability.worker_binding(home, task_id, incarnation)`. Produces `select_packet`, `enqueue_intent`, `run_lease`, `reserve_run`, `begin_run`, and the create-only binding at `data/observability/reviewer/<runUUID>/binding.json`: `{schema:1,purpose:'background-skill-review',review_run_id,native_session_id,session_dir}`. `session_dir` is the fixed sibling `omp` directory for that run, never a caller-selected path. The trusted broker `session` operation verifies the run-owned fixed directory, and after `SessionManager.create` returns its actual session ID, persists this binding before constructing the model/agent and before any model call.
 
 - [ ] **Step 1: Reconcile isolated worktree**
 
@@ -103,7 +106,7 @@ def ended_worker(home, task_id, incarnation, text, status):
 def test_packet_has_distinct_failure_and_counterexample_sources():
     with lab() as (home,_):
         a=ended_worker(home,'failed',str(uuid.uuid4()),'failure',1); b=ended_worker(home,'success',str(uuid.uuid4()),'counterexample',0)
-        packet=reviewer.select_packet(home,cutoff=time.time()); native=[s for s in packet['sources'] if s['kind']=='native-jsonl']
+        config=reviewer.read_config(home); packet=reviewer.select_packet(home,cutoff=time.time(),config_snapshot=config); native=[s for s in packet['sources'] if s['kind']=='native-jsonl']
         assert {x['task_id'] for x in packet['episodes']}=={a['id'],b['id']}
         assert len({x['source_id'] for x in native})==2
 ```
@@ -169,10 +172,12 @@ def read_packet(home,packet_id): _hex_id(packet_id); row=json.loads((paths(home)
 def read_report(home,report_id): _hex_id(report_id); row=json.loads((paths(home)['reports']/f'{report_id}.json').read_text()); row['report_id']=report_id; return row
 # Public contracts implemented by the seven-stage algorithm below:
 # assert_runtime_capability() -> {'ai_url':str,'core_url':str,'sdk_url':str,'telemetry_url':str}
-# select_packet(home,*,cutoff:float,retrospective_review_run_ids:tuple[str,...]=()) -> dict; begin_run(home,packet,intent,*,model,config_snapshot,instruction_snapshot,started_at:float,deadline_epoch_ms:int) -> dict
+# run_lease(home) -> nonblocking flock context; reserve_run(home,intent,*,config_snapshot,instruction_snapshot,started_at,deadline_epoch_ms) -> dict
+# select_packet(home,*,cutoff:float,config_snapshot:dict,retrospective_review_run_ids:tuple[str,...]=()) -> dict; begin_run(home,run,packet,*,model:str) -> dict
 ```
 
-`select_packet` snapshots validated config/limits and instruction bytes before collection. It (1) finds retained `runner-exit` observations at/before cutoff and their task/incarnation bindings: phase is irrelevant; a current incarnation needs `worker_alive is False`; a prior incarnation requires its closed observation and remains eligible even while a newer incarnation runs; (2) admits at most configured `max_candidates` distinct task/incarnation episodes; group retries of same task/incident together, never count them as independent recurrence; (3) incrementally parses each bound native v3 JSONL only to a frozen byte watermark, validates header and outer record timestamp, and stores bounded actual text excerpts with `source_id,kind,task_id,incarnation,session_id,message_id,span,source_path,version,sha256,cutoff,relation`; it never copies whole histories; (4) retains only explicitly linked decisions/human feedback matching task/incarnation/session plus bounded historical counterevidence; errors, partial files, withheld excerpts, active/unknown links, and no retained end proof become named coverage records rather than fabricated timestamps or negative findings; (5) snapshots real worker-skill catalog plus manifest bytes/hash, recording assigned/loaded/used/causal provenance separately and unknown when not evidenced; (6) admits closed prior review IDs only, records current/later/unknown IDs in coverage, excludes reviewer feedback by default, and permits one bounded later follow-up only when a material-basis watermark gains a linked feedback/span hash; (7) charges canonical packet metadata plus stored UTF-8 excerpts against the whole packet bound and rejects infeasible metadata before model dispatch. Packet fields are `schema,packet_id,cutoff,limits,episodes,sources,coverage,skill_inventory,material_basis`; episode fields are `task_id,incarnation,exit_observation_id,exit_observed_at,binding`; coverage has `unknown_relation,inaccessible,partial,withheld,retrospective`; inventory contains catalog and manifest content hashes plus provenance labels.
+`launch` holds `run_lease(home)`, freezes validated config/limits and instruction bytes together, and calls `reserve_run` to write the initial receipt with its absolute deadline before collection. It then calls `select_packet(..., config_snapshot=frozen_config)`. `select_packet` uses only that required snapshot—never `read_config` or live instruction data—and (1) finds retained `runner-exit` observations at/before cutoff and their task/incarnation bindings: phase is irrelevant; a current incarnation needs `worker_alive is False`; a prior incarnation requires its closed observation and remains eligible even while a newer incarnation runs; (2) admits at most configured `max_candidates` distinct task/incarnation episodes; group retries of same task/incident together, never count them as independent recurrence; (3) incrementally parses each bound native v3 JSONL only to a frozen byte watermark, validates header and outer record timestamp, and stores bounded actual text excerpts with source identity and coverage. Pass the resulting packet and reserved run to `begin_run(run, packet, model=...)`; native prompt loading uses the receipt's persisted instruction snapshot, not the changed-on-disk instruction file.
+Final review excludes an active worker incarnation: only its retained closed `runner-exit` evidence is eligible. It may additionally include retained central decision/feedback messages while the central session remains active, but only when a retained explicit link proves their relationship to the selected worker evidence; each is frozen at the same cutoff and byte watermark and marked active/partial coverage. Unknown, active-without-explicit-link, or merely nearby relations are excluded and reported as unknown coverage, never inferred from timing or proximity; this does not broaden collection to general central-session history.
 
 
 `lib/agd-reviewer-instructions.md` contents:
@@ -188,7 +193,7 @@ Every finding must state citations, counterexamples considered (or `[]` with why
 
 Return only JSON: `{"schema":1,"summary":"string","findings":[{"kind":"new-skill|existing-skill","target":"workflow-key-or-skill-id","finding":"string","applicability":"string","citations":["source-id"],"counterexamples":["source-id"],"uncertainty":"string","resolution":"draft|none","validation":"string","validation_limits":["string"],"new_skill":{"id":"string","draft":"frontmatter and body","triggers":["string"],"scope":"string","prerequisites":["string"]}}]}`.
 ```
-Selected excerpts and packet are content-hash create-only immutable files; live JSONL is not claimed immutable. `INSTRUCTION_FILE=Path(__file__).resolve().parents[2]/'lib/agd-reviewer-instructions.md'`; snapshot it as immutable JSON `{text,raw_utf8_sha256}` and make `instruction_snapshot_ref` point to it. `begin_run` writes mutable receipt `{review_run_id,intent_id,packet_id,model,config_snapshot_ref,instruction_snapshot_ref,started_at,deadline_epoch_ms,native_session_id,model_calls,input_bytes,output_bytes,dispatch}` under `state/reviewer/receipts`, preserving its passed intent/start/deadline. Native `reviewPrompt` loads this frozen blob text, never the live bundle. After actual native session ID exists and before first reserve, create-only publish the immutable run manifest. Default config is calendar `02:00 UTC`; `review_model=None` inherits native model.
+Selected excerpts and packet are content-hash create-only immutable files; live JSONL is not claimed immutable. `INSTRUCTION_FILE=Path(__file__).resolve().parents[2]/'lib/agd-reviewer-instructions.md'`; `reserve_run` snapshots instruction bytes as immutable JSON `{text,raw_utf8_sha256}`, stores `instruction_snapshot_ref` and `config_snapshot_ref` in the initial receipt, and preserves its initial intent/start/deadline/counters. `begin_run(run, packet, model=...)` updates only that existing receipt with packet/model dispatch fields and never allocates another run. Native `reviewPrompt` loads this frozen blob text, never the live bundle. The trusted broker accepts `session` only for its own `review_run_id` and fixed sibling `data/observability/reviewer/<runUUID>/omp` directory; immediately after manager creation it stores the manager-returned actual session ID in both receipt and the create-only binding, before agent/model construction or the first reserve. No RPC accepts arbitrary persistence paths.
 
 - [ ] **Step 5: Run packet tests to verify pass**
 
@@ -216,8 +221,10 @@ git commit -m "feat: persist reviewer evidence packets"
 from agd_lib import store, supervision, worker_skills
 def produced_run(home):
     started=time.time(); ended_worker(home,'failed',str(uuid.uuid4()),'failure',1); ended_worker(home,'success',str(uuid.uuid4()),'counterexample',0); ended_worker(home,'additional',str(uuid.uuid4()),'additional failure',1)
-    config=reviewer.read_config(home); packet=reviewer.select_packet(home,cutoff=time.time()); instruction=reviewer.INSTRUCTION_FILE.read_bytes()
-    return reviewer.begin_run(home,packet,reviewer.enqueue_intent(home,kind='default'),model='openai/reviewer-fixture',config_snapshot=config,instruction_snapshot=instruction,started_at=started,deadline_epoch_ms=int((started+config['limits']['max_runtime_seconds'])*1000)),packet
+    intent=reviewer.enqueue_intent(home,kind='default'); config=reviewer.read_config(home); instruction=reviewer.INSTRUCTION_FILE.read_bytes()
+    run=reviewer.reserve_run(home,intent,config_snapshot=config,instruction_snapshot=instruction,started_at=started,deadline_epoch_ms=int((started+config['limits']['max_runtime_seconds'])*1000))
+    packet=reviewer.select_packet(home,cutoff=time.time(),config_snapshot=config)
+    return reviewer.begin_run(home,run,packet,model='openai/reviewer-fixture'),packet
 def build_report(packet):
     failed=next(s['source_id'] for s in packet['sources'] if s['kind']=='native-jsonl' and s['task_id']=='failed'); success=next(s['source_id'] for s in packet['sources'] if s['kind']=='native-jsonl' and s['task_id']=='success')
     return {'schema':1,'summary':'native fixture','findings':[{'kind':'new-skill','target':'bounded-review','finding':'failure','applicability':'all','citations':[failed],'counterexamples':[success],'uncertainty':'low','resolution':'draft','validation':'curated resolve','validation_limits':['Requires human verification; not proof of causality'],'new_skill':{'id':'agd-review-draft','draft':'---\nname: agd-review-draft\ndescription: Review bounded evidence\n---\n# Draft\n','triggers':['review'],'scope':'review','prerequisites':[]}}]}
@@ -231,6 +238,8 @@ def test_revisions_and_finalization_are_inert():
         with pytest.raises(store.Refusal): reviewer.submit_report(home,run['review_run_id'],str(uuid.uuid4()),bad)
         reviewer.finalize_run(home,run['review_run_id'],'exited'); assert worker_skills.catalog(home)==before
 ```
+State-only tests may call `produced_run` without launching a child; the native Python bridge holds the same `run_lease(home)` across `produced_run`, handshake, and `serve_broker` so the bridge proves the production lifetime boundary.
+
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -314,6 +323,7 @@ export async function startBridge(){const proc=Bun.spawn(['uv','run','--python',
 export function scriptedStream(ai:any,turns:any[][],observed:string[],messages:any[]){let i=0;return(model:any,context:any)=>{observed.splice(0,observed.length,...context.tools.map((x:any)=>x.name));if(i===0)messages.push(...structuredClone(context.messages));const stream=new ai.AssistantMessageEventStream(),content=turns[i++]??[],message={role:'assistant',content,api:model.api,provider:model.provider,model:model.id,usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},stopReason:content.length?'toolUse':'stop',timestamp:Date.now()};queueMicrotask(()=>{stream.push({type:'done',reason:message.stopReason,message});stream.end(message)});return stream;};}
 export const call=(name:string,args:unknown)=>({type:'toolCall',id:crypto.randomUUID(),name,arguments:args});
 
+```
 ```ts
 // tests/reviewer.test.ts
 import {expect,test} from 'bun:test';import {readFileSync} from 'node:fs';import {join} from 'node:path';import {runReviewer} from '../lib/agd-reviewer';import {startBridge,scriptedStream,call} from './reviewer-fixture';
@@ -327,15 +337,16 @@ from support import lab
 from test_reviewer import produced_run, build_report
 from agd_lib import reviewer, reviewer_runner
 with lab() as (home, _):
-    run,packet=produced_run(home); report=build_report(packet); cap=reviewer_runner.assert_runtime_capability()
-    prompt=json.loads((reviewer.paths(home)['manifests']/f"{run['instruction_snapshot_ref']}.json").read_text())['text']
-    print(json.dumps({'aiUrl':cap['ai_url'],'coreUrl':cap['core_url'],'sdkUrl':cap['sdk_url'],'telemetryUrl':cap['telemetry_url'],'report':report,'reportDir':str(home/'data/reviewer/reports'),'input':{'cwd':str(home),'agentDir':str(home/'.omp'),'sessionDir':str(home/'data/observability/reviewer'/run['review_run_id']/'omp'),'reviewRunId':run['review_run_id'],'receipt':run,'reviewPrompt':prompt,'model':{'provider':'openai','api':'openai-completions','id':'reviewer-fixture','name':'Reviewer fixture','baseUrl':'http://127.0.0.1:1','reasoning':False,'input':['text'],'cost':{'input':0,'output':0,'cacheRead':0,'cacheWrite':0},'contextWindow':8192,'maxTokens':1024}}}),flush=True)
-    reviewer_runner.serve_broker(home,run['review_run_id'],sys.stdin,sys.stdout)
+    with reviewer.run_lease(home):
+        run,packet=produced_run(home); report=build_report(packet); cap=reviewer_runner.assert_runtime_capability()
+        prompt=json.loads((reviewer.paths(home)['manifests']/f"{run['instruction_snapshot_ref']}.json").read_text())['text']
+        print(json.dumps({'aiUrl':cap['ai_url'],'coreUrl':cap['core_url'],'sdkUrl':cap['sdk_url'],'telemetryUrl':cap['telemetry_url'],'report':report,'reportDir':str(home/'data/reviewer/reports'),'input':{'cwd':str(home),'agentDir':str(home/'.omp'),'sessionDir':str(home/'data/observability/reviewer'/run['review_run_id']/'omp'),'reviewRunId':run['review_run_id'],'receipt':run,'reviewPrompt':prompt,'model':{'provider':'openai','api':'openai-completions','id':'reviewer-fixture','name':'Reviewer fixture','baseUrl':'http://127.0.0.1:1','reasoning':False,'input':['text'],'cost':{'input':0,'output':0,'cacheRead':0,'cacheWrite':0},'contextWindow':8192,'maxTokens':1024}}}),flush=True)
+        reviewer_runner.serve_broker(home,run['review_run_id'],sys.stdin,sys.stdout)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `bun test tests/reviewer.test.ts`
+Run: `PATH=/tmp/agd-treehouse-v3.1.6:$PATH bun test tests/reviewer.test.ts`
 
 Expected: FAIL because host, fixture, and bridge do not exist.
 
@@ -464,7 +475,7 @@ git commit -m "feat: schedule bounded reviewer runs"
 
 **Files:** Modify `bin/agd`, `.omp/extensions/agd-primary.ts`, `tests/test_reviewer.py`, `tests/primary.test.ts`.
 
-**Interfaces:** CLI provides `reviewer run [--timer] [--retrospective-review-run UUID]`, `status`, reports/proposals list/show/dispose, timer enable/disable/status.
+**Interfaces:** CLI provides `reviewer run [--timer] [--retrospective-review-run UUID]`, `status`, reports/proposals list/show/dispose, timer enable/disable/status. `reviewer proposals list` and `reviewer proposals show ID` return each proposal with its triage `current` and append-only `history`; `reviewer reports show ID` returns the immutable report including its `review_run_id` and findings.
 
 - [ ] **Step 1: Write failing CLI/watcher test**
 
@@ -477,6 +488,7 @@ def test_reviewer_cli_mutates_reviewer_data_not_foreign_owner():
         command(home,'reviewer','proposals','dispose',result['proposal_ids'][0],'--status','accepted')
         assert owner_path.read_bytes()==before and task_before==((home/'data/tasks').read_bytes() if (home/'data/tasks').exists() else b'') and worker_skills.catalog(home)==catalog and worker_skills.resolve(home)==selection
 
+```
 ```python
 def test_manual_empty_corpus_leaves_private_timer_state_and_makes_no_model_call():
     with lab() as (home,_):
@@ -504,9 +516,9 @@ expect(deliveries.at(-1)).toEqual({deliverAs:'followUp'});
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py -q && bun test tests/primary.test.ts`
+Run: `PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py -q && PATH=/tmp/agd-treehouse-v3.1.6:$PATH bun test tests/primary.test.ts`
 
-Expected: FAIL because parser/reviewer-purpose watcher handling is absent.
+Expected: FAIL because the reviewer CLI parser/output contract is absent; the existing generic watcher already delivers the durable event.
 
 - [ ] **Step 3: Add parser/dispatch**
 
@@ -521,11 +533,11 @@ timer_p=reviewer_p.add_parser('timer').add_subparsers(dest='timer_op',required=T
 for name in ('enable','disable','status'): timer_p.add_parser(name)
 ```
 
-Route reviewer mutations through reviewer-private validation/locks, not `store.require_owner`; ordinary commands retain existing guard. Primary renders purpose event as ordinary follow-up only and never creates proposal controls.
+Route reviewer mutations through reviewer-private validation/locks, not `store.require_owner`; ordinary commands retain existing guard. Render proposal list/show with `current` plus append-only `history`, and report show with immutable `review_run_id` plus findings. Primary renders the already-generic purpose event as an ordinary follow-up only and never creates proposal controls.
 
 - [ ] **Step 4: Run CLI tests to verify pass**
 
-Run: `PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py tests/test_supervision.py -q && bun test tests/primary.test.ts`
+Run: `PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py tests/test_supervision.py -q && PATH=/tmp/agd-treehouse-v3.1.6:$PATH bun test tests/primary.test.ts`
 
 Expected: PASS; live foreign owner/task bytes remain unchanged.
 
@@ -538,60 +550,64 @@ git commit -m "feat: expose reviewer inbox"
 
 ### Task 6: Documentation and end-to-end acceptance
 
-**Files:** Modify `README.md`, `docs/operations.md`, `docs/compatibility.md`, `CHANGELOG.md`, `tests/test_reviewer.py`, `tests/reviewer.test.ts`.
+**Files:** Modify `README.md`, `docs/operations.md`, `docs/compatibility.md`, `CHANGELOG.md`, `tests/test_reviewer.py`, `tests/test_reviewer_timer.py`, `tests/reviewer.test.ts`, `tests/reviewer-fixture.ts`, `tests/primary.test.ts`.
 
 - [ ] **Step 1: Run a throwaway native bridge/CLI smoke**
 
 ```bash
-test ! -e tests/.reviewer-smoke.ts
-trap 'rm -f tests/.reviewer-smoke.ts' EXIT
-cat >tests/.reviewer-smoke.ts <<'EOF'
-import {existsSync,readdirSync,readFileSync} from 'node:fs'; import {join} from 'node:path';
+( set -euo pipefail
+  if [[ -e tests/.reviewer-smoke.ts || -L tests/.reviewer-smoke.ts ]]; then printf '%s\n' 'smoke file already exists' >&2; exit 1; fi
+  trap 'rm -f tests/.reviewer-smoke.ts' EXIT
+  cat >tests/.reviewer-smoke.ts <<'EOF'
+import {existsSync,readdirSync,readFileSync,statSync} from 'node:fs'; import {join} from 'node:path';
 import {startBridge,scriptedStream,call} from './reviewer-fixture'; import {runReviewer} from '../lib/agd-reviewer';
 const json=async(...args:string[])=>{const p=Bun.spawn(['bin/agd',...args],{stdout:'pipe',stderr:'pipe'}),[out,err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);if(code)throw Error(err);return JSON.parse(out)};
-const tree=(p:string):Record<string,string>=>existsSync(p)?Object.fromEntries(readdirSync(p,{recursive:true}).filter((x:any)=>{const q=join(p,x);return Bun.file(q).size!==undefined}).map((x:any)=>[x,readFileSync(join(p,x),'utf8')])):{};
-const b=await startBridge();try{const home=b.hello.input.cwd,before=JSON.stringify([await json('--home',home,'worker','skills','list'),await json('--home',home,'worker','profiles','list'),await json('--home',home,'task','list'),tree(join(home,'config/worker-skills'))]),tools:string[]=[],messages:any[]=[];
- const r=await runReviewer({...b.hello.input,broker:b.broker,native:b.native},scriptedStream(b.native.ai,[[call('reviewer_search',{query:'failure'})],[call('reviewer_submit',{report:b.hello.report})],[]],tools,messages)); await b.broker.rpc('finish',{});
- const report=await json('--home',home,'reviewer','reports','show',r.reportId),proposals=await json('--home',home,'reviewer','proposals','list');if(proposals.length!==1)throw Error('proposal count');const proposal=proposals[0].proposal_id,events=(await json('--home',home,'events','list')).filter((e:any)=>e.purpose==='background-skill-review'&&e.review_run_id===b.hello.input.reviewRunId);if(events.length!==1)throw Error('event count');
- const pending=await json('--home',home,'reviewer','proposals','show',proposal);await json('--home',home,'events','acknowledge',events[0].id);if(JSON.stringify(await json('--home',home,'reviewer','proposals','show',proposal))!==JSON.stringify(pending))throw Error('ack triage');await json('--home',home,'reviewer','proposals','dispose',proposal,'--status','accepted');if((await json('--home',home,'reviewer','proposals','show',proposal)).current!=='accepted')throw Error('triage');
- const receipt=JSON.parse(readFileSync(join(home,'state/reviewer/receipts',`${b.hello.input.reviewRunId}.json`),'utf8')),binding=JSON.parse(readFileSync(join(home,'data/observability/reviewer',b.hello.input.reviewRunId,'binding.json'),'utf8')),session=JSON.parse(readFileSync(readdirSync(b.hello.input.sessionDir).map(x=>join(b.hello.input.sessionDir,x)).find(x=>x.endsWith('.jsonl'))!,'utf8').split('\n')[0]);const first=JSON.stringify(messages);if(session.id!==receipt.native_session_id||binding.purpose!=='background-skill-review'||binding.review_run_id!==b.hello.input.reviewRunId||binding.native_session_id!==session.id||binding.session_dir!==b.hello.input.sessionDir||tools.sort().join()!=['reviewer_excerpt','reviewer_search','reviewer_submit'].join()||!first.includes(b.hello.report.findings[0].citations[0])||!first.includes('skill_inventory')||first.includes('OUTSIDE_PACKET_SENTINEL')||JSON.stringify([await json('--home',home,'worker','skills','list'),await json('--home',home,'worker','profiles','list'),await json('--home',home,'task','list'),tree(join(home,'config/worker-skills'))])!==before)throw Error('smoke invariant');console.log(JSON.stringify({report:r.reportId,run:b.hello.input.reviewRunId,session:session.id,event:events[0].id,proposal,state:report}));
+const tree=(p:string):Record<string,string>=>!existsSync(p)?{}:Object.fromEntries(readdirSync(p,{recursive:true}).map(String).filter(x=>statSync(join(p,x)).isFile()).sort().map(x=>[x,readFileSync(join(p,x)).toString('base64')]));
+const b=await startBridge();try{const home=b.hello.input.cwd,baseline=async()=>JSON.stringify([await json('--home',home,'worker','skills','list'),await json('--home',home,'worker','profiles','list'),await json('--home',home,'task','list'),tree(join(home,'config/worker-skills'))]),before=await baseline(),tools:string[]=[],messages:any[]=[];
+ const r=await runReviewer({...b.hello.input,broker:b.broker,native:b.native},scriptedStream(b.native.ai,[[call('reviewer_search',{query:'failure'})],[call('reviewer_submit',{report:b.hello.report})],[]],tools,messages));await b.broker.rpc('finish',{});
+ const report=await json('--home',home,'reviewer','reports','show',r.reportId),proposals=await json('--home',home,'reviewer','proposals','list');if(report.review_run_id!==b.hello.input.reviewRunId||proposals.length!==1)throw Error('report/proposal');
+ const proposal=proposals[0].proposal_id,events=(await json('--home',home,'events','list')).filter((e:any)=>e.purpose==='background-skill-review'&&e.review_run_id===b.hello.input.reviewRunId);if(events.length!==1)throw Error('event count');
+ const pending=await json('--home',home,'reviewer','proposals','show',proposal);if(pending.current!=='pending')throw Error('initial triage');await json('--home',home,'events','acknowledge',events[0].id);if(JSON.stringify(await json('--home',home,'reviewer','proposals','show',proposal))!==JSON.stringify(pending))throw Error('ack triage');await json('--home',home,'reviewer','proposals','dispose',proposal,'--status','accepted');if((await json('--home',home,'reviewer','proposals','show',proposal)).current!=='accepted'||before!==await baseline())throw Error('triage/mutation');
+ const receipt=JSON.parse(readFileSync(join(home,'state/reviewer/receipts',`${b.hello.input.reviewRunId}.json`),'utf8')),binding=JSON.parse(readFileSync(join(home,'data/observability/reviewer',b.hello.input.reviewRunId,'binding.json'),'utf8')),sessionPath=readdirSync(b.hello.input.sessionDir).map(x=>join(b.hello.input.sessionDir,x)).find(x=>x.endsWith('.jsonl')&&statSync(x).isFile());if(!sessionPath)throw Error('session');const session=JSON.parse(readFileSync(sessionPath,'utf8').split('\n')[0]),first=JSON.stringify(messages.slice(0,2));if(session.type!=='session'||session.version!==3||session.id!==receipt.native_session_id||binding.schema!==1||binding.purpose!=='background-skill-review'||binding.review_run_id!==b.hello.input.reviewRunId||binding.native_session_id!==session.id||binding.session_dir!==b.hello.input.sessionDir||tools.sort().join()!=['reviewer_excerpt','reviewer_search','reviewer_submit'].join()||!first.includes('failure')||!first.includes(b.hello.report.findings[0].citations[0])||!first.includes('skill_inventory')||first.includes('OUTSIDE_PACKET_SENTINEL'))throw Error('native contract');
+ console.log(JSON.stringify({report_id:r.reportId,review_run_id:b.hello.input.reviewRunId,native_session_id:session.id,event_id:events[0].id,proposal_id:proposal,disposition:'accepted'}));
 }finally{await b.close()}
 EOF
-PATH=/tmp/agd-treehouse-v3.1.6:$PATH bun tests/.reviewer-smoke.ts
+  PATH=/tmp/agd-treehouse-v3.1.6:$PATH bun tests/.reviewer-smoke.ts
+)
 ```
 
-- [ ] **Step 2: Add acceptance/docs matrix**
+- [ ] **Step 2: Add the exact approved acceptance matrix and documentation**
 
-| Case | Action | Observable |
-|---|---|---|
-| inventory/denial/injection | packet with sentinel | three tools, authorized evidence only |
-| LF native-only | LF available/unavailable | no query client, same result |
-| late feedback | one linked span | one follow-up only |
-| crash budget | reserve/kill | unknown outcome/no resume |
-| foreign owner | CLI triage | owner/task unchanged |
-| event lifecycle | finalize/ack | pending→handled; triage unchanged |
-| dedup | exact/material/uncertain basis | reuse/revision/distinct |
-| proposals | existing/new high-impact | validation schema |
-| skills | assigned not loaded | unknown provenance |
-| self review | closed/current/later IDs | only closed/no recursion |
-| links | explicit/unrelated | explicit only |
+| # | Approved criterion; concrete scenario input/action | Observable | Task and proof command |
+|---|---|---|---|
+| 1 | **Real reviewer launch inventory.** Give the packet an injection sentinel and attempt shell, mutation, generic read/query, MCP, repo-extension, task-spawn, install, publish, and each discovered extra tool. | Only `reviewer_excerpt`, `reviewer_search`, and `reviewer_submit` are exposed; every listed operation is denied and the sentinel is not instruction-followed. | Task 3; `PATH=/tmp/agd-treehouse-v3.1.6:$PATH bun test tests/reviewer.test.ts` |
+| 2 | **Broker boundary.** Request a source outside the frozen allowlist/cutoff, submit invalid citations and malformed report, and inspect prompt/packet with provider credentials configured. | Broker rejects all three; credentials occur only at `ModelRegistry.getApiKey`, never prompt/transcript packet. | Tasks 1, 3; `PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py -q && PATH=/tmp/agd-treehouse-v3.1.6:$PATH bun test tests/reviewer.test.ts` |
+| 3 | **Native collection and bounded late material.** Run the same disposable native v3 JSONL corpus with Langfuse discovery available and unavailable, then append late linked material; separately modify on-disk config and instructions after the initial receipt. | Identical native collection without a query client; one follow-up/coverage state, no pending loop; receipt caps and native prompt/evidence remain the frozen config/instruction/bytes. | Task 1; `PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py -q` |
+| 4 | **Native persistence and observability.** Run once with telemetry disabled and once with existing managed transport enabled. | Both create reviewer-namespace JSONL/artifacts and binding metadata; enabled transport carries purpose/run metadata without a new collector role or reviewer Langfuse key. | Tasks 1, 3; `PATH=/tmp/agd-treehouse-v3.1.6:$PATH bun test tests/reviewer.test.ts` |
+| 5 | **Manual/timer lifecycle.** Exercise manual-only with no timer, explicit enable while central is absent, one offline catch-up, concurrent invocation, UTC interval anchor, and IANA spring-gap/fall-fold schedule. | Config alone starts no model work; explicit user approval is required; catch-up is once, no drift/overlap, and DST result matches validated systemd/ZoneInfo behavior. Runtime activation is a separately approved disposable-home user-systemd proof only; until approval/proof exists, implementation cannot claim this criterion complete and pytest must not claim activation. | Tasks 4, 5; `PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer_timer.py tests/test_reviewer.py -q` |
+| 6 | **Crash/fault recovery.** Kill after reservation and after partial durable writes, then recover from the persisted receipt. | Checkpoints/evidence/history survive; no duplicate destructive effect and no exactly-once claim; original deadline/counters remain. | Tasks 1–3; `PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py -q` |
+| 7 | **Central offline/online acknowledgement.** Finalize while central is offline, later make it available, then acknowledge the batch event. | Durable event becomes visible; acknowledgement changes neither proposal disposition nor edit authority. | Tasks 2, 5; `PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py tests/test_supervision.py -q` |
+| 8 | **Dedup/history/uncertain merge.** Submit equivalent evidence after rejected/deferred/superseded triage, then materially new evidence, then an uncertain match. | Rejected/deferred/superseded history remains; equivalent evidence appends safely, material basis resurfaces explicitly, uncertain merge stays a distinct finding. | Task 2; `PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py -q` |
+| 9 | **Both proposal types remain inert.** Submit existing-skill and new-skill findings with evidence, counterexamples, uncertainty, and validation; inspect discovery roots/profiles. | Both schemas are enforced; new skill is absent from roots/profiles until separately approved implementation, with no automatic task/edit. | Tasks 2, 5; `PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py -q` |
+| 10 | **Retrospective/no auto-review.** Include closed, current, and later reviewer run IDs in an explicit retrospective request and submit a reviewer report. | Cutoff excludes current/later runs; reports do not trigger reviewers, alter policy/disposition, create tasks, apply a proposal, or self-approve. | Tasks 1–3, 5; `PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py -q` |
+| 11 | **Explicit links and coverage.** Select closed worker evidence, an explicitly linked retained central decision/feedback message from an active central session, and unrelated/unknown active material. | Linked central evidence is frozen at cutoff/watermark with active/partial coverage; active worker final review and unknown/unrelated relations are excluded and reported as coverage limitations, never proximity-inferred. | Task 1; `PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py -q` |
 
-Document defaults `262144/65536/20/1800/20`, null model inheritance, IANA/DST/UTC-hour anchor, frozen evidence privacy/retention/no pruning, triage/recovery/no USD budgets, native private metadata, inert drafts, explicit timer approval/no autostart/no OS sandbox. Record OMP 18.3.2 and readonly systemd 255 DST evidence; separately approved disposable systemd activation is never pytest and unavailable prerequisite is reported.
+Document defaults `20/262144/20/65536/1800`, null model inheritance, IANA/DST/UTC-hour anchor, frozen evidence privacy/retention/no pruning, triage/recovery/no USD budgets, native private metadata, inert drafts, explicit timer approval/no autostart/no OS sandbox. Record OMP 18.3.2 and readonly systemd 255 DST evidence. The documentation must state that user-systemd activation is unavailable without separate approval and that no test substitutes for that runtime proof.
 
-- [ ] **Step 3: Run final verification**
+- [ ] **Step 3: Run final regression verification**
 
 ```bash
-PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py tests/test_reviewer_timer.py tests/test_supervision.py -q
-PATH=/tmp/agd-treehouse-v3.1.6:$PATH bun test tests/reviewer.test.ts tests/primary.test.ts
+PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests -q
+PATH=/tmp/agd-treehouse-v3.1.6:$PATH bun test
 git diff --check
 ```
 
-Expected: PASS. Record native-only online/offline optional index behavior, linked-vs-heuristic feedback, assigned-vs-loaded skill provenance, late follow-up, self-review boundaries, crash budgets, broker recovery, dedup bases, inert new draft, owner variants, DST/boot/manual timer paths, and acknowledgement inertness. Report unavailable user-systemd as unexercised.
+Expected: PASS for the executable suite. Do not mark the full acceptance set complete until the separately approved disposable-home user-systemd activation proof has run; report that prerequisite as unavailable rather than claiming pytest proves it.
 
-- [ ] **Step 5: Commit Task 6**
+- [ ] **Step 4: Commit Task 6**
 
 ```bash
-git add README.md docs/operations.md docs/compatibility.md CHANGELOG.md tests/test_reviewer.py tests/reviewer.test.ts tests/reviewer-fixture.ts
+git add README.md docs/operations.md docs/compatibility.md CHANGELOG.md tests/test_reviewer.py tests/test_reviewer_timer.py tests/reviewer.test.ts tests/reviewer-fixture.ts tests/primary.test.ts
 git commit -m "docs: describe bounded skill review"
 ```
 
