@@ -466,7 +466,12 @@ def start_project_service(home, project_id, repository, popen=subprocess.Popen, 
             current['health'] = 'healthy'
             store.atomic_json(_service_file(home, project_id), current)
             return current
-        connector = _start_connector(runtime, root, popen)
+        try:
+            connector = _start_connector(runtime, root, popen)
+        except store.DependencyError:
+            current.update(health='unhealthy', blocked_reason='Relay GitHub connector could not start')
+            store.atomic_json(_service_file(home, project_id), current)
+            raise
         if connector.poll() is not None:
             current.update(health='unhealthy', blocked_reason='Relay GitHub connector exited during startup')
             store.atomic_json(_service_file(home, project_id), current)

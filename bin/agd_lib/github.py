@@ -55,44 +55,63 @@ def split_repository(repository):
     return owner, name
 
 
-def get_pr(repository, number, run=store.run):
-    owner, name = split_repository(repository)
-    if not isinstance(number, int) or number < 1:
-        raise store.Refusal('GitHub PR number is invalid')
-    node = graphql(PR_QUERY, {'owner': owner, 'name': name, 'number': number}, run)['repository'].get('pullRequest')
-    if not isinstance(node, dict):
-        raise store.Refusal('GitHub PR is missing')
-    if node.get('headRepository', {}).get('nameWithOwner') != repository:
-        raise store.Refusal('GitHub PR head repository does not match task')
+def _checks(node):
     try:
-        commit = node['commits']['nodes'][-1]['commit']
-        rollup = commit['statusCheckRollup']
+        rollup = node['commits']['nodes'][-1]['commit']['statusCheckRollup']
         if rollup is None:
-            contexts = []
-        else:
-            if rollup['contexts']['pageInfo']['hasNextPage']:
-                raise store.Refusal('GitHub PR check evidence is incomplete')
-            contexts = rollup['contexts']['nodes']
+            return {}
+        if not isinstance(rollup, dict):
+            raise TypeError
+        contexts = rollup['contexts']
+        if (not isinstance(contexts, dict) or not isinstance(contexts.get('pageInfo'), dict) or
+                not isinstance(contexts['pageInfo'].get('hasNextPage'), bool) or
+                contexts['pageInfo']['hasNextPage'] or not isinstance(contexts.get('nodes'), list)):
+            raise store.Refusal('GitHub PR check evidence is incomplete')
     except store.Refusal:
         raise
     except (KeyError, IndexError, TypeError):
         raise store.Refusal('GitHub PR check evidence is incomplete')
     checks = {}
-    for context in contexts:
+    for context in contexts['nodes']:
         if not isinstance(context, dict):
             raise store.Refusal('GitHub PR check evidence is incomplete')
         key = context.get('name', context.get('context'))
         if not isinstance(key, str) or not key:
             raise store.Refusal('GitHub PR check evidence is incomplete')
         checks[key] = context
-    return dict(node, repository=repository, checks=checks)
+    return checks
+
+
+def get_pr(repository, number, run=store.run):
+    owner, name = split_repository(repository)
+    if not isinstance(number, int) or number < 1:
+        raise store.Refusal('GitHub PR number is invalid')
+    response = graphql(PR_QUERY, {'owner': owner, 'name': name, 'number': number}, run)
+    repo = response.get('repository')
+    if not isinstance(repo, dict):
+        raise store.Refusal('GitHub repository is missing')
+    node = repo.get('pullRequest')
+    if not isinstance(node, dict):
+        raise store.Refusal('GitHub PR is missing')
+    head_repository = node.get('headRepository')
+    if not isinstance(head_repository, dict):
+        raise store.Refusal('GitHub PR head repository is missing')
+    if head_repository.get('nameWithOwner') != repository:
+        raise store.Refusal('GitHub PR head repository does not match task')
+    return dict(node, repository=repository, checks=_checks(node))
 
 
 def find_open_pr(repository, head, base, run=store.run):
     owner, name = split_repository(repository)
     data = graphql(SEARCH_QUERY, {'owner': owner, 'name': name, 'head': head, 'base': base}, run)
-    search = data['repository'].get('pullRequests', {})
-    if search.get('pageInfo', {}).get('hasNextPage'):
+    repo = data.get('repository')
+    if not isinstance(repo, dict):
+        raise store.Refusal('GitHub PR search is incomplete')
+    search = repo.get('pullRequests')
+    if not isinstance(search, dict):
+        raise store.Refusal('GitHub PR search is incomplete')
+    page_info = search.get('pageInfo')
+    if not isinstance(page_info, dict) or not isinstance(page_info.get('hasNextPage'), bool) or page_info['hasNextPage']:
         raise store.Refusal('GitHub PR search is incomplete')
     nodes = search.get('nodes')
     if not isinstance(nodes, list):
@@ -103,20 +122,12 @@ def find_open_pr(repository, head, base, run=store.run):
             continue
         if node.get('headRefName') != head or node.get('baseRefName') != base:
             continue
-        if node.get('headRepository', {}).get('nameWithOwner') != repository:
+        head_repository = node.get('headRepository')
+        if not isinstance(head_repository, dict):
+            raise store.Refusal('GitHub PR head repository is missing')
+        if head_repository.get('nameWithOwner') != repository:
             raise store.Refusal('GitHub PR head repository does not match task')
-        try:
-            rollup = node['commits']['nodes'][-1]['commit']['statusCheckRollup']
-            if rollup['contexts']['pageInfo']['hasNextPage']:
-                raise store.Refusal('GitHub PR check evidence is incomplete')
-            contexts = rollup['contexts']['nodes']
-        except store.Refusal:
-            raise
-        except (KeyError, IndexError, TypeError):
-            raise store.Refusal('GitHub PR check evidence is incomplete')
-        checks = {item.get('name', item.get('context')): item for item in contexts
-                  if isinstance(item, dict) and item.get('name', item.get('context'))}
-        found.append(dict(node, repository=repository, checks=checks))
+        found.append(dict(node, repository=repository, checks=_checks(node)))
     return found
 
 
@@ -132,11 +143,16 @@ def normalize_policy(classic, rules):
     if not pages or any(not isinstance(page, list) for page in pages):
         raise store.Refusal('GitHub policy evidence is incomplete')
     classic = classic or {}
-    checks = set(classic.get('required_status_checks', {}).get('contexts', []))
-    approvals = classic.get('required_pull_request_reviews', {}).get('required_approving_review_count', 0)
-    if (not all(isinstance(check, str) and check for check in checks) or
+    status_checks = classic.get('required_status_checks') or {}
+    reviews = classic.get('required_pull_request_reviews') or {}
+    if not isinstance(status_checks, dict) or not isinstance(reviews, dict):
+        raise store.Refusal('GitHub policy evidence is unrecognized')
+    contexts = status_checks.get('contexts', [])
+    approvals = reviews.get('required_approving_review_count', 0)
+    if (not isinstance(contexts, list) or not all(isinstance(check, str) and check for check in contexts) or
             not isinstance(approvals, int) or approvals < 0):
         raise store.Refusal('GitHub policy evidence is unrecognized')
+    checks = set(contexts)
     for rule in (rule for page in pages for rule in page):
         if not isinstance(rule, dict) or not isinstance(rule.get('parameters'), dict):
             raise store.Refusal('GitHub policy evidence is unrecognized')

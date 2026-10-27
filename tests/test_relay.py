@@ -252,6 +252,33 @@ def test_terminal_service_restarts_only_the_recorded_owned_process(tmp_path, mon
     assert stopped == [(11, 15)]
 
 
+def test_connector_spawn_failure_marks_owned_service_unhealthy(tmp_path, monkeypatch):
+    home = tmp_path/'home'
+    root = home/'state'/'relay'/'projects'/'sample'
+    (root/'.relay'/'connectors').mkdir(parents=True)
+    (root/'.relay'/'connectors'/'github.json').write_text('{}')
+    runtime = tmp_path/'runtime'; (runtime/'bin').mkdir(parents=True)
+    record = {'schema': 1, 'project': 'sample', 'repository': 'owner/repo',
+              'runtime': str(runtime), 'root': str(root), 'health': 'starting'}
+    (root/'service.json').write_text(json.dumps(record))
+    monkeypatch.setattr(relay, 'ensure_project_service', lambda *_args, **_kwargs: record)
+    monkeypatch.setattr('agd_lib.supervision.process_start', lambda pid: 'identity')
+
+    class Server:
+        pid = 99
+        def poll(self): return None
+        def terminate(self): pass
+        def wait(self, timeout): pass
+    def popen(argv, cwd, **_kwargs):
+        if argv[1] == 'connect':
+            raise OSError('connector unavailable')
+        (cwd/'.relay'/'runtime.json').write_text(json.dumps({'pid': 99, 'port': 4444}))
+        return Server()
+
+    with pytest.raises(store.DependencyError, match='connector could not start'):
+        relay.start_project_service(home, 'sample', 'owner/repo', popen=popen)
+    assert json.loads((root/'service.json').read_text())['health'] == 'unhealthy'
+
 def test_poll_and_reply_accept_pinned_delivery_shape(tmp_path, monkeypatch):
     from support import command, lab
     from agd_lib import tasks

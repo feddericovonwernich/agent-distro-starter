@@ -115,6 +115,31 @@ def test_get_pr_accepts_no_rollup_when_no_checks_are_required():
     assert github.finalize(pr, {'checks': (), 'approvals': 0}, 'abc',
                            'owner/repo', 'agd/task', 'main')['head_sha'] == 'abc'
 
+def test_get_pr_refuses_null_repository_or_head_repository():
+    for pull_request, message in ((None, 'missing'), ({'headRepository': None}, 'head repository')):
+        def gh(argv, **_):
+            return type('Result', (), {'stdout': json.dumps(
+                {'data': {'repository': {'pullRequest': pull_request}}})})()
+        with pytest.raises(store.Refusal, match=message):
+            github.get_pr('owner/repo', 7, run=gh)
+
+
+def test_find_open_pr_accepts_null_rollup_and_refuses_null_containers():
+    common = {'id': 'P_7', 'number': 7, 'url': 'https://example.test/owner/repo/pull/7',
+              'state': 'OPEN', 'headRefName': 'agd/task', 'headRefOid': 'abc', 'baseRefName': 'main',
+              'headRepository': {'nameWithOwner': 'owner/repo'},
+              'commits': {'nodes': [{'commit': {'statusCheckRollup': None}}]}}
+    def gh(argv, **_):
+        return type('Result', (), {'stdout': json.dumps(
+            {'data': {'repository': {'pullRequests': {'pageInfo': {'hasNextPage': False}, 'nodes': [common]}}}})})()
+    assert github.find_open_pr('owner/repo', 'agd/task', 'main', run=gh)[0]['checks'] == {}
+    for repository, message in ((None, 'search'), ({'pullRequests': {'pageInfo': {'hasNextPage': False},
+                                                       'nodes': [{**common, 'headRepository': None}]}}, 'head repository')):
+        def bad(argv, **_):
+            return type('Result', (), {'stdout': json.dumps({'data': {'repository': repository}})})()
+        with pytest.raises(store.Refusal, match=message):
+            github.find_open_pr('owner/repo', 'agd/task', 'main', run=bad)
+
 
 @pytest.mark.parametrize(('connection', 'message'), [
     ({'pageInfo': {'hasNextPage': True}, 'nodes': []}, 'incomplete'),
@@ -157,3 +182,15 @@ def test_normalize_policy_unions_known_paginated_rules():
           {'type': 'pull_request', 'parameters': {'required_approving_review_count': 2}}],
          [{'type': 'pull_request', 'parameters': {'required_approving_review_count': 3}}]])
     assert policy == {'checks': ('ci', 'classic', 'lint'), 'approvals': 3}
+
+@pytest.mark.parametrize('classic', [
+    {'required_status_checks': None, 'required_pull_request_reviews': None},
+    {'required_status_checks': {'contexts': {'ci': 'not-a-list'}}},
+    {'required_pull_request_reviews': {'required_approving_review_count': '1'}},
+])
+def test_normalize_policy_handles_null_requirements_and_refuses_malformed_values(classic):
+    if classic.get('required_status_checks') is None and classic.get('required_pull_request_reviews') is None:
+        assert github.normalize_policy(classic, {'rules': []}) == {'checks': (), 'approvals': 0}
+    else:
+        with pytest.raises(store.Refusal, match='policy'):
+            github.normalize_policy(classic, {'rules': []})
