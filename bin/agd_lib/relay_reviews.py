@@ -139,7 +139,7 @@ def _candidates(home):
                     not isinstance(receipt.get('local_head'), str) or not isinstance(receipt.get('remote_head'), str)):
                 raise ReviewTickError('PR review receipt is unavailable')
             yield task, receipt, None
-        except (store.Refusal, OSError, json.JSONDecodeError):
+        except (store.Refusal, OSError, json.JSONDecodeError, KeyError, TypeError):
             yield task, None, ReviewTickError('PR review receipt is unavailable')
 
 

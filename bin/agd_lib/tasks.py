@@ -291,7 +291,8 @@ def _authorize_pr_publish_locked(home, task, grant_id, require_clean=True):
         raise store.Refusal('PR publication grant missing or invalid') from error
     if (not isinstance(grant, dict) or grant.get('id') != grant_id or grant.get('task') != task['id'] or
             grant.get('action') != 'pr-publish' or grant.get('branch') != task['branch'] or
-            grant.get('base') != task['base'] or grant.get('target') != f'{grant.get("remote")}:{task["branch"]}'):
+            grant.get('base') != task['base'] or grant.get('target') != f'{grant.get("remote")}:{task["branch"]}' or
+            any(not isinstance(grant.get(key), str) or not grant[key] for key in ('remote', 'remote_url', 'grant_head'))):
         raise store.Refusal('PR publication grant does not match task target')
     work = verify_workspace(home, task)
     if require_clean and not store.clean(work):
