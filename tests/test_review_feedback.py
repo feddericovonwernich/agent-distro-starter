@@ -84,6 +84,13 @@ def test_current_head_changes_emit_distinct_relay_events_with_exact_correlation(
     assert relay.requests[-1]['idempotencyKey'] != relay.requests[1]['idempotencyKey']
 
 
+def test_mixed_case_repository_uses_worker_correlation(tmp_path):
+    github, relay = GitHub(), Relay()
+    github.pages['reviews'] = [[artifact('review-1', 'review', github.head, 'APPROVED')]]
+    review_feedback.watch_human_reviews(tmp_path, 'sample', 'Owner/Repo', 7, github, relay)
+    assert relay.requests[0]['correlationId'] == 'github:owner/repo:pull-request:7'
+
+
 def test_restart_deduplicates_and_new_head_replays_current_evidence(tmp_path):
     github, relay = GitHub(), Relay()
     github.pages['reviews'] = [[artifact('review-1', 'review', github.head, 'APPROVED')]]

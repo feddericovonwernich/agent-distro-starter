@@ -9,7 +9,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 from urllib.parse import urlsplit
 
-from . import store
+from . import relay as relay_runtime, store
 
 
 class ReviewFeedbackError(store.Refusal):
@@ -304,7 +304,7 @@ def watch_human_reviews(home, project_id, repository, pull_request, github, rela
                 intents.append((key, {'type': 'agd.pr.review', 'version': 1, 'payload': {'schemaVersion': 1,
                     'repository': repository, 'pullRequest': pull_request, 'headSha': head,
                     'reviewDecision': decision, 'artifacts': [item]},
-                    'correlationId': f'github:{repository}:pull-request:{pull_request}', 'idempotencyKey': key}))
+                    'correlationId': relay_runtime.correlation_id(repository, pull_request), 'idempotencyKey': key}))
             state['pending'] = {'head_sha': head, 'snapshot': snapshot, 'keys': [key for key, _ in intents]}
             _save(home, project_id, pull_request, state)
         for _, request in intents:

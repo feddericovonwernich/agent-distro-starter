@@ -20,6 +20,12 @@ MIN_NODE = (22, 19)
 MARKER = 'relay-install.json'
 
 
+def correlation_id(repository, pull_request):
+    if not isinstance(repository, str) or not repository or not isinstance(pull_request, int) or pull_request < 1:
+        raise store.Refusal('Relay PR correlation is invalid')
+    return f'github:{repository.lower()}:pull-request:{pull_request}'
+
+
 def runtime_root(home: Path) -> Path:
     return Path(home) / 'relay'
 
@@ -548,7 +554,7 @@ def _relay_task(home, task, grant, incarnation):
         raise store.Refusal('Relay task PR identity is unavailable')
     service = json.loads(_service_file(home, task['project']).read_text())
     root = Path(service['root'])
-    correlation = f'github:{repository.lower()}:pull-request:{number}'
+    correlation = correlation_id(repository, number)
     return task, receipt, service, root, correlation
 
 
