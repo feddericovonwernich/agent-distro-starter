@@ -66,7 +66,7 @@ Proposed configuration shape (exact storage/file naming is an implementation dec
 }
 ```
 
-These are proposed defaults, not approved cost or quality guarantees. A null `review_model` inherits the native configured OMP model. The runner resolves and records the concrete model identifier before a call; inability to resolve it refuses the run before any call. This does not introduce a telemetry API or promise exact token/cost accounting. Limits bound inputs, calls, output, and elapsed runtime; they cannot guarantee a USD ceiling.
+These are proposed defaults, not approved cost or quality guarantees. A null `review_model` inherits the native configured OMP model. The runner resolves and records the concrete model identifier before a call; inability to resolve it refuses the run before any call. This does not introduce a telemetry API or promise exact token/cost accounting. `max_candidates` bounds selected distinct episode candidates per run. `max_input_bytes` and `max_output_bytes` are UTF-8 bytes for the whole run's broker-supplied input packet(s) and persisted structured report output respectively. `max_model_calls` bounds native reviewer model invocations, including tool-continuation invocations. `max_runtime_seconds` is the runner's elapsed wall-clock deadline. These bounds do not guarantee a USD ceiling or cover hidden provider HTTP retry/transport attempts.
 
 `timezone` and `calendar` are required only for `calendar` mode and must be null for other modes. `interval_hours` is required only for `interval` and must be null otherwise; it is a positive whole number. The runner rejects every other combination. Manual invocation is available in every mode, so the calendar default is the approved nightly-plus-manual behavior without a second mode.
 
@@ -160,7 +160,7 @@ Minimum proposed immutable review fields:
 
 Each proposal revision contains: stable proposal ID; revision ID; kind (`existing-skill` or `new-skill`); evidence citation IDs; counterexamples considered; uncertainty/coverage limitations; suggested resolution; suggested validation; deduplication basis; and, for new skills, draft content, intended triggers/scope, prerequisites, and validation limits. Proposals without actual evidence references are refused.
 
-The stable proposal key is a canonical tuple of proposal schema, kind, target (`existing skill ID` or normalized uncovered-workflow key), and finding category. It excludes the growing evidence set and proposed wording. The revision ID hashes the stable proposal key, evidence basis, and proposed change. Equivalent re-observation appends evidence or a revision without erasing history. If a match is uncertain, the runner preserves a distinct proposal rather than suppressing it. Materially new evidence may create a new revision of a rejected/deferred/superseded proposal only with an explicit statement of the prior disposition and new basis; it never auto-accepts or overwrites a prior human outcome.
+The runner assigns a persistent proposal UUID when it first records a proposal. Its deduplication fingerprint is a canonical tuple of proposal schema, kind, target (`existing skill ID` or normalized uncovered-workflow key), normalized finding/problem, and applicability key; it excludes the growing evidence set and proposed wording. The revision ID hashes the persistent proposal UUID, evidence basis, and proposed change. A matching fingerprint permits an equivalent re-observation to append evidence or a revision without erasing history, but it is not a promise of semantic deduplication. If a match is uncertain or a fingerprint collision describes a distinct finding, the runner assigns a distinct proposal UUID rather than suppressing it. Materially new evidence may create a new revision of a rejected/deferred/superseded proposal only with an explicit statement of the prior disposition and new basis; it never auto-accepts or overwrites a prior human outcome.
 
 Minimum mutable triage entry:
 
@@ -176,7 +176,7 @@ A disposition reason is optional, though useful for rejection/defer/supersede. T
 
 ## Durability, notifications, and recovery
 
-Private durable data is separate from scheduler state. Under the effective `AGD_HOME`, the reviewer-owned namespace contains immutable native reviewer JSONL/artifacts, evidence/review/proposal/revision records, and mutable proposal-triage records; a sibling reviewer scheduler namespace contains only the dedicated lock, checkpoint, trigger/catch-up state, and runner receipt. Existing `state/events` and `state/events-handled` retain notification receipts. These namespaces must not be conflated with ordinary task directories or task IDs.
+Private durable data is separate from scheduler state. Under the effective `AGD_HOME`, the reviewer-owned namespace contains native reviewer JSONL/artifacts managed by the native OMP lifecycle, finalized immutable evidence/review/proposal-revision records, and mutable proposal-triage records; a sibling reviewer scheduler namespace contains only the dedicated lock, checkpoint, trigger/catch-up state, and runner receipt. Existing `state/events` and `state/events-handled` retain notification receipts. These namespaces must not be conflated with ordinary task directories or task IDs.
 
 Old sessions, evidence, reports, proposals, and triage history are retained; this design includes no pruning policy.
 
@@ -203,7 +203,7 @@ The exact command spelling, config location, event kind, and record paths are im
 
 - A missing, malformed, or inaccessible source produces a coverage entry; it never becomes a negative finding.
 - Selected redaction/withholding is identified by category/span metadata when safely possible; no promise is made that all secrets were detected.
-- Token/input/output/runtime limits stop additional collection or calls and yield a coverage-limited report or checkpointed follow-up as appropriate, never silent truncation.
+- Input/output/call/runtime limits stop additional collection or calls and yield a coverage-limited report or checkpointed follow-up as appropriate, never silent truncation.
 - A failed model call preserves the candidate checkpoint and exposes a retryable failure; it does not create a fabricated report.
 - Crash recovery uses stable records and reuses the frozen cutoff. It does not silently reconsider later human feedback under an earlier review.
 - A candidate with no grounded proposal may be recorded as reviewed with explicit coverage, rather than producing an empty or invented recommendation.
