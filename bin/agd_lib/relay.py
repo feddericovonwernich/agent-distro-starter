@@ -500,6 +500,15 @@ def _summary_schema(schema):
             schema.get('required') == ['summary'] and schema.get('additionalProperties') is False and
             set(properties) == {'summary'} and isinstance(properties['summary'], dict) and
             properties['summary'].get('type') == 'string')
+
+def _cancel_delivery(service, root, lease, run):
+    result = run([str(Path(service['runtime'])/'bin'/'relay'), 'agent', 'reply', lease, 'cancelled',
+                  '--project-root', str(root), '--json', '{"effects":[]}'], timeout=30)
+    try:
+        if json.loads(result.stdout) != {'ok': True}:
+            raise store.Refusal('Relay cancellation was rejected')
+    except json.JSONDecodeError as error:
+        raise store.Refusal('Relay cancellation authority is uncertain') from error
 def poll(home, task, grant, incarnation, run=store.run):
     from . import tasks
     task, receipt, service, root, correlation = _relay_task(home, task, grant, incarnation)
@@ -520,11 +529,6 @@ def poll(home, task, grant, incarnation, run=store.run):
     event, lease = delivery.get('event'), delivery.get('leaseId')
     definition = f"{event.get('type')}@{event.get('version')}" if isinstance(event, dict) else None
     actual = event.get('correlationId') if isinstance(event, dict) else None
-    receipt['relay'] = {**relay_state, 'lease': {'id': lease, 'status': 'active', 'definition': definition,
-                                                  'correlation': actual},
-                        'pending_feedback': {'status': 'pending', 'delivery': delivery,
-                                             'output_schema': delivery.get('outputSchema')}}
-    tasks.write_pr_receipt(home, task['id'], receipt)
     payload = event.get('payload') if isinstance(event, dict) else None
     valid = (isinstance(lease, str) and bool(lease) and definition in ('pr.ci.settled@1', 'agd.pr.review@1') and
              actual == correlation and isinstance(delivery.get('outputSchema'), dict))
@@ -532,12 +536,23 @@ def poll(home, task, grant, incarnation, run=store.run):
         valid = valid and (payload.get('repository') == receipt['repository'] and
                            payload.get('pullRequest') == receipt['pr']['number'] and
                            payload.get('headSha') == receipt['local_head'])
+    try:
+        current_task, current_receipt, _current_service, _current_root, _current_correlation = _relay_task(
+            home, task, grant, incarnation)
+        valid = valid and current_receipt.get('local_head') == receipt.get('local_head')
+    except store.Refusal:
+        valid = False
     if not valid:
         try:
-            reply(home, task, grant, incarnation, lease, 'cancelled', {'effects': []}, run=run)
+            _cancel_delivery(service, root, lease, run)
         except store.Refusal:
-            _block_receipt(home, task['id'], receipt, 'Relay invalid feedback could not be cancelled')
+            _block_receipt(home, task['id'], receipt, 'Relay invalid feedback cancellation is uncertain')
         raise store.Refusal('Relay delivery identity is invalid')
+    receipt['relay'] = {**relay_state, 'lease': {'id': lease, 'status': 'active', 'definition': definition,
+                                                  'correlation': actual},
+                        'pending_feedback': {'status': 'pending', 'delivery': delivery,
+                                             'output_schema': delivery.get('outputSchema')}}
+    tasks.write_pr_receipt(home, current_task['id'], receipt)
     return {'status': 'delivered', 'lease_id': lease, 'definition': definition}
 
 
