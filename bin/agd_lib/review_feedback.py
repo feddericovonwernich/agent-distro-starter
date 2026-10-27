@@ -290,24 +290,36 @@ def watch_human_reviews(home, project_id, repository, pull_request, github, rela
         artifacts.sort(key=lambda item: (item['kind'], item['id']))
         if len({(item['kind'], item['id']) for item in artifacts}) != len(artifacts):
             raise ReviewFeedbackError('GitHub review evidence identity is ambiguous')
+        snapshot = _digest({'head': head, 'decision': decision, 'artifacts': artifacts, 'sources': sources})
         with store.lock(Path(home)):
             state = read_service(home, project_id, repository, pull_request)
             prior = state['artifacts'] if state.get('head_sha') == head else {}
             changed = [item for item in artifacts if prior.get(f"{item['kind']}:{item['id']}") != _digest(item)]
             if (not state.get('observed') and decision is not None) or (state.get('observed') and state.get('review_decision') != decision):
                 changed.append({'id': 'review-decision', 'kind': 'review_decision', 'state': decision, 'body': None})
-            emitted, keys = 0, []
+            intents = []
             for item in changed:
                 artifact_digest = _digest(item)
                 key = f'{repository}/{pull_request}/{head}/{item["kind"]}/{item["id"]}/{artifact_digest}'
-                request = {'type': 'agd.pr.review', 'version': 1, 'payload': {'schemaVersion': 1, 'repository': repository, 'pullRequest': pull_request, 'headSha': head, 'reviewDecision': decision, 'artifacts': [item]}, 'correlationId': f'github:{repository}:pull-request:{pull_request}', 'idempotencyKey': key}
-                if _status(relay(request)) not in (200, 201):
-                    raise ReviewFeedbackError('Relay producer rejected review feedback')
-                emitted += 1
-                keys.append(key)
-            state.update({'healthy': True, 'blocked_reason': None, 'head_sha': head, 'head_digest': _digest({'head': head, 'decision': decision, 'artifacts': artifacts}), 'review_decision': decision, 'observed': True, 'cursor': {'version': 1, 'head_sha': head, 'sources': sources}, 'artifacts': {f"{item['kind']}:{item['id']}": _digest(item) for item in artifacts}, 'idempotency_keys': (state.get('idempotency_keys', []) + keys)[-1000:]})
+                intents.append((key, {'type': 'agd.pr.review', 'version': 1, 'payload': {'schemaVersion': 1,
+                    'repository': repository, 'pullRequest': pull_request, 'headSha': head,
+                    'reviewDecision': decision, 'artifacts': [item]},
+                    'correlationId': f'github:{repository}:pull-request:{pull_request}', 'idempotencyKey': key}))
+            state['pending'] = {'head_sha': head, 'snapshot': snapshot, 'keys': [key for key, _ in intents]}
             _save(home, project_id, pull_request, state)
-            return {'emitted': emitted, 'head_sha': head, 'healthy': True}
+        for _, request in intents:
+            if _status(relay(request)) not in (200, 201):
+                raise ReviewFeedbackError('Relay producer rejected review feedback')
+        if _metadata(github) != (head, decision):
+            raise ReviewFeedbackError('GitHub pull request head changed during review read')
+        with store.lock(Path(home)):
+            state = read_service(home, project_id, repository, pull_request)
+            if state.get('pending', {}).get('snapshot') != snapshot:
+                raise ReviewFeedbackError('review feedback snapshot changed during delivery')
+            state.update({'healthy': True, 'blocked_reason': None, 'head_sha': head, 'head_digest': _digest({'head': head, 'decision': decision, 'artifacts': artifacts}), 'review_decision': decision, 'observed': True, 'cursor': {'version': 1, 'head_sha': head, 'sources': sources}, 'artifacts': {f"{item['kind']}:{item['id']}": _digest(item) for item in artifacts}, 'idempotency_keys': (state.get('idempotency_keys', []) + [key for key, _ in intents])[-1000:]})
+            state.pop('pending', None)
+            _save(home, project_id, pull_request, state)
+            return {'emitted': len(intents), 'head_sha': head, 'healthy': True}
     except ReviewFeedbackError as error:
         _mark_unhealthy(home, project_id, repository, pull_request, str(error))
         raise

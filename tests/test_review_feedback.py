@@ -1,5 +1,6 @@
 import json
 import sys
+import multiprocessing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -42,6 +43,12 @@ class Relay:
 
 def artifact(identifier, kind, head, state=None, body=None):
     return {'id': identifier, 'headSha': head, 'state': state, 'body': body}
+
+
+def _lock_probe(home, result):
+    from agd_lib import store
+    with store.lock(Path(home)):
+        result.put(True)
 
 
 def test_central_reader_requires_dedicated_token_and_never_uses_ambient_auth(monkeypatch):
@@ -223,3 +230,21 @@ def test_loopback_disables_environment_proxy(monkeypatch):
     with patch('agd_lib.review_feedback.build_opener', side_effect=lambda *handlers: captured.extend(handlers) or Opener()):
         assert review_feedback.LoopbackRelay('http://127.0.0.1:4312', 'secret')({'type': 'agd.pr.review'}) == 201
     assert any(isinstance(handler, ProxyHandler) and handler.proxies == {} for handler in captured)
+
+
+def test_relay_post_does_not_hold_home_lock(tmp_path):
+    github = GitHub()
+    github.pages['reviews'] = [[artifact('review-1', 'review', github.head, 'APPROVED')]]
+
+    def relay(_request):
+        result = multiprocessing.Queue()
+        process = multiprocessing.Process(target=_lock_probe, args=(str(tmp_path), result))
+        process.start()
+        process.join(.5)
+        acquired = not process.is_alive() and result.get_nowait() is True
+        if process.is_alive():
+            process.terminate()
+            process.join()
+        return 201 if acquired else 500
+
+    assert review_feedback.watch_human_reviews(tmp_path, 'sample', 'owner/repo', 7, github, relay)['emitted'] == 1
