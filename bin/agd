@@ -242,9 +242,8 @@ def main(args):
             return relay.poll(home, task, tasks.authorize_pr_publish(home, task, args.grant), args.incarnation)
         if args.operation == 'relay-reply':
             task = tasks.read(home, args.id)
-            payload = json.loads(Path(args.payload).read_text()) if args.payload else None
-            return relay.reply(home, task, tasks.authorize_pr_publish(home, task, args.grant),
-                               args.incarnation, args.lease, args.action, payload)
+            return relay.reply_file(home, task, tasks.authorize_pr_publish(home, task, args.grant),
+                                    args.incarnation, args.lease, args.action, args.payload)
         if args.operation == 'run':
             return workers.run_worker(home, args.id, args.incarnation)
         if args.operation == 'event':
