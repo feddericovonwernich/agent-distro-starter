@@ -1,6 +1,13 @@
+import base64
+import fcntl
 import json
 import os
+import secrets
+import socket
 import stat
+import subprocess
+import time
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -23,6 +30,74 @@ def paths(home):
         'log_archive': state / 'archives' / 'logs',
         'metric_archive': state / 'archives' / 'metrics',
     }
+
+
+def run_control(command, stage):
+    try:
+        completed = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=120)
+    except FileNotFoundError:
+        return {'stage': stage, 'category': 'missing-executable', 'exit_code': None,
+                'message': f'{stage} failed: executable unavailable'}
+    except subprocess.TimeoutExpired:
+        return {'stage': stage, 'category': 'timeout', 'exit_code': None,
+                'message': f'{stage} failed: timed out'}
+    if completed.returncode:
+        return {'stage': stage, 'category': 'command-failed', 'exit_code': completed.returncode,
+                'message': f'{stage} failed: command failed'}
+    return None
+
+
+def render_collector(home, lock, secrets_value=None):
+    home = _home(home)
+    _validate_lock(lock)
+    locations = paths(home)
+    _runtime_directories(home)
+    value = secrets_value or _secrets(home, _allocation(home))
+    text = _render(_template('collector.yaml.tmpl'), {
+        'QUEUE': locations['queue'], 'TRACE_ARCHIVE': locations['trace_archive'] / 'traces.json',
+        'LOG_ARCHIVE': locations['log_archive'] / 'logs.json',
+        'METRIC_ARCHIVE': locations['metric_archive'] / 'metrics.json',
+        'OTLP_ENDPOINT': 'http://langfuse-web:3000/api/public/otel/v1/traces',
+        'OTLP_AUTHORIZATION': 'Basic ' + base64.b64encode(
+            f"{value['public_key']}:{value['secret_key']}".encode()).decode(),
+    })
+    path = locations['compose'] / 'collector.yaml'
+    _private_write(path, text)
+    return path
+
+
+def render_stack(home, lock=None):
+    home = _home(home)
+    lock = _load_lock() if lock is None else lock
+    _validate_lock(lock)
+    locations = paths(home)
+    _runtime_directories(home)
+    allocation = _allocation(home)
+    values = _secrets(home, allocation)
+    collector = render_collector(home, lock, values)
+    mapping = dict(lock['images'])
+    mapping.update({
+        'PROJECT': allocation['project'], 'WEB_PORT': allocation['web_port'],
+        'MINIO_PORT': allocation['minio_port'], 'OTLP_HTTP_PORT': allocation['otlp_http_port'],
+        'OTLP_GRPC_PORT': allocation['otlp_grpc_port'], 'COLLECTOR_CONFIG': collector,
+        'QUEUE': locations['queue'], 'TRACE_ARCHIVE': locations['trace_archive'],
+        'LOG_ARCHIVE': locations['log_archive'], 'METRIC_ARCHIVE': locations['metric_archive'],
+        'UID': os.getuid(), 'GID': os.getgid(), 'ORG_ID': values['org_id'],
+        'PROJECT_ID': values['project_id'], 'PUBLIC_KEY': values['public_key'],
+        'SECRET_KEY': values['secret_key'], 'POSTGRES_PASSWORD': values['postgres_password'],
+        'CLICKHOUSE_PASSWORD': values['clickhouse_password'], 'REDIS_PASSWORD': values['redis_password'],
+        'MINIO_USER': values['minio_user'], 'MINIO_PASSWORD': values['minio_password'],
+        'SALT': values['salt'], 'ENCRYPTION_KEY': values['encryption_key'],
+        'NEXTAUTH_SECRET': values['nextauth_secret'], 'ADMIN_PASSWORD': values['admin_password'],
+        'COLLECTOR': mapping.pop('collector'), 'LANGFUSE': mapping.pop('langfuse'),
+        'LANGFUSE_WORKER': mapping.pop('langfuse_worker'), 'POSTGRES': mapping.pop('postgres'),
+        'CLICKHOUSE': mapping.pop('clickhouse'), 'MINIO': mapping.pop('minio'), 'REDIS': mapping.pop('redis'),
+    })
+    compose = locations['compose'] / 'compose.yaml'
+    _private_write(compose, _render(_template('compose.yaml.tmpl'), mapping))
+    _private_write(locations['compose'] / 'release-lock.json', json.dumps(lock, sort_keys=True) + '\n')
+    return dict(allocation, compose=compose, collector=collector)
 
 
 def read_config(home):
@@ -183,3 +258,226 @@ def _validate_record(value, home, name, desired_key):
             not value['generation'].isdigit() or
             value.get(desired_key) not in ('disabled', 'enabled')):
         raise store.Refusal(f'observability {name} is malformed')
+
+
+def enable(home):
+    return _lifecycle(home, 'enable')
+
+
+def start(home):
+    return _lifecycle(home, 'start')
+
+
+def stop(home):
+    return _lifecycle(home, 'stop')
+
+
+def disable(home):
+    return _lifecycle(home, 'disable')
+
+
+def status(home):
+    home = _home(home)
+    config, observed = read_config(home), read_status(home)
+    if observed['runtime'] in ('disabled', 'stopped'):
+        return observed
+    compose = paths(home)['compose'] / 'compose.yaml'
+    if not compose.exists():
+        return dict(observed, runtime='unknown')
+    try:
+        output = subprocess.run(['docker', 'compose', '-p', config.get('project', ''), '-f', str(compose),
+                                 'ps', '--format', 'json'], stdin=subprocess.DEVNULL, capture_output=True,
+                                text=True, timeout=20, check=True).stdout
+        rows = json.loads(output) if output.strip().startswith('[') else [json.loads(line) for line in output.splitlines() if line]
+        if not any(row.get('Service') == 'collector' and row.get('State') == 'running' for row in rows):
+            return dict(observed, runtime='degraded')
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{config['ports']['web_port']}/api/public/health", timeout=3) as response:
+            return dict(observed, runtime='healthy' if response.status == 200 else 'degraded')
+    except (KeyError, OSError, ValueError, subprocess.SubprocessError, urllib.error.URLError):
+        return dict(observed, runtime='degraded')
+
+
+def _lifecycle(home, action):
+    home = _home(home)
+    locations = paths(home)
+    _runtime_directories(home)
+    fd = os.open(locations['compose'] / 'lifecycle.lock', os.O_CREAT | os.O_RDWR, 0o600)
+    acquired = False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError as error:
+            raise store.Refusal('observability lifecycle is busy') from error
+        _save_stage(home, action)
+        if action == 'enable':
+            rendered = render_stack(home); _compose(rendered, 'up', '-d')
+            _wait_ready(rendered, _secrets(home, rendered)); _save_state(home, 'enabled', 'healthy', rendered)
+            return status(home)
+        config = read_config(home)
+        if action == 'start':
+            if config['mode'] != 'enabled' or not (locations['compose'] / 'compose.yaml').exists():
+                raise store.Refusal('observability is not enabled')
+            rendered = dict(_allocation(home), compose=locations['compose'] / 'compose.yaml')
+            _compose(rendered, 'up', '-d'); _wait_ready(rendered, _secrets(home, rendered))
+            _save_state(home, 'enabled', 'healthy', rendered); return status(home)
+        if action in ('stop', 'disable'):
+            desired = 'disabled' if action == 'disable' else config['mode']
+            if not (locations['compose'] / 'compose.yaml').exists():
+                _save_state(home, desired, 'disabled' if action == 'disable' else 'stopped', _allocation(home))
+                return read_status(home)
+            rendered = dict(_allocation(home), compose=locations['compose'] / 'compose.yaml')
+            _compose(rendered, 'stop'); _save_state(home, desired, 'stopped', rendered)
+            return read_status(home)
+    except store.Refusal:
+        if acquired:
+            _save_failure(home, action)
+        raise
+    finally:
+        os.close(fd)
+
+
+def _compose(rendered, *command):
+    result = run_control(['docker', 'compose', '-p', rendered['project'], '-f', str(rendered['compose']), *command],
+                         command[0])
+    if result:
+        raise store.Refusal(result['message'])
+
+
+def _wait_ready(rendered, value):
+    url = f"http://127.0.0.1:{rendered['web_port']}/api/public/health"
+    deadline = time.monotonic() + 420
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=3) as response:
+                if response.status != 200:
+                    continue
+            auth = base64.b64encode(f"{value['public_key']}:{value['secret_key']}".encode()).decode()
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{rendered['web_port']}/api/public/projects",
+                headers={'Authorization': 'Basic ' + auth})
+            with urllib.request.urlopen(request, timeout=5) as project_response:
+                payload = json.loads(project_response.read())
+            projects = payload.get('data', payload) if isinstance(payload, dict) else payload
+            if isinstance(projects, list) and any(
+                    isinstance(project, dict) and project.get('id') == value['project_id'] for project in projects):
+                return
+        except (OSError, ValueError, urllib.error.URLError):
+            pass
+        time.sleep(2)
+    raise store.Refusal('observability start failed: stack did not become ready')
+
+
+def _save_state(home, desired, runtime, allocation):
+    with store.lock(home):
+        current = read_config(home)
+        generation = str(int(current['generation']) + (current['mode'] != desired))
+        config = {'schema': 1, 'home_id': _home_id(home), 'mode': desired, 'generation': generation,
+                  'project': allocation['project'], 'ports': {k: allocation[k] for k in allocation if k.endswith('_port')}}
+        status_value = {'schema': 1, 'home_id': _home_id(home), 'desired': desired,
+                        'runtime': runtime, 'generation': generation}
+        _private_directory(home, 'data', 'observability')
+        _private_directory(home, 'state', 'observability')
+        store.atomic_json(paths(home)['config'], config)
+        store.atomic_json(paths(home)['status'], status_value)
+
+
+
+
+def _save_stage(home, stage):
+    with store.lock(home):
+        current = read_config(home)
+        _private_directory(home, 'state', 'observability')
+        store.atomic_json(paths(home)['status'], {'schema': 1, 'home_id': _home_id(home),
+                          'desired': current['mode'], 'runtime': 'unknown',
+                          'generation': current['generation'], 'stage': stage})
+def _save_failure(home, action):
+    with store.lock(home):
+        current = read_config(home)
+        _private_directory(home, 'state', 'observability')
+        store.atomic_json(paths(home)['status'], {'schema': 1, 'home_id': _home_id(home),
+                          'desired': current['mode'], 'runtime': 'degraded',
+                          'generation': current['generation'], 'stage': action})
+
+
+def _runtime_directories(home):
+    for item in ('data', 'observability'), ('state', 'observability'), ('state', 'observability', 'compose'), (
+            'state', 'observability', 'collector', 'queue'), ('state', 'observability', 'archives', 'traces'), (
+            'state', 'observability', 'archives', 'logs'), ('state', 'observability', 'archives', 'metrics'):
+        _private_directory(home, *item)
+
+
+def _allocation(home):
+    token = _home_id(home).replace('-', '')[:12]
+    base = 20000 + int(token[:4], 16) % 20000
+    if not (paths(home)['compose'] / 'release-lock.json').exists():
+        for port in range(base, base + 4):
+            with socket.socket() as probe:
+                if probe.connect_ex(('127.0.0.1', port)) == 0:
+                    raise store.Refusal('observability loopback port is unavailable')
+    return {'project': f'agdobs{token}', 'web_port': base, 'minio_port': base + 1,
+            'otlp_http_port': base + 2, 'otlp_grpc_port': base + 3}
+
+
+def _secrets(home, allocation):
+    path = paths(home)['secrets']
+    existing = _read_json(path)
+    if existing is not None:
+        if not isinstance(existing, dict) or existing.get('home_id') != _home_id(home):
+            raise store.Refusal('observability secrets are malformed')
+        return existing
+    value = {'schema': 1, 'home_id': _home_id(home), 'org_id': str(uuid.uuid4()),
+             'project_id': str(uuid.uuid4()), 'public_key': 'pk-lf-' + secrets.token_urlsafe(24),
+             'secret_key': 'sk-lf-' + secrets.token_urlsafe(32), 'postgres_password': secrets.token_urlsafe(24),
+             'clickhouse_password': secrets.token_urlsafe(24), 'redis_password': secrets.token_urlsafe(24),
+             'minio_user': 'agd' + secrets.token_hex(6), 'minio_password': secrets.token_urlsafe(24),
+             'salt': secrets.token_urlsafe(24), 'encryption_key': secrets.token_hex(32),
+             'nextauth_secret': secrets.token_urlsafe(32), 'admin_password': secrets.token_urlsafe(24)}
+    _private_directory(home, 'data', 'observability')
+    store.atomic_json(path, value)
+    os.chmod(path, 0o600)
+    return value
+
+
+def _load_lock():
+    try:
+        return json.loads((_bundle() / 'release-lock.json').read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise store.Refusal('observability release lock is unavailable') from error
+
+
+def _validate_lock(lock):
+    required = {'collector', 'langfuse', 'langfuse_worker', 'postgres', 'clickhouse', 'minio', 'redis'}
+    if not isinstance(lock, dict) or lock.get('schema') != 1 or set(lock.get('images', ())) != required:
+        raise store.Refusal('observability release lock is unsupported')
+    if any(not isinstance(image, str) or '@sha256:' not in image or len(image.rsplit('@sha256:', 1)[1]) != 64
+           for image in lock['images'].values()):
+        raise store.Refusal('observability release lock is unsupported')
+
+
+def _template(name):
+    try:
+        return (_bundle() / name).read_text()
+    except OSError as error:
+        raise store.Refusal('observability template is unavailable') from error
+
+
+def _bundle():
+    return Path(__file__).resolve().parents[2] / 'bundled' / 'observability'
+
+
+def _render(text, values):
+    for key, value in values.items():
+        text = text.replace('{{' + key.upper() + '}}', str(value))
+    if '{{' in text:
+        raise store.Refusal('observability template is unsupported')
+    return text
+
+
+def _private_write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_name(path.name + '.tmp')
+    temporary.write_text(text)
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)

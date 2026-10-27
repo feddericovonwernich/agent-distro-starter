@@ -51,7 +51,7 @@ Cursor Agent still needs user authentication and a live transcript bound to its 
 
 ## Private observability state
 
-Worker incarnation bindings reserve owner-only native-session directories under `data/observability/`; repeated binding lookup preserves existing receipt and transcript data. New managed child environments remove ambient OTEL exporter, protocol, header, and content-capture settings while observability is disabled. This is a storage/configuration boundary only: no managed telemetry command or service is available yet.
+Worker incarnation bindings reserve owner-only native-session directories under `data/observability/`; repeated binding lookup preserves existing receipt and transcript data. Disabled child environments remove ambient OTEL exporter, protocol, header, and content-capture settings. `observability enable`, `status`, `stop`, `start`, and `disable` own one private, pinned loopback-only Langfuse/Collector stack; stop and disable preserve its volumes, archives, queue, and credentials. Managed central/worker launch integration remains unavailable at this lifecycle milestone.
 
 ## Landing, publication, and retention
 

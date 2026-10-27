@@ -1,0 +1,110 @@
+services:
+  postgres:
+    image: {{POSTGRES}}
+    environment: {POSTGRES_PASSWORD: {{POSTGRES_PASSWORD}}}
+    volumes: ["{{PROJECT}}_postgres:/var/lib/postgresql/data"]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U postgres"], interval: 3s, timeout: 3s, retries: 10}
+  clickhouse:
+    image: {{CLICKHOUSE}}
+    environment: {CLICKHOUSE_DB: default, CLICKHOUSE_USER: clickhouse, CLICKHOUSE_PASSWORD: {{CLICKHOUSE_PASSWORD}}}
+    volumes: ["{{PROJECT}}_clickhouse:/var/lib/clickhouse"]
+    healthcheck: {test: "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1", interval: 5s, timeout: 5s, retries: 10}
+  redis:
+    image: {{REDIS}}
+    command: ["redis-server", "--requirepass", "{{REDIS_PASSWORD}}"]
+    volumes: ["{{PROJECT}}_redis:/data"]
+    healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 3s, timeout: 10s, retries: 10}
+  minio:
+    image: {{MINIO}}
+    entrypoint: ["sh"]
+    command: ["-c", "mkdir -p /data/langfuse && exec minio server --address :9000 --console-address :9001 /data"]
+    environment: {MINIO_ROOT_USER: {{MINIO_USER}}, MINIO_ROOT_PASSWORD: {{MINIO_PASSWORD}}}
+    ports: ["127.0.0.1:{{MINIO_PORT}}:9000"]
+    volumes: ["{{PROJECT}}_minio:/data"]
+    healthcheck: {test: ["CMD", "mc", "ready", "local"], interval: 1s, timeout: 5s, retries: 5}
+  langfuse-worker:
+    image: {{LANGFUSE_WORKER}}
+    depends_on: &langfuse_depends
+      postgres: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      clickhouse: {condition: service_healthy}
+    environment: &langfuse
+      DATABASE_URL: postgresql://postgres:{{POSTGRES_PASSWORD}}@postgres:5432/postgres
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: {{CLICKHOUSE_PASSWORD}}
+      REDIS_AUTH: {{REDIS_PASSWORD}}
+      REDIS_HOST: redis
+      SALT: {{SALT}}
+      ENCRYPTION_KEY: {{ENCRYPTION_KEY}}
+      NEXTAUTH_URL: http://127.0.0.1:{{WEB_PORT}}
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: {{MINIO_USER}}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: {{MINIO_PASSWORD}}
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://127.0.0.1:{{MINIO_PORT}}
+      LANGFUSE_S3_MEDIA_UPLOAD_INTERNAL_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: {{MINIO_USER}}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: {{MINIO_PASSWORD}}
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      CLICKHOUSE_CLUSTER_NAME: default
+      LANGFUSE_USE_AZURE_BLOB: "false"
+      LANGFUSE_USE_OCI_NATIVE_OBJECT_STORAGE: "false"
+      LANGFUSE_OCI_AUTH_TYPE: workload_identity
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+      LANGFUSE_S3_MEDIA_UPLOAD_REQUEST_TIMEOUT_MS: "30000"
+      LANGFUSE_OBSERVATION_FIELD_OVERFLOW_ENABLED: "false"
+      LANGFUSE_OBSERVATION_FIELD_SIZE_LIMIT_BYTES: "2097152"
+      LANGFUSE_S3_BATCH_EXPORT_ENABLED: "false"
+      LANGFUSE_S3_BATCH_EXPORT_BUCKET: langfuse
+      LANGFUSE_S3_BATCH_EXPORT_PREFIX: exports/
+      LANGFUSE_S3_BATCH_EXPORT_REGION: auto
+      LANGFUSE_S3_BATCH_EXPORT_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT: http://127.0.0.1:{{MINIO_PORT}}
+      LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID: {{MINIO_USER}}
+      LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY: {{MINIO_PASSWORD}}
+      LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE: "true"
+      REDIS_PORT: "6379"
+      REDIS_TLS_ENABLED: "false"
+  langfuse-web:
+    image: {{LANGFUSE}}
+    depends_on: *langfuse_depends
+    ports: ["127.0.0.1:{{WEB_PORT}}:3000"]
+    environment:
+      <<: *langfuse
+      NEXTAUTH_SECRET: {{NEXTAUTH_SECRET}}
+      LANGFUSE_INIT_ORG_ID: {{ORG_ID}}
+      LANGFUSE_INIT_ORG_NAME: AGD
+      LANGFUSE_INIT_PROJECT_ID: {{PROJECT_ID}}
+      LANGFUSE_INIT_PROJECT_NAME: AGD
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: {{PUBLIC_KEY}}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: {{SECRET_KEY}}
+      LANGFUSE_INIT_USER_EMAIL: local@agd.invalid
+      LANGFUSE_INIT_USER_NAME: AGD
+      LANGFUSE_INIT_USER_PASSWORD: {{ADMIN_PASSWORD}}
+  collector:
+    image: {{COLLECTOR}}
+    user: "{{UID}}:{{GID}}"
+    command: ["--config=/etc/collector.yaml"]
+    ports: ["127.0.0.1:{{OTLP_HTTP_PORT}}:4318", "127.0.0.1:{{OTLP_GRPC_PORT}}:4317"]
+    volumes:
+      - "{{COLLECTOR_CONFIG}}:/etc/collector.yaml:ro"
+      - "{{QUEUE}}:{{QUEUE}}"
+      - "{{TRACE_ARCHIVE}}:{{TRACE_ARCHIVE}}"
+      - "{{LOG_ARCHIVE}}:{{LOG_ARCHIVE}}"
+      - "{{METRIC_ARCHIVE}}:{{METRIC_ARCHIVE}}"
+volumes:
+  {{PROJECT}}_postgres: {name: {{PROJECT}}_postgres}
+  {{PROJECT}}_clickhouse: {name: {{PROJECT}}_clickhouse}
+  {{PROJECT}}_redis: {name: {{PROJECT}}_redis}
+  {{PROJECT}}_minio: {name: {{PROJECT}}_minio}

@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -91,3 +92,93 @@ def test_disabled_environment_removes_only_ambient_otel_controls(monkeypatch):
         'OTEL_RESOURCE_ATTRIBUTES', 'OTEL_SERVICE_NAME',
     } or (key.startswith('OTEL_') and (
         'PROTOCOL' in key or 'HEADER' in key or 'CONTENT' in key)) for key in observed)
+
+
+def test_rendered_stack_keeps_only_browser_collector_and_media_ports_on_loopback():
+    with lab() as (home, _):
+        lock = {
+            'schema': 1,
+            'images': {
+                'collector': 'example.invalid/collector@sha256:' + '0' * 64,
+                'langfuse': 'example.invalid/langfuse@sha256:' + '1' * 64,
+                'langfuse_worker': 'example.invalid/worker@sha256:' + '2' * 64,
+                'postgres': 'example.invalid/postgres@sha256:' + '3' * 64,
+                'clickhouse': 'example.invalid/clickhouse@sha256:' + '4' * 64,
+                'minio': 'example.invalid/minio@sha256:' + '5' * 64,
+                'redis': 'example.invalid/redis@sha256:' + '6' * 64,
+            },
+        }
+        rendered = observability.render_stack(home, lock)
+        model = json.loads(subprocess.check_output(
+            ['docker', 'compose', '-f', str(rendered['compose']), 'config', '--format', 'json'],
+            text=True, stderr=subprocess.DEVNULL))
+
+    published = {name: service['ports'] for name, service in model['services'].items()
+                 if service.get('ports')}
+    assert set(published) <= {'langfuse-web', 'collector', 'minio'}
+    assert all(port['host_ip'] == '127.0.0.1'
+               for ports in published.values() for port in ports)
+
+
+def test_control_failure_is_sanitized_not_child_output():
+    assert observability.run_control(['missing-command'], 'start') == {
+        'stage': 'start', 'category': 'missing-executable', 'exit_code': None,
+        'message': 'start failed: executable unavailable'}
+
+
+def test_rendered_langfuse_environment_has_required_migration_and_bucket_settings():
+    with lab() as (home, _):
+        rendered = observability.render_stack(home)
+        model = json.loads(subprocess.check_output(
+            ['docker', 'compose', '-f', str(rendered['compose']), 'config', '--format', 'json'],
+            text=True, stderr=subprocess.DEVNULL))
+
+    environment = model['services']['langfuse-worker']['environment']
+    assert environment['CLICKHOUSE_MIGRATION_URL'] == 'clickhouse://clickhouse:9000'
+    assert environment['LANGFUSE_S3_EVENT_UPLOAD_BUCKET'] == 'langfuse'
+
+
+def test_rendered_langfuse_waits_for_upstream_health_checks():
+    with lab() as (home, _):
+        rendered = observability.render_stack(home)
+        model = json.loads(subprocess.check_output(
+            ['docker', 'compose', '-f', str(rendered['compose']), 'config', '--format', 'json'],
+            text=True, stderr=subprocess.DEVNULL))
+
+    assert model['services']['langfuse-web']['depends_on']['clickhouse']['condition'] == 'service_healthy'
+
+
+def test_existing_owned_render_recovers_its_port_allocation():
+    with lab() as (home, _):
+        first = observability.render_stack(home)
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', first['web_port']))
+            listener.listen()
+            assert observability.render_stack(home)['web_port'] == first['web_port']
+
+
+def test_rendered_minio_uses_the_pinned_compose_shell_contract():
+    with lab() as (home, _):
+        rendered = observability.render_stack(home)
+        model = json.loads(subprocess.check_output(
+            ['docker', 'compose', '-f', str(rendered['compose']), 'config', '--format', 'json'],
+            text=True, stderr=subprocess.DEVNULL))
+
+    assert model['services']['minio']['entrypoint'] == ['sh']
+    assert model['services']['minio']['command'][0] == '-c'
+
+
+def test_rendered_clickhouse_uses_pinned_user_contract():
+    with lab() as (home, _):
+        rendered = observability.render_stack(home)
+        model = json.loads(subprocess.check_output(
+            ['docker', 'compose', '-f', str(rendered['compose']), 'config', '--format', 'json'],
+            text=True, stderr=subprocess.DEVNULL))
+
+    assert model['services']['clickhouse']['environment']['CLICKHOUSE_USER'] == 'clickhouse'
+
+
+def test_disable_unconfigured_home_is_idempotent():
+    with lab() as (home, _):
+        assert observability.disable(home)['runtime'] == 'disabled'
+        assert observability.disable(home)['runtime'] == 'disabled'
