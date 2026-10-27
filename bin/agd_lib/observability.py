@@ -195,10 +195,13 @@ def managed_environment(home, role, task, incarnation):
 
 def central_argv(home, omp_args):
     home = _home(home)
-    forbidden = {'--cwd', '--session-dir', '--continue', '--resume', '--no-session'}
-    if any(argument in forbidden or any(argument.startswith(flag + '=') for flag in forbidden)
-           for argument in omp_args):
-        raise store.Refusal('managed central refuses forwarded cwd or native session controls')
+    forbidden = {'--cwd', '--session-dir', '--continue', '-c', '--resume', '-r', '--session',
+                 '--no-session', '--fork', '--from-claude', '--from-codex'}
+    for argument in omp_args:
+        if argument == '--':
+            break
+        if argument in forbidden or any(argument.startswith(flag + '=') for flag in forbidden):
+            raise store.Refusal('managed central refuses forwarded cwd or native session controls')
     config = read_config(home)
     warning = None
     if config['mode'] == 'enabled':

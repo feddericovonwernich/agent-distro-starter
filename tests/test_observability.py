@@ -103,8 +103,24 @@ def test_central_uses_private_session_root_and_refuses_native_conflicts():
         assert warning is None
         with pytest.raises(store.Refusal):
             observability.central_argv(home, ['--no-session'])
+
+
+@pytest.mark.parametrize('omp_args', [
+    ['--cwd', '/tmp'], ['--cwd=/tmp'], ['--session-dir', '/tmp'], ['--session-dir=/tmp'],
+    ['--continue'], ['-c'], ['--resume'], ['--resume=session-id'], ['-r'], ['--session'],
+    ['--session=session-id'], ['--fork', 'session-id'], ['--fork=session-id'],
+    ['--from-claude'], ['--from-codex'],
+])
+def test_central_refuses_every_omp_session_source_control(omp_args):
+    with lab() as (home, _):
         with pytest.raises(store.Refusal):
-            observability.central_argv(home, ['--cwd', '/tmp'])
+            observability.central_argv(home, omp_args)
+
+
+def test_central_preserves_flag_shaped_prompt_after_omp_separator():
+    with lab() as (home, _):
+        argv, _env, _warning = observability.central_argv(home, ['--', '--session', 'literal'])
+    assert argv[-3:] == ['--', '--session', 'literal']
 
 def test_rendered_stack_keeps_only_browser_collector_and_media_ports_on_loopback():
     with lab() as (home, _):
