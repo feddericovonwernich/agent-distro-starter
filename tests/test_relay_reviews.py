@@ -72,6 +72,27 @@ def test_task_failure_isolated_from_other_pr_and_shared_service(monkeypatch):
         assert 'blocked_reason' not in tasks.read_pr_receipt(home, 'healthy')
         assert json.loads(relay_reviews.relay._service_file(home, 'sample').read_text())['health'] == 'healthy'
 
+def test_malformed_grant_blocks_only_its_task_and_valid_task_emits(monkeypatch):
+    from agd_lib import store
+    with lab() as (home, _project):
+        broken, valid = _task_with_pr(home, 'broken'), _task_with_pr(home, 'valid')
+        grant_path = tasks.task_file(home, 'broken').parent/'approvals'/f'{broken["pr_grant"]}.json'
+        grant = json.loads(grant_path.read_text()); grant.pop('remote_url'); grant_path.write_text(json.dumps(grant))
+        with pytest.raises(store.Refusal):
+            tasks.authorize_pr_feedback(home, tasks.read(home, 'broken'), broken['pr_grant'])
+        head = tasks.read_pr_receipt(home, 'valid')['local_head']
+        monkeypatch.setattr(relay_reviews.supervision, 'gone', lambda *_: False)
+        monkeypatch.setattr(relay_reviews.review_feedback, 'central_github_reader', _github(head))
+        monkeypatch.setattr(relay_reviews, '_producer_token', lambda *_: 'producer')
+        monkeypatch.setattr(relay_reviews.review_feedback, 'LoopbackRelay', lambda *_: object())
+        emitted = []
+        monkeypatch.setattr(relay_reviews.review_feedback, 'watch_human_reviews',
+                            lambda *_: emitted.append(True) or {'emitted': 1})
+        assert relay_reviews.tick(home) == {'checked': 2, 'emitted': 1, 'blocked': 1}
+        assert emitted == [True]
+        assert any(event['task'] == 'broken' and event['kind'] == 'blocked'
+                   for event in supervision.reconcile(home)['pending'])
+
 
 def test_dead_connector_blocks_every_affected_pr_without_http(monkeypatch):
     with lab() as (home, _project):
