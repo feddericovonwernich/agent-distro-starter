@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from support import lab
+from support import command, lab
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
 from agd_lib import observability, store
@@ -248,3 +248,67 @@ def test_disable_persists_disabled_state_when_stop_fails(monkeypatch):
         assert observability.read_config(home)['mode'] == 'disabled'
         assert observability.read_status(home)['desired'] == 'disabled'
         assert observability.read_status(home)['runtime'] == 'degraded'
+
+
+def test_live_central_with_old_generation_requires_restart():
+    with lab() as (home, _):
+        observability.record_process_generation(home, 'central', '1')
+        observability.record_desired_generation(home, '2', 'enabled')
+        status = observability.status(home)
+        assert status['runtime'] == 'unknown'
+        assert status['central']['state'] == 'stale-restart-required'
+
+
+def test_exited_worker_receipt_is_not_reported_stale(monkeypatch):
+    with lab() as (home, _):
+        monkeypatch.setattr(observability, '_process_gone', lambda *_: True)
+        observability.record_process_generation(home, 'worker', '1', 'task-a', INCARNATION,
+                                                pid=123, start='old')
+        observability.record_desired_generation(home, '2', 'enabled')
+        worker = observability.status(home)['workers'][0]
+        assert worker['state'] == 'stopped'
+        assert worker['generation'] == '1'
+
+
+def test_collector_diagnostics_separates_queue_admission_and_send_failure_evidence():
+    diagnostics = observability._parse_collector_metrics('''
+otelcol_exporter_queue_size{exporter="otlphttp/langfuse"} 7
+otelcol_exporter_queue_capacity{exporter="otlphttp/langfuse"} 1000
+otelcol_exporter_enqueue_failed_spans{exporter="otlphttp/langfuse"} 2
+otelcol_exporter_send_failed_spans{exporter="otlphttp/langfuse",error_permanent="false"} 3
+otelcol_exporter_send_failed_spans{exporter="otlphttp/langfuse",error_permanent="true"} 5
+otelcol_exporter_sent_spans{exporter="otlphttp/langfuse"} 11
+''')
+    assert diagnostics == {
+        'state': 'known', 'queue_batches': 7, 'queue_capacity_batches': 1000,
+        'enqueue_failed_spans': 2, 'retryable_send_failed_spans': 3,
+        'permanent_send_failed_spans': 5, 'unclassified_send_failed_spans': 0,
+        'sent_spans': 11, 'disk_full': 'unknown',
+    }
+
+
+def test_scout_cleanup_preserves_native_binding_queue_and_archive_bytes():
+    with lab() as (home, _):
+        brief = home / 'brief.md'
+        brief.write_text('Inspect value.txt.\n')
+        command(home, 'task', 'create', 'scout', '--project', 'sample', '--brief', str(brief), '--kind', 'scout')
+        binding = observability.worker_binding(home, 'scout', INCARNATION)
+        session = Path(binding['session_dir'])
+        (session / 'native.jsonl').write_bytes(b'{"message":"old"}\n')
+        artifact = session / 'native' / 'artifact'
+        artifact.mkdir(parents=True)
+        (artifact / 'blob').write_bytes(b'old artifact')
+        queue = observability.paths(home)['queue']
+        queue.mkdir(parents=True)
+        (queue / 'item').write_bytes(b'queued')
+        archive = observability.paths(home)['trace_archive']
+        archive.parent.mkdir(parents=True)
+        archive.write_bytes(b'archive')
+        report = home / 'report.md'
+        report.write_text('verified\n')
+        command(home, 'task', 'ready', 'scout', '--report', str(report))
+        command(home, 'task', 'cleanup', 'scout')
+        assert (session / 'native.jsonl').read_bytes() == b'{"message":"old"}\n'
+        assert (artifact / 'blob').read_bytes() == b'old artifact'
+        assert (queue / 'item').read_bytes() == b'queued'
+        assert archive.read_bytes() == b'archive'

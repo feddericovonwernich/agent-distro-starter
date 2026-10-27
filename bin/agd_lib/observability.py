@@ -2,6 +2,7 @@ import base64
 import fcntl
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -25,6 +26,7 @@ def paths(home):
         'central_sessions': data / 'central' / 'omp',
         'task_sessions': data / 'tasks',
         'status': state / 'status.json',
+        'processes': state / 'processes',
         'compose': state / 'compose',
         'queue': state / 'collector' / 'queue',
         'trace_archive': state / 'archives' / 'traces',
@@ -81,7 +83,8 @@ def render_stack(home, lock=None):
     mapping.update({
         'PROJECT': allocation['project'], 'WEB_PORT': allocation['web_port'],
         'MINIO_PORT': allocation['minio_port'], 'OTLP_HTTP_PORT': allocation['otlp_http_port'],
-        'OTLP_GRPC_PORT': allocation['otlp_grpc_port'], 'COLLECTOR_HEALTH_PORT': allocation['collector_health_port'], 'COLLECTOR_CONFIG': collector,
+        'OTLP_GRPC_PORT': allocation['otlp_grpc_port'], 'COLLECTOR_HEALTH_PORT': allocation['collector_health_port'],
+        'COLLECTOR_METRICS_PORT': allocation['collector_metrics_port'], 'COLLECTOR_CONFIG': collector,
         'QUEUE': locations['queue'], 'TRACE_ARCHIVE': locations['trace_archive'],
         'LOG_ARCHIVE': locations['log_archive'], 'METRIC_ARCHIVE': locations['metric_archive'],
         'UID': os.getuid(), 'GID': os.getgid(), 'ORG_ID': values['org_id'],
@@ -209,12 +212,13 @@ def central_argv(home, omp_args):
             start(home)
         except store.Refusal as error:
             warning = f'observability degraded: {error}'
-    env, _generation, environment_warning = managed_environment(home, 'central', None, None)
+    env, generation, environment_warning = managed_environment(home, 'central', None, None)
     warning = warning or environment_warning
     _private_directory(home, 'data', 'observability', 'central', 'omp')
     binary = shutil.which('omp')
     if not binary:
         raise store.DependencyError('omp is not installed')
+    record_process_generation(home, 'central', generation)
     return [binary, '--cwd', str(home), '--session-dir', str(paths(home)['central_sessions']), *omp_args], env, warning
 
 
@@ -335,28 +339,162 @@ def disable(home):
     return _lifecycle(home, 'disable')
 
 
+def record_desired_generation(home, generation, mode):
+    home = _home(home)
+    if mode not in ('enabled', 'disabled') or not isinstance(generation, str) or not generation.isdigit():
+        raise ValueError('invalid observability generation')
+    with store.lock(home):
+        current = read_config(home)
+        actual_generation = generation if current['mode'] != mode else current['generation']
+        allocation = _allocation(home)
+        config = {'schema': 1, 'home_id': _home_id(home), 'mode': mode, 'generation': actual_generation,
+                  'project': allocation['project'],
+                  'ports': {key: allocation[key] for key in allocation if key.endswith('_port')}}
+        _private_directory(home, 'data', 'observability')
+        _private_directory(home, 'state', 'observability')
+        store.atomic_json(paths(home)['config'], config)
+        store.atomic_json(paths(home)['status'], {'schema': 1, 'home_id': _home_id(home), 'desired': mode,
+                                                  'runtime': 'unknown', 'generation': actual_generation})
+
+
+def record_process_generation(home, role, generation, task_id=None, incarnation=None, pid=None, start=None):
+    home = _home(home)
+    if role not in ('central', 'worker') or not isinstance(generation, str) or not generation.isdigit():
+        raise ValueError('invalid observability process generation')
+    if role == 'worker':
+        task_id, incarnation = store.validate_id(task_id), _incarnation(incarnation)
+    elif task_id is not None or incarnation is not None:
+        raise ValueError('central process cannot have task identity')
+    pid = os.getpid() if pid is None else pid
+    if not isinstance(pid, int) or pid <= 0:
+        raise ValueError('invalid observability process pid')
+    start = _process_start(pid) if start is None else start
+    if not isinstance(start, str) or not start:
+        raise ValueError('invalid observability process start')
+    identity = '-'.join((role, task_id or 'central', incarnation or 'session', str(pid), start))
+    name = uuid.uuid5(uuid.NAMESPACE_URL, identity).hex + '.json'
+    receipt = {'schema': 1, 'role': role, 'generation': generation, 'pid': pid, 'start': start,
+               'recorded_at': time.time()}
+    if role == 'worker':
+        receipt.update(task_id=task_id, incarnation=incarnation)
+    with store.lock(home):
+        directory = _private_directory(home, 'state', 'observability', 'processes')
+        store.atomic_json(directory / name, receipt)
+    return receipt
+
+
+def _process_start(pid):
+    from .supervision import process_start
+    return process_start(pid)
+
+
+def _process_gone(pid, start):
+    from .supervision import gone
+    return gone(pid, start)
+
+
 def status(home):
     home = _home(home)
     config, observed = read_config(home), read_status(home)
     if observed['runtime'] in ('disabled', 'stopped'):
-        return observed
+        return _with_process_status(home, config, observed)
     compose = paths(home)['compose'] / 'compose.yaml'
     if not compose.exists():
-        return dict(observed, runtime='unknown')
+        return _with_process_status(home, config, dict(observed, runtime='unknown'))
     try:
         output = subprocess.run(['docker', 'compose', '-p', config.get('project', ''), '-f', str(compose),
                                  'ps', '--format', 'json'], stdin=subprocess.DEVNULL, capture_output=True,
                                 text=True, timeout=20, check=True).stdout
-        rows = json.loads(output) if output.strip().startswith('[') else [json.loads(line) for line in output.splitlines() if line]
+        rows = json.loads(output) if output.strip().startswith('[') else [
+            json.loads(line) for line in output.splitlines() if line]
         if not any(row.get('Service') == 'collector' and row.get('State') == 'running' for row in rows):
-            return dict(observed, runtime='degraded')
+            return _with_process_status(home, config, dict(observed, runtime='degraded'))
         rendered = dict(config['ports'])
         rendered['project'] = config['project']
         if not _ready(rendered, _secrets(home, rendered)):
-            return dict(observed, runtime='degraded')
-        return dict(observed, runtime='healthy')
+            return _with_process_status(home, config, dict(observed, runtime='degraded'))
+        return _with_process_status(home, config, dict(observed, runtime='healthy'))
     except (KeyError, OSError, ValueError, subprocess.SubprocessError, urllib.error.URLError):
-        return dict(observed, runtime='degraded')
+        return _with_process_status(home, config, dict(observed, runtime='degraded'))
+
+
+def _with_process_status(home, config, observed):
+    directory = _existing_private_directory(home, 'state', 'observability', 'processes')
+    receipts = [] if directory is None else [_read_json(path) for path in sorted(directory.glob('*.json'))]
+    central = []
+    workers = []
+    for receipt in receipts:
+        if not isinstance(receipt, dict) or receipt.get('schema') != 1:
+            raise store.Refusal('observability process receipt is malformed')
+        role = receipt.get('role')
+        if role not in ('central', 'worker') or not isinstance(receipt.get('generation'), str):
+            raise store.Refusal('observability process receipt is malformed')
+        value = {key: receipt[key] for key in ('generation', 'pid', 'start') if key in receipt}
+        try:
+            exited = _process_gone(receipt['pid'], receipt['start'])
+        except (OSError, ValueError, TypeError):
+            value['state'] = 'unknown'
+        else:
+            value['state'] = 'stopped' if exited else (
+                'stale-restart-required' if receipt['generation'] != config['generation'] else observed['runtime'])
+        if role == 'central':
+            central.append(value)
+        else:
+            if not isinstance(receipt.get('task_id'), str) or not isinstance(receipt.get('incarnation'), str):
+                raise store.Refusal('observability worker process receipt is malformed')
+            workers.append(dict(value, task_id=receipt['task_id'], incarnation=receipt['incarnation']))
+    result = dict(observed)
+    result['central'] = (next((item for item in reversed(central)
+                               if item['state'] != 'stopped'), central[-1] if central else {'state': 'unknown'}))
+    result['workers'] = workers
+    result['delivery'] = (_collector_diagnostics(config) if config['mode'] == 'enabled' and
+                          observed['runtime'] in ('healthy', 'degraded') else {'state': 'unknown'})
+    return result
+
+
+def _collector_diagnostics(config):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{config['ports']['collector_metrics_port']}/metrics",
+                                    timeout=3) as response:
+            if response.status != 200:
+                return {'state': 'unknown'}
+            return _parse_collector_metrics(response.read().decode('utf-8', 'replace'))
+    except (KeyError, OSError, UnicodeError, urllib.error.URLError):
+        return {'state': 'unknown'}
+
+
+def _parse_collector_metrics(text):
+    values = {'queue_batches': None, 'queue_capacity_batches': None, 'enqueue_failed_spans': None,
+              'retryable_send_failed_spans': 0, 'permanent_send_failed_spans': 0,
+              'unclassified_send_failed_spans': 0, 'sent_spans': None, 'disk_full': 'unknown'}
+    names = {
+        'otelcol_exporter_queue_size': 'queue_batches',
+        'otelcol_exporter_queue_capacity': 'queue_capacity_batches',
+        'otelcol_exporter_enqueue_failed_spans': 'enqueue_failed_spans',
+        'otelcol_exporter_sent_spans': 'sent_spans',
+    }
+    found = False
+    for line in text.splitlines():
+        match = re.match(r'^(otelcol_exporter_[a-z_]+)(?:\{([^}]*)\})?\s+([0-9.eE+-]+)$', line.strip())
+        if not match or 'exporter="otlphttp/langfuse"' not in (match.group(2) or ''):
+            continue
+        name, labels, number = match.groups()
+        try:
+            value = int(float(number))
+        except ValueError:
+            continue
+        if name in names:
+            values[names[name]] = value
+            found = True
+        elif name == 'otelcol_exporter_send_failed_spans':
+            found = True
+            if 'error_permanent="true"' in (labels or '') or 'error.permanent="true"' in (labels or ''):
+                values['permanent_send_failed_spans'] += value
+            elif 'error_permanent="false"' in (labels or '') or 'error.permanent="false"' in (labels or ''):
+                values['retryable_send_failed_spans'] += value
+            else:
+                values['unclassified_send_failed_spans'] += value
+    return dict(state='known', **values) if found else {'state': 'unknown'}
 
 
 def _lifecycle(home, action):
@@ -481,13 +619,15 @@ def _runtime_directories(home):
 def _allocation(home):
     token = _home_id(home).replace('-', '')[:12]
     base = 20000 + int(token[:4], 16) % 20000
+    metrics_port = 40000 + int(token[4:8], 16) % 20000
     if not (paths(home)['compose'] / 'release-lock.json').exists():
-        for port in range(base, base + 5):
+        for port in (*range(base, base + 5), metrics_port):
             with socket.socket() as probe:
                 if probe.connect_ex(('127.0.0.1', port)) == 0:
                     raise store.Refusal('observability loopback port is unavailable')
     return {'project': f'agdobs{token}', 'web_port': base, 'minio_port': base + 1,
-            'otlp_http_port': base + 2, 'otlp_grpc_port': base + 3, 'collector_health_port': base + 4}
+            'otlp_http_port': base + 2, 'otlp_grpc_port': base + 3, 'collector_health_port': base + 4,
+            'collector_metrics_port': metrics_port}
 
 
 def _secrets(home, allocation):

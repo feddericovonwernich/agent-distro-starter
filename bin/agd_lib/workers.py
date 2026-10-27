@@ -128,7 +128,7 @@ def run_worker(home, task_id, incarnation):
     if task.get('worker_skills'):
         worker_skills.verify(home, task)
     if task['harness'] == 'omp':
-        child_env, _generation, warning = observability.managed_environment(home, 'worker', task, incarnation)
+        child_env, generation, warning = observability.managed_environment(home, 'worker', task, incarnation)
         session_dir = Path(task['observability']['session_dir'])
     else:
         child_env = dict(os.environ, AGD_HOME=str(home), AGD_TASK_ID=task_id, AGD_INCARNATION=incarnation)
@@ -144,6 +144,8 @@ def run_worker(home, task_id, incarnation):
                   phase='spawning')
     if warning:
         runner['observability_warning'] = warning
+    if task['harness'] == 'omp':
+        runner['observability_generation'] = generation
     store.atomic_json(receipt, runner)
     with store.lock(home):
         current = tasks.read(home, task_id)
@@ -155,6 +157,9 @@ def run_worker(home, task_id, incarnation):
     try:
         child = subprocess.Popen(args, cwd=task['worktree'], env=child_env, stdin=None)
         runner.update(phase='spawned', child_pid=child.pid, child_start=process_start(child.pid))
+        if task['harness'] == 'omp':
+            observability.record_process_generation(home, 'worker', generation, task_id, incarnation,
+                                                    child.pid, runner['child_start'])
         store.atomic_json(receipt, runner)
         status = child.wait()
     except Exception as error:

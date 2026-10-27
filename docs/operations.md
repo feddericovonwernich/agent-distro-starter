@@ -55,7 +55,9 @@ Cursor Agent still needs user authentication and a live transcript bound to its 
 
 OMP worker launch and relaunch reserve a fresh, owner-only task/incarnation session directory before the endpoint exists. Prior native JSONL and artifact data remains in its original incarnation directory. Managed OMP processes receive only Collector loopback OTLP settings, full native capture, and role/home/task/incarnation resource identity when enabled; workers never receive Langfuse credentials. Cursor remains unsupported for native observability and receives no such configuration.
 
-`observability enable`, `status`, `stop`, `start`, and `disable` own one private, pinned loopback-only Langfuse/Collector stack; stop and disable preserve its volumes, archives, queue, and credentials.
+`observability enable`, `status`, `stop`, `start`, and `disable` own one private, pinned loopback-only Langfuse/Collector stack; stop and disable preserve its volumes, archives, queue, and credentials. A mode toggle advances the desired generation. Launch receipts retain each central process identity and each worker `(task, incarnation)` environment generation; a live receipt from an older generation is `stale-restart-required`, while an exited receipt remains `stopped`.
+
+Status exposes Collector queue and failure counters only from its local detailed Prometheus endpoint. `queue_batches` is post-`file_storage` backlog evidence; receiver, processor, archive, and in-flight data are never called queued or delivered. Enqueue/send counters are historical, `sent_spans` is not per-item delivery proof, unavailable diagnostics remain `unknown`, and disk-full stays `unknown` unless actual sanitized storage evidence is available.
 
 ## Landing, publication, and retention
 
