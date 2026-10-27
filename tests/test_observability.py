@@ -292,6 +292,19 @@ def test_collector_error_classification_keeps_disk_and_file_storage_full_distinc
     assert observability._classify_collector_errors('file_storage: max_size exceeded') == 'file-storage-full'
 
 
+def test_metrics_outage_retains_sanitized_storage_failure(monkeypatch):
+    with lab() as (home, _):
+        monkeypatch.setattr(
+            observability.urllib.request, 'urlopen',
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(observability.urllib.error.URLError('offline')))
+        monkeypatch.setattr(
+            observability.subprocess, 'run',
+            lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, 'queue write failed: ENOSPC', ''))
+        assert observability._collector_diagnostics(home, {
+            'project': 'owned', 'ports': {'collector_metrics_port': 1},
+        }) == {'state': 'unknown', 'storage_failure': 'host-disk-full'}
+
+
 def test_scout_cleanup_preserves_native_binding_queue_and_archive_bytes():
     with lab() as (home, _):
         brief = home / 'brief.md'

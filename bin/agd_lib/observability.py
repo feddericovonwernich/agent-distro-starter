@@ -453,15 +453,16 @@ def _with_process_status(home, config, observed):
 
 
 def _collector_diagnostics(home, config):
+    storage_failure = _collector_storage_failure(home, config)
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{config['ports']['collector_metrics_port']}/metrics",
                                     timeout=3) as response:
             if response.status != 200:
-                return {'state': 'unknown'}
+                return {'state': 'unknown', 'storage_failure': storage_failure}
             result = _parse_collector_metrics(response.read().decode('utf-8', 'replace'))
     except (KeyError, OSError, UnicodeError, urllib.error.URLError):
-        return {'state': 'unknown'}
-    result['storage_failure'] = _collector_storage_failure(home, config)
+        return {'state': 'unknown', 'storage_failure': storage_failure}
+    result['storage_failure'] = storage_failure
     return result
 
 
