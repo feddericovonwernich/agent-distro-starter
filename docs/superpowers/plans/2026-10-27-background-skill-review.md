@@ -468,12 +468,13 @@ git commit -m "feat: schedule bounded reviewer runs"
 - [ ] **Step 1: Write failing CLI/watcher test**
 
 ```python
-def test_reviewer_cli_preserves_foreign_owner(tmp_path):
+def test_reviewer_cli_mutates_reviewer_data_not_foreign_owner():
     with lab() as (home,_):
-        before=(home/'state'/'owner.json').read_bytes() if (home/'state'/'owner.json').exists() else None
-        command(home,'reviewer','status')
-        assert ((home/'state'/'owner.json').read_bytes() if (home/'state'/'owner.json').exists() else None) == before
-```
+        run,packet=produced_run(home); result=reviewer.submit_report(home,run['review_run_id'],str(uuid.uuid4()),build_report(packet)); reviewer.finalize_run(home,run['review_run_id'],'exited')
+        task_before=(home/'data/tasks').read_bytes() if (home/'data/tasks').exists() else b''; catalog=worker_skills.catalog(home); selection=worker_skills.resolve(home)
+        owner={'pid':os.getpid(),'started':supervision.process_start(os.getpid()),'token':str(uuid.uuid4())}; owner_path=home/'state/owner.json'; owner_path.parent.mkdir(parents=True,exist_ok=True); owner_path.write_text(json.dumps(owner)); before=owner_path.read_bytes()
+        command(home,'reviewer','proposals','dispose',result['proposal_ids'][0],'--status','accepted')
+        assert owner_path.read_bytes()==before and task_before==((home/'data/tasks').read_bytes() if (home/'data/tasks').exists() else b'') and worker_skills.catalog(home)==catalog and worker_skills.resolve(home)==selection
 
 ```python
 def test_manual_empty_corpus_leaves_private_timer_state_and_makes_no_model_call():
