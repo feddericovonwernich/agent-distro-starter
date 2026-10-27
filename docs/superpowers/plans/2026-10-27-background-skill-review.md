@@ -195,19 +195,20 @@ git commit -m "feat: persist reviewer evidence packets"
 ```python
 from agd_lib import store, supervision, worker_skills
 def produced_run(home):
-    started=time.time(); ended_worker(home,'failed',str(uuid.uuid4()),'failure',1); ended_worker(home,'success',str(uuid.uuid4()),'counterexample',0)
-    config=reviewer.read_config(home); packet=reviewer.select_packet(home,cutoff=time.time())
-    instruction=Path('config/reviewer-instruction.txt').read_bytes()
+    started=time.time(); ended_worker(home,'failed',str(uuid.uuid4()),'failure',1); ended_worker(home,'success',str(uuid.uuid4()),'counterexample',0); ended_worker(home,'additional',str(uuid.uuid4()),'additional failure',1)
+    config=reviewer.read_config(home); packet=reviewer.select_packet(home,cutoff=time.time()); instruction=Path('config/reviewer-instruction.txt').read_bytes()
     return reviewer.begin_run(home,packet,reviewer.enqueue_intent(home,kind='default'),model='openai/reviewer-fixture',config_snapshot=config,instruction_snapshot=instruction,started_at=started,deadline_epoch_ms=int((started+config['limits']['max_runtime_seconds'])*1000)),packet
 def build_report(packet):
     failed=next(s['source_id'] for s in packet['sources'] if s['task_id']=='failed'); success=next(s['source_id'] for s in packet['sources'] if s['task_id']=='success')
     return {'schema':1,'summary':'native fixture','findings':[{'kind':'new-skill','target':'bounded-review','finding':'failure','applicability':'all','citations':[failed],'counterexamples':[success],'uncertainty':'low','resolution':'draft','validation':'curated resolve','validation_limits':['Requires human verification; not proof of causality'],'new_skill':{'id':'agd-review-draft','draft':'---\nname: AGD review draft\ndescription: Review bounded evidence\n---\n# Draft\n','triggers':['review'],'scope':'review','prerequisites':[]}}]}
 def test_revisions_and_finalization_are_inert():
     with lab() as (home,_):
-        before=worker_skills.catalog(home); run,packet=produced_run(home); report=build_report(packet)
-        first=reviewer.submit_report(home,run['review_run_id'],str(uuid.uuid4()),report); reviewer.dispose(home,first['proposal_ids'][0],'rejected','insufficient',None,{'uid':os.getuid(),'identity':str(os.getuid())})
-        report['findings'][0]['citations'].append('new-material-source'); second=reviewer.submit_report(home,run['review_run_id'],str(uuid.uuid4()),report)
-        assert second['proposal_ids']==first['proposal_ids']; assert len(reviewer.read_triage(home,first['proposal_ids'][0])['history'])==1
+        before=worker_skills.catalog(home); run,packet=produced_run(home); report=build_report(packet); first=reviewer.submit_report(home,run['review_run_id'],str(uuid.uuid4()),report); proposal=first['proposal_ids'][0]
+        reviewer.dispose(home,proposal,'rejected','insufficient',None,{'uid':os.getuid(),'identity':str(os.getuid())}); rejected=reviewer.read_triage(home,proposal)
+        report['findings'][0]['citations'].append(next(s['source_id'] for s in packet['sources'] if s['task_id']=='additional')); second=reviewer.submit_report(home,run['review_run_id'],str(uuid.uuid4()),report)
+        assert second['proposal_ids']==[proposal]; assert reviewer.read_triage(home,proposal)==rejected; assert reviewer.read_proposal(home,proposal)['head_revision'] != reviewer.read_proposal(home,proposal)['revisions'][0]['revision_hash']
+        bad=build_report(packet); bad['findings'][0]['citations']=['unknown-source']
+        with pytest.raises(store.Refusal): reviewer.submit_report(home,run['review_run_id'],str(uuid.uuid4()),bad)
         reviewer.finalize_run(home,run['review_run_id'],'exited'); assert worker_skills.catalog(home)==before
 ```
 
@@ -220,20 +221,32 @@ Expected: FAIL because report/revision/finalization functions are absent.
 - [ ] **Step 3: Implement report, revision, triage, and finalization kernels**
 
 ```python
-def proposal_path(home,proposal_id): return paths(home)['proposals']/f'{proposal_id}.json'
-def triage_path(home,proposal_id): return paths(home)['triage']/f'{proposal_id}.json'
+def _digest(v): return hashlib.sha256(json.dumps(v,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
+def normalize(value): return ' '.join(value.split()).casefold()
+def normalize_target(value): return normalize(value) if value else 'new-workflow'
+def proposal_path(home,proposal_id): uuid.UUID(proposal_id); return paths(home)['proposals']/f'{proposal_id}.json'
+def triage_path(home,proposal_id): uuid.UUID(proposal_id); return paths(home)['triage']/f'{proposal_id}.json'
+def read_proposal(home,proposal_id):
+    p=proposal_path(home,proposal_id)
+    if not p.is_file(): raise store.Refusal('unknown proposal')
+    return json.loads(p.read_text())
 def read_triage(home,proposal_id):
-    p=triage_path(home,proposal_id)
-    if not proposal_path(home,proposal_id).is_file(): raise store.Refusal('unknown proposal')
+    proposal_path(home,proposal_id); p=triage_path(home,proposal_id)
     return json.loads(p.read_text()) if p.is_file() else {'schema':1,'proposal_id':proposal_id,'current':'pending','history':[]}
-def fingerprint(f): return _digest([f['schema'],f['kind'],normalize_target(f['target']),normalize(f['finding']),normalize(f['applicability'])])
-def revision_hash(proposal_id,finding): return _digest([proposal_id,sorted(finding['citations']),sorted(finding.get('counterexamples',[])),finding['resolution'],finding.get('new_skill')])
+def parse_existing_proposal_or_revision(home,value):
+    proposal,sep,revision=value.partition('@'); row=read_proposal(home,proposal)
+    if sep and revision not in {r['revision_hash'] for r in row['revisions']}: raise store.Refusal('unknown revision')
+    return value
+def fingerprint(f): return _digest([1,f['kind'],normalize_target(f['target']),normalize(f['finding']),normalize(f['applicability'])])
+def revision_hash(proposal_id,finding): return _digest([proposal_id,sorted(finding['citations']),sorted(finding.get('counterexamples',[])),finding['resolution'],finding['validation'],finding.get('validation_limits',[]),finding.get('new_skill'),finding['uncertainty']])
 def dispose(home,proposal_id,status,reason,replacement_proposal_id,operator):
-    if status not in {'accepted','rejected','deferred','superseded'} or not isinstance(operator,dict): raise store.Refusal('disposition')
-    prior=read_triage(home,proposal_id); replacement=None if replacement_proposal_id is None else parse_existing_proposal_or_revision(home,replacement_proposal_id)
-    if (status=='superseded') != bool(replacement): raise store.Refusal('replacement')
-    row={'status':status,'reason':reason,'replacement':replacement,'operator':operator,'at':time.time(),'basis_revision':read_proposal(home,proposal_id)['head_revision']}
-    with store.lock(home): store.atomic_json(triage_path(home,proposal_id),{'schema':1,'proposal_id':proposal_id,'current':status,'history':[ *prior['history'],row]})
+    uuid.UUID(proposal_id)
+    if status not in {'accepted','rejected','deferred','superseded'} or (reason is not None and not isinstance(reason,str)) or not isinstance(operator,dict) or type(operator.get('uid')) is not int or not isinstance(operator.get('identity'),str): raise store.Refusal('disposition')
+    with store.lock(home):
+        prior=read_triage(home,proposal_id); proposal=read_proposal(home,proposal_id); replacement=None if replacement_proposal_id is None else parse_existing_proposal_or_revision(home,replacement_proposal_id)
+        if (status=='superseded') != bool(replacement): raise store.Refusal('replacement')
+        row={'status':status,'reason':reason,'replacement':replacement,'operator':operator,'at':time.time(),'basis_revision':proposal['head_revision']}
+        store.atomic_json(triage_path(home,proposal_id),{'schema':1,'proposal_id':proposal_id,'current':status,'history':[ *prior['history'],row]})
     return read_triage(home,proposal_id)
 ```
 
@@ -338,18 +351,18 @@ function cappedStreamFn(native:any,broker:Broker,ai:any) {
 }
 export async function runReviewer(input:ReviewerInput,streamFn:any=input.native.ai.streamSimple) {
   const {sdk,core,ai,telemetry:exporter}=input.native; await exporter.initTelemetryExport();
-  const settings=await sdk.Settings.init({cwd:input.cwd,agentDir:input.agentDir}), auth=await sdk.discoverAuthStorage(input.agentDir,{cwd:input.cwd,settings}), registry=new sdk.ModelRegistry(auth,undefined,{settings}), manager=sdk.SessionManager.create(input.cwd,input.sessionDir);
+  const settings=await sdk.Settings.init({cwd:input.cwd,agentDir:input.agentDir,readOnly:true,overrides:{context:{compaction:{enabled:false,midTurnEnabled:false,autoContinue:false,asyncEnabled:false,idleEnabled:false}},retry:{enabled:false,maxRetries:0,modelFallback:false,usageAwareFallback:false},advisor:{enabled:false},autolearn:{enabled:false,autoContinue:false}}}), auth=await sdk.discoverAuthStorage(input.agentDir,{cwd:input.cwd,settings}), registry=new sdk.ModelRegistry(auth,undefined,{settings}), manager=sdk.SessionManager.create(input.cwd,input.sessionDir);
   await input.broker.persistNativeSessionId(manager.getSessionId());
   const tools=reviewerTools(input.broker);
   const telemetry=exporter.isTelemetryExportEnabled()?exporter.createTelemetryExportConfig({attributes:{purpose:'background-skill-review',review_run_id:input.reviewRunId},captureMessageContent:'full'}):undefined;
   const agent=new core.Agent({initialState:{model:input.model,tools:[...tools.values()],systemPrompt:[input.reviewPrompt]},sessionId:manager.getSessionId(),deadline:input.receipt.deadline_epoch_ms,telemetry,getApiKey:(m:any,id:any,opt:any)=>registry.getApiKey(m,id,opt),streamFn:cappedStreamFn(streamFn,input.broker,ai)});
-  const session=new sdk.AgentSession({agent,sessionManager:manager,settings,modelRegistry:registry,toolRegistry:tools,sideStreamFn:cappedStreamFn(streamFn,input.broker,ai),memoryEnabled:false,skills:[],skillsReloadable:false,disableExtensionDiscovery:true,scoutAllowedBySpawnPolicy:false});
+  const session=new sdk.AgentSession({agent,sessionManager:manager,settings,modelRegistry:registry,toolRegistry:tools,sideStreamFn:cappedStreamFn(streamFn,input.broker,ai),advisorStreamFn:cappedStreamFn(streamFn,input.broker,ai),memoryEnabled:false,skills:[],skillsReloadable:false,disableExtensionDiscovery:true,scoutAllowedBySpawnPolicy:false});
   try {const packetText=await input.broker.rpc('packet',{});if(typeof packetText!=='string')throw new Error('invalid packet text');await session.prompt(packetText);await manager.flush();return await input.broker.finalResult();} finally {session.beginDispose();await session.dispose();await manager.close();await exporter.flushTelemetryExport();}
 }
 function reviewerTools(broker:Broker) { return new Map(['reviewer_excerpt','reviewer_search','reviewer_submit'].map(name=>[name,{name,label:name,description:name,parameters:{type:'object',properties:name==='reviewer_search'?{query:{type:'string'}}:name==='reviewer_excerpt'?{source_id:{type:'string'}}:{report:{type:'object'}},required:name==='reviewer_search'?['query']:name==='reviewer_excerpt'?['source_id']:['report'],additionalProperties:false},execute:async(_id:string,args:any)=>{const text=await broker.rpc(name,args);if(typeof text!=='string')throw new Error('invalid broker text');return {content:[{type:'text',text}],details:{}};}}]));}
 ```
 
-`serve_broker` reads JSONL requests, validates UUID IDs, and returns the same `{id,ok,value|error}` ID. Trusted-host control ops are `packet->{UTF-8 frozen rendered packet}` (reserves receipt input bytes before exposure), `reserve/settle/session/result/finish` with structured receipt/result values; only excerpt/search/submit are model tools and each returns UTF-8 budget-reserved rendered text. Reservation checks absolute deadline/counter; settlement writes `dispatch:'settled'`; a post-reservation host death is `unknown-provider-outcome` and rejects resume.
+`serve_broker` reads JSONL requests, validates UUID IDs, and returns the same `{id,ok,value|error}` ID. Trusted-host control ops are `packet->{UTF-8 frozen rendered packet}` (reserves receipt input bytes before exposure), `reserve/settle/session/result/finish` with structured receipt/result values; only excerpt/search/submit are model tools and each returns UTF-8 budget-reserved rendered text. Agent `streamFn`, maintenance `sideStreamFn`, and advisor `advisorStreamFn` share the durable cap. An offline forced context-overflow/maintenance test proves no uncapped provider call and fails closed when a required stream is absent. Reservation checks absolute deadline/counter; settlement writes `dispatch:'settled'`; a post-reservation host death is `unknown-provider-outcome` and rejects resume.
 
 - [ ] **Step 4: Run tests to verify pass**
 
