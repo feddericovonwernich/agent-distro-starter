@@ -334,6 +334,58 @@ def ensure_project_service(home, project_id, repository, run=store.run):
         return record
 
 
+
+def _connector_digest(root):
+    path = root/'.relay'/'connectors'/'github.json'
+    _lstat(path, 'file')
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _owned(record, name, supervision):
+    process = record.get(name)
+    return (isinstance(process, dict) and isinstance(process.get('pid'), int) and
+            isinstance(process.get('start'), str) and not supervision.gone(process['pid'], process['start']))
+
+
+def _terminate(process):
+    try:
+        process.terminate()
+        process.wait(timeout=1)
+    except (AttributeError, OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+            process.wait(timeout=1)
+        except (AttributeError, OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def _start_connector(runtime, root, popen):
+    try:
+        return popen([str(runtime/'bin'/'relay'), 'connect', 'github', '--config',
+                      '.relay/connectors/github.json', '--project-root', str(root)],
+                     cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as error:
+        raise store.DependencyError('Relay GitHub connector could not start') from error
+
+
+def stop_project_service(home, project_id, reason=None):
+    """Stop only processes whose persisted identity still belongs to this service."""
+    from . import supervision
+    with store.lock(home):
+        current = json.loads(_service_file(home, project_id).read_text())
+        for name in ('connector', 'server'):
+            record = current.get(name)
+            if _owned(current, name, supervision):
+                try:
+                    os.kill(record['pid'], 15)
+                except ProcessLookupError:
+                    pass
+            current.pop(name, None)
+        current['health'] = 'stopped'
+        if reason:
+            current['blocked_reason'] = str(reason)[:500]
+        store.atomic_json(_service_file(home, project_id), current)
+        return current
 def _process_record(process):
     from . import supervision
     return {'pid': process.pid, 'start': supervision.process_start(process.pid)}
@@ -343,60 +395,70 @@ def start_project_service(home, project_id, repository, popen=subprocess.Popen, 
     record = ensure_project_service(home, project_id, repository)
     root, runtime = Path(record['root']), Path(record['runtime'])
     from . import supervision
-    waiting = None
     with store.lock(home):
         current = json.loads(_service_file(home, project_id).read_text())
-        server = current.get('server')
-        if isinstance(server, dict) and isinstance(server.get('pid'), int) and isinstance(server.get('start'), str):
-            if not supervision.gone(server['pid'], server['start']):
-                if current.get('health') == 'healthy':
-                    return current
-                waiting = (server['pid'], server['start'])
-        if waiting is None:
+        if _owned(current, 'server', supervision):
+            if current.get('health') == 'healthy' and _owned(current, 'connector', supervision):
+                return current
+            server_process, waiting = None, True
+            identity = (current['server']['pid'], current['server']['start'])
+        else:
             try:
                 server_process = popen([str(runtime/'bin'/'relay'), 'start', '--project-root', str(root), '--port', '0'],
                                        cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except OSError as error:
                 raise store.DependencyError('Relay server could not start') from error
-            current.update(server={**_process_record(server_process), 'status': 'starting'}, health='starting')
+            server_identity = _process_record(server_process)
+            identity, waiting = (server_identity['pid'], server_identity['start']), False
+            current.update(server={**server_identity, 'status': 'starting'}, health='starting')
             store.atomic_json(_service_file(home, project_id), current)
-    if waiting is not None:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if supervision.gone(*waiting):
-                raise store.Refusal('Relay server exited during startup')
-            current = json.loads(_service_file(home, project_id).read_text())
-            if current.get('health') == 'healthy' and current.get('server', {}).get('pid') == waiting[0]:
-                return current
-            time.sleep(.05)
-        raise store.Refusal('Relay server startup timed out')
-    runtime_file = root/'.relay'/'runtime.json'
+    runtime_file, reason = root/'.relay'/'runtime.json', None
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if runtime_file.is_file() and not runtime_file.is_symlink():
             try:
-                runtime_state = json.loads(runtime_file.read_text())
-                if runtime_state.get('pid') == server_process.pid and isinstance(runtime_state.get('port'), int):
+                state = json.loads(runtime_file.read_text())
+                if state.get('pid') == identity[0] and isinstance(state.get('port'), int):
                     break
             except json.JSONDecodeError:
                 pass
-        if server_process.poll() is not None:
+        if waiting and supervision.gone(*identity):
+            reason = 'Relay server exited during startup'
+            break
+        if server_process is not None and server_process.poll() is not None:
             reason = 'Relay server exited before publishing runtime identity'
             break
         time.sleep(.05)
     else:
         reason = 'Relay server did not publish runtime identity'
-        server_process.terminate()
-    if 'reason' in locals():
+    if reason:
+        if server_process is not None:
+            _terminate(server_process)
         with store.lock(home):
             current = json.loads(_service_file(home, project_id).read_text())
-            if current.get('server', {}).get('pid') == server_process.pid:
-                current['health'] = 'unhealthy'
-                current['blocked_reason'] = reason
+            if (current.get('server', {}).get('pid'), current.get('server', {}).get('start')) == identity:
+                if waiting and _owned(current, 'server', supervision):
+                    try:
+                        os.kill(identity[0], 15)
+                    except ProcessLookupError:
+                        pass
+                current.update(health='unhealthy', blocked_reason=reason)
                 store.atomic_json(_service_file(home, project_id), current)
         raise store.Refusal(reason)
     with store.lock(home):
         current = json.loads(_service_file(home, project_id).read_text())
-        current.update(server=_process_record(server_process), health='healthy')
+        if (current.get('server', {}).get('pid'), current.get('server', {}).get('start')) != identity:
+            raise store.Refusal('Relay server identity changed during startup')
+        if _owned(current, 'connector', supervision):
+            current['health'] = 'healthy'
+            store.atomic_json(_service_file(home, project_id), current)
+            return current
+        connector = _start_connector(runtime, root, popen)
+        if connector.poll() is not None:
+            current.update(health='unhealthy', blocked_reason='Relay GitHub connector exited during startup')
+            store.atomic_json(_service_file(home, project_id), current)
+            raise store.Refusal('Relay GitHub connector exited during startup')
+        current.update(connector={**_process_record(connector), 'config_digest': _connector_digest(root),
+                                  'status': 'running'}, health='healthy')
         store.atomic_json(_service_file(home, project_id), current)
         return current

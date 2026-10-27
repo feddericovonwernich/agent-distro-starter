@@ -209,6 +209,9 @@ def test_granted_launch_uses_frozen_private_scoped_skill_and_prompt():
         class FakeBackend:
             def create(self, *_args): return {'created': True, 'incarnation': _args[2]}
         with patch.object(workers.harnesses, 'launch_argv', return_value=['true']), \
+             patch.object(__import__('agd_lib.pr', fromlist=['github_repository']), 'github_repository',
+                          return_value='owner/repo'), \
+             patch.object(__import__('agd_lib.relay', fromlist=['start_project_service']), 'start_project_service'), \
              patch.object(workers, 'backend', return_value=FakeBackend()), \
              patch.object(workers.shutil, 'which', return_value='/bin/true'):
             launched = workers.launch(home, 'granted', pr_grant=grant['id'])
@@ -230,6 +233,20 @@ def test_granted_launch_uses_frozen_private_scoped_skill_and_prompt():
             relaunched = workers.relaunch(home, 'granted')
         assert relaunched['incarnation'] != launched['incarnation']
         assert (Path(manifest['skills'][0]['snapshot'])/'SKILL.md').is_file()
+
+
+def test_granted_launch_refuses_non_github_remote_before_worker_creation():
+    import pytest
+    from agd_lib import store, workers
+    with lab() as (home, _project):
+        brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
+        command(home, 'task', 'create', 'nongithub', '--project', 'sample', '--brief', str(brief), '--kind', 'ship')
+        instruction = home/'grant.md'; instruction.write_text('Task grant.\n')
+        grant = tasks.grant_pr_publish(home, 'nongithub', 'origin:agd/nongithub', instruction)
+        with pytest.raises(store.Refusal, match='GitHub'):
+            workers.launch(home, 'nongithub', pr_grant=grant['id'])
+        assert tasks.read(home, 'nongithub')['phase'] == 'prepared'
+        assert (tasks.task_file(home, 'nongithub').parent/'relay-blocked.json').is_file()
 def test_concurrent_skill_launch_has_one_winner_without_orphans():
     from concurrent.futures import ThreadPoolExecutor
     from unittest.mock import patch

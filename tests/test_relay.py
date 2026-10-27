@@ -161,3 +161,68 @@ def test_project_service_rejects_symlinked_state_root(tmp_path, monkeypatch):
     except store.Refusal:
         return
     raise AssertionError('symlinked project state was accepted')
+
+
+def test_start_project_service_starts_one_owned_connector(tmp_path, monkeypatch):
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+    home = tmp_path/'home'
+    root = home/'state'/'relay'/'projects'/'sample'
+    (root/'.relay'/'connectors').mkdir(parents=True)
+    (root/'.relay'/'connectors'/'github.json').write_text('{}')
+    runtime = tmp_path/'runtime'
+    (runtime/'bin').mkdir(parents=True)
+    record = {'schema': 1, 'project': 'sample', 'repository': 'owner/repo',
+              'runtime': str(runtime), 'root': str(root), 'health': 'starting'}
+    (root/'service.json').write_text(json.dumps(record))
+    monkeypatch.setattr(relay, 'ensure_project_service', lambda *_args, **_kwargs: record)
+    monkeypatch.setattr('agd_lib.supervision.process_start', lambda pid: f'start-{pid}')
+    monkeypatch.setattr('agd_lib.supervision.gone', lambda *_args: False)
+
+    class Process:
+        next_pid = 10
+        def __init__(self, argv, cwd, **_kwargs):
+            self.argv, self.cwd, self.pid = argv, cwd, Process.next_pid
+            Process.next_pid += 1
+            if argv[1] == 'start':
+                (cwd/'.relay'/'runtime.json').write_text(json.dumps({'pid': self.pid, 'port': 4444}))
+        def poll(self):
+            return None
+
+    launched = []
+    def popen(*args, **kwargs):
+        process = Process(*args, **kwargs)
+        launched.append(process)
+        return process
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = list(pool.map(lambda _: relay.start_project_service(home, 'sample', 'owner/repo', popen=popen), range(2)))
+
+    assert first['health'] == second['health'] == 'healthy'
+    assert len(launched) == 2
+    assert launched[1].argv[1:4] == ['connect', 'github', '--config']
+    assert second['connector']['pid'] == launched[1].pid
+
+
+def test_start_project_service_marks_exact_timed_out_server_unhealthy(tmp_path, monkeypatch):
+    import json
+    home = tmp_path/'home'
+    root = home/'state'/'relay'/'projects'/'sample'
+    (root/'.relay'/'connectors').mkdir(parents=True)
+    runtime = tmp_path/'runtime'; (runtime/'bin').mkdir(parents=True)
+    record = {'schema': 1, 'project': 'sample', 'repository': 'owner/repo',
+              'runtime': str(runtime), 'root': str(root), 'health': 'starting'}
+    (root/'service.json').write_text(json.dumps(record))
+    monkeypatch.setattr(relay, 'ensure_project_service', lambda *_args, **_kwargs: record)
+    monkeypatch.setattr('agd_lib.supervision.process_start', lambda pid: 'identity')
+
+    class Process:
+        pid = 99
+        def poll(self): return None
+        def terminate(self): pass
+        def wait(self, timeout): pass
+    with pytest.raises(store.Refusal, match='did not publish'):
+        relay.start_project_service(home, 'sample', 'owner/repo', popen=lambda *_args, **_kwargs: Process(), timeout=.01)
+    state = json.loads((root/'service.json').read_text())
+    assert state['health'] == 'unhealthy'
+    assert state['server'] == {'pid': 99, 'start': 'identity', 'status': 'starting'}
