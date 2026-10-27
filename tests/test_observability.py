@@ -304,6 +304,22 @@ def test_metrics_outage_retains_sanitized_storage_failure(monkeypatch):
             'project': 'owned', 'ports': {'collector_metrics_port': 1},
         }) == {'state': 'unknown', 'storage_failure': 'host-disk-full'}
 
+def test_collector_diagnostics_reports_sanitized_permanent_rejection_from_logs(monkeypatch):
+    with lab() as (home, _):
+        monkeypatch.setattr(
+            observability.urllib.request, 'urlopen',
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(observability.urllib.error.URLError('offline')))
+        monkeypatch.setattr(
+            observability.subprocess, 'run',
+            lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                [], 0, 'export failed permanently: status code: 404', ''))
+        assert observability._collector_diagnostics(home, {
+            'project': 'owned', 'ports': {'collector_metrics_port': 1},
+        }) == {
+            'state': 'unknown', 'storage_failure': 'unknown',
+            'permanent_send_failed_spans': 1,
+        }
+
 
 def test_scout_cleanup_preserves_native_binding_queue_and_archive_bytes():
     with lab() as (home, _):

@@ -453,20 +453,23 @@ def _with_process_status(home, config, observed):
 
 
 def _collector_diagnostics(home, config):
-    storage_failure = _collector_storage_failure(home, config)
+    storage_failure, permanent_rejection = _collector_log_evidence(home, config)
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{config['ports']['collector_metrics_port']}/metrics",
                                     timeout=3) as response:
             if response.status != 200:
-                return {'state': 'unknown', 'storage_failure': storage_failure}
-            result = _parse_collector_metrics(response.read().decode('utf-8', 'replace'))
+                result = {'state': 'unknown', 'storage_failure': storage_failure}
+            else:
+                result = _parse_collector_metrics(response.read().decode('utf-8', 'replace'))
     except (KeyError, OSError, UnicodeError, urllib.error.URLError):
-        return {'state': 'unknown', 'storage_failure': storage_failure}
+        result = {'state': 'unknown', 'storage_failure': storage_failure}
     result['storage_failure'] = storage_failure
+    if permanent_rejection and not result.get('permanent_send_failed_spans'):
+        result['permanent_send_failed_spans'] = 1
     return result
 
 
-def _collector_storage_failure(home, config):
+def _collector_log_evidence(home, config):
     try:
         output = subprocess.run(['docker', 'compose', '-p', config['project'], '-f',
                                  str(paths(home)['compose'] / 'compose.yaml'),
@@ -474,8 +477,9 @@ def _collector_storage_failure(home, config):
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=3,
                                 check=False).stdout
     except (KeyError, OSError, subprocess.SubprocessError):
-        return 'unknown'
-    return _classify_collector_errors(output[-65536:])
+        return 'unknown', False
+    text = output[-65536:]
+    return _classify_collector_errors(text), _has_permanent_rejection(text)
 
 
 def _classify_collector_errors(text):
@@ -485,6 +489,10 @@ def _classify_collector_errors(text):
     if ('max_size' in text or 'max size' in text) and 'storage' in text:
         return 'file-storage-full'
     return 'unknown'
+
+def _has_permanent_rejection(text):
+    text = text.lower()
+    return 'permanent' in text and ('status code: 4' in text or 'status=4' in text or ' 4' in text)
 
 
 def _parse_collector_metrics(text):
