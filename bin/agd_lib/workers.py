@@ -52,7 +52,19 @@ def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=Fal
     if selected_backend not in ('tmux', 'herdr') or harness not in ('omp', 'cursor'):
         raise ValueError('unsupported backend or harness')
     if pr_grant:
-        tasks.authorize_pr_publish(home, task, pr_grant)
+        grant = tasks.authorize_pr_publish(home, task, pr_grant)
+        from . import pr, relay
+        try:
+            repository = pr.github_repository(grant['remote_url'])
+        except store.Refusal:
+            repository = None
+        if repository is not None:
+            try:
+                relay.start_project_service(home, task['project'], repository)
+            except (store.Refusal, store.DependencyError) as error:
+                store.atomic_json(tasks.task_file(home, task_id).parent/'relay-blocked.json',
+                                  {'reason': str(error)[:400]})
+                raise
         if profile is not None or skill_mode != 'profile' or skills:
             raise store.Refusal('PR grant launch controls worker skills')
         profile, skill_mode, skills = None, 'curated', ('agd-scoped-pr-relay',)
