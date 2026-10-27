@@ -34,9 +34,9 @@
 | `lib/agd-reviewer.ts` | direct native OMP host, tool registry, capped stream function |
 | `bin/agd_lib/reviewer_timer.py` | strict scheduling and user-unit lifecycle |
 | `bin/agd_lib/observability.py` | reviewer native-session binding after merged module reconciliation |
-| `bin/agd_lib/supervision.py` | reviewer-purpose event envelope support without changing task envelopes |
-| `bin/agd`, `.omp/extensions/agd-primary.ts` | complete backed CLI and reviewer event presentation |
-| `tests/test_reviewer.py`, `tests/reviewer_bridge.py`, `tests/test_reviewer_timer.py`, `tests/test_supervision.py`, `tests/reviewer.test.ts`, `tests/primary.test.ts` | behavior proof |
+| `bin/agd_lib/reviewer.py` | writes reviewer-purpose events using existing pending/handled atomic-file pattern; no supervision source change |
+| `bin/agd`, `.omp/extensions/agd-primary.ts` | complete backed CLI and neutral durable-event presentation |
+| `tests/test_reviewer.py`, `tests/reviewer_bridge.py`, `tests/test_reviewer_timer.py`, `tests/reviewer.test.ts`, `tests/primary.test.ts` | behavior proof |
 | `README.md`, `docs/operations.md`, `docs/compatibility.md`, `CHANGELOG.md` | user contract |
 
 ```python
@@ -46,7 +46,7 @@ DEFAULT_LIMITS = {'max_candidates':20,'max_input_bytes':262144,'max_model_calls'
 def select_packet(home: Path, *, cutoff: float, retrospective_review_run_ids: tuple[str,...]=()) -> dict: ...
 def enqueue_intent(home: Path, *, kind: str, retrospective_review_run_ids: tuple[str,...]=()) -> dict: ...
 def begin_run(home: Path, packet: dict, intent: dict, *, model: str, config_digest: str,
-              instruction_digest: str) -> dict: ...
+              instruction_digest: str, started_at: float, deadline_epoch_ms: int) -> dict: ...
 def submit_report(home: Path, review_run_id: str, request_id: str, report: dict) -> dict: ...
 def dispose(home: Path, proposal_id: str, status: str, reason: str|None,
             replacement_proposal_id: str|None, operator: dict) -> dict: ...
@@ -57,6 +57,8 @@ def serve_broker(home: Path, review_run_id: str, stdin, stdout) -> None: ...
 # reviewer_timer.py
 def calculate_due(schedule: dict, checkpoint: dict, now_utc: float) -> dict: ...
 ```
+
+The run lease is acquired before packet collection; it persists `started_at` and absolute `deadline_epoch_ms` before collection/model resolution. Every collector, resolver, broker, and child uses that same deadline. Parent waits with monotonic remaining time, kills the child process group at expiry, and records coverage/state. Recovery never resets deadline/counters; pending-intent waiting occurs before a lease and does not consume active budget.
 
 ### Task 1: Reconcile source and create authoritative reviewer packets
 
@@ -81,33 +83,26 @@ Expected: all commands exit 0; forge/merged-tree verification records any PR-5 s
 - [ ] **Step 2: Write failing native-evidence test**
 
 ```python
-import json, sys
+import hashlib, json, os, sys, time, uuid
 from pathlib import Path
+import pytest
 from support import lab, command
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
 from agd_lib import observability, reviewer, tasks
 
 def ended_worker(home, task_id, incarnation, text):
-    brief = home/f'{task_id}.md'; brief.write_text('Inspect value.txt.\n')
-    task = command(home, 'task', 'create', task_id, '--project', 'sample', '--brief', str(brief))
-    task.update(executor='worker', incarnation=incarnation, phase='failed', worker_alive=False)
-    tasks.save(home, task)
-    binding = observability.worker_binding(home, task_id, incarnation)
-    iso, ms = '2026-01-01T00:00:00.000Z', 1767225600000
-    rows = [{'type':'session','version':3,'id':'00000000-0000-4000-8000-000000000010','timestamp':iso,'cwd':str(home)},
-            {'type':'message','id':'00000000-0000-4000-8000-000000000011','parentId':None,'timestamp':iso,
-             'message':{'role':'user','content':text,'timestamp':ms}}]
-    Path(binding['session_dir'],'fixture.jsonl').write_text(''.join(json.dumps(x)+'\n' for x in rows))
-    return task
-
+    brief=home/f'{task_id}.md'; brief.write_text('Inspect value.txt.\n')
+    task=command(home,'task','create',task_id,'--project','sample','--brief',str(brief))
+    task.update(executor='worker',incarnation=incarnation,phase='failed',worker_alive=False); tasks.save(home,task)
+    binding=observability.worker_binding(home,task_id,incarnation); sid=str(uuid.uuid4()); iso='2026-01-01T00:00:00.000Z'
+    rows=[{'type':'session','version':3,'id':sid,'timestamp':iso,'cwd':str(home)},
+          {'type':'message','id':str(uuid.uuid4()),'parentId':None,'timestamp':iso,'message':{'role':'user','content':text,'timestamp':1767225600000}}]
+    Path(binding['session_dir'],f'{sid}.jsonl').write_text(''.join(json.dumps(x)+'\n' for x in rows)); return task
 def test_packet_has_distinct_failure_and_counterexample_sources():
-    with lab() as (home, _):
-        a = ended_worker(home, 'failed', '00000000-0000-4000-8000-000000000001', 'failure')
-        b = ended_worker(home, 'success', '00000000-0000-4000-8000-000000000002', 'counterexample')
-        packet = reviewer.select_packet(home, cutoff=1767312000.0)
-        native = [s for s in packet['sources'] if s['kind'] == 'native-jsonl']
-        assert {x['task_id'] for x in packet['episodes']} == {a['id'], b['id']}
-        assert len({x['source_id'] for x in native}) == 2
+    with lab() as (home,_):
+        a=ended_worker(home,'failed',str(uuid.uuid4()),'failure'); b=ended_worker(home,'success',str(uuid.uuid4()),'counterexample')
+        packet=reviewer.select_packet(home,cutoff=time.time()); native=[s for s in packet['sources'] if s['kind']=='native-jsonl']
+        assert {x['task_id'] for x in packet['episodes']}=={a['id'],b['id']}; assert len({x['source_id'] for x in native})==2
 ```
 
 - [ ] **Step 3: Run test to verify it fails**
@@ -119,28 +114,32 @@ Expected: FAIL because `agd_lib.reviewer` does not exist.
 - [ ] **Step 4: Implement packet/intent/run kernel**
 
 ```python
-def _canonical(value):
-    return json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
-def _digest(value): return hashlib.sha256(_canonical(value)).hexdigest()
-def select_packet(home, *, cutoff, retrospective_review_run_ids=()):
-    rows = _bound_ended_native_sources(home, cutoff)  # only worker_binding JSONL records
-    rows = _bounded_distinct_sources(rows, read_config(home)['limits']['max_input_bytes'])
-    packet = {'schema':1,'cutoff':cutoff,'sources':rows,'episodes':_episodes(rows),
-              'limits':read_config(home)['limits'],'langfuse_index':'unused'}
-    packet['packet_id'] = _digest(packet)
-    store.atomic_json(paths(home)['packets']/f"{packet['packet_id']}.json", packet)
-    return packet
-
-def begin_run(home, packet, intent, *, model, config_digest, instruction_digest):
-    receipt = {'schema':1,'review_run_id':str(uuid.uuid4()),'packet_id':packet['packet_id'],
-      'cutoff':packet['cutoff'],'intent':intent,'model':model,'config_digest':config_digest,
-      'instruction_digest':instruction_digest,'limits':packet['limits'],'input_bytes':0,
-      'output_bytes':0,'model_calls':0,'dispatch':'none','state':'created'}
-    store.atomic_json(paths(home)['runs']/f"{receipt['review_run_id']}.json", receipt)
-    return receipt
+def _canonical(v): return json.dumps(v,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()
+def _digest(v): return hashlib.sha256(_canonical(v)).hexdigest()
+def paths(home):
+    root=store.home(home); return {'config':root/'data/reviewer/config.json','packets':root/'data/reviewer/packets','runs':root/'data/reviewer/runs','pending':root/'state/reviewer/pending','lock':root/'state/reviewer/run.lock'}
+def _sources(home,cutoff,max_candidates):
+    found=[]
+    for p in sorted((store.home(home)/'data/tasks').glob('*/task.json')):
+        task=json.loads(p.read_text())
+        if task.get('worker_alive') is not False or task.get('phase')=='running': continue
+        b=store.home(home)/f"data/observability/tasks/{task['id']}/omp/{task['incarnation']}/binding.json"
+        if not b.is_file(): continue
+        for jsonl in sorted(Path(json.loads(b.read_text())['session_dir']).glob('*.jsonl')):
+            raw=jsonl.read_bytes()
+            if jsonl.stat().st_mtime<=cutoff: found.append({'source_id':_digest([task['id'],task['incarnation'],hashlib.sha256(raw).hexdigest()]),'kind':'native-jsonl','task_id':task['id'],'incarnation':task['incarnation'],'version':hashlib.sha256(raw).hexdigest(),'sha256':hashlib.sha256(raw).hexdigest(),'span':{'start':0,'bytes':len(raw)},'relation':'ended-worker'})
+    return found[:max_candidates]
+def select_packet(home,*,cutoff,retrospective_review_run_ids=()):
+    config=read_config(home); src=[]; used=0
+    for row in _sources(home,cutoff,config['limits']['max_candidates']):
+        if used+row['span']['bytes']<=config['limits']['max_input_bytes']: src.append(row); used+=row['span']['bytes']
+    packet={'schema':1,'cutoff':cutoff,'sources':src,'episodes':[{'task_id':x['task_id'],'incarnation':x['incarnation']} for x in src],'limits':config['limits'],'skill_inventory':[],'coverage':{'unknown_relation':[],'inaccessible':[],'withheld':[]},'langfuse_index':'unused'}; packet['packet_id']=_digest(packet); store.atomic_json(paths(home)['packets']/f"{packet['packet_id']}.json",packet); return packet
+def begin_run(home,packet,intent,*,model,config_digest,instruction_digest,started_at,deadline_epoch_ms):
+    if not model or not all(len(x)==64 for x in (config_digest,instruction_digest)) or deadline_epoch_ms<=int(started_at*1000): raise store.Refusal('unfrozen run')
+    run={'schema':1,'review_run_id':str(uuid.uuid4()),'packet_id':packet['packet_id'],'cutoff':packet['cutoff'],'model':model,'config_digest':config_digest,'instruction_digest':instruction_digest,'limits':packet['limits'],'started_at':started_at,'deadline_epoch_ms':deadline_epoch_ms,'native_session_id':None,'input_bytes':0,'output_bytes':0,'model_calls':0,'dispatch':'none','state':'created'}; store.atomic_json(paths(home)['runs']/f"{run['review_run_id']}.json",run); return run
 ```
 
-Implement `_bound_ended_native_sources` by parsing only v3 session/message JSONL below merged worker bindings, using file hash/byte spans and task `phase != 'running'`/`worker_alive is not True`; no task-name association. Resolve review model before calling `begin_run`; null `review_model` inherits native default and unresolved default raises before receipt dispatch.
+`read_config` validates exact schema/schedule/limits/review_model once, and `review_model=None` inherits native default before `begin_run`; retrospective branch accepts only closed prior reviewer UUIDs and records unknown/current/later IDs in coverage.
 
 - [ ] **Step 5: Run packet tests to verify pass**
 
@@ -158,9 +157,9 @@ git commit -m "feat: persist reviewer evidence packets"
 ### Task 2: Immutable reports, triage, and reviewer-purpose events
 
 **Files:**
-- Modify: `bin/agd_lib/reviewer.py`, `bin/agd_lib/supervision.py`, `tests/test_reviewer.py`, `tests/test_supervision.py`
+- Modify: `bin/agd_lib/reviewer.py`, `tests/test_reviewer.py`
 
-**Interfaces:** Consumes Task 1 receipt/packet. Produces `submit_report`, `dispose`, reviewer-purpose pending/handled event behavior.
+**Interfaces:** Consumes Task 1 receipt/packet. Produces `submit_report`, `dispose`, reviewer-purpose pending/handled event behavior through unchanged supervision helpers.
 
 - [ ] **Step 1: Write failing report/new-skill/triage tests**
 
@@ -168,11 +167,12 @@ git commit -m "feat: persist reviewer evidence packets"
 from agd_lib import store, supervision, worker_skills
 
 def produced_run(home):
-    ended_worker(home,'failed','00000000-0000-4000-8000-000000000001','failure')
-    ended_worker(home,'success','00000000-0000-4000-8000-000000000002','counterexample')
-    packet = reviewer.select_packet(home, cutoff=1767312000.0)
-    return reviewer.begin_run(home, packet, reviewer.enqueue_intent(home, kind='default'),
-      model='provider/model', config_digest='c'*64, instruction_digest='i'*64), packet
+    ended_worker(home,'failed',str(uuid.uuid4()),'failure'); ended_worker(home,'success',str(uuid.uuid4()),'counterexample')
+    packet=reviewer.select_packet(home,cutoff=time.time()); config=reviewer.read_config(home); started=time.time()
+    instruction=b'Review only supplied evidence.'
+    return reviewer.begin_run(home,packet,reviewer.enqueue_intent(home,kind='default'),model='native/default',
+      config_digest=hashlib.sha256(json.dumps(config,sort_keys=True).encode()).hexdigest(),instruction_digest=hashlib.sha256(instruction).hexdigest(),
+      started_at=started,deadline_epoch_ms=int((started+packet['limits']['max_runtime_seconds'])*1000)),packet
 
 def test_new_skill_acceptance_is_inert_and_event_is_once():
     with lab() as (home, _):
@@ -217,18 +217,18 @@ def reviewer_event_id(review_run_id):
     return str(uuid.uuid5(uuid.NAMESPACE_URL, 'reviewer-batch:'+review_run_id))
 ```
 
-Validate canonical UTF-8 report size, UUID request ID, frozen source IDs, required finding fields, distinct citations/counterexamples, and draft schema. Content-address immutable report/revision blobs; under short `store.lock`, publish index, then deterministic reviewer-purpose event, then mark receipt final. Recovery preserves blobs and recreates event only when neither pending nor handled event path exists. Extend `supervision.pending/acknowledge` to retain ordinary task behavior while moving reviewer event IDs between the same pending/handled directories.
+Validate canonical UTF-8 report size, UUID request ID, frozen source IDs, required finding fields, distinct citations/counterexamples, and draft schema. Content-address immutable report/revision blobs; under short `store.lock`, publish index, then reviewer-purpose event file using the existing `state/events/<uuid>.json` pattern, then mark receipt final. Recovery preserves blobs and recreates event only when neither pending nor handled event path exists. Existing `supervision.pending/acknowledge` already load/move arbitrary UUID envelopes unchanged.
 
-- [ ] **Step 4: Run report/supervision tests to verify pass**
+- [ ] **Step 4: Run report tests to verify pass**
 
-Run: `PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py tests/test_supervision.py -q`
+Run: `PATH=/tmp/agd-treehouse-v3.1.6:$PATH uv run --python 3.12 --with pytest pytest tests/test_reviewer.py -q`
 
 Expected: PASS; accepted draft remains undiscoverable and acknowledgement never changes triage.
 
 - [ ] **Step 5: Commit Task 2**
 
 ```bash
-git add bin/agd_lib/reviewer.py bin/agd_lib/supervision.py tests/test_reviewer.py tests/test_supervision.py
+git add bin/agd_lib/reviewer.py tests/test_reviewer.py
 git commit -m "feat: persist reviewer proposals"
 ```
 
@@ -383,9 +383,11 @@ Extend existing `session switch replaces only its owned watcher` test only after
 
 ```ts
 const reviewRunId='00000000-0000-4000-8000-000000000030';
+const beforeDeliveries=deliveries.length, deadline=Date.now()+5000;
 writeFileSync(join(home,'state','events','33333333-3333-4333-8333-333333333333.json'),JSON.stringify({
  id:'33333333-3333-4333-8333-333333333333',purpose:'background-skill-review',review_run_id:reviewRunId,kind:'reviewer-batch',details:{report_ids:[],proposal_ids:[]}}));
-while (deliveries.length < 3 && Date.now() < Date.now()+5000) await Bun.sleep(50);
+while (deliveries.length === beforeDeliveries && Date.now() < deadline) await Bun.sleep(50);
+expect(deliveries.length).toBe(beforeDeliveries+1);
 expect(deliveries.at(-1)).toEqual({deliverAs:'followUp'});
 ```
 
@@ -400,6 +402,10 @@ Expected: FAIL because parser/reviewer-purpose watcher handling is absent.
 ```python
 reviewer_p=sub.add_parser('reviewer').add_subparsers(dest='reviewer_op',required=True)
 run_p=reviewer_p.add_parser('run'); run_p.add_argument('--timer',action='store_true'); run_p.add_argument('--retrospective-review-run',action='append',default=[])
+reviewer_p.add_parser('status')
+reports=reviewer_p.add_parser('reports').add_subparsers(dest='report_op',required=True); reports.add_parser('list'); reports.add_parser('show').add_argument('report_id')
+proposals=reviewer_p.add_parser('proposals').add_subparsers(dest='proposal_op',required=True); proposals.add_parser('list'); proposals.add_parser('show').add_argument('proposal_id')
+dispose=proposals.add_parser('dispose'); dispose.add_argument('proposal_id'); dispose.add_argument('--status',required=True,choices=('accepted','rejected','deferred','superseded')); dispose.add_argument('--reason'); dispose.add_argument('--replacement')
 timer_p=reviewer_p.add_parser('timer').add_subparsers(dest='timer_op',required=True)
 for name in ('enable','disable','status'): timer_p.add_parser(name)
 ```
@@ -427,10 +433,10 @@ git commit -m "feat: expose reviewer inbox"
 
 ```python
 def test_bridge_report_can_be_triaged_without_skill_mutation():
-    result=run_bridge_fixture() # Task 3 fixture: actual packet→native tool→Python submit
-    assert reviewer.read_report(result['home'],result['report_id'])['review_run_id']==result['review_run_id']
-    command(result['home'],'reviewer','proposals','dispose',result['proposal_id'],'--status','accepted')
-    with pytest.raises(store.Refusal): worker_skills.resolve(result['home'],skill_mode='curated',skills=('agd-review-draft',))
+    with bridge_fixture() as result:
+        assert reviewer.read_report(result['home'],result['report_id'])['review_run_id']==result['review_run_id']
+        command(result['home'],'reviewer','proposals','dispose',result['proposal_id'],'--status','accepted')
+        with pytest.raises(store.Refusal): worker_skills.resolve(result['home'],skill_mode='curated',skills=('agd-review-draft',))
 ```
 
 - [ ] **Step 2: Run test to verify it fails before final wiring**
