@@ -46,6 +46,13 @@ The central agent has pinned upstream skills under `.agents/skills/`; the Relay 
 
 `project remove app` only unregisters and preserves the clone. Clone deletion needs a project-scoped approval and refuses retained tasks, uncommitted work and unverifiable local refs. No command publishes or merges without a separate, exact-target approval.
 
+## Background skill review
+
+`bin/agd reviewer run` manually reviews a bounded frozen packet of completed worker evidence for existing-skill improvements or inert new-skill drafts. It writes private receipts, reports, proposal revisions, triage, events, and native reviewer session data under the effective home; it never edits skills, creates tasks, approves a proposal, or reviews itself by default. The reviewer model has exactly `reviewer_excerpt`, `reviewer_search`, and `reviewer_submit`; this model-tool boundary is not an OS sandbox.
+
+Use `reviewer status`, `reviewer reports list|show ID`, and `reviewer proposals list|show ID` to inspect retained data. `reviewer proposals dispose ID --status accepted|rejected|deferred|superseded` records human triage only: acknowledgement, report access, and disposition are separate from authority to edit. See [operations](docs/operations.md#background-reviewer) for limits, privacy, timer approval, and failure states, and [compatibility](docs/compatibility.md#background-reviewer-acceptance) for the exact acceptance evidence and external blockers.
+
+
 ## Scoped PR repair workflow
 
 Existing `publish` records one approved ready head; it is not an iterative PR workflow. A running `ship` task instead needs a target-specific `pr-publish` grant, for example `bin/agd task approve NAME --action pr-publish --target REMOTE:agd/NAME --instruction FILE`, then `bin/agd worker launch NAME --pr-grant UUID`. The granted worker uses only guarded `publish-pr`, `relay-poll`, `relay-reply`, and `verify-pr` commands with its task ID, incarnation, and grant. They non-force publish only the assigned branch; never merge, tag, or change the base branch.

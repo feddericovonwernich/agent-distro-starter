@@ -127,8 +127,8 @@ def test_precise_fold_bracket_refuses_second_native_occurrence(tmp_path, monkeyp
 
 def test_timer_runner_skips_collection_until_interval_is_due(tmp_path, monkeypatch):
     root, xdg = home(tmp_path), tmp_path / 'xdg'; reviewer_timer.enable(root, interval_config(2), xdg_config_home=xdg, command_runner=lambda _: None, now=3_601)
-    monkeypatch.setattr(reviewer_runner, 'launch', lambda *_args, **_kwargs: pytest.fail('collection launched while ineligible'))
-    assert reviewer_runner.launch_timer(root, observed_omp_version='test', now=3_602) is None
+    monkeypatch.setattr(reviewer_runner, 'run_native_reviewer', lambda *_args, **_kwargs: pytest.fail('collection launched while ineligible'))
+    assert reviewer_runner.launch_timer(root, agent_dir='/unused', now=3_602) is None
 
 
 
