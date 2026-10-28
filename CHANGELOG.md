@@ -2,6 +2,7 @@
 
 ## Unreleased
 - Documented bounded background skill review operations, frozen native evidence and human-only triage. Real native reviewer inventory/persistence remains blocked by the installed OMP/pi-natives runtime mismatch; user-systemd activation remains unavailable without separately approved disposable-home proof.
+- Hardened reviewer deadline enforcement across collection, capability discovery, and child dispatch; reviewer immutable records now refuse unsafe symlink and non-regular paths.
 
 - Added reviewer CLI inspection, human triage, manual native-run dispatch, and durable no-work receipts. Timer activation remains an explicit command and is never automatic.
 - Added the inert reviewer scheduling kernel and owned per-user systemd unit rendering. Calendar schedules use systemd's native IANA/DST semantics, interval schedules use a fixed UTC-hour anchor, and no configuration or initialization action activates a timer.

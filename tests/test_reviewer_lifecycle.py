@@ -12,7 +12,7 @@ def test_native_runner_persists_no_work_without_capability_or_agent_dir(monkeypa
         checkpoint = reviewer.paths(home)['checkpoint']; checkpoint.parent.mkdir(parents=True, exist_ok=True)
         checkpoint.write_bytes(b'{"anchor":0,"last_due":0}')
         before = checkpoint.read_bytes()
-        monkeypatch.setattr(reviewer_runner, 'assert_runtime_capability', lambda: (_ for _ in ()).throw(AssertionError('capability called')))
+        monkeypatch.setattr(reviewer_runner, 'assert_runtime_capability', lambda *_: (_ for _ in ()).throw(AssertionError('capability called')))
         result = reviewer_runner.run_native_reviewer(home, reviewer.enqueue_intent(home, kind='manual'), agent_dir=home / 'missing')
         stored = reviewer._receipt(home, result['review_run_id'])
         assert result['state'] == stored['state'] == 'no-work'
@@ -34,7 +34,7 @@ def test_nonzero_fake_child_records_safe_terminal_diagnostic(monkeypatch):
         fake = home / 'fake-bun'
         fake.write_text('#!/usr/bin/env python3\nimport sys\nsys.stderr.write(\"SECRET=https://token@example.invalid\\\\n\")\nsys.exit(7)\n')
         fake.chmod(0o700)
-        monkeypatch.setattr(reviewer_runner, 'assert_runtime_capability', lambda: {'omp_version':'fake','ai_url':'x','core_url':'x','sdk_url':'x','telemetry_url':'x','resolver_url':'x'})
+        monkeypatch.setattr(reviewer_runner, 'assert_runtime_capability', lambda *_: {'omp_version':'fake','ai_url':'x','core_url':'x','sdk_url':'x','telemetry_url':'x','resolver_url':'x'})
         monkeypatch.setattr(reviewer_runner.shutil, 'which', lambda _: str(fake))
         result = reviewer_runner.run_native_reviewer(home, reviewer.enqueue_intent(home, kind='manual'), agent_dir=agent)
         raw = json.dumps(result)
@@ -76,7 +76,7 @@ def test_preparation_failure_is_terminal_without_child(monkeypatch):
     import uuid
     with lab() as (home, _):
         ended_worker(home, 'native', str(uuid.uuid4()), [message('evidence')]); agent=home/'agent'; agent.mkdir()
-        monkeypatch.setattr(reviewer_runner, 'assert_runtime_capability', lambda: {'omp_version':'fake','ai_url':'x','core_url':'x','sdk_url':'x','telemetry_url':'x','resolver_url':'x'})
+        monkeypatch.setattr(reviewer_runner, 'assert_runtime_capability', lambda *_: {'omp_version':'fake','ai_url':'x','core_url':'x','sdk_url':'x','telemetry_url':'x','resolver_url':'x'})
         monkeypatch.setattr(reviewer_runner.observability, 'reviewer_environment', lambda *_: (_ for _ in ()).throw(RuntimeError('secret preparation failure')))
         result=reviewer_runner.run_native_reviewer(home, reviewer.enqueue_intent(home, kind='manual'), agent_dir=agent)
         assert result['dispatch_state']=='final' and result['outcome']=='failed' and result['error']['code']=='preparation'
@@ -91,3 +91,32 @@ def test_cli_manual_no_work_preserves_timer_bytes():
         before=(checkpoint.read_bytes(),(units/'owned.timer').read_bytes())
         result=command(home,'reviewer','run')
         assert result['state']=='no-work' and before==(checkpoint.read_bytes(),(units/'owned.timer').read_bytes())
+
+
+
+
+def test_runner_expired_after_collection_skips_capability_and_child(monkeypatch):
+    from test_reviewer import ended_worker, message
+    import uuid
+    with lab() as (home, _):
+        ended_worker(home, 'native', str(uuid.uuid4()), [message('evidence')]); agent = home / 'agent'; agent.mkdir()
+        monkeypatch.setattr(reviewer_runner.reviewer, 'select_packet',
+                            lambda *_args, **_kwargs: {'packet_id': 'a' * 64, 'excerpts': [{}]})
+        monkeypatch.setattr(reviewer_runner.reviewer, 'deadline_remaining_seconds', lambda _: 0)
+        monkeypatch.setattr(reviewer_runner, 'assert_runtime_capability',
+                            lambda *_: (_ for _ in ()).throw(AssertionError('capability called')))
+        result = reviewer_runner.run_native_reviewer(home, reviewer.enqueue_intent(home, kind='manual'), agent_dir=agent)
+        assert result['dispatch_state'] == 'final' and result['outcome'] == 'failed' and result['error']['code'] == 'timeout'
+
+
+def test_capability_timeout_is_bounded_by_deadline(monkeypatch):
+    import subprocess, time
+    seen = []
+    monkeypatch.setattr(reviewer_runner.shutil, 'which', lambda _: 'bun')
+    def run(*_args, **kwargs):
+        seen.append(kwargs['timeout'])
+        raise subprocess.TimeoutExpired('bun', kwargs['timeout'])
+    monkeypatch.setattr(reviewer_runner.subprocess, 'run', run)
+    with __import__('pytest').raises(Exception, match='timed out'):
+        reviewer_runner.assert_runtime_capability(int((time.time() + 1) * 1000))
+    assert 0 < seen[0] <= 1

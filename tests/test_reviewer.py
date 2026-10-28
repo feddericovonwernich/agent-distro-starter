@@ -562,3 +562,61 @@ def test_broker_replay_charges_input_once_and_keeps_receipt_dispatchable():
         receipt = reviewer._receipt(home, run['review_run_id'])
         assert receipt['dispatch_state'] == 'begun'
         assert receipt['counters']['model_calls'] == 1 and receipt['counters']['provider_inflight'] == 0
+
+
+def test_past_deadline_refuses_packet_before_publish():
+    with lab() as (home, _):
+        with pytest.raises(store.Refusal, match='deadline'):
+            reviewer.select_packet(home, cutoff=time.time(), config_snapshot=reviewer.read_config(home),
+                                   deadline_epoch_ms=0)
+        assert not reviewer.paths(home)['packets'].exists()
+
+
+def test_reviewer_records_refusal_for_config_packet_and_immutable_symlinks():
+    with lab() as (home, _):
+        outside = home / 'outside.json'; outside.write_text('{"outside":true}')
+        config = reviewer.paths(home)['config']; config.parent.mkdir(parents=True, exist_ok=True)
+        config.symlink_to(outside)
+        with pytest.raises(store.Refusal):
+            reviewer.read_config(home)
+        assert outside.read_text() == '{"outside":true}'
+        config.unlink()
+        packet_id = 'a' * 64; packet_path = reviewer.paths(home)['packets'] / f'{packet_id}.json'
+        packet_path.parent.mkdir(parents=True); packet_path.symlink_to(outside)
+        with pytest.raises(store.Refusal):
+            reviewer.read_packet(home, packet_id)
+        with pytest.raises(store.Refusal):
+            reviewer.publish_immutable(packet_path, {'packet': 'new'})
+        assert outside.read_text() == '{"outside":true}'
+
+
+def test_observation_discovery_stops_at_deadline_between_task_and_observation_units(monkeypatch):
+    with lab() as (home, _):
+        ended_worker(home, 'deadline-discovery', str(uuid.uuid4()), [message('evidence')])
+        now, read = [0], reviewer._read_json
+        def advancing_read(path):
+            value = read(path)
+            if Path(path).name == 'task.json': now[0] = 2
+            return value
+        monkeypatch.setattr(reviewer.time, 'time', lambda: now[0])
+        monkeypatch.setattr(reviewer, '_read_json', advancing_read)
+        coverage = {'complete': True, 'unavailable': []}
+        with pytest.raises(store.Refusal, match='deadline'):
+            reviewer._observation_candidates(home, 10, coverage, deadline_epoch_ms=1000)
+        assert not reviewer.paths(home)['packets'].exists()
+
+
+def test_publish_immutable_refuses_symlink_swapped_before_no_follow_open(monkeypatch):
+    with lab() as (home, _):
+        path = reviewer.paths(home)['packets'] / ('b' * 64 + '.json')
+        path.parent.mkdir(parents=True); path.write_bytes(b'{"packet":"new"}')
+        outside = home / 'outside.json'; outside.write_bytes(b'{"packet":"new"}')
+        open_file = reviewer.os.open
+        def swap(pathname, *args, **kwargs):
+            if Path(pathname) == path:
+                path.unlink(); path.symlink_to(outside)
+            return open_file(pathname, *args, **kwargs)
+        monkeypatch.setattr(reviewer.os, 'open', swap)
+        with pytest.raises(store.Refusal):
+            reviewer.publish_immutable(path, {'packet': 'new'})
+        assert outside.read_bytes() == b'{"packet":"new"}'

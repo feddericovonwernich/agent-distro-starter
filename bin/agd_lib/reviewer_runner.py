@@ -12,8 +12,10 @@ from pathlib import Path
 from . import observability, reviewer, store
 
 
-def assert_runtime_capability():
+def assert_runtime_capability(deadline_epoch_ms):
     """Discover the supported installed OMP modules without machine-specific paths."""
+    remaining = reviewer.deadline_remaining_seconds(deadline_epoch_ms)
+    if remaining <= 0: raise store.DependencyError('reviewer deadline exceeded')
     binary = shutil.which('bun')
     if not binary:
         raise store.DependencyError('bun is unavailable')
@@ -23,7 +25,7 @@ for(const [name,value] of Object.entries({Settings:sdk.Settings,ModelRegistry:sd
 if(typeof root.VERSION!=='string'&&typeof root.version!=='string')throw new Error('unsupported OMP version export');
 console.log(JSON.stringify({ai_url:import.meta.resolve(aiName),core_url:import.meta.resolve(coreName),sdk_url:import.meta.resolve(agent+'/sdk'),telemetry_url:import.meta.resolve(agent+'/telemetry-export'),resolver_url:import.meta.resolve(agent+'/config/model-resolver'),omp_version:root.VERSION||root.version}));"""
     env = {key: os.environ[key] for key in ('PATH', 'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME') if key in os.environ}
-    try: result = subprocess.run([binary, '-e', script], capture_output=True, text=True, timeout=10, env=env)
+    try: result = subprocess.run([binary, '-e', script], capture_output=True, text=True, timeout=min(10, remaining), env=env)
     except subprocess.TimeoutExpired as error: raise store.DependencyError('installed OMP runtime capability timed out') from error
     if result.returncode:
         raise store.DependencyError(f'installed OMP runtime capability unavailable: {result.stderr.strip()}')
@@ -43,13 +45,27 @@ def run_native_reviewer(home, intent, *, agent_dir, omp_binary='omp'):
         config, started = reviewer.read_config(home), time.time()
         run = reviewer.reserve_run(home, intent, config_snapshot=config, instruction_snapshot=Path(reviewer.INSTRUCTION_FILE).read_bytes(),
                                    started_at=started, deadline_epoch_ms=int((started + config['limits']['max_runtime_seconds']) * 1000))
-        packet = reviewer.select_packet(home, cutoff=started, config_snapshot=config, retrospective_review_run_ids=tuple(intent.get('retrospective_review_run_ids', ())))
+        try:
+            packet = reviewer.select_packet(home, cutoff=started, config_snapshot=config,
+                                            retrospective_review_run_ids=tuple(intent.get('retrospective_review_run_ids', ())),
+                                            deadline_epoch_ms=run['deadline_epoch_ms'])
+        except store.Refusal:
+            if reviewer.deadline_remaining_seconds(run['deadline_epoch_ms']) <= 0:
+                return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='timeout')
+            raise
+        if reviewer.deadline_remaining_seconds(run['deadline_epoch_ms']) <= 0:
+            return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='timeout', packet=packet)
         if not packet['excerpts']:
             return reviewer.close_run(home, run['review_run_id'], 'no-work', packet=packet)
         directory = Path(agent_dir)
         if directory.is_symlink() or not directory.is_dir(): return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='agent-dir', packet=packet)
-        try: capability = assert_runtime_capability()
-        except Exception: return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='capability', packet=packet)
+        try: capability = assert_runtime_capability(run['deadline_epoch_ms'])
+        except Exception:
+            return reviewer.close_run(home, run['review_run_id'], 'failed',
+                                      error_code='timeout' if reviewer.deadline_remaining_seconds(run['deadline_epoch_ms']) <= 0 else 'capability',
+                                      packet=packet)
+        if reviewer.deadline_remaining_seconds(run['deadline_epoch_ms']) <= 0:
+            return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='timeout', packet=packet)
         try:
             with store.lock(store.home(home)):
                 receipt = reviewer._receipt(home, run['review_run_id'])
@@ -59,7 +75,7 @@ def run_native_reviewer(home, intent, *, agent_dir, omp_binary='omp'):
             payload = {'urls': {key: capability[f'{key}_url'] for key in ('ai', 'core', 'sdk', 'telemetry', 'resolver')},
                        'input': {'cwd': str(store.home(home)), 'agentDir': str(directory.resolve()), 'sessionDir': observability.reviewer_session_dir(home, run['review_run_id']),
                                  'reviewRunId': run['review_run_id'], 'receipt': {'deadline_epoch_ms': run['deadline_epoch_ms'], 'omp_version': capability['omp_version']},
-                                 'modelSelector': config['review_model'], 'reviewPrompt': json.loads((reviewer.paths(home)['manifests'] / f"{run['instruction_snapshot_ref']}.json").read_text())['text']}}
+                                 'modelSelector': config['review_model'], 'reviewPrompt': reviewer._read_json(reviewer.paths(home)['manifests'] / f"{run['instruction_snapshot_ref']}.json")['text']}}
         except Exception:
             return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='preparation', packet=packet)
         bun = shutil.which('bun')

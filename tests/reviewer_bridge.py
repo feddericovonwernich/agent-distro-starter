@@ -10,7 +10,7 @@ from test_reviewer import build_report, produced_run
 with lab() as (home, _):
     with reviewer.run_lease(home):
         run, packet = produced_run(home)
-        capability = reviewer_runner.assert_runtime_capability()
+        capability = reviewer_runner.assert_runtime_capability(int((__import__('time').time() + 10) * 1000))
         prompt = json.loads((reviewer.paths(home)['manifests'] / f"{run['instruction_snapshot_ref']}.json").read_text())['text']
         print(json.dumps({
             'aiUrl': capability['ai_url'], 'coreUrl': capability['core_url'], 'sdkUrl': capability['sdk_url'], 'telemetryUrl': capability['telemetry_url'], 'resolverUrl': capability['resolver_url'],

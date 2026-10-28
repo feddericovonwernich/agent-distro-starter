@@ -46,7 +46,7 @@ if MODE=="duplicate": print(json.dumps({"complete":True,"result":r}),flush=True)
     path.chmod(0o700)
 
 
-def capability(): return {'omp_version':'fake','ai_url':'file:///ai','core_url':'file:///core','sdk_url':'file:///sdk','telemetry_url':'file:///telemetry','resolver_url':'file:///resolver'}
+def capability(*_): return {'omp_version':'fake','ai_url':'file:///ai','core_url':'file:///core','sdk_url':'file:///sdk','telemetry_url':'file:///telemetry','resolver_url':'file:///resolver'}
 
 
 def test_fake_child_happy_binds_actual_session_and_finalizes(monkeypatch):

@@ -56,7 +56,9 @@ def publish_immutable(path, value):
         with os.fdopen(fd, 'wb') as stream: stream.write(body); stream.flush(); os.fsync(stream.fileno())
         try: os.link(temporary, path)
         except FileExistsError:
-            if path.read_bytes() != body: raise store.Refusal('immutable collision')
+            try: existing = _read_regular_bytes(path, require_current_uid=True)
+            except (OSError, ValueError) as error: raise store.Refusal('unsafe immutable record') from error
+            if existing != body: raise store.Refusal('immutable collision')
         directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try: os.fsync(directory)
         finally: os.close(directory)
@@ -87,9 +89,10 @@ def validate_config(value):
 
 def read_config(home):
     path = paths(home)['config']
-    if not path.exists(): return {'schema': 1, 'schedule': dict(DEFAULT_CONFIG['schedule']), 'limits': dict(DEFAULT_LIMITS), 'review_model': None}
-    try: return validate_config(json.loads(path.read_text()))
-    except json.JSONDecodeError as error: raise store.Refusal('invalid config JSON') from error
+    try: os.lstat(path)
+    except FileNotFoundError: return {'schema': 1, 'schedule': dict(DEFAULT_CONFIG['schedule']), 'limits': dict(DEFAULT_LIMITS), 'review_model': None}
+    try: return validate_config(_read_json(path))
+    except (OSError, ValueError, json.JSONDecodeError) as error: raise store.Refusal('invalid config JSON') from error
 
 
 def _hex_id(value):
@@ -97,40 +100,72 @@ def _hex_id(value):
 
 
 def read_packet(home, packet_id):
-    _hex_id(packet_id); value = json.loads((paths(home)['packets'] / f'{packet_id}.json').read_text()); value['packet_id'] = packet_id; return value
+    _hex_id(packet_id)
+    try: value = _read_json(paths(home)['packets'] / f'{packet_id}.json')
+    except (OSError, ValueError, json.JSONDecodeError) as error: raise store.Refusal('unknown packet') from error
+    if not isinstance(value, dict): raise store.Refusal('invalid packet')
+    value['packet_id'] = packet_id
+    return value
 
 
 def _coverage(coverage, bucket, value): coverage['complete'] = False; coverage[bucket].append(value)
 
 
+def _read_regular_bytes(path, *, require_current_uid=False):
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    with os.fdopen(fd, 'rb') as stream:
+        identity = os.fstat(stream.fileno())
+        if not stat.S_ISREG(identity.st_mode) or (require_current_uid and identity.st_uid != os.getuid()):
+            raise ValueError('unsafe record')
+        return stream.read()
+
+
 def _read_json(path):
-    if path.is_symlink() or not path.is_file(): raise ValueError('unsafe record')
-    return json.loads(path.read_text())
+    return json.loads(_read_regular_bytes(path))
 
 
-def _observation_candidates(home, cutoff, coverage):
+def deadline_remaining_seconds(deadline_epoch_ms):
+    return deadline_epoch_ms / 1000 - time.time()
+
+
+def _check_deadline(deadline_epoch_ms):
+    if deadline_epoch_ms is not None and deadline_remaining_seconds(deadline_epoch_ms) <= 0:
+        raise store.Refusal('reviewer deadline exceeded')
+
+
+def _observation_candidates(home, cutoff, coverage, deadline_epoch_ms=None):
     result = []; home = store.home(home)
+    _check_deadline(deadline_epoch_ms)
     root = observability._existing_private_directory(home, 'data', 'tasks')
     if root is None: return result
     for directory in sorted(root.iterdir()):
+        _check_deadline(deadline_epoch_ms)
         task_file = directory / 'task.json'
         try:
             if observability._existing_private_directory(home, 'data', 'tasks', directory.name) != directory:
                 raise ValueError('unsafe task directory')
             task = _read_json(task_file)
+            _check_deadline(deadline_epoch_ms)
             task_id = store.validate_id(task.get('id'))
             if task_id != directory.name: raise ValueError('task directory mismatch')
             observations = directory / 'observations'
             if observations.exists() and (observations.is_symlink() or not observations.is_dir()): raise ValueError('unsafe observations')
             for path in sorted(observations.glob('*.json')) if observations.exists() else ():
-                try: event = _read_json(path)
+                _check_deadline(deadline_epoch_ms)
+                try:
+                    event = _read_json(path)
+                    _check_deadline(deadline_epoch_ms)
                 except (OSError, ValueError, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'path': str(path), 'reason': 'observation-malformed'}); continue
                 if event.get('key') != 'runner-exit' or not isinstance(event.get('observed_at'), (int, float)) or event['observed_at'] > cutoff: continue
                 incarnation = observability._incarnation(event.get('incarnation'))
                 if incarnation == task.get('incarnation') and task.get('worker_alive') is not False: continue
                 result.append((event['observed_at'], task, event, directory))
-        except (OSError, TypeError, ValueError, store.Refusal, json.JSONDecodeError):
+        except store.Refusal:
+            if deadline_epoch_ms is not None and deadline_remaining_seconds(deadline_epoch_ms) <= 0: raise
             _coverage(coverage, 'unavailable', {'path': str(task_file), 'reason': 'task-record-malformed'})
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            _coverage(coverage, 'unavailable', {'path': str(task_file), 'reason': 'task-record-malformed'})
+    _check_deadline(deadline_epoch_ms)
     return sorted(result, key=lambda row: (row[0], row[1].get('id', ''), row[2].get('id', '')))
 
 
@@ -153,20 +188,29 @@ def _render_content(content):
     return ''.join(texts), unsupported
 
 
-def _messages(session_path, cutoff, budget):
+def _messages(session_path, cutoff, budget, deadline_epoch_ms=None):
+    _check_deadline(deadline_epoch_ms)
     if session_path.is_symlink() or not session_path.is_file(): raise store.Refusal('unsafe native JSONL')
     with session_path.open('rb') as stream:
         header_line = stream.readline(budget + 1)
+        # Local reads are checked between bounded reads; an active syscall cannot be cancelled.
+        _check_deadline(deadline_epoch_ms)
         if not header_line or len(header_line) > budget: raise store.Refusal('invalid native JSONL header')
         try: header = json.loads(header_line)
         except (json.JSONDecodeError, UnicodeDecodeError) as error: raise store.Refusal('native JSONL header is invalid') from error
         hasher = hashlib.sha256(header_line); watermark = len(header_line)
         if not isinstance(header, dict) or header.get('type') != 'session' or header.get('version') != 3 or not isinstance(header.get('id'), str): raise store.Refusal('native JSONL header is invalid')
         rows, late, limited, withheld, number, retained = [], False, False, [], 1, 0
-        while line := stream.readline(budget + 1):
+        while True:
+            _check_deadline(deadline_epoch_ms)
+            line = stream.readline(budget + 1)
+            _check_deadline(deadline_epoch_ms)
+            if not line: break
             number += 1; start = watermark
             while line and not line.endswith(b'\n'):
+                _check_deadline(deadline_epoch_ms)
                 hasher.update(line); watermark += len(line); line = stream.readline(budget + 1)
+                _check_deadline(deadline_epoch_ms)
                 limited = True
             if not line: break
             hasher.update(line); watermark += len(line)
@@ -203,10 +247,11 @@ def _fixed_session(root, task_id, incarnation, binding):
     return expected
 
 
-def _catalog(home, coverage):
+def _catalog(home, coverage, deadline_epoch_ms=None):
     try:
         result = []
         for item in worker_skills.catalog(home):
+            _check_deadline(deadline_epoch_ms)
             raw = (store.home(home) / 'config' / 'worker-skills' / item['id'] / 'SKILL.md').read_bytes()
             excerpt = raw[:256].decode('utf-8', 'replace')
             result.append({'id': item['id'], 'description': item['description'],
@@ -214,30 +259,43 @@ def _catalog(home, coverage):
                            'snapshot_total_bytes': len(raw), 'snapshot_truncated': len(raw) > 256,
                            'snapshot_invalid_utf8': '\ufffd' in excerpt})
         return result
-    except (OSError, store.Refusal):
+    except store.Refusal:
+        if deadline_epoch_ms is not None and deadline_remaining_seconds(deadline_epoch_ms) <= 0: raise
+        _coverage(coverage, 'unavailable', {'category': 'skill-catalog', 'reason': 'catalog-unavailable'})
+        return []
+    except OSError:
         _coverage(coverage, 'unavailable', {'category': 'skill-catalog', 'reason': 'catalog-unavailable'})
         return []
 
-def _manifest(home, task_dir, task, coverage):
+def _manifest(home, task_dir, task, coverage, deadline_epoch_ms=None):
+    _check_deadline(deadline_epoch_ms)
     path = task_dir / 'worker-skills.json'
     if not path.exists(): return []
     try:
         manifest = worker_skills._manifest(home, task)
         result = []
         for item in manifest['skills']:
+            _check_deadline(deadline_epoch_ms)
             snap = Path(item['snapshot'])
-            result.append({'id': item['id'], 'snapshot_sha256': hashlib.sha256((snap / 'SKILL.md').read_bytes()).hexdigest(),
+            raw = (snap / 'SKILL.md').read_bytes()
+            _check_deadline(deadline_epoch_ms)
+            result.append({'id': item['id'], 'snapshot_sha256': hashlib.sha256(raw).hexdigest(),
                            'manifest_sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
         return result
-    except (OSError, ValueError, json.JSONDecodeError, store.Refusal):
+    except store.Refusal:
+        if deadline_epoch_ms is not None and deadline_remaining_seconds(deadline_epoch_ms) <= 0: raise
+        _coverage(coverage, 'unavailable', {'task_id': task.get('id'), 'reason': 'assigned-manifest-unavailable'})
+        return []
+    except (OSError, ValueError, json.JSONDecodeError):
         _coverage(coverage, 'unavailable', {'task_id': task.get('id'), 'reason': 'assigned-manifest-unavailable'})
         return []
 
 
-def _central(task_dir, task_id, incarnation, cutoff, coverage):
+def _central(task_dir, task_id, incarnation, cutoff, coverage, deadline_epoch_ms=None):
     sources, excerpts = [], []; folder = task_dir / 'decisions'
     if not folder.exists(): return sources, excerpts
     for path in sorted(folder.glob('*.json')):
+        _check_deadline(deadline_epoch_ms)
         if path.name.endswith('.answer.json'): continue
         try:
             decision = _read_json(path); at = decision.get('resolved_at')
@@ -263,19 +321,23 @@ def _candidate_is_reviewed(root, task_id, incarnation, material_basis):
         return False
 
 
-def _candidate_material(root, task, event, task_dir, jsonls, cutoff, limit, coverage):
+def _candidate_material(root, task, event, task_dir, jsonls, cutoff, limit, coverage, deadline_epoch_ms=None):
     key = task['id'], event['incarnation']; sources, excerpts = [], []
     for jsonl in jsonls:
+        _check_deadline(deadline_epoch_ms)
         try:
-            sid, watermark, digest, rows, late, limited, withheld = _messages(jsonl, cutoff, limit)
+            sid, watermark, digest, rows, late, limited, withheld = _messages(jsonl, cutoff, limit, deadline_epoch_ms)
             source = {'kind': 'native-jsonl', 'task_id': key[0], 'incarnation': key[1], 'session_id': sid, 'path': str(jsonl.relative_to(root)), 'byte_watermark': watermark, 'content_sha256': digest}; source['source_id'] = _digest(source); sources.append(source)
             for row in rows:
                 excerpt = {'source_id': source['source_id'], **row}; excerpt['excerpt_id'] = _digest(excerpt); excerpts.append(excerpt)
             for row in withheld: _coverage(coverage, 'withheld', row)
             if limited: _coverage(coverage, 'late_basis', {'task_id': key[0], 'session_id': sid, 'reason': 'input-limit'})
             if late: _coverage(coverage, 'late_basis', {'task_id': key[0], 'session_id': sid, 'reason': 'post-cutoff-native-row'})
-        except (OSError, store.Refusal, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'task_id': key[0], 'incarnation': key[1], 'reason': 'native-jsonl-malformed'})
-    extra_sources, extra_excerpts = _central(task_dir, key[0], key[1], cutoff, coverage)
+        except store.Refusal:
+            if deadline_epoch_ms is not None and deadline_remaining_seconds(deadline_epoch_ms) <= 0: raise
+            _coverage(coverage, 'unavailable', {'task_id': key[0], 'incarnation': key[1], 'reason': 'native-jsonl-malformed'})
+        except (OSError, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'task_id': key[0], 'incarnation': key[1], 'reason': 'native-jsonl-malformed'})
+    extra_sources, extra_excerpts = _central(task_dir, key[0], key[1], cutoff, coverage, deadline_epoch_ms)
     if extra_sources: sources.extend(extra_sources); excerpts.extend(extra_excerpts); coverage['central_feedback'] = 'active-partial'; coverage['complete'] = False
     admitted = {'sources': sources, 'excerpts': excerpts, 'coverage': {'late_basis': []}}
     _cap(admitted, limit)
@@ -293,9 +355,10 @@ def _cap(packet, limit):
     if len(_json_bytes(packet)) > limit: raise store.Refusal('max_input_bytes cannot encode required coverage')
 
 
-def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids=()):
+def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids=(), deadline_epoch_ms=None):
     config = validate_config(config_snapshot)
     if not isinstance(cutoff, (int, float)) or cutoff < 0 or not isinstance(retrospective_review_run_ids, tuple): raise store.Refusal('packet scope is invalid')
+    _check_deadline(deadline_epoch_ms)
     root = store.home(home)
     scope = {'schema': 1, 'cutoff': cutoff, 'config_snapshot_sha256': _digest(config), 'retrospective_review_run_ids': list(retrospective_review_run_ids)}
     scope_id = _digest(scope)
@@ -306,7 +369,8 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
         return read_packet(root, saved['packet_id'])
     coverage = {'complete': True, 'withheld': [], 'unavailable': [], 'unknown': [], 'langfuse_index': 'unused', 'late_basis': [], 'central_feedback': 'unknown', 'retrospective_excluded': []}
     episodes, sources, excerpts, provenance, seen, candidate_versions = [], [], [], [], set(), {}
-    for observed_at, task, event, task_dir in _observation_candidates(root, cutoff, coverage):
+    for observed_at, task, event, task_dir in _observation_candidates(root, cutoff, coverage, deadline_epoch_ms):
+        _check_deadline(deadline_epoch_ms)
         key = (task.get('id'), event.get('incarnation'))
         if key in seen: continue
         try:
@@ -314,13 +378,13 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
             if not jsonls: raise ValueError('no JSONL')
         except (OSError, ValueError, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'task_id': key[0], 'incarnation': key[1], 'reason': 'native-jsonl-unavailable'}); continue
         candidate_sources, candidate_excerpts, candidate_basis = _candidate_material(
-            root, task, event, task_dir, jsonls, cutoff, config['limits']['max_input_bytes'], coverage)
+            root, task, event, task_dir, jsonls, cutoff, config['limits']['max_input_bytes'], coverage, deadline_epoch_ms)
         try: reviewed = set(_read_json(paths(root)['candidates'] / f'{_candidate_id(*key)}.json').get('reviewed_excerpt_ids', []))
         except (OSError, ValueError, json.JSONDecodeError): reviewed = set()
         candidate_excerpts = [excerpt for excerpt in candidate_excerpts if f"{excerpt['message_id']}:{hashlib.sha256(excerpt['text'].encode()).hexdigest()}" not in reviewed]
         candidate_sources = [source for source in candidate_sources if any(excerpt['source_id'] == source['source_id'] for excerpt in candidate_excerpts)]
         if not candidate_excerpts or len(episodes) >= config['limits']['max_candidates']: continue
-        seen.add(key); episodes.append({'task_id': key[0], 'incarnation': key[1], 'closed_at': observed_at, 'exit_observation_id': event.get('id')}); provenance.append({'task_id': key[0], 'assigned': _manifest(root, task_dir, task, coverage), 'usage': 'unknown'})
+        seen.add(key); episodes.append({'task_id': key[0], 'incarnation': key[1], 'closed_at': observed_at, 'exit_observation_id': event.get('id')}); provenance.append({'task_id': key[0], 'assigned': _manifest(root, task_dir, task, coverage, deadline_epoch_ms), 'usage': 'unknown'})
         sources.extend(candidate_sources); excerpts.extend(candidate_excerpts); candidate_versions[key] = candidate_basis
     if coverage['central_feedback'] == 'unknown': coverage['unknown'].append({'category': 'central-feedback', 'reason': 'no explicit retained links'})
     retrospective = []
@@ -329,6 +393,7 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
         except (ValueError, TypeError, AttributeError) as error: raise store.Refusal('invalid retrospective run') from error
         if set(retrospective_review_run_ids) != requested: raise store.Refusal('invalid retrospective run')
         for receipt_path in sorted(paths(root)['receipts'].glob('*.json')):
+            _check_deadline(deadline_epoch_ms)
             receipt = _read_json(receipt_path); rid = receipt.get('review_run_id'); closed = receipt.get('closed_at')
             try: canonical_rid = str(uuid.UUID(rid))
             except (ValueError, TypeError, AttributeError) as error: raise store.Refusal('retrospective receipt ID is invalid') from error
@@ -346,8 +411,9 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
             except (OSError, ValueError, store.Refusal, json.JSONDecodeError) as error: raise store.Refusal('retrospective native evidence is unavailable') from error
             retrospective.append({'review_run_id': rid, 'closed_at': closed, 'source_count': len(jsonls)})
             for jsonl in jsonls:
+                _check_deadline(deadline_epoch_ms)
                 try:
-                    sid, watermark, digest, rows, late, limited, withheld = _messages(jsonl, cutoff, config['limits']['max_input_bytes'])
+                    sid, watermark, digest, rows, late, limited, withheld = _messages(jsonl, cutoff, config['limits']['max_input_bytes'], deadline_epoch_ms)
                     source = {'kind': 'reviewer-native-jsonl', 'review_run_id': rid, 'session_id': sid, 'path': str(jsonl.relative_to(root)), 'byte_watermark': watermark, 'content_sha256': digest}
                     source['source_id'] = _digest(source); sources.append(source)
                     for row in rows:
@@ -355,8 +421,12 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
                     if limited: _coverage(coverage, 'late_basis', {'review_run_id': rid, 'reason': 'input-limit'})
                     if late: _coverage(coverage, 'late_basis', {'review_run_id': rid, 'reason': 'post-cutoff-native-row'})
                     for row in withheld: _coverage(coverage, 'withheld', row)
-                except (OSError, store.Refusal, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'review_run_id': rid, 'reason': 'retrospective-native-jsonl-malformed'})
+                except store.Refusal:
+                    if deadline_epoch_ms is not None and deadline_remaining_seconds(deadline_epoch_ms) <= 0: raise
+                    _coverage(coverage, 'unavailable', {'review_run_id': rid, 'reason': 'retrospective-native-jsonl-malformed'})
+                except (OSError, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'review_run_id': rid, 'reason': 'retrospective-native-jsonl-malformed'})
             for report_id in receipt.get('report_ids', []):
+                _check_deadline(deadline_epoch_ms)
                 try:
                     report = _read_json(report_path(root, report_id))
                     source = {'kind': 'reviewer-report', 'review_run_id': rid, 'report_id': report_id, 'content_sha256': hashlib.sha256(_json_bytes(report)).hexdigest()}
@@ -366,10 +436,11 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
                 except (OSError, ValueError, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'review_run_id': rid, 'reason': 'committed-report-unavailable'})
         if {item['review_run_id'] for item in retrospective} != requested: raise store.Refusal('unknown retrospective run')
     coverage['followup_id'] = '0' * 64  # reserve final metadata before the sole shared cap
-    packet = {'schema': 1, 'purpose': 'background-skill-review', 'cutoff': cutoff, 'episodes': episodes, 'sources': sources, 'excerpts': excerpts, 'catalog': _catalog(root, coverage), 'skill_provenance': provenance, 'coverage': coverage, 'retrospective_review_run_ids': list(retrospective_review_run_ids), 'retrospective_episodes': retrospective, 'config_snapshot_sha256': _digest(config)}
+    packet = {'schema': 1, 'purpose': 'background-skill-review', 'cutoff': cutoff, 'episodes': episodes, 'sources': sources, 'excerpts': excerpts, 'catalog': _catalog(root, coverage, deadline_epoch_ms), 'skill_provenance': provenance, 'coverage': coverage, 'retrospective_review_run_ids': list(retrospective_review_run_ids), 'retrospective_episodes': retrospective, 'config_snapshot_sha256': _digest(config)}
     _cap(packet, config['limits']['max_input_bytes'])
     candidates = []
     for episode in packet['episodes']:
+        _check_deadline(deadline_epoch_ms)
         retained = [f"{excerpt['message_id']}:{hashlib.sha256(excerpt['text'].encode()).hexdigest()}" for excerpt in packet['excerpts'] if any(
             source['source_id'] == excerpt['source_id']
             and ((source.get('kind') == 'native-jsonl' and source.get('task_id') == episode['task_id'] and source.get('incarnation') == episode['incarnation'])
@@ -384,10 +455,13 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
                               'excerpts': [excerpt['excerpt_id'] for excerpt in packet['excerpts']]})
     packet['coverage']['followup_id'] = material_basis
     with store.lock(root):
+        _check_deadline(deadline_epoch_ms)
         state_path = paths(root)['followups'] / f'{material_basis}.json'
         if not state_path.exists():
             store.atomic_json(state_path, {'schema': 1, 'material_basis': material_basis, 'state': 'pending', 'candidates': candidates})
+    _check_deadline(deadline_epoch_ms)
     packet_id = _digest(packet); publish_immutable(paths(root)['packets'] / f'{packet_id}.json', packet)
+    _check_deadline(deadline_epoch_ms)
     store.atomic_json(checkpoint, {'scope': scope, 'packet_id': packet_id, 'material_basis': material_basis})
     packet['packet_id'] = packet_id; return packet
 
