@@ -196,8 +196,11 @@ def _catalog(home, coverage):
         result = []
         for item in worker_skills.catalog(home):
             text = (store.home(home) / 'config' / 'worker-skills' / item['id'] / 'SKILL.md').read_text()
+            encoded = text.encode()
+            excerpt = encoded[:512].decode('utf-8', 'ignore')
             result.append({'id': item['id'], 'description': item['description'],
-                           'catalog_sha256': hashlib.sha256(text.encode()).hexdigest(), 'snapshot_excerpt': text[:512]})
+                           'catalog_sha256': hashlib.sha256(encoded).hexdigest(), 'snapshot_excerpt': excerpt,
+                           'snapshot_total_bytes': len(encoded), 'snapshot_truncated': len(encoded) > len(excerpt.encode())})
         return result
     except (OSError, store.Refusal):
         _coverage(coverage, 'unavailable', {'category': 'skill-catalog', 'reason': 'catalog-unavailable'})

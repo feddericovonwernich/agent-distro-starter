@@ -101,13 +101,15 @@ def test_packet_freezes_catalog_and_assigned_manifest_without_claiming_usage():
     with lab() as (home, _):
         task, _, _ = ended_worker(home, 'skills', str(uuid.uuid4()), [message('evidence')])
         skill = home / 'config' / 'worker-skills' / 'agd-test'; skill.mkdir(parents=True)
-        (skill / 'SKILL.md').write_text('---\nname: agd-test\ndescription: Test skill\n---\n')
+        (skill / 'SKILL.md').write_text('---\nname: agd-test\ndescription: Test skill\n---\n' + 'x' * 600)
         task.update(harness='omp')
         tasks.save(home, task)
         worker_skills = __import__('agd_lib.worker_skills', fromlist=['prepare'])
         worker_skills.prepare(home, task, {'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-test']})
         selected = packet(home)
         assert any(row['id'] == 'agd-test' for row in selected['catalog'])
+        catalog_entry = next(row for row in selected['catalog'] if row['id'] == 'agd-test')
+        assert catalog_entry['snapshot_truncated'] is True and catalog_entry['snapshot_total_bytes'] > len(catalog_entry['snapshot_excerpt'].encode())
         assert selected['skill_provenance'][0]['assigned'][0]['id'] == 'agd-test'
         assert selected['skill_provenance'][0]['usage'] == 'unknown'
 
@@ -238,7 +240,7 @@ def test_shared_cap_does_not_consume_clipped_candidate_material():
         ended_worker(home, 'first', str(uuid.uuid4()), [message('a' * 3000, 100)])
         ended_worker(home, 'second', str(uuid.uuid4()), [message('b' * 3000, 100)])
         config = reviewer.read_config(home)
-        config['limits'].update(max_candidates=2, max_input_bytes=14000)
+        config['limits'].update(max_candidates=2, max_input_bytes=15000)
         cutoff = time.time() + 100
         first = reviewer.select_packet(home, cutoff=cutoff, config_snapshot=config)
         assert {source['task_id'] for source in first['sources'] if source['kind'] == 'native-jsonl'} == {'first', 'second'}
