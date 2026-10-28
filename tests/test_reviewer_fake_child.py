@@ -31,6 +31,11 @@ rpc("reviewer_submit",{"report":{"schema":1,"summary":"fixture","findings":[]}})
 r=rpc("result",{})
 if MODE=="mismatch": r={"reportId":"wrong"}
 if MODE!="absent": print(json.dumps({"complete":True,"result":r}),flush=True)
+if MODE=="wait":
+ import time,os
+ open(payload["input"]["cwd"]+"/running","w").write("running")
+ while not os.path.exists(payload["input"]["cwd"]+"/release"): time.sleep(.02)
+ open(payload["input"]["cwd"]+"/exited","w").write("exited")
 if MODE=="duplicate": print(json.dumps({"complete":True,"result":r}),flush=True)
 ''')
     path.chmod(0o700)
@@ -73,3 +78,21 @@ def test_fake_child_timeout_leaves_inflight_unknown_and_kills_group(monkeypatch)
         assert result['outcome']=='unknown' and result['counters']['provider_inflight']==1
         for pid in map(int,(home/'fake-pids').read_text().split()):
             with __import__('pytest').raises(ProcessLookupError): os.kill(pid,0)
+
+def test_run_lease_holds_until_child_exit_and_finalization(monkeypatch):
+    import threading, time
+    from agd_lib import store
+    with lab() as (home, _):
+        ended_worker(home, 'native', str(uuid.uuid4()), [message('evidence')]); agent=home/'agent'; agent.mkdir(); fake=home/'bun'; fake_child(fake,'wait')
+        monkeypatch.setattr(reviewer_runner,'assert_runtime_capability',capability); monkeypatch.setattr(reviewer_runner.shutil,'which',lambda _:str(fake))
+        seen=[]; original=reviewer.finalize_run
+        def finalize(*args,**kwargs): seen.append((home/'exited').exists()); return original(*args,**kwargs)
+        monkeypatch.setattr(reviewer,'finalize_run',finalize)
+        intent=reviewer.enqueue_intent(home,kind='manual'); thread=threading.Thread(target=lambda: reviewer_runner.run_native_reviewer(home,intent,agent_dir=agent)); thread.start()
+        deadline=time.time()+5
+        while not (home/'running').exists() and time.time()<deadline: time.sleep(.02)
+        assert (home/'running').exists()
+        with __import__('pytest').raises(store.Refusal):
+            with reviewer.run_lease(home): pass
+        (home/'release').write_text('go'); thread.join(5)
+        assert not thread.is_alive() and seen == [True]
