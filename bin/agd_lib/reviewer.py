@@ -199,12 +199,12 @@ def _catalog(home, coverage):
     try:
         result = []
         for item in worker_skills.catalog(home):
-            text = (store.home(home) / 'config' / 'worker-skills' / item['id'] / 'SKILL.md').read_text()
-            encoded = text.encode()
-            excerpt = encoded[:512].decode('utf-8', 'ignore')
+            raw = (store.home(home) / 'config' / 'worker-skills' / item['id'] / 'SKILL.md').read_bytes()
+            excerpt = raw[:256].decode('utf-8', 'replace')
             result.append({'id': item['id'], 'description': item['description'],
-                           'catalog_sha256': hashlib.sha256(encoded).hexdigest(), 'snapshot_excerpt': excerpt,
-                           'snapshot_total_bytes': len(encoded), 'snapshot_truncated': len(encoded) > len(excerpt.encode())})
+                           'catalog_sha256': hashlib.sha256(raw).hexdigest(), 'snapshot_excerpt': excerpt,
+                           'snapshot_total_bytes': len(raw), 'snapshot_truncated': len(raw) > 256,
+                           'snapshot_invalid_utf8': '\ufffd' in excerpt})
         return result
     except (OSError, store.Refusal):
         _coverage(coverage, 'unavailable', {'category': 'skill-catalog', 'reason': 'catalog-unavailable'})
@@ -449,14 +449,13 @@ def reserve_run(home, intent, *, config_snapshot, instruction_snapshot, started_
     return run
 
 
-def begin_run(home, run, packet, *, model):
-    if not isinstance(run, dict) or not isinstance(run.get('review_run_id'), str) or not isinstance(model, str) or not model.strip(): raise store.Refusal('invalid reviewer dispatch')
+def begin_run(home, run, packet, *, model, observed_omp_version):
+    if not isinstance(run, dict) or not isinstance(run.get('review_run_id'), str) or not isinstance(model, str) or not model.strip() or not isinstance(observed_omp_version, str) or not observed_omp_version.strip(): raise store.Refusal('invalid reviewer dispatch')
     packet_id = packet.get('packet_id') if isinstance(packet, dict) else None; _hex_id(packet_id); receipt = paths(home)['receipts'] / f'{run["review_run_id"]}.json'
     with store.lock(store.home(home)):
         stored = _read_json(receipt)
         if stored != run or stored.get('dispatch_state') != 'reserved': raise store.Refusal('reviewer receipt is not reservable')
-        stored.update(packet_id=packet_id, model=model, dispatch_state='begun')
-        if model.endswith('-fixture'): stored['omp_version'] = 'fixture-only'
+        stored.update(packet_id=packet_id, model=model, omp_version=observed_omp_version, dispatch_state='begun')
         store.atomic_json(receipt, stored)
     return stored
 
