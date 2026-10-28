@@ -1,3 +1,4 @@
+import os
 import json
 import sys
 import time
@@ -9,7 +10,7 @@ import pytest
 from support import command, lab
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
-from agd_lib import observability, reviewer, reviewer_runner, store, supervision, tasks, workers
+from agd_lib import observability, reviewer, reviewer_runner, store, supervision, tasks, worker_skills, workers
 
 
 def ended_worker(home, task_id, incarnation, rows, status=1):
@@ -232,6 +233,22 @@ def test_reviewed_candidates_advance_and_new_material_resurfaces_once():
         reviewer.mark_material_reviewed(home, resurfaced['coverage']['followup_id'])
         assert reviewer.select_packet(home, cutoff=cutoff + 3, config_snapshot=config)['episodes'] == []
 
+def test_shared_cap_does_not_consume_clipped_candidate_material():
+    with lab() as (home, _):
+        ended_worker(home, 'first', str(uuid.uuid4()), [message('a' * 3000, 100)])
+        ended_worker(home, 'second', str(uuid.uuid4()), [message('b' * 3000, 100)])
+        config = reviewer.read_config(home)
+        config['limits'].update(max_candidates=2, max_input_bytes=14000)
+        cutoff = time.time() + 100
+        first = reviewer.select_packet(home, cutoff=cutoff, config_snapshot=config)
+        assert {source['task_id'] for source in first['sources'] if source['kind'] == 'native-jsonl'} == {'first', 'second'}
+        assert {source['task_id'] for source in first['sources'] if any(excerpt['source_id'] == source['source_id'] for excerpt in first['excerpts'])} == {'first'}
+        reviewer.mark_material_reviewed(home, first['coverage']['followup_id'])
+        second = reviewer.select_packet(home, cutoff=cutoff + 1, config_snapshot=config)
+        assert {source['task_id'] for source in second['sources'] if source['kind'] == 'native-jsonl'} == {'second'}
+        reviewer.mark_material_reviewed(home, second['coverage']['followup_id'])
+        assert reviewer.select_packet(home, cutoff=cutoff + 2, config_snapshot=config)['episodes'] == []
+
 
 def test_reviewed_oversized_candidate_does_not_repeat_its_admitted_prefix():
     with lab() as (home, _):
@@ -273,3 +290,64 @@ def test_new_linked_decision_resurfaces_reviewed_candidate_once():
         assert any(source['kind'] == 'central-decision' for source in changed['sources'])
         reviewer.mark_material_reviewed(home, changed['coverage']['followup_id'])
         assert reviewer.select_packet(home, cutoff=cutoff + 2, config_snapshot=config)['episodes'] == []
+
+def tree_bytes(root):
+    return [(str(path.relative_to(root)), path.read_bytes()) for path in sorted(root.rglob('*')) if path.is_file()]
+
+
+def produced_run(home):
+    started = time.time()
+    ended_worker(home, 'failed', str(uuid.uuid4()), [message('failure')])
+    ended_worker(home, 'success', str(uuid.uuid4()), [message('counterexample')], 0)
+    ended_worker(home, 'additional', str(uuid.uuid4()), [message('additional failure')])
+    intent = reviewer.enqueue_intent(home, kind='default')
+    config = reviewer.read_config(home)
+    run = reviewer.reserve_run(home, intent, config_snapshot=config,
+                               instruction_snapshot=reviewer.INSTRUCTION_FILE.read_bytes(), started_at=started,
+                               deadline_epoch_ms=int((started + config['limits']['max_runtime_seconds']) * 1000))
+    selected = reviewer.select_packet(home, cutoff=time.time(), config_snapshot=config)
+    return reviewer.begin_run(home, run, selected, model='openai/reviewer-fixture'), selected
+
+
+def build_report(selected):
+    failed = next(source['source_id'] for source in selected['sources'] if source['kind'] == 'native-jsonl' and source['task_id'] == 'failed')
+    success = next(source['source_id'] for source in selected['sources'] if source['kind'] == 'native-jsonl' and source['task_id'] == 'success')
+    return {'schema': 1, 'summary': 'native fixture', 'findings': [{'kind': 'new-skill', 'target': 'bounded-review',
+            'finding': 'failure', 'applicability': 'all', 'citations': [failed], 'counterexamples': [success],
+            'uncertainty': 'low', 'resolution': 'draft', 'validation': 'curated resolve',
+            'validation_limits': ['Requires human verification; not proof of causality'],
+            'new_skill': {'id': 'agd-review-draft', 'draft': '---\nname: agd-review-draft\ndescription: Review bounded evidence\n---\n# Draft\n',
+                          'triggers': ['review'], 'scope': 'review', 'prerequisites': []}}]}
+
+
+def test_report_revisions_triage_and_finalization_preserve_inert_state():
+    with lab() as (home, _):
+        before_catalog, before_profiles = worker_skills.catalog(home), worker_skills.resolve(home)
+        run, selected = produced_run(home)
+        before_tasks = tree_bytes(home / 'data' / 'tasks')
+        before_sources = tree_bytes(home / 'data' / 'observability')
+        report = build_report(selected)
+        first = reviewer.submit_report(home, run['review_run_id'], str(uuid.uuid4()), report)
+        proposal = first['proposal_ids'][0]
+        reviewer.dispose(home, proposal, 'rejected', 'insufficient', None, {'uid': os.getuid(), 'identity': str(os.getuid())})
+        rejected = reviewer.read_triage(home, proposal)
+        report['findings'][0]['citations'].append(next(source['source_id'] for source in selected['sources'] if source['kind'] == 'native-jsonl' and source['task_id'] == 'additional'))
+        second = reviewer.submit_report(home, run['review_run_id'], str(uuid.uuid4()), report)
+        row = reviewer.read_proposal(home, proposal)
+        assert second['proposal_ids'] == [proposal]
+        assert reviewer.read_triage(home, proposal) == rejected
+        assert row['head_revision'] != row['revisions'][0]['revision_hash']
+        with pytest.raises(store.Refusal):
+            reviewer.submit_report(home, run['review_run_id'], str(uuid.uuid4()), {**build_report(selected), 'findings': [{**build_report(selected)['findings'][0], 'citations': ['unknown-source']}]})
+        finalized = reviewer.finalize_run(home, run['review_run_id'], 'exited')
+        event = supervision.pending(home)[0]
+        report_bytes = reviewer.report_path(home, first['report_id']).read_bytes()
+        triage_bytes = reviewer.triage_path(home, proposal).read_bytes()
+        supervision.acknowledge(home, [event['id']])
+        assert reviewer.report_path(home, first['report_id']).read_bytes() == report_bytes
+        assert reviewer.triage_path(home, proposal).read_bytes() == triage_bytes
+        assert reviewer.finalize_run(home, run['review_run_id'], 'exited') == finalized
+        reviewer.dispose(home, proposal, 'accepted', None, None, {'uid': os.getuid(), 'identity': str(os.getuid())})
+        assert (worker_skills.catalog(home), worker_skills.resolve(home)) == (before_catalog, before_profiles)
+        assert tree_bytes(home / 'data' / 'tasks') == before_tasks
+        assert tree_bytes(home / 'data' / 'observability') == before_sources

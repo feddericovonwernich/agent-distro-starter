@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added immutable reviewer reports and proposal revisions, audited human-only triage, idempotent final batch events, and final-packet-only candidate consumption. New-skill drafts remain stored inertly outside discovery roots.
 - Added private, immutable reviewer evidence packets selected from closed worker incarnations, with bounded native JSONL excerpts, frozen config/instructions, provenance and explicit unknown-coverage records. Reviewer model hosting, reports, timers, and CLI commands remain unavailable.
 - Added a private project registry, explicit trust/deletion approval, pinned Treehouse task leases, readiness, exact-head landing, publication evidence and guarded cleanup.
 - Added private worker skill catalogs, exact profile/curated selection, frozen task snapshots, OMP native materialization, collision/exclusion guards, and lifecycle integrity checks. Cursor nonempty provisioning remains fail-closed pending authenticated live verification.

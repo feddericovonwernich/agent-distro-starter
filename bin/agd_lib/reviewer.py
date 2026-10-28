@@ -24,9 +24,9 @@ DEFAULT_CONFIG = {'schema': 1, 'schedule': {'mode': 'calendar', 'timezone': 'UTC
 def paths(home):
     root = store.home(home); data, state = root / 'data' / 'reviewer', root / 'state' / 'reviewer'
     return {'config': data / 'config.json', 'packets': data / 'packets', 'reports': data / 'reports', 'proposals': data / 'proposals',
-            'manifests': data / 'manifests', 'triage': data / 'triage', 'intents': state / 'intents', 'receipts': state / 'receipts',
-            'pending': state / 'pending', 'checkpoints': state / 'checkpoints', 'followups': state / 'followups', 'candidates': state / 'candidates',
-            'checkpoint': state / 'checkpoint.json', 'lock': state / 'run.lock'}
+            'revisions': data / 'revisions', 'manifests': data / 'manifests', 'triage': data / 'triage', 'intents': state / 'intents',
+            'receipts': state / 'receipts', 'pending': state / 'pending', 'checkpoints': state / 'checkpoints', 'followups': state / 'followups',
+            'candidates': state / 'candidates', 'checkpoint': state / 'checkpoint.json', 'lock': state / 'run.lock'}
 
 
 def _private(path):
@@ -193,10 +193,15 @@ def _fixed_session(root, task_id, incarnation, binding):
 
 def _catalog(home, coverage):
     try:
-        entries = worker_skills.catalog(home)
-        return [{'id': item['id'], 'description': item['description'], 'catalog_sha256': hashlib.sha256((store.home(home) / 'config' / 'worker-skills' / item['id'] / 'SKILL.md').read_bytes()).hexdigest()} for item in entries]
-    except (OSError, store.Refusal): _coverage(coverage, 'unavailable', {'category': 'skill-catalog', 'reason': 'catalog-unavailable'}); return []
-
+        result = []
+        for item in worker_skills.catalog(home):
+            text = (store.home(home) / 'config' / 'worker-skills' / item['id'] / 'SKILL.md').read_text()
+            result.append({'id': item['id'], 'description': item['description'],
+                           'catalog_sha256': hashlib.sha256(text.encode()).hexdigest(), 'snapshot_excerpt': text[:512]})
+        return result
+    except (OSError, store.Refusal):
+        _coverage(coverage, 'unavailable', {'category': 'skill-catalog', 'reason': 'catalog-unavailable'})
+        return []
 
 def _manifest(home, task_dir, task, coverage):
     path = task_dir / 'worker-skills.json'
@@ -330,10 +335,14 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
         if {item['review_run_id'] for item in retrospective} != requested: raise store.Refusal('unknown retrospective run')
     packet = {'schema': 1, 'purpose': 'background-skill-review', 'cutoff': cutoff, 'episodes': episodes, 'sources': sources, 'excerpts': excerpts, 'catalog': _catalog(root, coverage), 'skill_provenance': provenance, 'coverage': coverage, 'retrospective_review_run_ids': list(retrospective_review_run_ids), 'retrospective_episodes': retrospective, 'config_snapshot_sha256': _digest(config)}
     _cap(packet, config['limits']['max_input_bytes'])
+    # Only the final immutable packet admits candidate material.  A retained
+    # source with no retained excerpt was not reviewed and must resurface.
     candidates = [{'candidate_id': _candidate_id(episode['task_id'], episode['incarnation']),
                    'material_basis': candidate_versions[(episode['task_id'], episode['incarnation'])]}
                   for episode in packet['episodes']
-                  if any(source.get('kind') == 'native-jsonl' and source.get('task_id') == episode['task_id'] and source.get('incarnation') == episode['incarnation']
+                  if any(source.get('kind') == 'native-jsonl' and source.get('task_id') == episode['task_id']
+                         and source.get('incarnation') == episode['incarnation']
+                         and any(excerpt['source_id'] == source['source_id'] for excerpt in packet['excerpts'])
                          for source in packet['sources'])]
     material_basis = _digest({'sources': [(source['source_id'], source.get('content_sha256'), source.get('answer_sha256')) for source in packet['sources']],
                               'excerpts': [excerpt['excerpt_id'] for excerpt in packet['excerpts']]})
@@ -420,3 +429,174 @@ def begin_run(home, run, packet, *, model):
         if stored != run or stored.get('dispatch_state') != 'reserved': raise store.Refusal('reviewer receipt is not reservable')
         stored.update(packet_id=packet_id, model=model, dispatch_state='begun'); store.atomic_json(receipt, stored)
     return stored
+
+
+def normalize(value):
+    if not isinstance(value, str): raise store.Refusal('text')
+    return ' '.join(value.split()).casefold()
+
+
+def proposal_path(home, proposal_id):
+    try: proposal_id = str(uuid.UUID(str(proposal_id)))
+    except (ValueError, TypeError, AttributeError) as error: raise store.Refusal('proposal ID') from error
+    return paths(home)['proposals'] / f'{proposal_id}.json'
+
+
+def triage_path(home, proposal_id):
+    try: proposal_id = str(uuid.UUID(str(proposal_id)))
+    except (ValueError, TypeError, AttributeError) as error: raise store.Refusal('proposal ID') from error
+    return paths(home)['triage'] / f'{proposal_id}.json'
+
+
+def report_path(home, report_id):
+    _hex_id(report_id)
+    return paths(home)['reports'] / f'{report_id}.json'
+
+
+def read_proposal(home, proposal_id):
+    try: return _read_json(proposal_path(home, proposal_id))
+    except (OSError, ValueError, json.JSONDecodeError) as error: raise store.Refusal('unknown proposal') from error
+
+
+def read_triage(home, proposal_id):
+    proposal = read_proposal(home, proposal_id); path = triage_path(home, proposal['proposal_id'])
+    if not path.exists(): return {'schema': 1, 'proposal_id': proposal['proposal_id'], 'current': 'pending', 'history': []}
+    try: return _read_json(path)
+    except (OSError, ValueError, json.JSONDecodeError) as error: raise store.Refusal('invalid triage') from error
+
+
+def list_proposals(home):
+    folder = paths(home)['proposals']
+    return [read_proposal(home, path.stem) for path in sorted(folder.glob('*.json'))] if folder.exists() else []
+
+
+def _finding_fingerprint(finding):
+    target = normalize(finding['target'])
+    if not target: raise store.Refusal('target')
+    return _digest([1, finding['kind'], target, normalize(finding['finding']), normalize(finding['applicability'])])
+
+
+def _revision_hash(proposal_id, finding):
+    return _digest([proposal_id, sorted(finding['citations']), sorted(finding['counterexamples']), finding['resolution'],
+                    finding['validation'], finding['validation_limits'], finding.get('new_skill'), finding['uncertainty'],
+                    finding.get('target_source_version')])
+
+
+def _receipt(home, review_run_id):
+    try: review_run_id = str(uuid.UUID(str(review_run_id)))
+    except (ValueError, TypeError, AttributeError) as error: raise store.Refusal('review run ID') from error
+    try: return _read_json(paths(home)['receipts'] / f'{review_run_id}.json')
+    except (OSError, ValueError, json.JSONDecodeError) as error: raise store.Refusal('unknown reviewer run') from error
+
+
+def _validate_report(home, receipt, packet, report):
+    if not isinstance(report, dict) or set(report) != {'schema', 'summary', 'findings'} or report['schema'] != 1 or not isinstance(report['summary'], str) or not isinstance(report['findings'], list):
+        raise store.Refusal('report schema')
+    config = _read_json(paths(home)['manifests'] / f"{receipt['config_snapshot_ref']}.json")
+    if len(_json_bytes(report)) > config['limits']['max_output_bytes']: raise store.Refusal('report exceeds output limit')
+    source_ids = {source['source_id'] for source in packet['sources']}
+    inventory = {row['id']: row['catalog_sha256'] for row in packet.get('catalog', [])}
+    required = {'kind', 'target', 'finding', 'applicability', 'citations', 'counterexamples', 'uncertainty', 'resolution', 'validation', 'validation_limits'}
+    for finding in report['findings']:
+        if not isinstance(finding, dict) or not required <= set(finding) or finding['kind'] not in ('new-skill', 'existing-skill'):
+            raise store.Refusal('finding schema')
+        if not all(isinstance(finding[key], str) and finding[key].strip() for key in ('target', 'finding', 'applicability', 'uncertainty', 'resolution', 'validation')):
+            raise store.Refusal('finding text')
+        if not isinstance(finding['citations'], list) or not finding['citations'] or not set(finding['citations']) <= source_ids:
+            raise store.Refusal('citation')
+        if not isinstance(finding['counterexamples'], list) or not set(finding['counterexamples']) <= source_ids or not isinstance(finding['validation_limits'], list) or not all(isinstance(row, str) for row in finding['validation_limits']):
+            raise store.Refusal('finding evidence')
+        if finding['kind'] == 'existing-skill':
+            if set(finding) != required | {'target_source_version'} or inventory.get(finding['target']) != finding['target_source_version']:
+                raise store.Refusal('frozen skill target')
+        else:
+            draft = finding.get('new_skill')
+            if set(finding) != required | {'new_skill'} or not isinstance(draft, dict) or set(draft) != {'id', 'draft', 'triggers', 'scope', 'prerequisites'} or not isinstance(draft['draft'], str) or not re.match(r'\A---\nname: [^\n]+\ndescription: [^\n]+\n---\n', draft['draft']):
+                raise store.Refusal('new skill draft')
+    return report
+
+
+def submit_report(home, review_run_id, request_id, report):
+    try: request_id = str(uuid.UUID(str(request_id)))
+    except (ValueError, TypeError, AttributeError) as error: raise store.Refusal('request ID') from error
+    receipt = _receipt(home, review_run_id)
+    if receipt.get('dispatch_state') not in ('begun', 'report-committed'): raise store.Refusal('reviewer receipt cannot accept a report')
+    packet = read_packet(home, receipt.get('packet_id'))
+    report = _validate_report(home, receipt, packet, report)
+    report_id = _digest({'review_run_id': receipt['review_run_id'], 'request_id': request_id, 'report': report})
+    result = {'report_id': report_id, 'proposal_ids': []}
+    with store.lock(store.home(home)):
+        receipt = _receipt(home, review_run_id)
+        requests = receipt.setdefault('report_requests', {})
+        if request_id in requests:
+            if requests[request_id] != _digest(report): raise store.Refusal('conflicting request reuse')
+            return receipt['report_results'][request_id]
+        proposals = list_proposals(home)
+        for finding in report['findings']:
+            fingerprint = _finding_fingerprint(finding)
+            matches = [row for row in proposals if row['fingerprint'] == fingerprint]
+            proposal = matches[0] if len(matches) == 1 else None
+            if proposal is None:
+                proposal_id = str(uuid.uuid4())
+                proposal = {'schema': 1, 'proposal_id': proposal_id, 'fingerprint': fingerprint, 'head_revision': None,
+                            'revisions': [], 'uncertain_distinct': bool(matches)}
+            else: proposal_id = proposal['proposal_id']
+            revision = _revision_hash(proposal_id, finding)
+            if revision not in {row['revision_hash'] for row in proposal['revisions']}:
+                revision_row = {'revision_hash': revision, 'basis_source_ids': sorted(finding['citations']),
+                                'proposed_change': finding, 'resurfaced': bool(proposal['revisions'])}
+                publish_immutable(paths(home)['revisions'] / f'{revision}.json', revision_row)
+                proposal['revisions'].append(revision_row)
+                proposal['head_revision'] = revision
+                store.atomic_json(proposal_path(home, proposal_id), proposal)
+            result['proposal_ids'].append(proposal_id)
+        record = {'schema': 1, 'review_run_id': receipt['review_run_id'], 'request_id': request_id, 'report': report,
+                  'packet_id': receipt['packet_id'], 'proposal_ids': result['proposal_ids']}
+        publish_immutable(report_path(home, report_id), record)
+        receipt['report_requests'][request_id] = _digest(report)
+        receipt.setdefault('report_results', {})[request_id] = result
+        receipt.setdefault('report_ids', []).append(report_id)
+        receipt.setdefault('proposal_ids', []).extend(result['proposal_ids'])
+        receipt['proposal_ids'] = sorted(set(receipt['proposal_ids']))
+        receipt['dispatch_state'] = 'report-committed'
+        store.atomic_json(paths(home)['receipts'] / f"{receipt['review_run_id']}.json", receipt)
+    return result
+
+
+def dispose(home, proposal_id, status, reason, replacement_proposal_id, operator):
+    if status not in {'accepted', 'rejected', 'deferred', 'superseded'} or (reason is not None and not isinstance(reason, str)) or not isinstance(operator, dict) or type(operator.get('uid')) is not int or not isinstance(operator.get('identity'), str):
+        raise store.Refusal('disposition')
+    with store.lock(store.home(home)):
+        proposal = read_proposal(home, proposal_id); replacement = None
+        if replacement_proposal_id is not None:
+            candidate, separator, revision = str(replacement_proposal_id).partition('@'); row = read_proposal(home, candidate)
+            if separator and revision not in {item['revision_hash'] for item in row['revisions']}: raise store.Refusal('unknown revision')
+            replacement = str(replacement_proposal_id)
+        if (status == 'superseded') != bool(replacement): raise store.Refusal('replacement')
+        prior = read_triage(home, proposal['proposal_id'])
+        item = {'status': status, 'reason': reason, 'replacement': replacement, 'operator': operator, 'at': time.time(), 'basis_revision': proposal['head_revision']}
+        store.atomic_json(triage_path(home, proposal['proposal_id']), {'schema': 1, 'proposal_id': proposal['proposal_id'], 'current': status, 'history': [*prior['history'], item]})
+    return read_triage(home, proposal_id)
+
+
+def finalize_run(home, review_run_id, outcome):
+    if not isinstance(outcome, str) or not outcome: raise store.Refusal('outcome')
+    receipt = _receipt(home, review_run_id)
+    if receipt.get('dispatch_state') == 'final': return receipt
+    if receipt.get('dispatch_state') != 'report-committed': raise store.Refusal('report is not committed')
+    proposal_ids = sorted(set(receipt.get('proposal_ids', [])))
+    event_id = None
+    if proposal_ids:
+        from . import supervision
+        event_id = supervision.emit(store.home(home), 'reviewer', receipt['review_run_id'], 'background-skill-review',
+                                    _digest([receipt['review_run_id'], receipt.get('report_ids', []), proposal_ids]),
+                                    {'purpose': 'background-skill-review', 'review_run_id': receipt['review_run_id'], 'report_ids': receipt.get('report_ids', []), 'proposal_ids': proposal_ids})
+    with store.lock(store.home(home)):
+        receipt = _receipt(home, review_run_id)
+        if receipt.get('dispatch_state') == 'final': return receipt
+        receipt.update(dispatch_state='final', outcome=outcome, closed_at=time.time(), event_id=event_id)
+        store.atomic_json(paths(home)['receipts'] / f"{receipt['review_run_id']}.json", receipt)
+    if receipt.get('coverage', {}).get('followup_id'): mark_material_reviewed(home, receipt['coverage']['followup_id'])
+    elif (packet_id := receipt.get('packet_id')):
+        mark_material_reviewed(home, read_packet(home, packet_id)['coverage']['followup_id'])
+    return receipt
