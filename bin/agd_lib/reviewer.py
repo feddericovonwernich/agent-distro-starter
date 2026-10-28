@@ -567,7 +567,9 @@ def submit_report(home, review_run_id, request_id, report):
         for finding in report['findings']:
             fingerprint = _finding_fingerprint(finding)
             matches = [row for row in proposals if row['fingerprint'] == fingerprint]
-            proposal = matches[0] if len(matches) == 1 else None
+            proposal = matches[0] if len(matches) == 1 and any(
+                set(item['basis_source_ids']) & set(finding['citations']) or item['proposed_change'] == finding
+                for item in matches[0]['revisions']) else None
             if proposal is None:
                 proposal_id = str(uuid.uuid4())
                 proposal = {'schema': 1, 'proposal_id': proposal_id, 'fingerprint': fingerprint, 'head_revision': None,
