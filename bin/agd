@@ -8,14 +8,15 @@ import sys
 import uuid
 import pwd
 from pathlib import Path
-from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr, relay, observability, reviewer, reviewer_runner, reviewer_timer
+from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr, relay, observability, reviewer, reviewer_runner, reviewer_timer, launcher
 
 
 def parser():
     p = argparse.ArgumentParser(prog='agd')
     p.add_argument('--home')
     sub = p.add_subparsers(dest='command', required=True)
-    sub.add_parser('init')
+    init = sub.add_parser('init')
+    init.add_argument('--backend', choices=('tmux', 'herdr'), default='tmux')
     doctor = sub.add_parser('doctor')
     doctor.add_argument('--harness', choices=('omp', 'cursor'), default='omp')
     doctor.add_argument('--backend', choices=('tmux', 'herdr'), default='tmux')
@@ -183,12 +184,13 @@ def main(args):
             else:
                 still_fresh = fresh and lock_only and all(
                     path.name == 'state' for path in home.iterdir())
+            if not still_fresh:
+                raise store.Refusal('fresh non-symlink launcher home required')
             for name in ('config', 'projects', 'data/projects', 'data/tasks', 'state'):
                 (home/name).mkdir(parents=True, exist_ok=True, mode=0o700)
-            if not (home/'data'/'home.json').exists():
-                store.atomic_json(home/'data'/'home.json', {'schema': 1, 'home_id': str(uuid.uuid4())})
-            if still_fresh:
-                worker_skills.seed_defaults(home)
+            store.atomic_json(home/'data'/'home.json', {'schema': 1, 'home_id': str(uuid.uuid4())})
+            launcher.initialize(home, args.backend)
+            worker_skills.seed_defaults(home)
         return {'home': str(home)}
     if args.command == 'doctor':
         names = ['git', 'treehouse', 'omp' if args.harness == 'omp' else 'cursor-agent',
