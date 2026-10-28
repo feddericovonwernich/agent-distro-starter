@@ -62,6 +62,12 @@ def launch(home, intent, *, omp_binary='omp', observed_omp_version):
         return reviewer.begin_run(home, run, packet, model=model, observed_omp_version=observed_omp_version)
 
 
+def launch_timer(home, *, observed_omp_version, now=None, omp_binary='omp'):
+    """Future `reviewer run --timer` entry point: skip before collection if not due."""
+    intent = reviewer.timer_intent(home, now=now)
+    return None if intent is None else launch(home, intent, omp_binary=omp_binary, observed_omp_version=observed_omp_version)
+
+
 def _request_id(value):
     try:
         return str(uuid.UUID(str(value)))

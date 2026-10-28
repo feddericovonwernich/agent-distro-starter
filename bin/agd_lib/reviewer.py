@@ -438,6 +438,12 @@ def enqueue_intent(home, *, kind, retrospective_review_run_ids=()):
         return intent
 
 
+def timer_intent(home, *, now=None):
+    """Create a timer intent only when its persisted schedule is eligible."""
+    from . import reviewer_timer
+    return reviewer_timer.timer_tick(home, now=now)
+
+
 @contextlib.contextmanager
 def run_lease(home):
     lock = paths(home)['lock']; _private(lock.parent)

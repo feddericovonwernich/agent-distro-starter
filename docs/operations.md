@@ -73,6 +73,10 @@ OMP worker launch and relaunch reserve a fresh, owner-only task/incarnation sess
 
 Full captured prompts, system instructions, tool arguments/results, and any supported attachments may be sensitive. They remain in private native sessions and may reach the local Langfuse project while enabled; do not copy credentials or payloads into shell history, tickets, or logs. Collector routes traces to Langfuse and local trace archives only. OTLP logs and metrics are archived locally and are not Langfuse ingestion.
 
+## Reviewer scheduling
+
+Reviewer configuration is inert by default: `calendar` defaults to `02:00` in `UTC`; `interval` uses a positive whole number of UTC hours; and `manual-only` has no timer. An explicit future `reviewer timer enable` operation is the sole activation boundary. It renders one private, home-and-UID-marked systemd user timer/service pair; it does not use cron, linger, a daemon, or a global unit. Interval timers wake hourly but only run on their fixed hour-aligned N-hour deadline, preserving a single offline catch-up without completion-time drift. Calendar enablement refuses a timezone/expression when native systemd and IANA `ZoneInfo` disagree on skipped gaps or repeated folds. Changing a schedule needs an explicit re-enable; initialization, configuration edits, updates, and central startup never enable or start it.
+
 ## Landing, publication, and retention
 
 For local landing obtain a concrete user instruction, `task approve NAME --action local-merge --target PROJECT:BASE --instruction FILE`, then `task land NAME --approval ID`. The exact ready head must fast-forward a clean stable clone. After a stopped worker, `task cleanup NAME` conditionally returns the lease. Dirty, unlanded or identity-uncertain work stays intact.

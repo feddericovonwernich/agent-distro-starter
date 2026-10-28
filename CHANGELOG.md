@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added the inert reviewer scheduling kernel and owned per-user systemd unit rendering. Calendar schedules use systemd's native IANA/DST semantics, interval schedules use a fixed UTC-hour anchor, and no configuration or initialization action activates a timer.
 - Added immutable reviewer reports and proposal revisions, audited human-only triage, idempotent final batch events, and final-packet-only candidate consumption. New-skill drafts remain stored inertly outside discovery roots.
 - Hardened reviewer native JSONL collection to preserve bounded physical offsets and hashes across malformed, non-object, late, and skipped rows; finalized retrospective packets include committed reports.
 - Made reviewer report submission crash-recoverable through retained request-keyed prepared records with exact output reservations; identical finalized-request retries return their committed receipt.
