@@ -29,7 +29,12 @@ def paths(home):
 
 
 def _private(path):
-    path = Path(path); path.mkdir(parents=True, exist_ok=True, mode=0o700); path.chmod(0o700)
+    path = Path(path)
+    for ancestor in (path, *path.parents):
+        if ancestor.exists() or ancestor.is_symlink():
+            identity = os.lstat(ancestor)
+            if stat.S_ISLNK(identity.st_mode) or not stat.S_ISDIR(identity.st_mode): raise store.Refusal('reviewer path is unsafe')
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
     current = path
     while True:
         identity = os.lstat(current)
@@ -126,7 +131,10 @@ def _observation_candidates(home, cutoff, coverage):
 
 def _epoch(value):
     if isinstance(value, (int, float)): return float(value)
-    if isinstance(value, str): return datetime.fromisoformat(value.replace('Z', '+00:00')).replace(tzinfo=timezone.utc if '+' not in value and 'Z' not in value else None).timestamp()
+    if isinstance(value, str):
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if parsed.tzinfo is None: raise ValueError('naive timestamp')
+        return parsed.astimezone(timezone.utc).timestamp()
     raise ValueError('timestamp')
 
 
@@ -141,24 +149,29 @@ def _render_content(content):
 
 
 def _messages(session_path, cutoff):
-    raw = session_path.read_bytes(); lines = raw.splitlines(keepends=True)
-    if not lines: raise store.Refusal('empty native JSONL')
-    header = json.loads(lines[0]);
-    if header.get('type') != 'session' or header.get('version') != 3 or not isinstance(header.get('id'), str): raise store.Refusal('native JSONL header is invalid')
-    offset, rows, late, withheld = len(lines[0]), [], False, []
-    for number, line in enumerate(lines[1:], 2):
-        start, offset = offset, offset + len(line)
-        try: row = json.loads(line)
-        except json.JSONDecodeError: withheld.append({'reason': 'native-row-malformed', 'line_start': number}); continue
-        try: at = _epoch(row.get('timestamp'))
-        except (TypeError, ValueError): withheld.append({'reason': 'native-row-missing-timestamp', 'line_start': number}); continue
-        if at > cutoff: late = True; continue
-        message = row.get('message') if isinstance(row, dict) else None
-        if not isinstance(message, dict) or not isinstance(row.get('id'), str): continue
-        text, unsupported = _render_content(message.get('content'))
-        if unsupported: withheld.append({'reason': 'unsupported-content-block', 'line_start': number, 'message_id': row['id']})
-        if text: rows.append({'message_id': row['id'], 'text': text, 'line_start': number, 'line_end': number, 'byte_start': start, 'byte_end': offset})
-    return header['id'], offset, hashlib.sha256(raw[:offset]).hexdigest(), rows, late, withheld
+    if session_path.is_symlink() or not session_path.is_file(): raise store.Refusal('unsafe native JSONL')
+    with session_path.open('rb') as stream:
+        header_line = stream.readline()
+        if not header_line: raise store.Refusal('empty native JSONL')
+        header = json.loads(header_line); hasher = hashlib.sha256(header_line); watermark = len(header_line)
+        if header.get('type') != 'session' or header.get('version') != 3 or not isinstance(header.get('id'), str): raise store.Refusal('native JSONL header is invalid')
+        rows, late, withheld, number = [], False, [], 1
+        while line := stream.readline():
+            number += 1; start = watermark
+            try: row = json.loads(line)
+            except json.JSONDecodeError: withheld.append({'reason': 'native-row-malformed', 'line_start': number}); continue
+            try: at = _epoch(row.get('timestamp'))
+            except (TypeError, ValueError): withheld.append({'reason': 'native-row-missing-timestamp', 'line_start': number}); continue
+            if at > cutoff:
+                late = True
+                break
+            watermark += len(line); hasher.update(line)
+            message = row.get('message') if isinstance(row, dict) else None
+            if not isinstance(message, dict) or not isinstance(row.get('id'), str): continue
+            text, unsupported = _render_content(message.get('content'))
+            if unsupported: withheld.append({'reason': 'unsupported-content-block', 'line_start': number, 'message_id': row['id']})
+            if text: rows.append({'message_id': row['id'], 'text': text, 'line_start': number, 'line_end': number, 'byte_start': start, 'byte_end': watermark})
+    return header['id'], watermark, hasher.hexdigest(), rows, late, withheld
 
 
 def _fixed_session(root, task_id, incarnation, binding):
@@ -176,19 +189,20 @@ def _catalog(home, coverage):
     except (OSError, store.Refusal): _coverage(coverage, 'unavailable', {'category': 'skill-catalog', 'reason': 'catalog-unavailable'}); return []
 
 
-def _manifest(task_dir, task, coverage):
+def _manifest(home, task_dir, task, coverage):
     path = task_dir / 'worker-skills.json'
     if not path.exists(): return []
     try:
-        manifest = _read_json(path); records = manifest.get('skills') if isinstance(manifest, dict) else None
-        if not isinstance(records, list): raise ValueError('manifest')
+        manifest = worker_skills._manifest(home, task)
         result = []
-        for item in records:
-            if not isinstance(item, dict) or not isinstance(item.get('id'), str) or not isinstance(item.get('snapshot'), str): raise ValueError('record')
-            snap = Path(item['snapshot']); digest = hashlib.sha256((snap / 'SKILL.md').read_bytes()).hexdigest()
-            result.append({'id': item['id'], 'snapshot_sha256': digest, 'manifest_sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+        for item in manifest['skills']:
+            snap = Path(item['snapshot'])
+            result.append({'id': item['id'], 'snapshot_sha256': hashlib.sha256((snap / 'SKILL.md').read_bytes()).hexdigest(),
+                           'manifest_sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
         return result
-    except (OSError, ValueError, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'task_id': task.get('id'), 'reason': 'assigned-manifest-unavailable'}); return []
+    except (OSError, ValueError, json.JSONDecodeError, store.Refusal):
+        _coverage(coverage, 'unavailable', {'task_id': task.get('id'), 'reason': 'assigned-manifest-unavailable'})
+        return []
 
 
 def _central(task_dir, task, cutoff, coverage):
@@ -197,12 +211,12 @@ def _central(task_dir, task, cutoff, coverage):
     for path in sorted(folder.glob('*.json')):
         if path.name.endswith('.answer.json'): continue
         try:
-            decision = _read_json(path); at = decision.get('resolved_at', decision.get('observed_at', 0))
+            decision = _read_json(path); at = decision.get('resolved_at')
             if decision.get('incarnation') != task.get('incarnation') or decision.get('status') != 'resolved' or not isinstance(at, (int, float)) or at > cutoff or not isinstance(decision.get('answer'), str): continue
             answer = task_dir / decision['answer']
-            body = _read_json(answer).get('body')
-            if not isinstance(body, str): raise ValueError('answer')
-            source = {'kind': 'central-decision', 'linked_task_id': task['id'], 'incarnation': task['incarnation'], 'decision_key': decision.get('key'), 'decision_sha256': hashlib.sha256(path.read_bytes()).hexdigest(), 'answer_sha256': hashlib.sha256(answer.read_bytes()).hexdigest(), 'byte_watermark': answer.stat().st_size}
+            answer_value = _read_json(answer); body = answer_value.get('body')
+            if answer_value.get('task_id') != task['id'] or answer_value.get('incarnation') != task['incarnation'] or answer_value.get('resolved_at') != at or not isinstance(body, str): raise ValueError('answer')
+            source = {'kind': 'central-decision', 'linked_task_id': task['id'], 'incarnation': task['incarnation'], 'decision_key': decision.get('key'), 'resolved_at': at, 'decision_sha256': hashlib.sha256(path.read_bytes()).hexdigest(), 'answer_sha256': hashlib.sha256(answer.read_bytes()).hexdigest(), 'byte_watermark': answer.stat().st_size}
             source['source_id'] = _digest(source); sources.append(source)
             excerpt = {'source_id': source['source_id'], 'message_id': decision.get('message_id', decision.get('key')), 'text': body, 'line_start': 1, 'line_end': 1, 'byte_start': 0, 'byte_end': len(body.encode())}; excerpt['excerpt_id'] = _digest(excerpt); excerpts.append(excerpt)
         except (OSError, ValueError, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'task_id': task.get('id'), 'reason': 'linked-central-decision-unavailable'})
@@ -230,7 +244,7 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
             binding = _read_json(root / 'data' / 'observability' / 'tasks' / key[0] / 'omp' / key[1] / 'binding.json'); session_dir = _fixed_session(root, key[0], key[1], binding); jsonls = sorted(session_dir.glob('*.jsonl'))
             if not jsonls: raise ValueError('no JSONL')
         except (OSError, ValueError, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'task_id': key[0], 'incarnation': key[1], 'reason': 'native-jsonl-unavailable'}); continue
-        seen.add(key); episodes.append({'task_id': key[0], 'incarnation': key[1], 'closed_at': observed_at, 'exit_observation_id': event.get('id')}); provenance.append({'task_id': key[0], 'assigned': _manifest(task_dir, task, coverage), 'usage': 'unknown'})
+        seen.add(key); episodes.append({'task_id': key[0], 'incarnation': key[1], 'closed_at': observed_at, 'exit_observation_id': event.get('id')}); provenance.append({'task_id': key[0], 'assigned': _manifest(root, task_dir, task, coverage), 'usage': 'unknown'})
         for jsonl in jsonls:
             try:
                 sid, watermark, digest, rows, late, withheld = _messages(jsonl, cutoff)
@@ -251,10 +265,25 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
             if isinstance(rid, str) and isinstance(closed, (int, float)) and closed > cutoff: coverage['retrospective_excluded'].append(rid)
             if rid not in requested: continue
             if receipt.get('dispatch_state') != 'closed' or not isinstance(closed, (int, float)) or closed > cutoff: raise store.Refusal('retrospective run is not closed before cutoff')
-            packet_id = receipt.get('packet_id'); _hex_id(packet_id)
-            try: prior = read_packet(root, packet_id)
-            except (OSError, json.JSONDecodeError, store.Refusal) as error: raise store.Refusal('retrospective packet is unavailable') from error
-            retrospective.append({'review_run_id': rid, 'closed_at': closed, 'packet_id': packet_id, 'source_count': len(prior.get('sources', []))})
+            binding_path = root / 'data' / 'observability' / 'reviewer' / rid / 'binding.json'
+            try:
+                binding = _read_json(binding_path)
+                session_dir = root / 'data' / 'observability' / 'reviewer' / rid / 'omp'
+                if binding.get('review_run_id') != rid or binding.get('session_dir') != str(session_dir) or session_dir.is_symlink() or not session_dir.is_dir(): raise ValueError('binding')
+                jsonls = sorted(session_dir.glob('*.jsonl'))
+                if not jsonls: raise ValueError('session')
+            except (OSError, ValueError, json.JSONDecodeError) as error: raise store.Refusal('retrospective native evidence is unavailable') from error
+            retrospective.append({'review_run_id': rid, 'closed_at': closed, 'source_count': len(jsonls)})
+            for jsonl in jsonls:
+                try:
+                    sid, watermark, digest, rows, late, withheld = _messages(jsonl, cutoff)
+                    source = {'kind': 'reviewer-native-jsonl', 'review_run_id': rid, 'session_id': sid, 'path': str(jsonl.relative_to(root)), 'byte_watermark': watermark, 'content_sha256': digest}
+                    source['source_id'] = _digest(source); sources.append(source)
+                    for row in rows:
+                        excerpt = {'source_id': source['source_id'], **row}; excerpt['excerpt_id'] = _digest(excerpt); excerpts.append(excerpt)
+                    if late: _coverage(coverage, 'late_basis', {'review_run_id': rid, 'reason': 'post-cutoff-native-row'})
+                    for row in withheld: _coverage(coverage, 'withheld', row)
+                except (OSError, store.Refusal, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'review_run_id': rid, 'reason': 'retrospective-native-jsonl-malformed'})
         if {item['review_run_id'] for item in retrospective} != requested: raise store.Refusal('unknown retrospective run')
     packet = {'schema': 1, 'purpose': 'background-skill-review', 'cutoff': cutoff, 'episodes': episodes, 'sources': sources, 'excerpts': excerpts, 'catalog': _catalog(root, coverage), 'skill_provenance': provenance, 'coverage': coverage, 'retrospective_review_run_ids': list(retrospective_review_run_ids), 'retrospective_episodes': retrospective, 'config_snapshot_sha256': _digest(config)}
     _cap(packet, config['limits']['max_input_bytes']); packet_id = _digest(packet); publish_immutable(paths(root)['packets'] / f'{packet_id}.json', packet); packet['packet_id'] = packet_id; return packet

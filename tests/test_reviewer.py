@@ -61,6 +61,19 @@ def test_packet_excludes_late_rows_and_records_followup_basis():
         assert selected['coverage']['late_basis'][0]['reason'] == 'post-cutoff-native-row'
 
 
+def test_late_append_does_not_change_frozen_source_identity():
+    with lab() as (home, _):
+        task, binding, session = ended_worker(home, 'identity', str(uuid.uuid4()), [message('kept', 100)])
+        event = next((tasks.task_file(home, task['id']).parent / 'observations').glob('*.json'))
+        value = json.loads(event.read_text()); value['observed_at'] = 150.0; store.atomic_json(event, value)
+        first = packet(home, cutoff=200)
+        jsonl = Path(binding['session_dir']) / f'{session}.jsonl'
+        with jsonl.open('a') as stream:
+            stream.write(json.dumps(message('future', 300)) + '\n')
+        second = packet(home, cutoff=200)
+        assert first['sources'][0]['source_id'] == second['sources'][0]['source_id']
+
+
 def test_packet_reports_unsupported_blocks_and_whole_packet_limit():
     with lab() as (home, _):
         ended_worker(home, 'bounded', str(uuid.uuid4()), [message('a' * 200, content=[{'type': 'text', 'text': 'ok'}, {'type': 'image'}])])
@@ -88,10 +101,10 @@ def test_packet_freezes_catalog_and_assigned_manifest_without_claiming_usage():
         task, _, _ = ended_worker(home, 'skills', str(uuid.uuid4()), [message('evidence')])
         skill = home / 'config' / 'worker-skills' / 'agd-test'; skill.mkdir(parents=True)
         (skill / 'SKILL.md').write_text('---\nname: agd-test\ndescription: Test skill\n---\n')
-        snapshot = home / 'data' / 'tasks' / task['id'] / 'worker-skills' / 'agd-test'; snapshot.mkdir(parents=True)
-        (snapshot / 'SKILL.md').write_text((skill / 'SKILL.md').read_text())
-        manifest = {'schema': 1, 'harness': 'omp', 'roots': ['.omp/skills'], 'skills': [{'id': 'agd-test', 'source': str(skill), 'snapshot': str(snapshot), 'destination': str(Path(task['worktree']) / '.omp/skills/agd-test'), 'files': []}]}
-        store.atomic_json(tasks.task_file(home, task['id']).parent / 'worker-skills.json', manifest)
+        task.update(harness='omp')
+        tasks.save(home, task)
+        worker_skills = __import__('agd_lib.worker_skills', fromlist=['prepare'])
+        worker_skills.prepare(home, task, {'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-test']})
         selected = packet(home)
         assert any(row['id'] == 'agd-test' for row in selected['catalog'])
         assert selected['skill_provenance'][0]['assigned'][0]['id'] == 'agd-test'
@@ -101,11 +114,14 @@ def test_packet_freezes_catalog_and_assigned_manifest_without_claiming_usage():
 def test_packet_collects_explicit_linked_decision_answer_as_partial_central_evidence():
     with lab() as (home, _):
         task, _, _ = ended_worker(home, 'linked', str(uuid.uuid4()), [message('work')])
-        folder = tasks.task_file(home, task['id']).parent; decision = {'key': 'choice', 'status': 'resolved', 'incarnation': task['incarnation'], 'question': 'Which?', 'message_id': 'link-1', 'answer': 'decisions/choice.answer.json', 'resolved_at': 150.0}
-        (folder / 'decisions').mkdir(exist_ok=True); store.atomic_json(folder / 'decisions' / 'choice.json', decision); store.atomic_json(folder / 'decisions' / 'choice.answer.json', {'body': 'Use safe path.'})
+        question = tasks.task_file(home, task['id']).parent / 'question.txt'; question.write_text('Which?\n')
+        workers.event(home, task['id'], task['incarnation'], 'decision', 'choice', question)
+        supervision.reconcile(home)
+        answer = tasks.task_file(home, task['id']).parent / 'answer.txt'; answer.write_text('Use safe path.\n')
+        supervision.resolve(home, task['id'], 'choice', answer)
         selected = packet(home)
         central = [source for source in selected['sources'] if source['kind'] == 'central-decision']
-        assert central and central[0]['linked_task_id'] == task['id']
+        assert central and central[0]['linked_task_id'] == task['id'] and central[0]['resolved_at'] > 0
         assert selected['coverage']['central_feedback'] == 'active-partial'
 
 
@@ -113,11 +129,14 @@ def test_retrospective_requires_closed_prior_receipt_and_excludes_later_runs():
     with lab() as (home, _):
         prior, later = str(uuid.uuid4()), str(uuid.uuid4())
         receipts = reviewer.paths(home)['receipts']; receipts.mkdir(parents=True)
-        store.atomic_json(receipts / f'{prior}.json', {'schema': 1, 'purpose': 'background-skill-review', 'review_run_id': prior, 'dispatch_state': 'closed', 'closed_at': 100.0, 'packet_id': 'a' * 64})
-        store.atomic_json(receipts / f'{later}.json', {'schema': 1, 'purpose': 'background-skill-review', 'review_run_id': later, 'dispatch_state': 'closed', 'closed_at': 300.0, 'packet_id': 'b' * 64})
-        reviewer.publish_immutable(reviewer.paths(home)['packets'] / ('a' * 64 + '.json'), {'schema': 1, 'sources': [], 'excerpts': []})
+        store.atomic_json(receipts / f'{prior}.json', {'schema': 1, 'purpose': 'background-skill-review', 'review_run_id': prior, 'dispatch_state': 'closed', 'closed_at': 100.0})
+        store.atomic_json(receipts / f'{later}.json', {'schema': 1, 'purpose': 'background-skill-review', 'review_run_id': later, 'dispatch_state': 'closed', 'closed_at': 300.0})
+        binding = observability.reviewer_binding(home, prior, 'native-review')
+        native = Path(binding['session_dir']) / 'native-review.jsonl'
+        native.write_text('\n'.join(json.dumps(row) for row in [{'type': 'session', 'version': 3, 'id': 'native-review', 'timestamp': '1970-01-01T00:00:00Z'}, message('retrospective evidence', 100)]) + '\n')
         selected = packet(home, cutoff=200, retrospective=(prior,))
         assert selected['retrospective_episodes'][0]['review_run_id'] == prior
+        assert any(source['kind'] == 'reviewer-native-jsonl' for source in selected['sources'])
         assert selected['coverage']['retrospective_excluded'] == [later]
         with pytest.raises(store.Refusal):
             packet(home, retrospective=(later,))
