@@ -46,3 +46,11 @@ def test_fake_child_bad_completion_is_terminal(monkeypatch):
         monkeypatch.setattr(reviewer_runner,'assert_runtime_capability',capability); monkeypatch.setattr(reviewer_runner.shutil,'which',lambda _:str(fake))
         result=reviewer_runner.run_native_reviewer(home,reviewer.enqueue_intent(home,kind='manual'),agent_dir=agent)
         assert result['dispatch_state']=='final' and result['outcome']=='failed'
+
+def test_fake_child_absent_or_duplicate_completion_is_terminal(monkeypatch):
+    for mode in ('absent', 'duplicate'):
+        with lab() as (home, _):
+            ended_worker(home, 'native', str(uuid.uuid4()), [message('evidence')]); agent=home/'agent'; agent.mkdir(); fake=home/'bun'; fake_child(fake,mode)
+            monkeypatch.setattr(reviewer_runner,'assert_runtime_capability',capability); monkeypatch.setattr(reviewer_runner.shutil,'which',lambda _:str(fake))
+            result=reviewer_runner.run_native_reviewer(home,reviewer.enqueue_intent(home,kind='manual'),agent_dir=agent)
+            assert result['dispatch_state']=='final' and result['outcome']=='failed'

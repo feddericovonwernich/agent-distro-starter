@@ -161,10 +161,10 @@ def serve_broker(home, review_run_id, stdin, stdout):
     completion = None
     for line in stdin:
         if not line.strip(): continue
+        if completion is not None: raise store.Refusal('reviewer protocol after completion')
         response = {'id': None, 'ok': False}
         try:
             request = json.loads(line)
-            if completion is not None: raise store.Refusal('reviewer protocol after completion')
             if set(request) == {'complete', 'result'}:
                 result = request['result']; receipt = reviewer._receipt(home, review_run_id)
                 if receipt.get('dispatch_state') != 'report-committed' or request['complete'] is not True or not isinstance(result, dict) or set(result) != {'reportId'} or not isinstance(result['reportId'], str) or result != _durable_result(home, review_run_id):
