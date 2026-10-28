@@ -14,8 +14,9 @@ const rpc = async (op: string, args: unknown) => {
   if (value.id !== id || !value.ok) throw new Error(value.error || 'broker refused');
   return value.value;
 };
+// Runtime capability URLs are validated by the Python launcher before this isolated host imports them.
 const urls = input.urls;
-const native: Native = { ai: await import(urls.ai), core: await import(urls.core), sdk: await import(urls.sdk), telemetry: await import(urls.telemetry), resolver: await import(urls.resolver) };
+const native: Native = { ai: await import(urls.ai), core: await import(urls.core), sdk: await import(urls.sdk), registry: await import(urls.registry), manager: await import(urls.manager), session: await import(urls.session), telemetry: await import(urls.telemetry), resolver: await import(urls.resolver) };
 const broker: Broker = { rpc, reserveModelCall: async () => { await rpc('reserve', {}); }, settleModelCall: async () => { await rpc('settle', {}); }, persistNativeSessionId: async id => { await rpc('session', { id }); }, persistModel: async id => { await rpc('model', { id }); }, finalResult: async () => rpc('result', {}) as Promise<{reportId: string}> };
 const result = await runReviewer({ ...input.input, native, broker } as ReviewerInput);
 process.stdout.write(`${JSON.stringify({ complete: true, result })}\n`);

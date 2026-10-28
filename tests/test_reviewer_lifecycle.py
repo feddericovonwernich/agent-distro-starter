@@ -34,7 +34,7 @@ def test_nonzero_fake_child_records_safe_terminal_diagnostic(monkeypatch):
         fake = home / 'fake-bun'
         fake.write_text('#!/usr/bin/env python3\nimport sys\nsys.stderr.write(\"SECRET=https://token@example.invalid\\\\n\")\nsys.exit(7)\n')
         fake.chmod(0o700)
-        monkeypatch.setattr(reviewer_runner, 'assert_runtime_capability', lambda *_: {'omp_version':'fake','ai_url':'x','core_url':'x','sdk_url':'x','telemetry_url':'x','resolver_url':'x'})
+        monkeypatch.setattr(reviewer_runner, 'assert_runtime_capability', lambda *_args, **_kwargs: {'omp_version':'fake','ai_url':'x','core_url':'x','sdk_url':'x','registry_url':'x','manager_url':'x','session_url':'x','telemetry_url':'x','resolver_url':'x'})
         monkeypatch.setattr(reviewer_runner.shutil, 'which', lambda _: str(fake))
         result = reviewer_runner.run_native_reviewer(home, reviewer.enqueue_intent(home, kind='manual'), agent_dir=agent)
         raw = json.dumps(result)
@@ -76,7 +76,7 @@ def test_preparation_failure_is_terminal_without_child(monkeypatch):
     import uuid
     with lab() as (home, _):
         ended_worker(home, 'native', str(uuid.uuid4()), [message('evidence')]); agent=home/'agent'; agent.mkdir()
-        monkeypatch.setattr(reviewer_runner, 'assert_runtime_capability', lambda *_: {'omp_version':'fake','ai_url':'x','core_url':'x','sdk_url':'x','telemetry_url':'x','resolver_url':'x'})
+        monkeypatch.setattr(reviewer_runner, 'assert_runtime_capability', lambda *_args, **_kwargs: {'omp_version':'fake','ai_url':'x','core_url':'x','sdk_url':'x','registry_url':'x','manager_url':'x','session_url':'x','telemetry_url':'x','resolver_url':'x'})
         monkeypatch.setattr(reviewer_runner.observability, 'reviewer_environment', lambda *_: (_ for _ in ()).throw(RuntimeError('secret preparation failure')))
         result=reviewer_runner.run_native_reviewer(home, reviewer.enqueue_intent(home, kind='manual'), agent_dir=agent)
         assert result['dispatch_state']=='final' and result['outcome']=='failed' and result['error']['code']=='preparation'
@@ -109,10 +109,13 @@ def test_runner_expired_after_collection_skips_capability_and_child(monkeypatch)
         assert result['dispatch_state'] == 'final' and result['outcome'] == 'failed' and result['error']['code'] == 'timeout'
 
 
-def test_capability_timeout_is_bounded_by_deadline(monkeypatch):
+def test_capability_timeout_is_bounded_by_deadline(monkeypatch, tmp_path):
     import subprocess, time
+    root = tmp_path / 'omp'; (root / 'dist').mkdir(parents=True)
+    (root / 'dist' / 'cli.js').write_text('')
+    (root / 'package.json').write_text('{"name":"@oh-my-pi/pi-coding-agent","version":"test","bin":{"omp":"dist/cli.js"}}')
     seen = []
-    monkeypatch.setattr(reviewer_runner.shutil, 'which', lambda _: 'bun')
+    monkeypatch.setattr(reviewer_runner.shutil, 'which', lambda name: str(root / 'dist' / 'cli.js') if name == 'omp' else 'bun')
     def run(*_args, **kwargs):
         seen.append(kwargs['timeout'])
         raise subprocess.TimeoutExpired('bun', kwargs['timeout'])
@@ -120,3 +123,15 @@ def test_capability_timeout_is_bounded_by_deadline(monkeypatch):
     with __import__('pytest').raises(Exception, match='timed out'):
         reviewer_runner.assert_runtime_capability(int((time.time() + 1) * 1000))
     assert 0 < seen[0] <= 1
+
+
+
+def test_capability_uses_omp_package_from_arbitrary_cwd_without_local_modules(monkeypatch, tmp_path):
+    import shutil, time
+    omp = shutil.which('omp')
+    assert omp
+    monkeypatch.chdir(tmp_path)
+    capability = reviewer_runner.assert_runtime_capability(int((time.time() + 10) * 1000), omp_binary=omp)
+    assert set(capability) == {'ai_url', 'core_url', 'sdk_url', 'registry_url', 'manager_url', 'session_url', 'telemetry_url', 'resolver_url', 'omp_version'}
+    assert all(capability[key].startswith('file:') for key in capability if key.endswith('_url'))
+    assert capability['omp_version']

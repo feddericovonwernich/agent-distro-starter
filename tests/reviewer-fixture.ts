@@ -21,7 +21,7 @@ export async function startBridge() {
   try {
     hello = JSON.parse(await Promise.race([next(), Bun.sleep(5000).then(() => { if (proc.exitCode === null) proc.kill(); throw new Error('bridge hello timed out'); })]));
   } catch (error) { if (proc.exitCode === null) proc.kill(); await proc.exited; await lines.return?.(); throw error; }
-  const native = { ai: await import(hello.aiUrl), core: await import(hello.coreUrl), sdk: await import(hello.sdkUrl), telemetry: await import(hello.telemetryUrl), resolver: await import(hello.resolverUrl) };
+  const native = { ai: await import(hello.aiUrl), core: await import(hello.coreUrl), sdk: await import(hello.sdkUrl), registry: await import(hello.registryUrl), manager: await import(hello.managerUrl), session: await import(hello.sessionUrl), telemetry: await import(hello.telemetryUrl), resolver: await import(hello.resolverUrl) };
   let queue = Promise.resolve();
   const rpc = (op: string, args: unknown) => {
     const request = queue.then(async () => {
@@ -40,7 +40,8 @@ export async function startBridge() {
     settleModelCall: async () => { await rpc('settle', {}); },
     persistNativeSessionId: async (id: string) => { await rpc('session', { id }); },
     persistModel: async (id: string) => { await rpc('model', { id }); },
-  }, close: async () => { proc.stdin.end(); await Promise.race([proc.exited, Bun.sleep(5000).then(() => { if (proc.exitCode === null) proc.kill(); return proc.exited; })]); await lines.return?.(); } };
+    finalResult: async () => rpc('result', {}) as Promise<{ reportId: string }>,
+  }, finish: (result: { reportId: string }) => { proc.stdin.write(`${JSON.stringify({ complete: true, result })}\n`); }, close: async () => { proc.stdin.end(); await Promise.race([proc.exited, Bun.sleep(5000).then(() => { if (proc.exitCode === null) proc.kill(); return proc.exited; })]); await lines.return?.(); } };
 }
 
 export function scriptedStream(ai: { AssistantMessageEventStream: new () => { push(event: unknown): void; end(result: unknown): void } }, turns: unknown[][], observed: string[], messages: unknown[][]) {

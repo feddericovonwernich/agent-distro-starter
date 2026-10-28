@@ -356,7 +356,7 @@ def produced_run(home):
                                instruction_snapshot=reviewer.INSTRUCTION_FILE.read_bytes(), started_at=started,
                                deadline_epoch_ms=int((started + config['limits']['max_runtime_seconds']) * 1000))
     selected = reviewer.select_packet(home, cutoff=time.time(), config_snapshot=config)
-    return reviewer.begin_run(home, run, selected, model='openai/reviewer-fixture', observed_omp_version='fixture-test'), selected
+    return reviewer.begin_run(home, run, selected, model='openai/gpt-5.2-codex', observed_omp_version='fixture-test'), selected
 
 
 def build_report(selected):

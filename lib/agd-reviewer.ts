@@ -10,7 +10,10 @@ type Session = { prompt(text: string): Promise<void>; beginDispose(): void; disp
 export type Native = {
   ai: { streamSimple: StreamFn; AssistantMessageEventStream: new () => OuterStream };
   core: { Agent: new (options: unknown) => unknown };
-  sdk: { Settings: { init(options: unknown): Promise<Settings> }; discoverAuthStorage(agentDir: string, options: unknown): Promise<unknown>; ModelRegistry: new (...args: unknown[]) => Registry; SessionManager: { create(cwd: string, sessionDir: string): Manager }; AgentSession: new (options: unknown) => Session };
+  sdk: { Settings: { init(options: unknown): Promise<Settings> }; discoverAuthStorage(agentDir: string, options: unknown): Promise<unknown> };
+  registry: { ModelRegistry: new (...args: unknown[]) => Registry };
+  manager: { SessionManager: { create(cwd: string, sessionDir: string): Manager } };
+  session: { AgentSession: new (options: unknown) => Session };
   resolver: { getModelMatchPreferences(settings: Settings): unknown; resolveAllowedModels(registry: Registry, settings: Settings, preferences: unknown): Promise<Model[]>; resolveModelRoleValue(role: unknown, allowed: Model[], options: unknown): { model: Model | undefined }; resolveCliModel(options: unknown): { model: Model | undefined; error?: string }; formatModelString(model: Model): string };
   telemetry: { initTelemetryExport(): Promise<void>; isTelemetryExportEnabled(): boolean; createTelemetryExportConfig(options: unknown): unknown; flushTelemetryExport(): Promise<void> };
 };
@@ -54,16 +57,16 @@ async function resolveModel(input: ReviewerInput, settings: Settings, registry: 
 }
 
 export async function runReviewer(input: ReviewerInput, streamFn: StreamFn = input.native.ai.streamSimple): Promise<{ reportId: string }> {
-  const { sdk, core, ai, telemetry } = input.native; await telemetry.initTelemetryExport();
+  const { sdk, registry: registryApi, manager: managerApi, session: sessionApi, core, ai, telemetry } = input.native; await telemetry.initTelemetryExport();
   const settings = await sdk.Settings.init({ cwd: input.cwd, agentDir: input.agentDir, readOnly: true, overrides: { 'compaction.enabled': false, 'compaction.midTurnEnabled': false, 'compaction.autoContinue': false, 'compaction.asyncEnabled': false, 'compaction.idleEnabled': false, 'retry.enabled': false, 'retry.maxRetries': 0, 'retry.modelFallback': false, 'retry.usageAwareFallback': false, 'advisor.enabled': false, 'autolearn.enabled': false, 'autolearn.autoContinue': false } });
   const auth = await sdk.discoverAuthStorage(input.agentDir, { cwd: input.cwd, settings });
-  const registry = new sdk.ModelRegistry(auth, undefined, { settings }); const model = await resolveModel(input, settings, registry);
+  const registry = new registryApi.ModelRegistry(auth, undefined, { settings }); const model = await resolveModel(input, settings, registry);
   await input.broker.persistModel(`${model.provider}/${model.id}`);
-  const manager = sdk.SessionManager.create(input.cwd, input.sessionDir); await input.broker.persistNativeSessionId(manager.getSessionId());
+  const manager = managerApi.SessionManager.create(input.cwd, input.sessionDir); await input.broker.persistNativeSessionId(manager.getSessionId());
   const tools = reviewerTools(input.broker); const capped = cappedStreamFn(streamFn, input.broker, ai);
   const exporter = telemetry.isTelemetryExportEnabled() ? telemetry.createTelemetryExportConfig({ attributes: { purpose: 'background-skill-review', review_run_id: input.reviewRunId }, captureMessageContent: 'full' }) : undefined;
   const agent = new core.Agent({ initialState: { model, tools: [...tools.values()], systemPrompt: [input.reviewPrompt] }, sessionId: manager.getSessionId(), deadline: input.receipt.deadline_epoch_ms, telemetry: exporter, getApiKey: (...args: unknown[]) => registry.getApiKey(...args), streamFn: capped });
-  const session = new sdk.AgentSession({ agent, sessionManager: manager, settings, modelRegistry: registry, toolRegistry: tools, sideStreamFn: capped, advisorStreamFn: capped, memoryEnabled: false, skills: [], skillsReloadable: false, disableExtensionDiscovery: true, scoutAllowedBySpawnPolicy: false });
+  const session = new sessionApi.AgentSession({ agent, sessionManager: manager, settings, modelRegistry: registry, toolRegistry: tools, sideStreamFn: capped, advisorStreamFn: capped, memoryEnabled: false, skills: [], skillsReloadable: false, disableExtensionDiscovery: true, scoutAllowedBySpawnPolicy: false });
   try { const packet = await input.broker.rpc('packet', {}); if (typeof packet !== 'string') throw new Error('invalid packet text'); await session.prompt(packet); await manager.flush(); return await input.broker.finalResult(); }
   finally { session.beginDispose(); await session.dispose(); await manager.close(); await telemetry.flushTelemetryExport(); }
 }

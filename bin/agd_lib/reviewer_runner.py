@@ -7,33 +7,51 @@ import subprocess
 import threading
 import time
 import uuid
+from urllib.parse import unquote, urlparse
+
 from pathlib import Path
 
 from . import observability, reviewer, store
 
 
-def assert_runtime_capability(deadline_epoch_ms):
-    """Discover the supported installed OMP modules without machine-specific paths."""
+def assert_runtime_capability(deadline_epoch_ms, *, omp_binary='omp'):
+    """Discover public installed OMP modules from the selected OMP executable."""
     remaining = reviewer.deadline_remaining_seconds(deadline_epoch_ms)
     if remaining <= 0: raise store.DependencyError('reviewer deadline exceeded')
-    binary = shutil.which('bun')
-    if not binary:
-        raise store.DependencyError('bun is unavailable')
-    script = """const agent='@oh-my-pi/pi-coding-agent', aiName='@oh-my-pi/pi-ai', coreName='@oh-my-pi/pi-agent-core';
-const [root,sdk,ai,core,telemetry,resolver]=await Promise.all([import(agent),import(agent+'/sdk'),import(aiName),import(coreName),import(agent+'/telemetry-export'),import(agent+'/config/model-resolver')]);
-for(const [name,value] of Object.entries({Settings:sdk.Settings,ModelRegistry:sdk.ModelRegistry,AgentSession:sdk.AgentSession,SessionManager:sdk.SessionManager,Agent:core.Agent,AssistantMessageEventStream:ai.AssistantMessageEventStream,initTelemetryExport:telemetry.initTelemetryExport,getModelMatchPreferences:resolver.getModelMatchPreferences,resolveAllowedModels:resolver.resolveAllowedModels,resolveModelRoleValue:resolver.resolveModelRoleValue,resolveCliModel:resolver.resolveCliModel,formatModelString:resolver.formatModelString}))if(!value)throw new Error('unsupported OMP export: '+name);
-if(typeof root.VERSION!=='string'&&typeof root.version!=='string')throw new Error('unsupported OMP version export');
-console.log(JSON.stringify({ai_url:import.meta.resolve(aiName),core_url:import.meta.resolve(coreName),sdk_url:import.meta.resolve(agent+'/sdk'),telemetry_url:import.meta.resolve(agent+'/telemetry-export'),resolver_url:import.meta.resolve(agent+'/config/model-resolver'),omp_version:root.VERSION||root.version}));"""
-    env = {key: os.environ[key] for key in ('PATH', 'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME') if key in os.environ}
-    try: result = subprocess.run([binary, '-e', script], capture_output=True, text=True, timeout=min(10, remaining), env=env)
-    except subprocess.TimeoutExpired as error: raise store.DependencyError('installed OMP runtime capability timed out') from error
-    if result.returncode:
-        raise store.DependencyError(f'installed OMP runtime capability unavailable: {result.stderr.strip()}')
+    omp = shutil.which(omp_binary)
+    if not omp: raise store.DependencyError('omp is unavailable')
     try:
-        capability = json.loads(result.stdout)
-    except json.JSONDecodeError as error:
-        raise store.DependencyError('installed OMP runtime capability malformed') from error
-    if not all(isinstance(capability.get(key), str) and capability[key] for key in ('ai_url', 'core_url', 'sdk_url', 'telemetry_url', 'resolver_url', 'omp_version')):
+        entry = Path(omp).resolve(strict=True)
+        if not entry.is_file(): raise ValueError
+        root = next((parent for parent in (entry.parent, *entry.parents)
+                     if (parent / 'package.json').is_file() and not (parent / 'package.json').is_symlink()
+                     and json.loads((parent / 'package.json').read_text()).get('name') == '@oh-my-pi/pi-coding-agent'), None)
+        if root is None: raise ValueError
+        manifest = json.loads((root / 'package.json').read_text())
+        declared = (root / manifest['bin']['omp']).resolve(strict=True)
+        if declared != entry or root not in entry.parents or not manifest.get('version'): raise ValueError
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        raise store.DependencyError('installed OMP package root is unavailable')
+    binary = shutil.which('bun')
+    if not binary: raise store.DependencyError('bun is unavailable')
+    script = """const agent='@oh-my-pi/pi-coding-agent', modules={ai:'@oh-my-pi/pi-ai',core:'@oh-my-pi/pi-agent-core',sdk:agent+'/sdk',registry:agent+'/config/model-registry',manager:agent+'/session/session-manager',session:agent+'/session/agent-session',telemetry:agent+'/telemetry-export',resolver:agent+'/config/model-resolver'};
+const [ai,core,sdk,registry,manager,session,telemetry,resolver]=await Promise.all(Object.values(modules).map(name=>import(name)));
+for(const [name,value] of Object.entries({Agent:core.Agent,streamSimple:ai.streamSimple,AssistantMessageEventStream:ai.AssistantMessageEventStream,Settings:sdk.Settings,discoverAuthStorage:sdk.discoverAuthStorage,ModelRegistry:registry.ModelRegistry,SessionManager:manager.SessionManager,AgentSession:session.AgentSession,initTelemetryExport:telemetry.initTelemetryExport,isTelemetryExportEnabled:telemetry.isTelemetryExportEnabled,createTelemetryExportConfig:telemetry.createTelemetryExportConfig,flushTelemetryExport:telemetry.flushTelemetryExport,getModelMatchPreferences:resolver.getModelMatchPreferences,resolveAllowedModels:resolver.resolveAllowedModels,resolveModelRoleValue:resolver.resolveModelRoleValue,resolveCliModel:resolver.resolveCliModel,formatModelString:resolver.formatModelString}))if(typeof value!=='function')throw new Error('unsupported OMP export: '+name);
+console.log(JSON.stringify({ai_url:import.meta.resolve(modules.ai),core_url:import.meta.resolve(modules.core),sdk_url:import.meta.resolve(modules.sdk),registry_url:import.meta.resolve(modules.registry),manager_url:import.meta.resolve(modules.manager),session_url:import.meta.resolve(modules.session),telemetry_url:import.meta.resolve(modules.telemetry),resolver_url:import.meta.resolve(modules.resolver),omp_version:process.argv[1]}));"""
+    env = {key: os.environ[key] for key in ('PATH', 'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME') if key in os.environ}
+    try: result = subprocess.run([binary, '-e', script, manifest['version']], capture_output=True, text=True, cwd=root, timeout=min(10, remaining), env=env)
+    except subprocess.TimeoutExpired as error: raise store.DependencyError('installed OMP runtime capability timed out') from error
+    if result.returncode: raise store.DependencyError(f'installed OMP runtime capability unavailable: {result.stderr.strip()}')
+    try: capability = json.loads(result.stdout)
+    except json.JSONDecodeError as error: raise store.DependencyError('installed OMP runtime capability malformed') from error
+    expected = {'ai_url', 'core_url', 'sdk_url', 'registry_url', 'manager_url', 'session_url', 'telemetry_url', 'resolver_url', 'omp_version'}
+    try:
+        if set(capability) != expected or not isinstance(capability['omp_version'], str) or not capability['omp_version']: raise ValueError
+        for key in expected - {'omp_version'}:
+            parsed = urlparse(capability[key])
+            location = Path(unquote(parsed.path)).resolve(strict=True)
+            if parsed.scheme != 'file' or root.parents[1] not in location.parents: raise ValueError
+    except (OSError, TypeError, ValueError):
         raise store.DependencyError('installed OMP runtime capability malformed')
     return capability
 
@@ -59,7 +77,7 @@ def run_native_reviewer(home, intent, *, agent_dir, omp_binary='omp'):
             return reviewer.close_run(home, run['review_run_id'], 'no-work', packet=packet)
         directory = Path(agent_dir)
         if directory.is_symlink() or not directory.is_dir(): return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='agent-dir', packet=packet)
-        try: capability = assert_runtime_capability(run['deadline_epoch_ms'])
+        try: capability = assert_runtime_capability(run['deadline_epoch_ms'], omp_binary=omp_binary)
         except Exception:
             return reviewer.close_run(home, run['review_run_id'], 'failed',
                                       error_code='timeout' if reviewer.deadline_remaining_seconds(run['deadline_epoch_ms']) <= 0 else 'capability',
@@ -72,7 +90,7 @@ def run_native_reviewer(home, intent, *, agent_dir, omp_binary='omp'):
                 receipt.update(packet_id=packet['packet_id'], omp_version=capability['omp_version'])
                 store.atomic_json(reviewer.paths(home)['receipts'] / f"{run['review_run_id']}.json", receipt)
             env, _, _ = observability.reviewer_environment(home, run['review_run_id'])
-            payload = {'urls': {key: capability[f'{key}_url'] for key in ('ai', 'core', 'sdk', 'telemetry', 'resolver')},
+            payload = {'urls': {key: capability[f'{key}_url'] for key in ('ai', 'core', 'sdk', 'registry', 'manager', 'session', 'telemetry', 'resolver')},
                        'input': {'cwd': str(store.home(home)), 'agentDir': str(directory.resolve()), 'sessionDir': observability.reviewer_session_dir(home, run['review_run_id']),
                                  'reviewRunId': run['review_run_id'], 'receipt': {'deadline_epoch_ms': run['deadline_epoch_ms'], 'omp_version': capability['omp_version']},
                                  'modelSelector': config['review_model'], 'reviewPrompt': reviewer._read_json(reviewer.paths(home)['manifests'] / f"{run['instruction_snapshot_ref']}.json")['text']}}
