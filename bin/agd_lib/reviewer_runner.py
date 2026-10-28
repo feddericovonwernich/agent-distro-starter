@@ -95,12 +95,20 @@ def _replay_or_reserve_input(home, review_run_id, request_id, op, args, value, l
 
 
 def _durable_result(home, review_run_id):
-    receipt = reviewer.recover_submissions(home, review_run_id)
-    results = receipt.get('report_results', {})
-    if not results: raise store.Refusal('report is unavailable')
-    result = results[sorted(results)[-1]]
-    if not isinstance(result, dict) or not isinstance(result.get('report_id'), str): raise store.Refusal('report result is malformed')
-    return {'reportId': result['report_id']}
+    reviewer.recover_submissions(home, review_run_id)
+    with store.lock(store.home(home)):
+        receipt = reviewer._receipt(home, review_run_id)
+        chosen = receipt.get('broker_result')
+        if chosen is None:
+            results = receipt.get('report_results', {})
+            if len(results) != 1: raise store.Refusal('report result is ambiguous')
+            request_id, result = next(iter(results.items()))
+            if not isinstance(result, dict) or not isinstance(result.get('report_id'), str): raise store.Refusal('report result is malformed')
+            chosen = {'request_id': request_id, 'report_id': result['report_id']}
+            receipt['broker_result'] = chosen
+            store.atomic_json(reviewer.paths(home)['receipts'] / f'{review_run_id}.json', receipt)
+        if not isinstance(chosen, dict) or not isinstance(chosen.get('request_id'), str) or not isinstance(chosen.get('report_id'), str): raise store.Refusal('report result is malformed')
+        return {'reportId': chosen['report_id']}
 
 
 def serve_broker(home, review_run_id, stdin, stdout):
@@ -133,6 +141,10 @@ def serve_broker(home, review_run_id, stdin, stdout):
             elif op == 'reviewer_submit':
                 report = args.get('report')
                 result = reviewer.submit_report(home, review_run_id, request_id, report)
+                with store.lock(store.home(home)):
+                    receipt = reviewer._receipt(home, review_run_id)
+                    receipt['broker_result'] = {'request_id': request_id, 'report_id': result['report_id']}
+                    store.atomic_json(reviewer.paths(home)['receipts'] / f'{review_run_id}.json', receipt)
                 value = _replay_or_reserve_input(home, review_run_id, request_id, op, args, _broker_text({'reportId': result['report_id']}), limit)
             elif op == 'reserve':
                 if time.time() * 1000 >= receipt['deadline_epoch_ms']: raise store.Refusal('review deadline exceeded')
