@@ -231,3 +231,45 @@ def test_reviewed_candidates_advance_and_new_material_resurfaces_once():
         assert [item['task_id'] for item in resurfaced['episodes']] == ['first']
         reviewer.mark_material_reviewed(home, resurfaced['coverage']['followup_id'])
         assert reviewer.select_packet(home, cutoff=cutoff + 3, config_snapshot=config)['episodes'] == []
+
+
+def test_reviewed_oversized_candidate_does_not_repeat_its_admitted_prefix():
+    with lab() as (home, _):
+        ended_worker(home, 'oversized', str(uuid.uuid4()), [message('x' * 1000) for _ in range(40)])
+        config = reviewer.read_config(home); config['limits']['max_input_bytes'] = 12000
+        cutoff = time.time() + 100
+        first = reviewer.select_packet(home, cutoff=cutoff, config_snapshot=config)
+        reviewer.mark_material_reviewed(home, first['coverage']['followup_id'])
+        assert reviewer.select_packet(home, cutoff=cutoff + 1, config_snapshot=config)['episodes'] == []
+
+
+def test_same_size_native_rewrite_resurfaces_reviewed_candidate_once():
+    with lab() as (home, _):
+        task, binding, session = ended_worker(home, 'rewrite', str(uuid.uuid4()), [message('alpha', 100)])
+        config = reviewer.read_config(home); cutoff = time.time() + 100
+        first = reviewer.select_packet(home, cutoff=cutoff, config_snapshot=config)
+        reviewer.mark_material_reviewed(home, first['coverage']['followup_id'])
+        native = Path(binding['session_dir']) / f'{session}.jsonl'
+        native.write_text(native.read_text().replace('alpha', 'bravo'))
+        changed = reviewer.select_packet(home, cutoff=cutoff + 1, config_snapshot=config)
+        assert [item['task_id'] for item in changed['episodes']] == [task['id']]
+        reviewer.mark_material_reviewed(home, changed['coverage']['followup_id'])
+        assert reviewer.select_packet(home, cutoff=cutoff + 2, config_snapshot=config)['episodes'] == []
+
+
+def test_new_linked_decision_resurfaces_reviewed_candidate_once():
+    with lab() as (home, _):
+        task, _, _ = ended_worker(home, 'central-later', str(uuid.uuid4()), [message('native', 100)])
+        config = reviewer.read_config(home); cutoff = time.time() + 100
+        first = reviewer.select_packet(home, cutoff=cutoff, config_snapshot=config)
+        reviewer.mark_material_reviewed(home, first['coverage']['followup_id'])
+        question = tasks.task_file(home, task['id']).parent / 'question.txt'; question.write_text('Which?\n')
+        workers.event(home, task['id'], task['incarnation'], 'decision', 'choice', question)
+        supervision.reconcile(home)
+        answer = tasks.task_file(home, task['id']).parent / 'answer.txt'; answer.write_text('Later feedback.\n')
+        supervision.resolve(home, task['id'], 'choice', answer)
+        changed = reviewer.select_packet(home, cutoff=cutoff + 1, config_snapshot=config)
+        assert [item['task_id'] for item in changed['episodes']] == [task['id']]
+        assert any(source['kind'] == 'central-decision' for source in changed['sources'])
+        reviewer.mark_material_reviewed(home, changed['coverage']['followup_id'])
+        assert reviewer.select_packet(home, cutoff=cutoff + 2, config_snapshot=config)['episodes'] == []

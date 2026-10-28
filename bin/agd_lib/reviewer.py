@@ -235,13 +235,33 @@ def _central(task_dir, task, cutoff, coverage):
 def _candidate_id(task_id, incarnation): return _digest({'task_id': task_id, 'incarnation': incarnation})
 
 
-def _candidate_is_reviewed(root, task_id, incarnation, session_dir):
+def _candidate_is_reviewed(root, task_id, incarnation, material_basis):
     try:
         state = _read_json(paths(root)['candidates'] / f'{_candidate_id(task_id, incarnation)}.json')
-        if state.get('state') != 'reviewed': return False
-        return all(path.stat().st_size <= state['watermarks'][path.name] for path in session_dir.glob('*.jsonl'))
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return state.get('state') == 'reviewed' and state.get('material_basis') == material_basis
+    except (OSError, ValueError, json.JSONDecodeError):
         return False
+
+
+def _candidate_material(root, task, event, task_dir, jsonls, cutoff, limit, coverage):
+    key = task['id'], event['incarnation']; sources, excerpts = [], []
+    for jsonl in jsonls:
+        try:
+            sid, watermark, digest, rows, late, limited, withheld = _messages(jsonl, cutoff, limit)
+            source = {'kind': 'native-jsonl', 'task_id': key[0], 'incarnation': key[1], 'session_id': sid, 'path': str(jsonl.relative_to(root)), 'byte_watermark': watermark, 'content_sha256': digest}; source['source_id'] = _digest(source); sources.append(source)
+            for row in rows:
+                excerpt = {'source_id': source['source_id'], **row}; excerpt['excerpt_id'] = _digest(excerpt); excerpts.append(excerpt)
+            for row in withheld: _coverage(coverage, 'withheld', row)
+            if limited: _coverage(coverage, 'late_basis', {'task_id': key[0], 'session_id': sid, 'reason': 'input-limit'})
+            if late: _coverage(coverage, 'late_basis', {'task_id': key[0], 'session_id': sid, 'reason': 'post-cutoff-native-row'})
+        except (OSError, store.Refusal, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'task_id': key[0], 'incarnation': key[1], 'reason': 'native-jsonl-malformed'})
+    extra_sources, extra_excerpts = _central(task_dir, task, cutoff, coverage)
+    if extra_sources: sources.extend(extra_sources); excerpts.extend(extra_excerpts); coverage['central_feedback'] = 'active-partial'; coverage['complete'] = False
+    admitted = {'sources': sources, 'excerpts': excerpts, 'coverage': {'late_basis': []}}
+    _cap(admitted, limit)
+    return sources, excerpts, _digest({'sources': [source['source_id'] for source in admitted['sources']],
+                                        'excerpts': [excerpt['excerpt_id'] for excerpt in admitted['excerpts']],
+                                        'max_input_bytes': limit})
 
 
 def _cap(packet, limit):
@@ -265,7 +285,7 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
         if saved.get('scope') != scope: raise store.Refusal('reviewer checkpoint collision')
         return read_packet(root, saved['packet_id'])
     coverage = {'complete': True, 'withheld': [], 'unavailable': [], 'unknown': [], 'langfuse_index': 'unused', 'late_basis': [], 'central_feedback': 'unknown', 'retrospective_excluded': []}
-    episodes, sources, excerpts, provenance, seen = [], [], [], [], set()
+    episodes, sources, excerpts, provenance, seen, candidate_versions = [], [], [], [], set(), {}
     for observed_at, task, event, task_dir in _observation_candidates(root, cutoff, coverage):
         key = (task.get('id'), event.get('incarnation'))
         if key in seen: continue
@@ -273,20 +293,11 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
             binding = _read_json(root / 'data' / 'observability' / 'tasks' / key[0] / 'omp' / key[1] / 'binding.json'); session_dir = _fixed_session(root, key[0], key[1], binding); jsonls = sorted(session_dir.glob('*.jsonl'))
             if not jsonls: raise ValueError('no JSONL')
         except (OSError, ValueError, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'task_id': key[0], 'incarnation': key[1], 'reason': 'native-jsonl-unavailable'}); continue
-        if _candidate_is_reviewed(root, key[0], key[1], session_dir) or len(episodes) >= config['limits']['max_candidates']: continue
+        candidate_sources, candidate_excerpts, candidate_basis = _candidate_material(
+            root, task, event, task_dir, jsonls, cutoff, config['limits']['max_input_bytes'], coverage)
+        if _candidate_is_reviewed(root, key[0], key[1], candidate_basis) or len(episodes) >= config['limits']['max_candidates']: continue
         seen.add(key); episodes.append({'task_id': key[0], 'incarnation': key[1], 'closed_at': observed_at, 'exit_observation_id': event.get('id')}); provenance.append({'task_id': key[0], 'assigned': _manifest(root, task_dir, task, coverage), 'usage': 'unknown'})
-        for jsonl in jsonls:
-            try:
-                sid, watermark, digest, rows, late, limited, withheld = _messages(jsonl, cutoff, config['limits']['max_input_bytes'])
-                source = {'kind': 'native-jsonl', 'task_id': key[0], 'incarnation': key[1], 'session_id': sid, 'path': str(jsonl.relative_to(root)), 'byte_watermark': watermark, 'content_sha256': digest}; source['source_id'] = _digest(source); sources.append(source)
-                for row in rows:
-                    excerpt = {'source_id': source['source_id'], **row}; excerpt['excerpt_id'] = _digest(excerpt); excerpts.append(excerpt)
-                for row in withheld: _coverage(coverage, 'withheld', row)
-                if limited: _coverage(coverage, 'late_basis', {'task_id': key[0], 'session_id': sid, 'reason': 'input-limit'})
-                if late: _coverage(coverage, 'late_basis', {'task_id': key[0], 'session_id': sid, 'reason': 'post-cutoff-native-row'})
-            except (OSError, store.Refusal, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'task_id': key[0], 'incarnation': key[1], 'reason': 'native-jsonl-malformed'})
-        extra_sources, extra_excerpts = _central(task_dir, task, cutoff, coverage)
-        if extra_sources: sources.extend(extra_sources); excerpts.extend(extra_excerpts); coverage['central_feedback'] = 'active-partial'; coverage['complete'] = False
+        sources.extend(candidate_sources); excerpts.extend(candidate_excerpts); candidate_versions[key] = candidate_basis
     if coverage['central_feedback'] == 'unknown': coverage['unknown'].append({'category': 'central-feedback', 'reason': 'no explicit retained links'})
     retrospective = []
     if retrospective_review_run_ids:
@@ -319,10 +330,11 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
         if {item['review_run_id'] for item in retrospective} != requested: raise store.Refusal('unknown retrospective run')
     packet = {'schema': 1, 'purpose': 'background-skill-review', 'cutoff': cutoff, 'episodes': episodes, 'sources': sources, 'excerpts': excerpts, 'catalog': _catalog(root, coverage), 'skill_provenance': provenance, 'coverage': coverage, 'retrospective_review_run_ids': list(retrospective_review_run_ids), 'retrospective_episodes': retrospective, 'config_snapshot_sha256': _digest(config)}
     _cap(packet, config['limits']['max_input_bytes'])
-    candidates = [{'candidate_id': _candidate_id(episode['task_id'], episode['incarnation']), 'task_id': episode['task_id'], 'incarnation': episode['incarnation'],
-                   'watermarks': {Path(source['path']).name: source['byte_watermark'] for source in packet['sources']
-                                  if source.get('kind') == 'native-jsonl' and source.get('task_id') == episode['task_id'] and source.get('incarnation') == episode['incarnation']}}
-                  for episode in packet['episodes']]
+    candidates = [{'candidate_id': _candidate_id(episode['task_id'], episode['incarnation']),
+                   'material_basis': candidate_versions[(episode['task_id'], episode['incarnation'])]}
+                  for episode in packet['episodes']
+                  if any(source.get('kind') == 'native-jsonl' and source.get('task_id') == episode['task_id'] and source.get('incarnation') == episode['incarnation']
+                         for source in packet['sources'])]
     material_basis = _digest({'sources': [(source['source_id'], source.get('content_sha256'), source.get('answer_sha256')) for source in packet['sources']],
                               'excerpts': [excerpt['excerpt_id'] for excerpt in packet['excerpts']]})
     with store.lock(root):
@@ -355,10 +367,10 @@ def mark_material_reviewed(home, material_basis):
             state = {**state, 'state': 'reviewed'}
             store.atomic_json(paths(home)['followups'] / f'{material_basis}.json', state)
             for candidate in state.get('candidates', []):
-                if candidate.get('watermarks'):
+                if isinstance(candidate.get('material_basis'), str):
                     store.atomic_json(paths(home)['candidates'] / f"{candidate['candidate_id']}.json",
                                       {'schema': 1, 'candidate_id': candidate['candidate_id'], 'state': 'reviewed',
-                                       'watermarks': candidate['watermarks']})
+                                       'material_basis': candidate['material_basis']})
         return state
 
 
