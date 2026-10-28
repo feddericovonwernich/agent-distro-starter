@@ -127,6 +127,23 @@ def test_packet_collects_explicit_linked_decision_answer_as_partial_central_evid
         assert central and central[0]['linked_task_id'] == task['id'] and central[0]['resolved_at'] > 0
         assert selected['coverage']['central_feedback'] == 'active-partial'
 
+def test_old_incarnation_collects_only_its_resolved_central_feedback():
+    with lab() as (home, _):
+        task, _, _ = ended_worker(home, 'incarnations', str(uuid.uuid4()), [message('old work')])
+        old = task['incarnation']
+        old_question = tasks.task_file(home, task['id']).parent / 'old.txt'; old_question.write_text('old?\n')
+        workers.event(home, task['id'], old, 'decision', 'old-choice', old_question); supervision.reconcile(home)
+        old_answer = tasks.task_file(home, task['id']).parent / 'old-answer.txt'; old_answer.write_text('old answer\n')
+        supervision.resolve(home, task['id'], 'old-choice', old_answer)
+        task.update(incarnation=str(uuid.uuid4()), worker_alive=False); tasks.save(home, task)
+        new_question = tasks.task_file(home, task['id']).parent / 'new.txt'; new_question.write_text('new?\n')
+        workers.event(home, task['id'], task['incarnation'], 'decision', 'new-choice', new_question); supervision.reconcile(home)
+        new_answer = tasks.task_file(home, task['id']).parent / 'new-answer.txt'; new_answer.write_text('new answer\n')
+        supervision.resolve(home, task['id'], 'new-choice', new_answer)
+        selected = packet(home)
+        old_feedback = [row['text'] for row in selected['excerpts'] if row['text'] in ('old answer\n', 'new answer\n')]
+        assert old_feedback == ['old answer\n']
+
 
 def test_retrospective_requires_closed_prior_receipt_and_excludes_later_runs():
     with lab() as (home, _):
