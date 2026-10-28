@@ -176,6 +176,7 @@ def serve_broker(home, review_run_id, stdin, stdout):
             elif op == 'result':
                 value = _durable_result(home, review_run_id)
             elif op == 'finish':
+                _durable_result(home, review_run_id)
                 value = reviewer.finalize_run(home, review_run_id, 'completed')
             else:
                 raise store.Refusal('broker operation is denied')
