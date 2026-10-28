@@ -86,7 +86,7 @@ def run_native_reviewer(home, intent, *, agent_dir, omp_binary='omp'):
         finally:
             timer.cancel()
             if process.poll() is None: os.killpg(process.pid, signal.SIGKILL); process.wait()
-            process.stdout.close(); process.stdin.close(); thread.join(timeout=1)
+            process.stdout.close(); process.stdin.close(); thread.join(timeout=1); process.stderr.close()
         receipt = reviewer._receipt(home, run['review_run_id'])
         outcome = 'unknown' if receipt['counters'].get('provider_inflight') else 'failed'
         if timed_out.is_set() or failure or code or not isinstance(completion, dict):
@@ -158,15 +158,19 @@ def serve_broker(home, review_run_id, stdin, stdout):
     limit, packet, sources, excerpts = config['limits']['max_input_bytes'], None, set(), []
     if receipt.get('dispatch_state') in ('begun', 'report-committed'):
         packet = reviewer.read_packet(home, receipt['packet_id']); sources = {item['source_id'] for item in packet['sources']}; excerpts = [item for item in packet['excerpts'] if item['source_id'] in sources]
+    completion = None
     for line in stdin:
+        if not line.strip(): continue
         response = {'id': None, 'ok': False}
         try:
             request = json.loads(line)
+            if completion is not None: raise store.Refusal('reviewer protocol after completion')
             if set(request) == {'complete', 'result'}:
                 result = request['result']; receipt = reviewer._receipt(home, review_run_id)
                 if receipt.get('dispatch_state') != 'report-committed' or request['complete'] is not True or not isinstance(result, dict) or set(result) != {'reportId'} or not isinstance(result['reportId'], str) or result != _durable_result(home, review_run_id):
                     raise store.Refusal('invalid reviewer completion')
-                return result
+                completion = result
+                continue
             request_id = _request_id(request.get('id')); response['id'] = request_id
             op, args = request.get('op'), request.get('args')
             receipt = reviewer._receipt(home, review_run_id)
@@ -239,3 +243,4 @@ def serve_broker(home, review_run_id, stdin, stdout):
         except (json.JSONDecodeError, store.Refusal, ValueError, TypeError) as error:
             response['error'] = str(error)
         stdout.write(json.dumps(response, sort_keys=True) + '\n'); stdout.flush()
+    return completion
