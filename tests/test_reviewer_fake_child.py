@@ -19,9 +19,16 @@ def rpc(op,args):
  return r["value"]
 if "baseUrl" in json.dumps(payload) or "secret" in json.dumps(payload): raise SystemExit(4)
 rpc("model",{"id":"fixture/model"}); rpc("session",{"id":"actual-session"}); rpc("packet",{})
+MODE=''' + repr(mode) + '''
+if MODE=="timeout":
+ import subprocess,time,os
+ rpc("reserve",{})
+ kid=subprocess.Popen([sys.executable,"-c","import time;time.sleep(30)"])
+ open(payload["input"]["cwd"]+"/fake-pids","w").write(str(os.getpid())+" "+str(kid.pid))
+ time.sleep(30)
+ raise SystemExit
 rpc("reviewer_submit",{"report":{"schema":1,"summary":"fixture","findings":[]}})
 r=rpc("result",{})
-MODE=''' + repr(mode) + '''
 if MODE=="mismatch": r={"reportId":"wrong"}
 if MODE!="absent": print(json.dumps({"complete":True,"result":r}),flush=True)
 if MODE=="duplicate": print(json.dumps({"complete":True,"result":r}),flush=True)
@@ -54,3 +61,15 @@ def test_fake_child_absent_or_duplicate_completion_is_terminal(monkeypatch):
             monkeypatch.setattr(reviewer_runner,'assert_runtime_capability',capability); monkeypatch.setattr(reviewer_runner.shutil,'which',lambda _:str(fake))
             result=reviewer_runner.run_native_reviewer(home,reviewer.enqueue_intent(home,kind='manual'),agent_dir=agent)
             assert result['dispatch_state']=='final' and result['outcome']=='failed'
+
+def test_fake_child_timeout_leaves_inflight_unknown_and_kills_group(monkeypatch):
+    import os
+    from agd_lib import store
+    with lab() as (home, _):
+        ended_worker(home, 'native', str(uuid.uuid4()), [message('evidence')]); agent=home/'agent'; agent.mkdir(); fake=home/'bun'; fake_child(fake,'timeout')
+        config=reviewer.read_config(home); config['limits']['max_runtime_seconds']=1; store.atomic_json(reviewer.paths(home)['config'],config)
+        monkeypatch.setattr(reviewer_runner,'assert_runtime_capability',capability); monkeypatch.setattr(reviewer_runner.shutil,'which',lambda _:str(fake))
+        result=reviewer_runner.run_native_reviewer(home,reviewer.enqueue_intent(home,kind='manual'),agent_dir=agent)
+        assert result['outcome']=='unknown' and result['counters']['provider_inflight']==1
+        for pid in map(int,(home/'fake-pids').read_text().split()):
+            with __import__('pytest').raises(ProcessLookupError): os.kill(pid,0)
