@@ -39,6 +39,18 @@ def packet(home, cutoff=None, limit=262144, retrospective=()):
                                   retrospective_review_run_ids=retrospective)
 
 
+def test_messages_tracks_physical_prefix_across_malformed_rows(tmp_path):
+    header = b'{"type":"session","version":3,"id":"native"}\n'
+    bad = b'{bad}\n'; array = b'[]\n'
+    late = json.dumps(message('late', 300)).encode() + b'\n'
+    valid = json.dumps(message('kept', 100)).encode() + b'\n'
+    path = tmp_path / 'native.jsonl'; path.write_bytes(header + bad + array + late + valid)
+    _, watermark, digest, rows, late_seen, _, withheld = reviewer._messages(path, 200, 4096)
+    body = path.read_bytes()
+    assert watermark == len(body) and digest == __import__('hashlib').sha256(body).hexdigest()
+    assert rows[0]['text'] == 'kept' and body[rows[0]['byte_start']:rows[0]['byte_end']] == valid
+    assert late_seen and [item['reason'] for item in withheld].count('native-row-malformed') == 2
+
 def test_packet_collects_closed_failure_and_success_with_stable_cited_spans():
     with lab() as (home, _):
         failed, _, _ = ended_worker(home, 'failed', str(uuid.uuid4()), [message('failure')])
@@ -217,7 +229,7 @@ def test_large_native_history_keeps_only_bounded_selected_evidence():
         assert len(selected['excerpts']) < len(rows)
         assert sum(len(row['text'].encode()) for row in selected['excerpts']) < 12000
         session = home / 'data' / 'observability' / 'tasks' / task['id'] / 'omp' / task['incarnation']
-        assert selected['sources'][0]['byte_watermark'] < next(session.glob('*.jsonl')).stat().st_size
+        assert selected['sources'][0]['byte_watermark'] == next(session.glob('*.jsonl')).stat().st_size
         assert any(row['reason'] == 'input-limit' for row in selected['coverage']['late_basis'])
 
 

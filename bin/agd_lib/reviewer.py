@@ -152,29 +152,33 @@ def _render_content(content):
 def _messages(session_path, cutoff, budget):
     if session_path.is_symlink() or not session_path.is_file(): raise store.Refusal('unsafe native JSONL')
     with session_path.open('rb') as stream:
-        header_line = stream.readline()
-        if not header_line: raise store.Refusal('empty native JSONL')
-        header = json.loads(header_line); hasher = hashlib.sha256(header_line); watermark = len(header_line)
-        if header.get('type') != 'session' or header.get('version') != 3 or not isinstance(header.get('id'), str): raise store.Refusal('native JSONL header is invalid')
+        header_line = stream.readline(budget + 1)
+        if not header_line or len(header_line) > budget: raise store.Refusal('invalid native JSONL header')
+        try: header = json.loads(header_line)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error: raise store.Refusal('native JSONL header is invalid') from error
+        hasher = hashlib.sha256(header_line); watermark = len(header_line)
+        if not isinstance(header, dict) or header.get('type') != 'session' or header.get('version') != 3 or not isinstance(header.get('id'), str): raise store.Refusal('native JSONL header is invalid')
         rows, late, limited, withheld, number, retained = [], False, False, [], 1, 0
-        while line := stream.readline():
+        while line := stream.readline(budget + 1):
             number += 1; start = watermark
-            if len(line) > budget:
+            while line and not line.endswith(b'\n'):
+                hasher.update(line); watermark += len(line); line = stream.readline(budget + 1)
                 limited = True
-                break
+            if not line: break
+            hasher.update(line); watermark += len(line)
+            if len(line) > budget:
+                limited = True; withheld.append({'reason': 'native-row-too-large', 'line_start': number}); continue
             try: row = json.loads(line)
-            except json.JSONDecodeError: withheld.append({'reason': 'native-row-malformed', 'line_start': number}); continue
+            except (json.JSONDecodeError, UnicodeDecodeError): withheld.append({'reason': 'native-row-malformed', 'line_start': number}); continue
+            if not isinstance(row, dict): withheld.append({'reason': 'native-row-malformed', 'line_start': number}); continue
             try: at = _epoch(row.get('timestamp'))
             except (TypeError, ValueError): withheld.append({'reason': 'native-row-missing-timestamp', 'line_start': number}); continue
             if at > cutoff:
-                late = True
-                break
-            message = row.get('message') if isinstance(row, dict) else None
+                late = True; continue
+            message = row.get('message')
             text, unsupported = _render_content(message.get('content')) if isinstance(message, dict) else (None, False)
             if text and retained + len(text.encode()) > budget:
-                limited = True
-                break
-            watermark += len(line); hasher.update(line)
+                limited = True; continue
             if not isinstance(message, dict) or not isinstance(row.get('id'), str): continue
             if unsupported: withheld.append({'reason': 'unsupported-content-block', 'line_start': number, 'message_id': row['id']})
             if text:
