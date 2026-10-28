@@ -8,6 +8,8 @@ process.env.OPENAI_API_KEY ??= 'provider-free-fixture';
 
 test('native loop persists actual bridge report', async () => {
   const bridge = await startBridge();
+  if (process.env.AGD_TELEMETRY_MARKER === '1') console.log(`AGD_REVIEW_RUN_ID=${bridge.hello.input.reviewRunId}`);
+
   try {
     const observed: string[] = [], messages: unknown[][] = [];
     const result = await runReviewer({ ...bridge.hello.input, broker: bridge.broker, native: bridge.native }, scriptedStream(bridge.native.ai, [[call('reviewer_search', { query: 'failure' })], [call('reviewer_submit', { report: bridge.hello.report })], []], observed, messages));
