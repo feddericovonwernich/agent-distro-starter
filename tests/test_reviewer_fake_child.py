@@ -18,7 +18,8 @@ def rpc(op,args):
  if not r.get("ok"): raise SystemExit(3)
  return r["value"]
 if "baseUrl" in json.dumps(payload) or "secret" in json.dumps(payload): raise SystemExit(4)
-rpc("model",{"id":"fixture/model"}); rpc("session",{"id":"actual-session"}); rpc("packet",{})
+rpc("model",{"id":"fixture/model"}); rpc("session",{"id":"actual-session"})
+packet=json.loads(rpc("packet",{}))
 MODE=''' + repr(mode) + '''
 if MODE=="timeout":
  import subprocess,time,os
@@ -27,9 +28,13 @@ if MODE=="timeout":
  open(payload["input"]["cwd"]+"/fake-pids","w").write(str(os.getpid())+" "+str(kid.pid))
  time.sleep(30)
  raise SystemExit
-rpc("reviewer_submit",{"report":{"schema":1,"summary":"fixture","findings":[]}})
+report={"schema":1,"summary":"fixture","findings":[]}
+if MODE=="finding-mismatch":
+ source=packet["excerpts"][0]["source_id"]
+ report["findings"]=[{"kind":"new-skill","target":"fixture-workflow","finding":"fixture finding","applicability":"fixture","citations":[source],"counterexamples":[],"uncertainty":"fixture","resolution":"fixture","validation":"fixture","validation_limits":[],"new_skill":{"id":"fixture-skill","draft":"---\\nname: fixture-skill\\ndescription: fixture\\n---\\nfixture\\n","triggers":["fixture"],"scope":"fixture","prerequisites":[]}}]
+rpc("reviewer_submit",{"report":report})
 r=rpc("result",{})
-if MODE=="mismatch": r={"reportId":"wrong"}
+if MODE in ("mismatch","finding-mismatch"): r={"reportId":"wrong"}
 if MODE!="absent": print(json.dumps({"complete":True,"result":r}),flush=True)
 if MODE=="wait":
  import time,os
@@ -96,3 +101,15 @@ def test_run_lease_holds_until_child_exit_and_finalization(monkeypatch):
             with reviewer.run_lease(home): pass
         (home/'release').write_text('go'); thread.join(5)
         assert not thread.is_alive() and seen == [True]
+
+def test_committed_finding_survives_mismatched_completion_with_one_event(monkeypatch):
+    with lab() as (home, _):
+        ended_worker(home, 'native', str(uuid.uuid4()), [message('evidence')]); agent=home/'agent'; agent.mkdir(); fake=home/'bun'; fake_child(fake,'finding-mismatch')
+        monkeypatch.setattr(reviewer_runner,'assert_runtime_capability',capability); monkeypatch.setattr(reviewer_runner.shutil,'which',lambda _:str(fake))
+        result=reviewer_runner.run_native_reviewer(home,reviewer.enqueue_intent(home,kind='manual'),agent_dir=agent)
+        assert result['outcome']=='failed' and result['report_ids'] and result['proposal_ids']
+        event=list((home/'state'/'events').glob('*.json')); assert len(event)==1
+        report=reviewer.report_path(home,result['report_ids'][0]).read_bytes(); triage=reviewer.triage_path(home,result['proposal_ids'][0])
+        triage_bytes=triage.read_bytes() if triage.exists() else b''
+        assert reviewer.close_run(home,result['review_run_id'],'failed')['event_id']==result['event_id']
+        assert len(list((home/'state'/'events').glob('*.json')))==1 and report==reviewer.report_path(home,result['report_ids'][0]).read_bytes() and triage_bytes==(triage.read_bytes() if triage.exists() else b'')
