@@ -375,3 +375,12 @@ def test_same_report_duplicate_finding_reuses_proposal_identity():
         report['findings'].append(dict(report['findings'][0]))
         result = reviewer.submit_report(home, run['review_run_id'], str(uuid.uuid4()), report)
         assert result['proposal_ids'][0] == result['proposal_ids'][1]
+
+def test_finalization_recovers_missing_event_for_final_receipt():
+    with lab() as (home, _):
+        run, selected = produced_run(home)
+        submitted = reviewer.submit_report(home, run['review_run_id'], str(uuid.uuid4()), build_report(selected))
+        final = reviewer.finalize_run(home, run['review_run_id'], 'exited')
+        (home / 'state' / 'events' / f"{final['event_id']}.json").unlink()
+        reviewer.finalize_run(home, run['review_run_id'], 'exited')
+        assert supervision.pending(home)[0]['id'] == final['event_id']
