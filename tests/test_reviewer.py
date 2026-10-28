@@ -1,3 +1,4 @@
+import io
 import os
 import json
 import sys
@@ -199,6 +200,7 @@ def test_default_intents_coalesce_identical_scope_but_retrospectives_do_not():
 def test_runner_persists_reservation_before_resolver_failure(monkeypatch):
     with lab() as (home, _):
         config = reviewer.read_config(home); config['review_model'] = 'configured'; store.atomic_json(reviewer.paths(home)['config'], config)
+        ended_worker(home, 'resolver', str(uuid.uuid4()), [message('review me', time.time() - 1)])
         intent = reviewer.enqueue_intent(home, kind='manual')
         monkeypatch.setattr(reviewer_runner, 'resolve_model', lambda *_: (_ for _ in ()).throw(store.Refusal('no model')))
         with pytest.raises(store.Refusal, match='no model'):
@@ -477,3 +479,65 @@ def test_begin_run_requires_and_persists_observed_runtime_version():
         assert not reviewer.paths(home)['prepared'].exists() and not reviewer.paths(home)['reports'].exists()
         begun = reviewer.begin_run(home, run, selected, model='real/model', observed_omp_version='omp 1.2.3')
         assert begun['omp_version'] == 'omp 1.2.3'
+
+
+def test_packet_rejects_symlinked_task_directory_before_native_read(tmp_path):
+    with lab() as (home, _):
+        cutoff = time.time()
+        ended_worker(home, 'unsafe', str(uuid.uuid4()), [message('outside', cutoff - 1)], status=1)
+        task_dir = home / 'data' / 'tasks' / 'unsafe'
+        outside = tmp_path / 'outside'; task_dir.rename(outside); task_dir.symlink_to(outside, target_is_directory=True)
+        selected = packet(home, cutoff)
+        assert selected['episodes'] == []
+        assert any(row.get('reason') == 'task-record-malformed' for row in selected['coverage']['unavailable'])
+
+
+@pytest.mark.parametrize('task_id,incarnation', [
+    ('/absolute', str(uuid.uuid4())), ('../traversal', str(uuid.uuid4())),
+    ('valid', '../traversal'), ('valid', str(uuid.uuid4()).upper()),
+])
+def test_packet_refuses_noncanonical_stored_task_or_incarnation_ids(task_id, incarnation):
+    with lab() as (home, _):
+        directory = home / 'data' / 'tasks' / 'record'; directory.mkdir(parents=True)
+        (directory / 'task.json').write_text(json.dumps({'id': task_id, 'incarnation': incarnation, 'worker_alive': False}))
+        observations = directory / 'observations'; observations.mkdir()
+        (observations / 'exit.json').write_text(json.dumps({'key': 'runner-exit', 'id': 'exit', 'observed_at': time.time() - 1, 'incarnation': incarnation}))
+        selected = packet(home)
+        assert selected['episodes'] == []
+        assert any(row.get('reason') == 'task-record-malformed' for row in selected['coverage']['unavailable'])
+
+
+def test_reviewer_environment_sanitizes_ambient_identity_and_otel(monkeypatch):
+    with lab() as (home, _):
+        monkeypatch.setenv('AGD_TASK_ID', 'foreign-task')
+        monkeypatch.setenv('AGD_INCARNATION', str(uuid.uuid4()))
+        monkeypatch.setenv('AGD_MANAGED_CENTRAL', '1')
+        monkeypatch.setenv('AGD_OWNER', 'owner-token')
+        monkeypatch.setenv('OTEL_EXPORTER_OTLP_ENDPOINT', 'http://outside.invalid')
+        env, _, _ = observability.reviewer_environment(home, str(uuid.uuid4()))
+        assert env['AGD_HOME'] == str(home)
+        assert not {'AGD_TASK_ID', 'AGD_INCARNATION', 'AGD_MANAGED_CENTRAL', 'AGD_OWNER'} & set(env)
+        assert not any(key.startswith('OTEL_') for key in env)
+
+
+def test_broker_only_exposes_frozen_packet_and_persists_report():
+    with lab() as (home, _):
+        run, selected = produced_run(home)
+        requests = [
+            {'id': str(uuid.uuid4()), 'op': 'packet', 'args': {}},
+            {'id': str(uuid.uuid4()), 'op': 'reviewer_excerpt', 'args': {'source_id': 'outside'}},
+            {'id': str(uuid.uuid4()), 'op': 'reviewer_search', 'args': {'query': 'failure'}},
+            {'id': str(uuid.uuid4()), 'op': 'reviewer_submit', 'args': {'report': build_report(selected)}},
+            {'id': str(uuid.uuid4()), 'op': 'result', 'args': {}},
+            {'id': str(uuid.uuid4()), 'op': 'finish', 'args': {}},
+        ]
+        output = io.StringIO()
+        reviewer_runner.serve_broker(home, run['review_run_id'],
+                                     io.StringIO(''.join(json.dumps(row) + '\n' for row in requests)), output)
+        responses = [json.loads(row) for row in output.getvalue().splitlines()]
+        assert json.loads(responses[0]['value'])['packet_id'] == selected['packet_id']
+        assert responses[1]['ok'] is False
+        assert responses[2]['ok'] is True
+        assert responses[3]['value']['reportId'] == responses[4]['value']['reportId']
+        assert reviewer.report_path(home, responses[4]['value']['reportId']).is_file()
+        assert reviewer._receipt(home, run['review_run_id'])['dispatch_state'] == 'final'

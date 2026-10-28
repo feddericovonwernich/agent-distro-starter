@@ -227,6 +227,37 @@ def managed_environment(home, role, task, incarnation):
     return env, config['generation'], warning
 
 
+def reviewer_environment(home, review_run_id):
+    """Return the managed native environment for one reviewer run."""
+    home = _home(home)
+    try:
+        review_run_id = str(uuid.UUID(review_run_id))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise ValueError('invalid reviewer run ID') from error
+    config = read_config(home)
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith('OTEL_') and key not in {'AGD_TASK_ID', 'AGD_INCARNATION', 'AGD_MANAGED_CENTRAL', 'AGD_OWNER'}}
+    env['AGD_HOME'] = str(home)
+    if config['mode'] == 'disabled':
+        return env, config['generation'], None
+    allocation, project_id = config.get('ports'), config.get('project_id')
+    if not isinstance(allocation, dict) or not isinstance(allocation.get('otlp_http_port'), int) or not isinstance(project_id, str) or not project_id:
+        raise store.Refusal('observability configuration is malformed')
+    endpoint = f"http://127.0.0.1:{allocation['otlp_http_port']}"
+    attributes = {'service.name': 'agent-distro', 'agd.home_id': config['home_id'], 'agd.distro_id': config['home_id'],
+                  'agd.langfuse_project': project_id, 'agd.role': 'reviewer', 'agd.session_scope': 'background-skill-review',
+                  'agd.review_run_id': review_run_id, 'purpose': 'background-skill-review'}
+    env.update(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=endpoint + '/v1/traces', OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=endpoint + '/v1/logs',
+               OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=endpoint + '/v1/metrics', OTEL_EXPORTER_OTLP_TRACES_PROTOCOL='http/protobuf',
+               OTEL_EXPORTER_OTLP_LOGS_PROTOCOL='http/protobuf', OTEL_EXPORTER_OTLP_METRICS_PROTOCOL='http/protobuf',
+               OTEL_TRACES_EXPORTER='otlp', OTEL_LOGS_EXPORTER='otlp', OTEL_METRICS_EXPORTER='otlp',
+               OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT='true',
+               OTEL_RESOURCE_ATTRIBUTES=','.join(f'{key}={value}' for key, value in attributes.items()),
+               OTEL_SERVICE_NAME='agent-distro')
+    warning = None if read_status(home)['runtime'] == 'healthy' else 'observability is degraded; continuing without confirmed Collector health'
+    return env, config['generation'], warning
+
+
 def central_argv(home, omp_args):
     home = _home(home)
     forbidden = {'--cwd', '--session-dir', '--continue', '-c', '--resume', '-r', '--session',

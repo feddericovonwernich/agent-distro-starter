@@ -1,12 +1,38 @@
-"""Reviewer collection lifecycle; native OMP dispatch is deliberately owned by the host bridge."""
+"""Reviewer collection lifecycle and the trusted JSONL evidence broker."""
+import json
+import shutil
+import subprocess
 import time
+import uuid
 from pathlib import Path
 
-from . import reviewer, store
+from . import observability, reviewer, store
+
+
+def assert_runtime_capability():
+    """Discover the supported installed OMP modules without machine-specific paths."""
+    binary = shutil.which('bun')
+    if not binary:
+        raise store.DependencyError('bun is unavailable')
+    script = """const agent='@oh-my-pi/pi-coding-agent', aiName='@oh-my-pi/pi-ai', coreName='@oh-my-pi/pi-agent-core';
+const [root,sdk,ai,core,telemetry,resolver]=await Promise.all([import(agent),import(agent+'/sdk'),import(aiName),import(coreName),import(agent+'/telemetry-export'),import(agent+'/config/model-resolver')]);
+for(const [name,value] of Object.entries({Settings:sdk.Settings,ModelRegistry:sdk.ModelRegistry,AgentSession:sdk.AgentSession,SessionManager:sdk.SessionManager,Agent:core.Agent,AssistantMessageEventStream:ai.AssistantMessageEventStream,initTelemetryExport:telemetry.initTelemetryExport,resolveModelRoleValue:resolver.resolveModelRoleValue}))if(!value)throw new Error('unsupported OMP export: '+name);
+if(typeof root.VERSION!=='string'&&typeof root.version!=='string')throw new Error('unsupported OMP version export');
+console.log(JSON.stringify({ai_url:import.meta.resolve(aiName),core_url:import.meta.resolve(coreName),sdk_url:import.meta.resolve(agent+'/sdk'),telemetry_url:import.meta.resolve(agent+'/telemetry-export'),omp_version:root.VERSION||root.version}));"""
+    result = subprocess.run([binary, '-e', script], capture_output=True, text=True)
+    if result.returncode:
+        raise store.DependencyError(f'installed OMP runtime capability unavailable: {result.stderr.strip()}')
+    try:
+        capability = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise store.DependencyError('installed OMP runtime capability malformed') from error
+    if not all(isinstance(capability.get(key), str) and capability[key] for key in ('ai_url', 'core_url', 'sdk_url', 'telemetry_url', 'omp_version')):
+        raise store.DependencyError('installed OMP runtime capability malformed')
+    return capability
 
 
 def resolve_model(config, omp_binary):
-    """Return the configured concrete model; native default resolution belongs to the host bridge."""
+    """Only an explicit configured safe ID is resolved in Python; null is host-owned."""
     config = reviewer.validate_config(config)
     model = config['review_model']
     if not model:
@@ -17,7 +43,7 @@ def resolve_model(config, omp_binary):
 
 
 def launch(home, intent, *, omp_binary='omp', observed_omp_version):
-    """Atomically reserve, collect, and mark one receipt ready for native dispatch."""
+    """Reserve before collection; native host owns descriptor/default resolution."""
     with reviewer.run_lease(home):
         config = reviewer.read_config(home)
         instructions = Path(reviewer.INSTRUCTION_FILE).read_bytes()
@@ -25,7 +51,84 @@ def launch(home, intent, *, omp_binary='omp', observed_omp_version):
         deadline_epoch_ms = int((started + config['limits']['max_runtime_seconds']) * 1000)
         run = reviewer.reserve_run(home, intent, config_snapshot=config, instruction_snapshot=instructions,
                                    started_at=started, deadline_epoch_ms=deadline_epoch_ms)
-        model = resolve_model(config, omp_binary)
         packet = reviewer.select_packet(home, cutoff=started, config_snapshot=config,
                                         retrospective_review_run_ids=tuple(intent.get('retrospective_review_run_ids', ())))
+        if not packet['excerpts']:
+            return run
+        model = resolve_model(config, omp_binary)
         return reviewer.begin_run(home, run, packet, model=model, observed_omp_version=observed_omp_version)
+
+
+def _request_id(value):
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise store.Refusal('invalid broker request ID') from error
+
+
+def _broker_text(value, limit):
+    body = json.dumps(value, sort_keys=True, ensure_ascii=False)
+    if len(body.encode()) > limit:
+        raise store.Refusal('broker response exceeds frozen input limit')
+    return body
+
+
+def serve_broker(home, review_run_id, stdin, stdout):
+    """Serve only frozen packet evidence and receipt transitions over JSONL."""
+    receipt = reviewer._receipt(home, review_run_id)
+    if receipt.get('dispatch_state') not in ('begun', 'report-committed'):
+        raise store.Refusal('reviewer receipt is not dispatchable')
+    packet = reviewer.read_packet(home, receipt['packet_id'])
+    config = json.loads((reviewer.paths(home)['manifests'] / f"{receipt['config_snapshot_ref']}.json").read_text())
+    limit = config['limits']['max_input_bytes']
+    sources = {item['source_id'] for item in packet['sources']}
+    excerpts = [item for item in packet['excerpts'] if item['source_id'] in sources]
+    result = None
+    for line in stdin:
+        response = {'id': None, 'ok': False}
+        try:
+            request = json.loads(line); request_id = _request_id(request.get('id')); response['id'] = request_id
+            op, args = request.get('op'), request.get('args')
+            if not isinstance(op, str) or not isinstance(args, dict): raise store.Refusal('invalid broker request')
+            if op == 'packet':
+                value = _broker_text(packet, limit)
+            elif op == 'reviewer_excerpt':
+                source_id = args.get('source_id')
+                if source_id not in sources: raise store.Refusal('source is outside packet')
+                value = _broker_text([item for item in excerpts if item['source_id'] == source_id], limit)
+            elif op == 'reviewer_search':
+                query = args.get('query')
+                if not isinstance(query, str) or not query or len(query.encode()) > 256: raise store.Refusal('invalid packet search')
+                value = _broker_text([item for item in excerpts if query.casefold() in item['text'].casefold()], limit)
+            elif op == 'reviewer_submit':
+                report = args.get('report')
+                result = reviewer.submit_report(home, review_run_id, str(uuid.uuid4()), report)
+                value = {'reportId': result['report_id']}
+            elif op == 'reserve':
+                if time.time() * 1000 >= receipt['deadline_epoch_ms']: raise store.Refusal('review deadline exceeded')
+                with store.lock(store.home(home)):
+                    current = reviewer._receipt(home, review_run_id)
+                    if current['counters']['model_calls'] >= config['limits']['max_model_calls']: raise store.Refusal('model-call limit exceeded')
+                    current['counters']['model_calls'] += 1; current['dispatch_state'] = 'reserved-provider'
+                    store.atomic_json(reviewer.paths(home)['receipts'] / f'{review_run_id}.json', current)
+                value = {'model_calls': current['counters']['model_calls']}
+            elif op == 'settle':
+                with store.lock(store.home(home)):
+                    current = reviewer._receipt(home, review_run_id); current['dispatch_state'] = 'settled'
+                    store.atomic_json(reviewer.paths(home)['receipts'] / f'{review_run_id}.json', current)
+                value = {'dispatch_state': 'settled'}
+            elif op == 'session':
+                native_session_id = args.get('id')
+                value = observability.reviewer_binding(home, review_run_id, native_session_id)
+            elif op == 'result':
+                if result is None: raise store.Refusal('report is unavailable')
+                value = {'reportId': result['report_id']}
+            elif op == 'finish':
+                if result is None: raise store.Refusal('report is unavailable')
+                value = reviewer.finalize_run(home, review_run_id, 'completed')
+            else:
+                raise store.Refusal('broker operation is denied')
+            response.update(ok=True, value=value)
+        except (json.JSONDecodeError, store.Refusal, ValueError, TypeError) as error:
+            response['error'] = str(error)
+        stdout.write(json.dumps(response, sort_keys=True) + '\n'); stdout.flush()

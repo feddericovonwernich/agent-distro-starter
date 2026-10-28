@@ -12,8 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from . import store, worker_skills
-
+from . import observability, store, worker_skills
 INSTRUCTION_FILE = Path(__file__).resolve().parents[2] / 'lib' / 'agd-reviewer-instructions.md'
 DEFAULT_LIMITS = {'max_candidates': 20, 'max_input_bytes': 262144, 'max_model_calls': 20,
                   'max_output_bytes': 65536, 'max_runtime_seconds': 1800}
@@ -110,23 +109,28 @@ def _read_json(path):
 
 
 def _observation_candidates(home, cutoff, coverage):
-    result = []; root = store.home(home) / 'data' / 'tasks'
-    if not root.exists(): return result
+    result = []; home = store.home(home)
+    root = observability._existing_private_directory(home, 'data', 'tasks')
+    if root is None: return result
     for directory in sorted(root.iterdir()):
         task_file = directory / 'task.json'
         try:
+            if observability._existing_private_directory(home, 'data', 'tasks', directory.name) != directory:
+                raise ValueError('unsafe task directory')
             task = _read_json(task_file)
+            task_id = store.validate_id(task.get('id'))
+            if task_id != directory.name: raise ValueError('task directory mismatch')
             observations = directory / 'observations'
             if observations.exists() and (observations.is_symlink() or not observations.is_dir()): raise ValueError('unsafe observations')
             for path in sorted(observations.glob('*.json')) if observations.exists() else ():
                 try: event = _read_json(path)
                 except (OSError, ValueError, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'path': str(path), 'reason': 'observation-malformed'}); continue
                 if event.get('key') != 'runner-exit' or not isinstance(event.get('observed_at'), (int, float)) or event['observed_at'] > cutoff: continue
-                incarnation = event.get('incarnation')
-                if not isinstance(incarnation, str): _coverage(coverage, 'unavailable', {'path': str(path), 'reason': 'observation-malformed'}); continue
+                incarnation = observability._incarnation(event.get('incarnation'))
                 if incarnation == task.get('incarnation') and task.get('worker_alive') is not False: continue
                 result.append((event['observed_at'], task, event, directory))
-        except (OSError, ValueError, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'path': str(task_file), 'reason': 'task-record-malformed'})
+        except (OSError, TypeError, ValueError, store.Refusal, json.JSONDecodeError):
+            _coverage(coverage, 'unavailable', {'path': str(task_file), 'reason': 'task-record-malformed'})
     return sorted(result, key=lambda row: (row[0], row[1].get('id', ''), row[2].get('id', '')))
 
 
@@ -188,9 +192,13 @@ def _messages(session_path, cutoff, budget):
 
 
 def _fixed_session(root, task_id, incarnation, binding):
-    expected = root / 'data' / 'observability' / 'tasks' / task_id / 'omp' / incarnation
-    for parent in (root / 'data', root / 'data' / 'observability', root / 'data' / 'observability' / 'tasks', expected.parent, expected):
-        if parent.is_symlink() or not parent.is_dir(): raise ValueError('unsafe session path')
+    try:
+        task_id = store.validate_id(task_id); incarnation = observability._incarnation(incarnation)
+    except (TypeError, ValueError) as error:
+        raise ValueError('invalid native session identity') from error
+    expected = observability._existing_private_directory(
+        root, 'data', 'observability', 'tasks', task_id, 'omp', incarnation)
+    if expected is None: raise ValueError('missing native session')
     if binding.get('task_id') != task_id or binding.get('incarnation') != incarnation or binding.get('session_dir') != str(expected): raise ValueError('binding mismatch')
     return expected
 
