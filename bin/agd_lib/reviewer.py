@@ -480,14 +480,18 @@ def begin_run(home, run, packet, *, model, observed_omp_version):
         store.atomic_json(receipt, stored)
     return stored
 
-def close_run(home, review_run_id, outcome, *, error=None, packet=None):
-    """Persist a terminal non-report receipt without emitting a review event."""
+def close_run(home, review_run_id, outcome, *, error_code=None, diagnostic=b'', packet=None):
+    """Persist controlled terminal diagnostics, never child exception text."""
     if outcome not in ('no-work', 'failed', 'unknown'): raise store.Refusal('reviewer outcome')
+    if _receipt(home, review_run_id).get('dispatch_state') == 'report-committed':
+        return finalize_run(home, review_run_id, outcome)
     with store.lock(store.home(home)):
         receipt = _receipt(home, review_run_id)
+        if receipt.get('dispatch_state') == 'final': return receipt
         if packet is not None: receipt['packet_id'] = packet['packet_id']
         receipt.update(dispatch_state='final', outcome=outcome, closed_at=time.time())
-        if error: receipt['error'] = str(error)[:512]
+        if outcome == 'no-work': receipt['state'] = 'no-work'
+        if error_code: receipt['error'] = {'code': error_code, 'bytes': len(diagnostic), 'sha256': hashlib.sha256(diagnostic).hexdigest()}
         store.atomic_json(paths(home)['receipts'] / f"{receipt['review_run_id']}.json", receipt)
     return _receipt(home, review_run_id)
 
@@ -700,7 +704,7 @@ def finalize_run(home, review_run_id, outcome):
         receipt = _receipt(home, review_run_id)
         event_id = _review_event(home, receipt)
         if receipt.get('dispatch_state') != 'final':
-            receipt.update(dispatch_state='final', outcome=outcome, closed_at=time.time(), event_id=event_id)
+            receipt.update(dispatch_state='final', outcome=outcome, state=outcome, closed_at=time.time(), event_id=event_id)
             store.atomic_json(paths(home)['receipts'] / f"{receipt['review_run_id']}.json", receipt)
     mark_material_reviewed(home, read_packet(home, receipt['packet_id'])['coverage']['followup_id'])
     return _receipt(home, review_run_id)

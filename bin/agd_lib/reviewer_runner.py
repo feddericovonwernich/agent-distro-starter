@@ -47,24 +47,24 @@ def run_native_reviewer(home, intent, *, agent_dir, omp_binary='omp'):
         if not packet['excerpts']:
             return reviewer.close_run(home, run['review_run_id'], 'no-work', packet=packet)
         directory = Path(agent_dir)
-        if directory.is_symlink() or not directory.is_dir(): return reviewer.close_run(home, run['review_run_id'], 'failed', error='native reviewer agent directory is required', packet=packet)
+        if directory.is_symlink() or not directory.is_dir(): return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='agent-dir', packet=packet)
         try: capability = assert_runtime_capability()
-        except Exception as error: return reviewer.close_run(home, run['review_run_id'], 'failed', error=error, packet=packet)
+        except Exception: return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='capability', packet=packet)
         with store.lock(store.home(home)):
             receipt = reviewer._receipt(home, run['review_run_id'])
             receipt.update(packet_id=packet['packet_id'], omp_version=capability['omp_version'])
             store.atomic_json(reviewer.paths(home)['receipts'] / f"{run['review_run_id']}.json", receipt)
         env, _, _ = observability.reviewer_environment(home, run['review_run_id'])
         payload = {'urls': {key: capability[f'{key}_url'] for key in ('ai', 'core', 'sdk', 'telemetry', 'resolver')},
-                   'input': {'cwd': str(store.home(home)), 'agentDir': str(directory.resolve()), 'sessionDir': str(observability.reviewer_binding(home, run['review_run_id'], 'pending')['session_dir']),
+                   'input': {'cwd': str(store.home(home)), 'agentDir': str(directory.resolve()), 'sessionDir': observability.reviewer_session_dir(home, run['review_run_id']),
                              'reviewRunId': run['review_run_id'], 'receipt': {'deadline_epoch_ms': run['deadline_epoch_ms'], 'omp_version': capability['omp_version']},
                              'modelSelector': config['review_model'], 'reviewPrompt': json.loads((reviewer.paths(home)['manifests'] / f"{run['instruction_snapshot_ref']}.json").read_text())['text']}}
         bun = shutil.which('bun')
-        if not bun: return reviewer.close_run(home, run['review_run_id'], 'failed', error='bun is unavailable', packet=packet)
+        if not bun: return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='bun', packet=packet)
         stderr = bytearray()
         try:
             process = subprocess.Popen([bun, str(Path(__file__).resolve().parents[2] / 'lib' / 'agd-reviewer-host.ts')], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, start_new_session=True)
-        except OSError as error: return reviewer.close_run(home, run['review_run_id'], 'failed', error=error, packet=packet)
+        except OSError: return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='spawn', packet=packet)
         def drain():
             for chunk in iter(lambda: process.stderr.read(256), ''):
                 if len(stderr) < 4096: stderr.extend(chunk.encode(errors='replace')[:4096-len(stderr)])
@@ -90,10 +90,11 @@ def run_native_reviewer(home, intent, *, agent_dir, omp_binary='omp'):
         receipt = reviewer._receipt(home, run['review_run_id'])
         outcome = 'unknown' if receipt['counters'].get('provider_inflight') else 'failed'
         if timed_out.is_set() or failure or code or not isinstance(completion, dict):
-            return reviewer.close_run(home, run['review_run_id'], outcome, error=(stderr.decode(errors='replace') or str(failure or 'native reviewer completion missing')), packet=packet)
-        result = _durable_result(home, run['review_run_id'])
+            return reviewer.close_run(home, run['review_run_id'], outcome, error_code='timeout' if timed_out.is_set() else ('nonzero' if code else 'ipc'), diagnostic=bytes(stderr), packet=packet)
+        try: result = _durable_result(home, run['review_run_id'])
+        except Exception: return reviewer.close_run(home, run['review_run_id'], outcome, error_code='completion', diagnostic=bytes(stderr), packet=packet)
         if completion.get('reportId') != result['reportId']:
-            return reviewer.close_run(home, run['review_run_id'], outcome, error='native reviewer completion mismatch', packet=packet)
+            return reviewer.close_run(home, run['review_run_id'], outcome, error_code='completion', diagnostic=bytes(stderr), packet=packet)
         return reviewer.finalize_run(home, run['review_run_id'], 'exited')
 
 def launch_timer(home, *, agent_dir, now=None):
@@ -162,8 +163,8 @@ def serve_broker(home, review_run_id, stdin, stdout):
         try:
             request = json.loads(line)
             if set(request) == {'complete', 'result'}:
-                result = request['result']
-                if request['complete'] is not True or not isinstance(result, dict) or set(result) != {'reportId'} or not isinstance(result['reportId'], str):
+                result = request['result']; receipt = reviewer._receipt(home, review_run_id)
+                if receipt.get('dispatch_state') != 'report-committed' or request['complete'] is not True or not isinstance(result, dict) or set(result) != {'reportId'} or not isinstance(result['reportId'], str) or result != _durable_result(home, review_run_id):
                     raise store.Refusal('invalid reviewer completion')
                 return result
             request_id = _request_id(request.get('id')); response['id'] = request_id

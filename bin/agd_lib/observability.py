@@ -155,6 +155,14 @@ def worker_binding(home, task_id, incarnation):
         return worker_binding_locked(home, task_id, incarnation)
 
 
+def reviewer_session_dir(home, review_run_id):
+    """Provision only the reviewer native directory; binding awaits the real ID."""
+    home = _home(home)
+    try: review_run_id = str(uuid.UUID(review_run_id))
+    except (ValueError, TypeError, AttributeError) as error: raise ValueError('invalid reviewer run ID') from error
+    with store.lock(home):
+        return str(_private_directory(_private_directory(home, 'data', 'observability', 'reviewer', review_run_id), 'omp'))
+
 def reviewer_binding(home, review_run_id, native_session_id):
     """Create the reviewer-owned native session receipt after native allocation."""
     home = _home(home)
