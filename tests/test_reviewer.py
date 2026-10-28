@@ -538,7 +538,7 @@ def test_broker_only_exposes_frozen_packet_and_persists_report():
         assert json.loads(responses[0]['value'])['packet_id'] == selected['packet_id']
         assert responses[1]['ok'] is False
         assert responses[2]['ok'] is True
-        assert responses[3]['value']['reportId'] == responses[4]['value']['reportId']
+        assert json.loads(responses[3]['value'])['reportId'] == responses[4]['value']['reportId']
         assert reviewer.report_path(home, responses[4]['value']['reportId']).is_file()
         assert reviewer._receipt(home, run['review_run_id'])['dispatch_state'] == 'final'
 
@@ -563,11 +563,11 @@ def test_retrospective_rejects_mismatched_receipt_and_session_symlink(tmp_path):
 def test_broker_replay_charges_input_once_and_keeps_receipt_dispatchable():
     with lab() as (home, _):
         run, _ = produced_run(home); request_id = str(uuid.uuid4())
-        assert reviewer_runner._replay_or_reserve_input(home, run['review_run_id'], request_id, 'packet', {}, 'abc', 6) == 'abc'
-        assert reviewer_runner._replay_or_reserve_input(home, run['review_run_id'], request_id, 'packet', {}, 'abc', 6) == 'abc'
-        assert reviewer._receipt(home, run['review_run_id'])['counters']['input_bytes'] == len(json.dumps('abc').encode())
+        assert reviewer_runner._replay_or_reserve_input(home, run['review_run_id'], request_id, 'packet', {}, 'abc', 5) == 'abc'
+        assert reviewer_runner._replay_or_reserve_input(home, run['review_run_id'], request_id, 'packet', {}, 'abc', 5) == 'abc'
+        assert reviewer._receipt(home, run['review_run_id'])['counters']['input_bytes'] == len('abc'.encode())
         with pytest.raises(store.Refusal, match='cumulative'):
-            reviewer_runner._replay_or_reserve_input(home, run['review_run_id'], str(uuid.uuid4()), 'search', {}, 'abc', 6)
+            reviewer_runner._replay_or_reserve_input(home, run['review_run_id'], str(uuid.uuid4()), 'search', {}, 'abc', 5)
         requests = [{'id': str(uuid.uuid4()), 'op': 'reserve', 'args': {}}, {'id': str(uuid.uuid4()), 'op': 'settle', 'args': {}}]
         output = io.StringIO()
         reviewer_runner.serve_broker(home, run['review_run_id'], io.StringIO(''.join(json.dumps(row) + '\n' for row in requests)), output)

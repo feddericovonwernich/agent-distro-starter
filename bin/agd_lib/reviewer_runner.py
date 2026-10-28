@@ -73,7 +73,7 @@ def _broker_text(value):
     return json.dumps(value, sort_keys=True, ensure_ascii=False)
 
 
-def _replay_or_reserve_input(home, review_run_id, request_id, op, args, value, limit):
+def _replay_or_reserve_input(home, review_run_id, request_id, op, args, value, limit, *, evidence_limit=None):
     digest = reviewer._digest({'op': op, 'args': args})
     with store.lock(store.home(home)):
         receipt = reviewer._receipt(home, review_run_id)
@@ -82,14 +82,25 @@ def _replay_or_reserve_input(home, review_run_id, request_id, op, args, value, l
         if prior:
             if prior.get('digest') != digest: raise store.Refusal('conflicting broker request reuse')
             return prior['value']
-        encoded = _broker_text(value)
+        encoded = value if isinstance(value, str) else _broker_text(value)
         counters = receipt.setdefault('counters', {})
         used = counters.get('input_bytes', 0)
         if not isinstance(used, int) or used + len(encoded.encode()) > limit: raise store.Refusal('cumulative broker input limit exceeded')
+        if evidence_limit is not None and counters.get('evidence_calls', 0) >= evidence_limit: raise store.Refusal('evidence-call limit exceeded')
         counters['input_bytes'] = used + len(encoded.encode())
+        if evidence_limit is not None: counters['evidence_calls'] = counters.get('evidence_calls', 0) + 1
         replies[request_id] = {'digest': digest, 'value': value}
         store.atomic_json(reviewer.paths(home)['receipts'] / f'{review_run_id}.json', receipt)
     return value
+
+
+def _durable_result(home, review_run_id):
+    receipt = reviewer.recover_submissions(home, review_run_id)
+    results = receipt.get('report_results', {})
+    if not results: raise store.Refusal('report is unavailable')
+    result = results[sorted(results)[-1]]
+    if not isinstance(result, dict) or not isinstance(result.get('report_id'), str): raise store.Refusal('report result is malformed')
+    return {'reportId': result['report_id']}
 
 
 def serve_broker(home, review_run_id, stdin, stdout):
@@ -114,15 +125,15 @@ def serve_broker(home, review_run_id, stdin, stdout):
             elif op == 'reviewer_excerpt':
                 source_id = args.get('source_id')
                 if source_id not in sources: raise store.Refusal('source is outside packet')
-                value = _replay_or_reserve_input(home, review_run_id, request_id, op, args, _broker_text([item for item in excerpts if item['source_id'] == source_id]), limit)
+                value = _replay_or_reserve_input(home, review_run_id, request_id, op, args, _broker_text([item for item in excerpts if item['source_id'] == source_id]), limit, evidence_limit=config['limits']['max_model_calls'])
             elif op == 'reviewer_search':
                 query = args.get('query')
                 if not isinstance(query, str) or not query or len(query.encode()) > 256: raise store.Refusal('invalid packet search')
-                value = _replay_or_reserve_input(home, review_run_id, request_id, op, args, _broker_text([item for item in excerpts if query.casefold() in item['text'].casefold()]), limit)
+                value = _replay_or_reserve_input(home, review_run_id, request_id, op, args, _broker_text([item for item in excerpts if query.casefold() in item['text'].casefold()]), limit, evidence_limit=config['limits']['max_model_calls'])
             elif op == 'reviewer_submit':
                 report = args.get('report')
                 result = reviewer.submit_report(home, review_run_id, request_id, report)
-                value = _replay_or_reserve_input(home, review_run_id, request_id, op, args, {'reportId': result['report_id']}, limit)
+                value = _replay_or_reserve_input(home, review_run_id, request_id, op, args, _broker_text({'reportId': result['report_id']}), limit)
             elif op == 'reserve':
                 if time.time() * 1000 >= receipt['deadline_epoch_ms']: raise store.Refusal('review deadline exceeded')
                 with store.lock(store.home(home)):
@@ -151,10 +162,8 @@ def serve_broker(home, review_run_id, stdin, stdout):
                 native_session_id = args.get('id')
                 value = observability.reviewer_binding(home, review_run_id, native_session_id)
             elif op == 'result':
-                if result is None: raise store.Refusal('report is unavailable')
-                value = {'reportId': result['report_id']}
+                value = _durable_result(home, review_run_id)
             elif op == 'finish':
-                if result is None: raise store.Refusal('report is unavailable')
                 value = reviewer.finalize_run(home, review_run_id, 'completed')
             else:
                 raise store.Refusal('broker operation is denied')

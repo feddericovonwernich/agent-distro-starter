@@ -451,7 +451,7 @@ def reserve_run(home, intent, *, config_snapshot, instruction_snapshot, started_
     config = validate_config(config_snapshot)
     if not isinstance(intent, dict) or not isinstance(intent.get('intent_id'), str) or not isinstance(instruction_snapshot, bytes) or not isinstance(started_at, (int, float)) or type(deadline_epoch_ms) is not int: raise store.Refusal('invalid reviewer reservation')
     run_id = str(uuid.uuid4()); config_ref, instruction_ref = _digest(config), hashlib.sha256(instruction_snapshot).hexdigest(); publish_immutable(paths(home)['manifests'] / f'{config_ref}.json', config); publish_immutable(paths(home)['manifests'] / f'{instruction_ref}.json', {'text': instruction_snapshot.decode('utf-8'), 'raw_utf8_sha256': instruction_ref})
-    run = {'schema': 1, 'purpose': 'background-skill-review', 'review_run_id': run_id, 'intent': intent, 'config_snapshot_ref': config_ref, 'instruction_snapshot_ref': instruction_ref, 'started_at': started_at, 'deadline_epoch_ms': deadline_epoch_ms, 'counters': {'model_calls': 0, 'input_bytes': 0, 'provider_inflight': 0}, 'dispatch_state': 'reserved'}
+    run = {'schema': 1, 'purpose': 'background-skill-review', 'review_run_id': run_id, 'intent': intent, 'config_snapshot_ref': config_ref, 'instruction_snapshot_ref': instruction_ref, 'started_at': started_at, 'deadline_epoch_ms': deadline_epoch_ms, 'counters': {'model_calls': 0, 'evidence_calls': 0, 'input_bytes': 0, 'provider_inflight': 0}, 'dispatch_state': 'reserved'}
     with store.lock(store.home(home)):
         publish_immutable(paths(home)['receipts'] / f'{run_id}.json', run)
         pending = paths(home)['pending'] / f'{intent["intent_id"]}.json'

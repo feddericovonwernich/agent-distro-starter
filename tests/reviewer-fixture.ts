@@ -17,7 +17,10 @@ export async function startBridge() {
     if (row.done) throw new Error(`bridge EOF: ${await stderr}`);
     return row.value;
   };
-  const hello = JSON.parse(await next());
+  let hello;
+  try {
+    hello = JSON.parse(await Promise.race([next(), Bun.sleep(5000).then(() => { if (proc.exitCode === null) proc.kill(); throw new Error('bridge hello timed out'); })]));
+  } catch (error) { if (proc.exitCode === null) proc.kill(); await proc.exited; await lines.return?.(); throw error; }
   const native = { ai: await import(hello.aiUrl), core: await import(hello.coreUrl), sdk: await import(hello.sdkUrl), telemetry: await import(hello.telemetryUrl) };
   let queue = Promise.resolve();
   const rpc = (op: string, args: unknown) => {
