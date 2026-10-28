@@ -564,6 +564,11 @@ def submit_report(home, review_run_id, request_id, report):
             if requests[request_id] != _digest(report): raise store.Refusal('conflicting request reuse')
             return receipt['report_results'][request_id]
         proposals = list_proposals(home)
+        config = _read_json(paths(home)['manifests'] / f"{receipt['config_snapshot_ref']}.json")
+        used = sum(report_path(home, old).stat().st_size for old in receipt.get('report_ids', []) if report_path(home, old).exists())
+        # Reserve the report envelope before publishing any revision/header artifacts.
+        if used + len(_json_bytes(report)) + 2048 * len(report['findings']) > config['limits']['max_output_bytes']:
+            raise store.Refusal('cumulative report output exceeds limit')
         for finding in report['findings']:
             fingerprint = _finding_fingerprint(finding)
             matches = [row for row in proposals if row['fingerprint'] == fingerprint]

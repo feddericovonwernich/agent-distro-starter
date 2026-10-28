@@ -384,3 +384,14 @@ def test_finalization_recovers_missing_event_for_final_receipt():
         (home / 'state' / 'events' / f"{final['event_id']}.json").unlink()
         reviewer.finalize_run(home, run['review_run_id'], 'exited')
         assert supervision.pending(home)[0]['id'] == final['event_id']
+
+def test_persisted_report_over_budget_refuses_before_revisions():
+    with lab() as (home, _):
+        run, selected = produced_run(home)
+        report = build_report(selected)
+        config = reviewer.read_config(home); config['limits']['max_output_bytes'] = len(reviewer._json_bytes(report)) + 1
+        store.atomic_json(reviewer.paths(home)['manifests'] / f"{run['config_snapshot_ref']}.json", config)
+        with pytest.raises(store.Refusal, match='cumulative'):
+            reviewer.submit_report(home, run['review_run_id'], str(uuid.uuid4()), report)
+        assert not reviewer.paths(home)['reports'].exists() and not reviewer.paths(home)['revisions'].exists()
+
