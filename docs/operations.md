@@ -49,6 +49,12 @@ Routine supervision is hidden from the conversation but stays available to the a
 
 Cursor Agent still needs user authentication and a live transcript bound to its runner before either Cursor/backend combination can be claimed operational. Herdr 0.8.2 with protocol 20 has live OMP worker evidence only inside an explicitly named session. `doctor --harness cursor --backend herdr` diagnoses executable versions; it does not authenticate Cursor or provision a Herdr session.
 
+## Background reviewer
+
+`reviewer run` creates one bounded manual receipt; an empty eligible corpus returns `state: "no-work"` without native capability/model dispatch. `reviewer status`, `reviewer reports list|show ID`, and `reviewer proposals list|show ID` only inspect retained reviewer data. `reviewer proposals dispose ID --status accepted|rejected|deferred|superseded` appends local human triage; it never edits skills or creates tasks.
+
+`reviewer timer enable|disable` is the sole systemd user-unit activation path. Configuration, `init`, and manual runs never enable it. Set the real native agent directory with `OMP_AGENT_DIR` before a nonempty native reviewer run; AGD does not substitute a private empty `.omp` directory.
+
 ## Managed observability
 
 Managed observability is opt-in and needs Docker Engine 29.6.0, Docker Compose v5.1.4, and the private Treehouse v3.1.6 binary on `PATH`:

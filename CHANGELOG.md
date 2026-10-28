@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added reviewer CLI inspection, human triage, manual native-run dispatch, and durable no-work receipts. Timer activation remains an explicit command and is never automatic.
 - Added the inert reviewer scheduling kernel and owned per-user systemd unit rendering. Calendar schedules use systemd's native IANA/DST semantics, interval schedules use a fixed UTC-hour anchor, and no configuration or initialization action activates a timer.
 - Added immutable reviewer reports and proposal revisions, audited human-only triage, idempotent final batch events, and final-packet-only candidate consumption. New-skill drafts remain stored inertly outside discovery roots.
 - Hardened reviewer native JSONL collection to preserve bounded physical offsets and hashes across malformed, non-object, late, and skipped rows; finalized retrospective packets include committed reports.

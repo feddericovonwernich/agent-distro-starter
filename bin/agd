@@ -7,7 +7,7 @@ import json
 import sys
 import uuid
 from pathlib import Path
-from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr, relay, observability
+from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr, relay, observability, reviewer, reviewer_runner, reviewer_timer
 
 
 def parser():
@@ -132,6 +132,16 @@ def parser():
         observability_command.add_parser(action)
     central = observability_command.add_parser('central')
     central.add_argument('omp_args', nargs=argparse.REMAINDER)
+    reviewer_p = sub.add_parser('reviewer').add_subparsers(dest='reviewer_op', required=True)
+    run_p = reviewer_p.add_parser('run'); run_p.add_argument('--timer', action='store_true'); run_p.add_argument('--retrospective-review-run', action='append', default=[])
+    reviewer_p.add_parser('status')
+    reports = reviewer_p.add_parser('reports').add_subparsers(dest='report_op', required=True)
+    reports.add_parser('list'); reports.add_parser('show').add_argument('report_id')
+    proposals = reviewer_p.add_parser('proposals').add_subparsers(dest='proposal_op', required=True)
+    proposals.add_parser('list'); proposals.add_parser('show').add_argument('proposal_id')
+    dispose = proposals.add_parser('dispose'); dispose.add_argument('proposal_id'); dispose.add_argument('--status', required=True, choices=('accepted', 'rejected', 'deferred', 'superseded')); dispose.add_argument('--reason'); dispose.add_argument('--replacement')
+    timer_p = reviewer_p.add_parser('timer').add_subparsers(dest='timer_op', required=True)
+    for action in ('enable', 'disable', 'status'): timer_p.add_parser(action)
     return p
 
 
@@ -276,6 +286,25 @@ def main(args):
             return workers.stop(home, args.id)
         if args.operation == 'relaunch':
             return workers.relaunch(home, args.id)
+    if args.command == 'reviewer':
+        if args.reviewer_op == 'run':
+            if args.timer and args.retrospective_review_run: raise store.Refusal('timer runs cannot be retrospective')
+            if args.timer: return reviewer_runner.launch_timer(home, observed_omp_version=reviewer_runner.assert_runtime_capability()['omp_version'])
+            selected = tuple(args.retrospective_review_run)
+            return reviewer_runner.run_native_reviewer(home, reviewer.enqueue_intent(home, kind='retrospective' if selected else 'manual', retrospective_review_run_ids=selected))
+        if args.reviewer_op == 'status':
+            return {'timer': reviewer_timer._read_record(home), 'runs': len(list(reviewer.paths(home)['receipts'].glob('*.json')))}
+        if args.reviewer_op == 'reports':
+            if args.report_op == 'list': return [reviewer._read_json(p) for p in sorted(reviewer.paths(home)['reports'].glob('*.json'))]
+            return reviewer._read_json(reviewer.report_path(home, args.report_id))
+        if args.reviewer_op == 'proposals':
+            if args.proposal_op == 'dispose': return reviewer.dispose(home, args.proposal_id, args.status, args.reason, args.replacement, {'uid': os.getuid(), 'identity': 'observed-local-cli-identity'})
+            rows = reviewer.list_proposals(home) if args.proposal_op == 'list' else [reviewer.read_proposal(home, args.proposal_id)]
+            rendered = [{**row, 'current': reviewer.read_triage(home, row['proposal_id'])['current'], 'history': reviewer.read_triage(home, row['proposal_id'])['history']} for row in rows]
+            return rendered if args.proposal_op == 'list' else rendered[0]
+        if args.timer_op == 'status': return reviewer_timer._read_record(home)
+        if args.timer_op == 'enable': return reviewer_timer.enable(home, reviewer.read_config(home), source_cli=str(Path(__file__).resolve()))
+        return reviewer_timer.disable(home)
     if args.command == 'decision':
         return supervision.resolve(home, args.id, args.key, args.answer)
     if args.command == 'session':
