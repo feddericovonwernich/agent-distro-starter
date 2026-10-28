@@ -155,6 +155,30 @@ def worker_binding(home, task_id, incarnation):
         return worker_binding_locked(home, task_id, incarnation)
 
 
+def reviewer_binding(home, review_run_id, native_session_id):
+    """Create the reviewer-owned native session receipt after native allocation."""
+    home = _home(home)
+    try:
+        review_run_id = str(uuid.UUID(review_run_id))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise ValueError('invalid reviewer run ID') from error
+    if not isinstance(native_session_id, str) or not native_session_id or '/' in native_session_id:
+        raise ValueError('invalid native reviewer session ID')
+    with store.lock(home):
+        directory = _private_directory(home, 'data', 'observability', 'reviewer', review_run_id)
+        session_dir = _private_directory(directory, 'omp')
+        receipt = directory / 'binding.json'
+        expected = {'schema': 1, 'purpose': 'background-skill-review', 'review_run_id': review_run_id,
+                    'native_session_id': native_session_id, 'session_dir': str(session_dir)}
+        value = _read_json(receipt)
+        if value is None:
+            store.atomic_json(receipt, expected)
+            return expected
+        if value != expected:
+            raise store.Refusal('reviewer binding is immutable')
+        return value
+
+
 def managed_environment(home, role, task, incarnation):
     home = _home(home)
     config = read_config(home)
