@@ -50,15 +50,18 @@ def run_native_reviewer(home, intent, *, agent_dir, omp_binary='omp'):
         if directory.is_symlink() or not directory.is_dir(): return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='agent-dir', packet=packet)
         try: capability = assert_runtime_capability()
         except Exception: return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='capability', packet=packet)
-        with store.lock(store.home(home)):
-            receipt = reviewer._receipt(home, run['review_run_id'])
-            receipt.update(packet_id=packet['packet_id'], omp_version=capability['omp_version'])
-            store.atomic_json(reviewer.paths(home)['receipts'] / f"{run['review_run_id']}.json", receipt)
-        env, _, _ = observability.reviewer_environment(home, run['review_run_id'])
-        payload = {'urls': {key: capability[f'{key}_url'] for key in ('ai', 'core', 'sdk', 'telemetry', 'resolver')},
-                   'input': {'cwd': str(store.home(home)), 'agentDir': str(directory.resolve()), 'sessionDir': observability.reviewer_session_dir(home, run['review_run_id']),
-                             'reviewRunId': run['review_run_id'], 'receipt': {'deadline_epoch_ms': run['deadline_epoch_ms'], 'omp_version': capability['omp_version']},
-                             'modelSelector': config['review_model'], 'reviewPrompt': json.loads((reviewer.paths(home)['manifests'] / f"{run['instruction_snapshot_ref']}.json").read_text())['text']}}
+        try:
+            with store.lock(store.home(home)):
+                receipt = reviewer._receipt(home, run['review_run_id'])
+                receipt.update(packet_id=packet['packet_id'], omp_version=capability['omp_version'])
+                store.atomic_json(reviewer.paths(home)['receipts'] / f"{run['review_run_id']}.json", receipt)
+            env, _, _ = observability.reviewer_environment(home, run['review_run_id'])
+            payload = {'urls': {key: capability[f'{key}_url'] for key in ('ai', 'core', 'sdk', 'telemetry', 'resolver')},
+                       'input': {'cwd': str(store.home(home)), 'agentDir': str(directory.resolve()), 'sessionDir': observability.reviewer_session_dir(home, run['review_run_id']),
+                                 'reviewRunId': run['review_run_id'], 'receipt': {'deadline_epoch_ms': run['deadline_epoch_ms'], 'omp_version': capability['omp_version']},
+                                 'modelSelector': config['review_model'], 'reviewPrompt': json.loads((reviewer.paths(home)['manifests'] / f"{run['instruction_snapshot_ref']}.json").read_text())['text']}}
+        except Exception:
+            return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='preparation', packet=packet)
         bun = shutil.which('bun')
         if not bun: return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='bun', packet=packet)
         stderr = bytearray()

@@ -71,3 +71,23 @@ def test_invalid_retrospective_is_rejected_before_reviewer_writes():
         assert not reviewer.paths(home)['intents'].exists() and not reviewer.paths(home)['receipts'].exists()
 
 
+def test_preparation_failure_is_terminal_without_child(monkeypatch):
+    from test_reviewer import ended_worker, message
+    import uuid
+    with lab() as (home, _):
+        ended_worker(home, 'native', str(uuid.uuid4()), [message('evidence')]); agent=home/'agent'; agent.mkdir()
+        monkeypatch.setattr(reviewer_runner, 'assert_runtime_capability', lambda: {'omp_version':'fake','ai_url':'x','core_url':'x','sdk_url':'x','telemetry_url':'x','resolver_url':'x'})
+        monkeypatch.setattr(reviewer_runner.observability, 'reviewer_environment', lambda *_: (_ for _ in ()).throw(RuntimeError('secret preparation failure')))
+        result=reviewer_runner.run_native_reviewer(home, reviewer.enqueue_intent(home, kind='manual'), agent_dir=agent)
+        assert result['dispatch_state']=='final' and result['outcome']=='failed' and result['error']['code']=='preparation'
+        assert 'secret' not in json.dumps(result)
+
+
+def test_cli_manual_no_work_preserves_timer_bytes():
+    from support import command
+    with lab() as (home, _):
+        checkpoint=reviewer.paths(home)['checkpoint']; checkpoint.parent.mkdir(parents=True,exist_ok=True); checkpoint.write_bytes(b'{"anchor":0,"last_due":0}')
+        units=home/'private-units'; units.mkdir(); (units/'owned.timer').write_bytes(b'owned')
+        before=(checkpoint.read_bytes(),(units/'owned.timer').read_bytes())
+        result=command(home,'reviewer','run')
+        assert result['state']=='no-work' and before==(checkpoint.read_bytes(),(units/'owned.timer').read_bytes())
