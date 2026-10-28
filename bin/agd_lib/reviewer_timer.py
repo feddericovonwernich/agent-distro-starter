@@ -65,12 +65,21 @@ def _zoneinfo_next(schedule, base):
     raise store.Refusal('calendar horizon unavailable')
 
 
+def _transition_bases(schedule, base):
+    zone = ZoneInfo(schedule['timezone']); start = datetime.fromtimestamp(base, timezone.utc)
+    prior = start.astimezone(zone).utcoffset(); found = []
+    for day in range(1, 401):
+        point = start + timedelta(days=day); offset = point.astimezone(zone).utcoffset()
+        if offset != prior: found.append(point.timestamp() - 21600)
+        prior = offset
+    return found
+
+
 def native_calendar_agrees(schedule, base):
-    expected = _zoneinfo_next(schedule, base)
-    actual = native_next_calendar(schedule, base)
-    if actual != expected:
-        raise store.Refusal('native calendar semantics disagree with IANA timezone')
-    return actual
+    for point in [base, *_transition_bases(schedule, base)]:
+        if native_next_calendar(schedule, point) != _zoneinfo_next(schedule, point):
+            raise store.Refusal('native calendar semantics disagree with IANA timezone')
+    return native_next_calendar(schedule, base)
 
 
 def calculate_due(schedule, checkpoint, now_utc):
@@ -148,14 +157,14 @@ def _safe_directory(path):
     while not current.exists() and not current.is_symlink():
         chain.append(current)
         current = current.parent
-    if current.is_symlink() or not current.is_dir():
+    if current.is_symlink() or not current.is_dir() or os.lstat(current).st_uid != os.getuid():
         raise store.Refusal('unit directory is unsafe')
     for item in reversed(chain):
         item.mkdir(mode=0o700)
     for item in (path, *path.parents):
         if item.exists() or item.is_symlink():
-            mode = os.lstat(item).st_mode
-            if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            mode = os.lstat(item)
+            if stat.S_ISLNK(mode.st_mode) or not stat.S_ISDIR(mode.st_mode) or mode.st_uid != os.getuid():
                 raise store.Refusal('unit directory is unsafe')
         if item == current:
             break
@@ -170,8 +179,8 @@ def _unit_directory(xdg_config_home):
 
 def _owned(path, marker):
     try:
-        mode = os.lstat(path).st_mode
-        return stat.S_ISREG(mode) and not stat.S_ISLNK(mode) and marker in path.read_text().splitlines()
+        mode = os.lstat(path)
+        return stat.S_ISREG(mode.st_mode) and not stat.S_ISLNK(mode.st_mode) and mode.st_uid == os.getuid() and marker in path.read_text().splitlines()
     except OSError:
         return False
 
@@ -221,8 +230,9 @@ def enable(home, config, *, xdg_config_home=None, command_runner=store.run, sour
         previous = _read_record(root)
         unchanged = previous and previous.get('schedule') == schedule and previous.get('state') == 'enabled'
         anchor = previous.get('anchor') if unchanged and schedule['mode'] == 'interval' else float(int(now // 3600) * 3600)
+        checkpoint = previous.get('checkpoint') if unchanged else ({'next_due': agreed_next} if agreed_next is not None else {'anchor': anchor, 'last_due': anchor})
         record = {'schema': 1, 'home_id': _home_id(root), 'uid': os.getuid(), 'schedule': schedule,
-                  'anchor': anchor if schedule['mode'] == 'interval' else None, 'state': 'enabling'}
+                  'anchor': anchor if schedule['mode'] == 'interval' else None, 'checkpoint': checkpoint, 'state': 'enabling'}
         reviewer._private(_timer_record(root).parent); store.atomic_json(_timer_record(root), record)
     next_due = agreed_next
     try:
@@ -238,35 +248,38 @@ def enable(home, config, *, xdg_config_home=None, command_runner=store.run, sour
             store.atomic_json(_timer_record(root), {**record, 'state': 'failed', 'error': str(error)})
         raise
     with store.lock(root):
-        final = {**record, 'state': 'enabled',
-                 'checkpoint': {'next_due': next_due} if next_due is not None else {'anchor': anchor, 'last_due': anchor}}
+        final = {**record, 'state': 'enabled'}
         store.atomic_json(_timer_record(root), final)
     return final
 
 
 def disable(home, *, xdg_config_home=None, command_runner=store.run):
     root = store.home(home); name = unit_name(root); service = name[:-6] + '.service'; marker = f'X-AGD-Reviewer-Owner={_home_id(root)}:{os.getuid()}'
-    directory = _unit_directory(xdg_config_home)
-    owned = [directory / item for item in (name, service) if (directory / item).exists()]
-    if any(not _owned(path, marker) for path in owned):
-        raise store.Refusal('existing unit is not owned by this home')
-    command_runner(['systemctl', '--user', 'disable', '--now', name])
-    for path in owned: path.unlink()
-    command_runner(['systemctl', '--user', 'daemon-reload'])
+    directory = _unit_directory(xdg_config_home); paths = [directory / item for item in (name, service)]
+    present = [path for path in paths if path.exists() or path.is_symlink()]
+    if any(not _owned(path, marker) for path in present): raise store.Refusal('existing unit is not owned by this home')
     with store.lock(root):
         record = _read_record(root) or {'schema': 1, 'home_id': _home_id(root), 'uid': os.getuid()}
-        store.atomic_json(_timer_record(root), {**record, 'state': 'disabled'})
+        if record.get('state') == 'disabled' and not present: return
+        store.atomic_json(_timer_record(root), {**record, 'state': 'disabling'})
+    try:
+        if present: command_runner(['systemctl', '--user', 'disable', '--now', name])
+        for path in present: path.unlink()
+        command_runner(['systemctl', '--user', 'daemon-reload'])
+    except Exception as error:
+        with store.lock(root): store.atomic_json(_timer_record(root), {**record, 'state': 'disabling', 'error': str(error)})
+        raise
+    with store.lock(root): store.atomic_json(_timer_record(root), {**record, 'state': 'disabled'})
 
 
 def timer_tick(home, *, now=None):
-    """Record one eligible timer intent; callers launch it after this returns."""
+    """Durably write the immutable intent before consuming its due occurrence."""
     root = store.home(home); now = time.time() if now is None else float(now)
     with store.lock(root):
         record = _read_record(root)
-        if not record or record.get('state') != 'enabled':
-            raise store.Refusal('reviewer timer is not enabled')
+        if not record or record.get('state') != 'enabled': raise store.Refusal('reviewer timer is not enabled')
         due = calculate_due(record['schedule'], record['checkpoint'], now)
-        if due['due_at'] is None:
-            return None
+        if due['due_at'] is None: return None
+        intent = reviewer._enqueue_intent_locked(root, kind='timer')
         store.atomic_json(_timer_record(root), {**record, 'checkpoint': due['checkpoint']})
-    return reviewer.enqueue_intent(root, kind='timer')
+        return intent

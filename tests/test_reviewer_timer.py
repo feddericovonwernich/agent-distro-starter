@@ -20,8 +20,13 @@ def home(tmp_path):
     return root
 
 
+def interval_config(hours=12):
+    return {'schedule': {'mode': 'interval', 'timezone': None, 'calendar': None, 'interval_hours': hours},
+            'limits': dict(reviewer.DEFAULT_LIMITS)}
+
+
 def test_interval_hour_anchor_catches_up_once():
-    schedule = {'mode': 'interval', 'timezone': None, 'calendar': None, 'interval_hours': 12}
+    schedule = interval_config()['schedule']
     assert reviewer_timer.calculate_due(schedule, {'anchor': 0., 'last_due': 0.}, 36 * 3600 + 1) == {
         'due_at': 12 * 3600, 'next_due': 48 * 3600,
         'checkpoint': {'anchor': 0., 'last_due': 36 * 3600}}
@@ -41,8 +46,7 @@ def test_manual_schedule_never_changes_checkpoint():
 
 
 def test_rendered_interval_units_are_hourly_private_and_escaped(tmp_path):
-    config = {'schedule': {'mode': 'interval', 'timezone': None, 'calendar': None, 'interval_hours': 12},
-              'limits': {'max_runtime_seconds': 321, 'max_candidates': 1, 'max_input_bytes': 1, 'max_model_calls': 1, 'max_output_bytes': 1}}
+    config = interval_config(); config['limits']['max_runtime_seconds'] = 321
     rendered = reviewer_timer.render_units(home(tmp_path), config, source_cli='/opt/a b/agd%run')
     assert 'OnCalendar=*-*-* *:00:00 UTC' in rendered['timer']
     assert 'Persistent=true' in rendered['timer']
@@ -53,47 +57,84 @@ def test_rendered_interval_units_are_hourly_private_and_escaped(tmp_path):
 
 
 def test_refuses_symlink_and_foreign_unit_before_command(tmp_path):
-    root, xdg = home(tmp_path), tmp_path / 'xdg'
-    units = xdg / 'systemd' / 'user'
-    units.mkdir(parents=True)
-    foreign = units / reviewer_timer.unit_name(root)
-    foreign.write_text('[Unit]\nDescription=foreign\n')
+    root, xdg = home(tmp_path), tmp_path / 'xdg'; units = xdg / 'systemd' / 'user'; units.mkdir(parents=True)
+    foreign = units / reviewer_timer.unit_name(root); foreign.write_text('[Unit]\nDescription=foreign\n')
     calls = []
-    with pytest.raises(store.Refusal):
-        reviewer_timer.enable(root, reviewer_timer.default_config(), xdg_config_home=xdg,
-                              command_runner=lambda argv: calls.append(argv))
+    with pytest.raises(store.Refusal): reviewer_timer.enable(root, reviewer_timer.default_config(), xdg_config_home=xdg, command_runner=calls.append)
     assert calls == []
-    foreign.unlink()
-    (units / 'systemd-link').symlink_to('/tmp')
-    with pytest.raises(store.Refusal):
-        reviewer_timer.enable(root, reviewer_timer.default_config(), xdg_config_home=units / 'systemd-link',
-                              command_runner=lambda argv: calls.append(argv))
+    foreign.unlink(); (units / 'systemd-link').symlink_to('/tmp')
+    with pytest.raises(store.Refusal): reviewer_timer.enable(root, reviewer_timer.default_config(), xdg_config_home=units / 'systemd-link', command_runner=calls.append)
     assert calls == []
 
 
-def test_enable_releases_store_lock_before_runner_and_is_idempotent(tmp_path):
-    root, xdg = home(tmp_path), tmp_path / 'xdg'
-    calls = []
+def test_enable_releases_store_lock_and_preserves_progress(tmp_path):
+    root, xdg, calls = home(tmp_path), tmp_path / 'xdg', []
     def runner(argv):
-        lock = root / 'state' / 'mutation.lock'
-        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock = root / 'state' / 'mutation.lock'; lock.parent.mkdir(parents=True, exist_ok=True)
         with lock.open('a+') as stream:
-            import fcntl
-            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            import fcntl; fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
         calls.append(argv)
-    config = {'schedule': {'mode': 'interval', 'timezone': None, 'calendar': None, 'interval_hours': 12},
-              'limits': dict(reviewer.DEFAULT_LIMITS)}
+    config = interval_config()
     first = reviewer_timer.enable(root, config, xdg_config_home=xdg, command_runner=runner, now=13_001)
+    reviewer_timer.timer_tick(root, now=54_001)
     second = reviewer_timer.enable(root, config, xdg_config_home=xdg, command_runner=runner, now=99_999)
     assert first['anchor'] == second['anchor'] == 10_800
+    assert second['checkpoint']['last_due'] == 54_000
     assert len(calls) == 3
-    assert all(command[:2] == ['systemctl', '--user'] for command in calls)
+
+
+def test_due_tick_writes_pending_intent_before_checkpoint_and_recovers(tmp_path, monkeypatch):
+    root, xdg = home(tmp_path), tmp_path / 'xdg'; reviewer_timer.enable(root, interval_config(), xdg_config_home=xdg, command_runner=lambda _: None, now=1)
+    original = store.atomic_json
+    def fail_checkpoint(path, value):
+        if Path(path) == reviewer_timer._timer_record(root): raise OSError('interrupted')
+        return original(path, value)
+    monkeypatch.setattr(store, 'atomic_json', fail_checkpoint)
+    with pytest.raises(OSError): reviewer_timer.timer_tick(root, now=43_201)
+    monkeypatch.setattr(store, 'atomic_json', original)
+    assert len(list(reviewer.paths(root)['pending'].glob('*.json'))) == 1
+    assert reviewer_timer.timer_tick(root, now=43_201)['intent_id']
+    assert reviewer_timer._read_record(root)['checkpoint']['last_due'] == 43_200
+
+
+def test_disable_is_idempotent_and_recovers_after_reload_failure(tmp_path):
+    root, xdg, calls = home(tmp_path), tmp_path / 'xdg', []
+    reviewer_timer.enable(root, interval_config(), xdg_config_home=xdg, command_runner=lambda _: None, now=1)
+    def failing(argv):
+        calls.append(argv)
+        if argv[-1] == 'daemon-reload': raise OSError('reload')
+    with pytest.raises(OSError): reviewer_timer.disable(root, xdg_config_home=xdg, command_runner=failing)
+    assert reviewer_timer._read_record(root)['state'] == 'disabling'
+    reviewer_timer.disable(root, xdg_config_home=xdg, command_runner=calls.append)
+    after = len(calls); reviewer_timer.disable(root, xdg_config_home=xdg, command_runner=calls.append)
+    assert reviewer_timer._read_record(root)['state'] == 'disabled'
+    assert len(calls) == after
+
+
+def test_transition_mismatch_refuses_enable_before_writes(tmp_path, monkeypatch):
+    root, xdg, calls = home(tmp_path), tmp_path / 'xdg', []
+    schedule = {'mode': 'calendar', 'timezone': 'Europe/Berlin', 'calendar': '02:00', 'interval_hours': None}
+    monkeypatch.setattr(reviewer_timer, '_transition_bases', lambda *_: [100.0])
+    monkeypatch.setattr(reviewer_timer, 'native_next_calendar', lambda *_: 999.0)
+    with pytest.raises(store.Refusal): reviewer_timer.enable(root, {'schedule': schedule, 'limits': dict(reviewer.DEFAULT_LIMITS)}, xdg_config_home=xdg, command_runner=calls.append, now=1)
+    assert not xdg.exists() and calls == []
 
 
 def test_timer_runner_skips_collection_until_interval_is_due(tmp_path, monkeypatch):
-    root, xdg = home(tmp_path), tmp_path / 'xdg'
-    config = {'schedule': {'mode': 'interval', 'timezone': None, 'calendar': None, 'interval_hours': 2},
-              'limits': dict(reviewer.DEFAULT_LIMITS)}
-    reviewer_timer.enable(root, config, xdg_config_home=xdg, command_runner=lambda _: None, now=3_601)
+    root, xdg = home(tmp_path), tmp_path / 'xdg'; reviewer_timer.enable(root, interval_config(2), xdg_config_home=xdg, command_runner=lambda _: None, now=3_601)
     monkeypatch.setattr(reviewer_runner, 'launch', lambda *_args, **_kwargs: pytest.fail('collection launched while ineligible'))
     assert reviewer_runner.launch_timer(root, observed_omp_version='test', now=3_602) is None
+
+
+
+def test_refuses_foreign_owned_xdg_root(tmp_path, monkeypatch):
+    root, xdg = home(tmp_path), tmp_path / 'xdg'; xdg.mkdir()
+    actual = reviewer_timer.os.lstat
+    def foreign(path):
+        result = actual(path)
+        if Path(path) == xdg:
+            return type('Stat', (), {'st_mode': result.st_mode, 'st_uid': os.getuid() + 1})()
+        return result
+    monkeypatch.setattr(reviewer_timer.os, 'lstat', foreign)
+    with pytest.raises(store.Refusal):
+        reviewer_timer.enable(root, interval_config(), xdg_config_home=xdg, command_runner=lambda _: None)

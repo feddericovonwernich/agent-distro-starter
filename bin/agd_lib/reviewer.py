@@ -421,21 +421,23 @@ def mark_material_reviewed(home, material_basis):
         return state
 
 
-def enqueue_intent(home, *, kind, retrospective_review_run_ids=()):
+def _enqueue_intent_locked(home, *, kind, retrospective_review_run_ids=()):
     if kind not in ('default', 'manual', 'timer', 'retrospective') or not isinstance(retrospective_review_run_ids, tuple): raise store.Refusal('invalid reviewer intent')
     if kind == 'retrospective' and not retrospective_review_run_ids: raise store.Refusal('retrospective intent needs explicit closed runs')
-    root = store.home(home); scope = {'kind': kind, 'retrospective_review_run_ids': list(retrospective_review_run_ids)}
-    with store.lock(root):
-        if kind in ('default', 'timer'):
-            for path in paths(root)['intents'].glob('*.json') if paths(root)['intents'].exists() else ():
-                existing = _read_json(path)
-                pending = paths(root)['pending'] / f'{existing["intent_id"]}.json'
-                if {key: existing.get(key) for key in scope} == scope and pending.exists() and _read_json(pending).get('state') == 'pending':
-                    return existing
-        intent = {'schema': 1, 'intent_id': str(uuid.uuid4()), **scope, 'created_at': time.time()}
-        publish_immutable(paths(root)['intents'] / f'{intent["intent_id"]}.json', intent)
-        store.atomic_json(paths(root)['pending'] / f'{intent["intent_id"]}.json', {'intent_id': intent['intent_id'], 'state': 'pending'})
-        return intent
+    scope = {'kind': kind, 'retrospective_review_run_ids': list(retrospective_review_run_ids)}
+    if kind in ('default', 'timer'):
+        for path in paths(home)['intents'].glob('*.json') if paths(home)['intents'].exists() else ():
+            existing = _read_json(path); pending = paths(home)['pending'] / f'{existing["intent_id"]}.json'
+            if {key: existing.get(key) for key in scope} == scope and pending.exists() and _read_json(pending).get('state') == 'pending': return existing
+    intent = {'schema': 1, 'intent_id': str(uuid.uuid4()), **scope, 'created_at': time.time()}
+    publish_immutable(paths(home)['intents'] / f'{intent["intent_id"]}.json', intent)
+    store.atomic_json(paths(home)['pending'] / f'{intent["intent_id"]}.json', {'intent_id': intent['intent_id'], 'state': 'pending'})
+    return intent
+
+
+def enqueue_intent(home, *, kind, retrospective_review_run_ids=()):
+    with store.lock(store.home(home)):
+        return _enqueue_intent_locked(store.home(home), kind=kind, retrospective_review_run_ids=retrospective_review_run_ids)
 
 
 def timer_intent(home, *, now=None):
