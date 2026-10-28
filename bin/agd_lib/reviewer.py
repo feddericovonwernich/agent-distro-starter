@@ -581,6 +581,9 @@ def submit_report(home, review_run_id, request_id, report):
     try: request_id = str(uuid.UUID(str(request_id)))
     except (ValueError, TypeError, AttributeError) as error: raise store.Refusal('request ID') from error
     receipt = _receipt(home, review_run_id)
+    if receipt.get('dispatch_state') == 'final' and request_id in receipt.get('report_requests', {}):
+        if receipt['report_requests'][request_id] != _digest(report): raise store.Refusal('conflicting request reuse')
+        return receipt['report_results'][request_id]
     if receipt.get('dispatch_state') not in ('begun', 'report-committed'): raise store.Refusal('reviewer receipt cannot accept a report')
     packet = read_packet(home, receipt.get('packet_id'))
     report = _validate_report(home, receipt, packet, report)
