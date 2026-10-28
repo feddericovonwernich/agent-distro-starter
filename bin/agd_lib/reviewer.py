@@ -25,7 +25,8 @@ def paths(home):
     root = store.home(home); data, state = root / 'data' / 'reviewer', root / 'state' / 'reviewer'
     return {'config': data / 'config.json', 'packets': data / 'packets', 'reports': data / 'reports', 'proposals': data / 'proposals',
             'manifests': data / 'manifests', 'triage': data / 'triage', 'intents': state / 'intents', 'receipts': state / 'receipts',
-            'pending': state / 'pending', 'checkpoint': state / 'checkpoint.json', 'lock': state / 'run.lock'}
+            'pending': state / 'pending', 'checkpoints': state / 'checkpoints', 'followups': state / 'followups',
+            'checkpoint': state / 'checkpoint.json', 'lock': state / 'run.lock'}
 
 
 def _private(path):
@@ -235,7 +236,15 @@ def _cap(packet, limit):
 def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids=()):
     config = validate_config(config_snapshot)
     if not isinstance(cutoff, (int, float)) or cutoff < 0 or not isinstance(retrospective_review_run_ids, tuple): raise store.Refusal('packet scope is invalid')
-    root = store.home(home); coverage = {'complete': True, 'withheld': [], 'unavailable': [], 'unknown': [], 'langfuse_index': 'unused', 'late_basis': [], 'central_feedback': 'unknown', 'retrospective_excluded': []}
+    root = store.home(home)
+    scope = {'schema': 1, 'cutoff': cutoff, 'config_snapshot_sha256': _digest(config), 'retrospective_review_run_ids': list(retrospective_review_run_ids)}
+    scope_id = _digest(scope)
+    checkpoint = paths(root)['checkpoints'] / f'{scope_id}.json'
+    if checkpoint.exists():
+        saved = _read_json(checkpoint)
+        if saved.get('scope') != scope: raise store.Refusal('reviewer checkpoint collision')
+        return read_packet(root, saved['packet_id'])
+    coverage = {'complete': True, 'withheld': [], 'unavailable': [], 'unknown': [], 'langfuse_index': 'unused', 'late_basis': [], 'central_feedback': 'unknown', 'retrospective_excluded': []}
     episodes, sources, excerpts, provenance, seen = [], [], [], [], set()
     for observed_at, task, event, task_dir in _observation_candidates(root, cutoff, coverage):
         key = (task.get('id'), event.get('incarnation'))
@@ -285,8 +294,14 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
                     for row in withheld: _coverage(coverage, 'withheld', row)
                 except (OSError, store.Refusal, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'review_run_id': rid, 'reason': 'retrospective-native-jsonl-malformed'})
         if {item['review_run_id'] for item in retrospective} != requested: raise store.Refusal('unknown retrospective run')
+    material_basis = _digest({'sources': [(source['source_id'], source['content_sha256']) for source in sources if 'content_sha256' in source],
+                              'central': [(source['source_id'], source.get('answer_sha256')) for source in sources if source['kind'] == 'central-decision']})
+    publish_immutable(paths(root)['followups'] / f'{material_basis}.json', {'schema': 1, 'material_basis': material_basis, 'state': 'pending'})
+    coverage['followup_id'] = material_basis
     packet = {'schema': 1, 'purpose': 'background-skill-review', 'cutoff': cutoff, 'episodes': episodes, 'sources': sources, 'excerpts': excerpts, 'catalog': _catalog(root, coverage), 'skill_provenance': provenance, 'coverage': coverage, 'retrospective_review_run_ids': list(retrospective_review_run_ids), 'retrospective_episodes': retrospective, 'config_snapshot_sha256': _digest(config)}
-    _cap(packet, config['limits']['max_input_bytes']); packet_id = _digest(packet); publish_immutable(paths(root)['packets'] / f'{packet_id}.json', packet); packet['packet_id'] = packet_id; return packet
+    _cap(packet, config['limits']['max_input_bytes']); packet_id = _digest(packet); publish_immutable(paths(root)['packets'] / f'{packet_id}.json', packet)
+    store.atomic_json(checkpoint, {'scope': scope, 'packet_id': packet_id, 'material_basis': material_basis})
+    packet['packet_id'] = packet_id; return packet
 
 
 def enqueue_intent(home, *, kind, retrospective_review_run_ids=()):

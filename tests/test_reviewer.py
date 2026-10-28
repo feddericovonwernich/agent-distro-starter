@@ -167,3 +167,23 @@ def test_reserved_default_intent_is_consumed_before_next_identical_trigger():
         reviewer.reserve_run(home, intent, config_snapshot=reviewer.read_config(home), instruction_snapshot=b'frozen',
                              started_at=1.0, deadline_epoch_ms=2)
         assert reviewer.enqueue_intent(home, kind='default')['intent_id'] != intent['intent_id']
+
+
+def test_frozen_scope_reuses_packet_and_new_scope_creates_one_material_followup():
+    with lab() as (home, _):
+        task, binding, session = ended_worker(home, 'frozen', str(uuid.uuid4()), [message('first', 100)])
+        event = next((tasks.task_file(home, task['id']).parent / 'observations').glob('*.json'))
+        value = json.loads(event.read_text()); value['observed_at'] = 150.0; store.atomic_json(event, value)
+        frozen = packet(home, cutoff=200)
+        jsonl = Path(binding['session_dir']) / f'{session}.jsonl'
+        with jsonl.open('a') as stream:
+            stream.write(json.dumps(message('backdated arrival', 150)) + '\n')
+        assert packet(home, cutoff=200)['packet_id'] == frozen['packet_id']
+        followup = packet(home, cutoff=400)
+        repeated = packet(home, cutoff=400)
+        assert {row['text'] for row in followup['excerpts']} == {'first', 'backdated arrival'}
+        assert followup['coverage']['followup_id'] == repeated['coverage']['followup_id']
+        with jsonl.open('a') as stream:
+            stream.write(json.dumps(message('further material', 350)) + '\n')
+        newer = packet(home, cutoff=500)
+        assert newer['coverage']['followup_id'] != followup['coverage']['followup_id']
