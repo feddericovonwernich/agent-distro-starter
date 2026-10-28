@@ -367,3 +367,11 @@ def test_report_revisions_triage_and_finalization_preserve_inert_state():
         assert (worker_skills.catalog(home), worker_skills.resolve(home)) == (before_catalog, before_profiles)
         assert tree_bytes(home / 'data' / 'tasks') == before_tasks
         assert tree_bytes(home / 'data' / 'observability') == before_sources
+
+def test_same_report_duplicate_finding_reuses_proposal_identity():
+    with lab() as (home, _):
+        run, selected = produced_run(home)
+        report = build_report(selected)
+        report['findings'].append(dict(report['findings'][0]))
+        result = reviewer.submit_report(home, run['review_run_id'], str(uuid.uuid4()), report)
+        assert result['proposal_ids'][0] == result['proposal_ids'][1]

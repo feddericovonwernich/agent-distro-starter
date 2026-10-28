@@ -572,6 +572,7 @@ def submit_report(home, review_run_id, request_id, report):
                 proposal_id = str(uuid.uuid4())
                 proposal = {'schema': 1, 'proposal_id': proposal_id, 'fingerprint': fingerprint, 'head_revision': None,
                             'revisions': [], 'uncertain_distinct': bool(matches)}
+                proposals.append(proposal)
             else: proposal_id = proposal['proposal_id']
             revision = _revision_hash(proposal_id, finding)
             if revision not in {row['revision_hash'] for row in proposal['revisions']}:
