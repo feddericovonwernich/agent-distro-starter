@@ -130,8 +130,8 @@ def test_retrospective_requires_closed_prior_receipt_and_excludes_later_runs():
     with lab() as (home, _):
         prior, later = str(uuid.uuid4()), str(uuid.uuid4())
         receipts = reviewer.paths(home)['receipts']; receipts.mkdir(parents=True)
-        store.atomic_json(receipts / f'{prior}.json', {'schema': 1, 'purpose': 'background-skill-review', 'review_run_id': prior, 'dispatch_state': 'closed', 'closed_at': 100.0})
-        store.atomic_json(receipts / f'{later}.json', {'schema': 1, 'purpose': 'background-skill-review', 'review_run_id': later, 'dispatch_state': 'closed', 'closed_at': 300.0})
+        store.atomic_json(receipts / f'{prior}.json', {'schema': 1, 'purpose': 'background-skill-review', 'review_run_id': prior, 'dispatch_state': 'final', 'closed_at': 100.0})
+        store.atomic_json(receipts / f'{later}.json', {'schema': 1, 'purpose': 'background-skill-review', 'review_run_id': later, 'dispatch_state': 'final', 'closed_at': 300.0})
         binding = observability.reviewer_binding(home, prior, 'native-review')
         native = Path(binding['session_dir']) / 'native-review.jsonl'
         native.write_text('\n'.join(json.dumps(row) for row in [{'type': 'session', 'version': 3, 'id': 'native-review', 'timestamp': '1970-01-01T00:00:00Z'}, message('retrospective evidence', 100)]) + '\n')

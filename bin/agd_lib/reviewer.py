@@ -311,7 +311,7 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
             receipt = _read_json(receipt_path); rid = receipt.get('review_run_id'); closed = receipt.get('closed_at')
             if isinstance(rid, str) and isinstance(closed, (int, float)) and closed > cutoff: coverage['retrospective_excluded'].append(rid)
             if rid not in requested: continue
-            if receipt.get('dispatch_state') != 'closed' or not isinstance(closed, (int, float)) or closed > cutoff: raise store.Refusal('retrospective run is not closed before cutoff')
+            if receipt.get('dispatch_state') != 'final' or not isinstance(closed, (int, float)) or closed > cutoff: raise store.Refusal('retrospective run is not finalized before cutoff')
             binding_path = root / 'data' / 'observability' / 'reviewer' / rid / 'binding.json'
             try:
                 binding = _read_json(binding_path)
@@ -332,6 +332,17 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
                     if late: _coverage(coverage, 'late_basis', {'review_run_id': rid, 'reason': 'post-cutoff-native-row'})
                     for row in withheld: _coverage(coverage, 'withheld', row)
                 except (OSError, store.Refusal, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'review_run_id': rid, 'reason': 'retrospective-native-jsonl-malformed'})
+            for report_id in receipt.get('report_ids', []):
+                try:
+                    report = _read_json(report_path(root, report_id))
+                    source = {'kind': 'reviewer-report', 'review_run_id': rid, 'report_id': report_id,
+                              'content_sha256': hashlib.sha256(_json_bytes(report)).hexdigest()}
+                    source['source_id'] = _digest(source); sources.append(source)
+                    excerpt = {'source_id': source['source_id'], 'message_id': report_id, 'text': json.dumps(report, sort_keys=True),
+                               'line_start': 1, 'line_end': 1, 'byte_start': 0, 'byte_end': len(_json_bytes(report))}
+                    excerpt['excerpt_id'] = _digest(excerpt); excerpts.append(excerpt)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    _coverage(coverage, 'unavailable', {'review_run_id': rid, 'reason': 'committed-report-unavailable'})
         if {item['review_run_id'] for item in retrospective} != requested: raise store.Refusal('unknown retrospective run')
     packet = {'schema': 1, 'purpose': 'background-skill-review', 'cutoff': cutoff, 'episodes': episodes, 'sources': sources, 'excerpts': excerpts, 'catalog': _catalog(root, coverage), 'skill_provenance': provenance, 'coverage': coverage, 'retrospective_review_run_ids': list(retrospective_review_run_ids), 'retrospective_episodes': retrospective, 'config_snapshot_sha256': _digest(config)}
     _cap(packet, config['limits']['max_input_bytes'])
@@ -375,11 +386,11 @@ def mark_material_reviewed(home, material_basis):
         if state['state'] == 'pending':
             state = {**state, 'state': 'reviewed'}
             store.atomic_json(paths(home)['followups'] / f'{material_basis}.json', state)
-            for candidate in state.get('candidates', []):
-                if isinstance(candidate.get('material_basis'), str):
-                    store.atomic_json(paths(home)['candidates'] / f"{candidate['candidate_id']}.json",
-                                      {'schema': 1, 'candidate_id': candidate['candidate_id'], 'state': 'reviewed',
-                                       'material_basis': candidate['material_basis']})
+        for candidate in state.get('candidates', []):
+            if isinstance(candidate.get('material_basis'), str):
+                store.atomic_json(paths(home)['candidates'] / f"{candidate['candidate_id']}.json",
+                                  {'schema': 1, 'candidate_id': candidate['candidate_id'], 'state': 'reviewed',
+                                   'material_basis': candidate['material_basis']})
         return state
 
 
@@ -427,7 +438,9 @@ def begin_run(home, run, packet, *, model):
     with store.lock(store.home(home)):
         stored = _read_json(receipt)
         if stored != run or stored.get('dispatch_state') != 'reserved': raise store.Refusal('reviewer receipt is not reservable')
-        stored.update(packet_id=packet_id, model=model, dispatch_state='begun'); store.atomic_json(receipt, stored)
+        stored.update(packet_id=packet_id, model=model, dispatch_state='begun')
+        if model.endswith('-fixture'): stored['omp_version'] = 'fixture-only'
+        store.atomic_json(receipt, stored)
     return stored
 
 
@@ -494,7 +507,7 @@ def _validate_report(home, receipt, packet, report):
         raise store.Refusal('report schema')
     config = _read_json(paths(home)['manifests'] / f"{receipt['config_snapshot_ref']}.json")
     if len(_json_bytes(report)) > config['limits']['max_output_bytes']: raise store.Refusal('report exceeds output limit')
-    source_ids = {source['source_id'] for source in packet['sources']}
+    admitted = {source['source_id'] for source in packet['sources'] if any(excerpt['source_id'] == source['source_id'] for excerpt in packet['excerpts'])}
     inventory = {row['id']: row['catalog_sha256'] for row in packet.get('catalog', [])}
     required = {'kind', 'target', 'finding', 'applicability', 'citations', 'counterexamples', 'uncertainty', 'resolution', 'validation', 'validation_limits'}
     for finding in report['findings']:
@@ -502,16 +515,22 @@ def _validate_report(home, receipt, packet, report):
             raise store.Refusal('finding schema')
         if not all(isinstance(finding[key], str) and finding[key].strip() for key in ('target', 'finding', 'applicability', 'uncertainty', 'resolution', 'validation')):
             raise store.Refusal('finding text')
-        if not isinstance(finding['citations'], list) or not finding['citations'] or not set(finding['citations']) <= source_ids:
+        if not isinstance(finding['citations'], list) or not finding['citations'] or not set(finding['citations']) <= admitted:
             raise store.Refusal('citation')
-        if not isinstance(finding['counterexamples'], list) or not set(finding['counterexamples']) <= source_ids or not isinstance(finding['validation_limits'], list) or not all(isinstance(row, str) for row in finding['validation_limits']):
+        if not isinstance(finding['counterexamples'], list) or not set(finding['counterexamples']) <= admitted or not isinstance(finding['validation_limits'], list) or not all(isinstance(row, str) for row in finding['validation_limits']):
             raise store.Refusal('finding evidence')
         if finding['kind'] == 'existing-skill':
-            if set(finding) != required | {'target_source_version'} or inventory.get(finding['target']) != finding['target_source_version']:
+            version = finding.get('target_source_version')
+            if set(finding) != required | {'target_source_version'} or not isinstance(version, str) or not version or inventory.get(finding['target']) != version:
                 raise store.Refusal('frozen skill target')
         else:
             draft = finding.get('new_skill')
-            if set(finding) != required | {'new_skill'} or not isinstance(draft, dict) or set(draft) != {'id', 'draft', 'triggers', 'scope', 'prerequisites'} or not isinstance(draft['draft'], str) or not re.match(r'\A---\nname: [^\n]+\ndescription: [^\n]+\n---\n', draft['draft']):
+            if (set(finding) != required | {'new_skill'} or not isinstance(draft, dict) or set(draft) != {'id', 'draft', 'triggers', 'scope', 'prerequisites'}
+                or not isinstance(draft['id'], str) or not draft['id'].strip() or not isinstance(draft['draft'], str)
+                or not isinstance(draft['scope'], str) or not draft['scope'].strip() or not isinstance(draft['triggers'], list)
+                or not draft['triggers'] or not all(isinstance(row, str) and row.strip() for row in draft['triggers'])
+                or not isinstance(draft['prerequisites'], list) or not all(isinstance(row, str) for row in draft['prerequisites'])
+                or not re.match(r'\A---\nname: [^\n]+\ndescription: [^\n]+\n---\n', draft['draft'])):
                 raise store.Refusal('new skill draft')
     return report
 
@@ -543,15 +562,24 @@ def submit_report(home, review_run_id, request_id, report):
             else: proposal_id = proposal['proposal_id']
             revision = _revision_hash(proposal_id, finding)
             if revision not in {row['revision_hash'] for row in proposal['revisions']}:
-                revision_row = {'revision_hash': revision, 'basis_source_ids': sorted(finding['citations']),
-                                'proposed_change': finding, 'resurfaced': bool(proposal['revisions'])}
+                revision_row = {'schema': 1, 'proposal_id': proposal_id, 'revision_hash': revision, 'report_id': report_id,
+                                'packet_id': receipt['packet_id'], 'basis_source_ids': sorted(finding['citations']),
+                                'proposed_change': finding, 'observer': {'model': receipt['model'],
+                                'omp_version': receipt.get('omp_version'), 'instruction_snapshot_ref': receipt['instruction_snapshot_ref']},
+                                'resurfaced': bool(proposal['revisions'])}
                 publish_immutable(paths(home)['revisions'] / f'{revision}.json', revision_row)
                 proposal['revisions'].append(revision_row)
                 proposal['head_revision'] = revision
                 store.atomic_json(proposal_path(home, proposal_id), proposal)
             result['proposal_ids'].append(proposal_id)
         record = {'schema': 1, 'review_run_id': receipt['review_run_id'], 'request_id': request_id, 'report': report,
-                  'packet_id': receipt['packet_id'], 'proposal_ids': result['proposal_ids']}
+                  'packet_id': receipt['packet_id'], 'proposal_ids': result['proposal_ids'],
+                  'observer': {'model': receipt['model'], 'omp_version': receipt.get('omp_version'),
+                               'instruction_snapshot_ref': receipt['instruction_snapshot_ref'],
+                               'catalog_versions': [{'id': row['id'], 'catalog_sha256': row['catalog_sha256']} for row in packet['catalog']]}}
+        config = _read_json(paths(home)['manifests'] / f"{receipt['config_snapshot_ref']}.json")
+        used = sum(report_path(home, old).stat().st_size for old in receipt.get('report_ids', []) if report_path(home, old).exists())
+        if used + len(_json_bytes(record)) > config['limits']['max_output_bytes']: raise store.Refusal('cumulative report output exceeds limit')
         publish_immutable(report_path(home, report_id), record)
         receipt['report_requests'][request_id] = _digest(report)
         receipt.setdefault('report_results', {})[request_id] = result
@@ -579,24 +607,28 @@ def dispose(home, proposal_id, status, reason, replacement_proposal_id, operator
     return read_triage(home, proposal_id)
 
 
+def _review_event(home, receipt):
+    proposal_ids = sorted(set(receipt.get('proposal_ids', [])))
+    if not proposal_ids: return None
+    event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, _digest([receipt['review_run_id'], receipt.get('report_ids', []), proposal_ids])))
+    pending, handled = store.home(home) / 'state' / 'events' / f'{event_id}.json', store.home(home) / 'state' / 'events-handled' / f'{event_id}.json'
+    if not pending.exists() and not handled.exists():
+        store.atomic_json(pending, {'schema': 1, 'id': event_id, 'kind': 'background-skill-review',
+                                    'key': receipt['review_run_id'], 'observed_at': time.time(),
+                                    'details': {'purpose': 'background-skill-review', 'review_run_id': receipt['review_run_id'],
+                                                'report_ids': receipt.get('report_ids', []), 'proposal_ids': proposal_ids}})
+    return event_id
+
+
 def finalize_run(home, review_run_id, outcome):
     if not isinstance(outcome, str) or not outcome: raise store.Refusal('outcome')
     receipt = _receipt(home, review_run_id)
-    if receipt.get('dispatch_state') == 'final': return receipt
-    if receipt.get('dispatch_state') != 'report-committed': raise store.Refusal('report is not committed')
-    proposal_ids = sorted(set(receipt.get('proposal_ids', [])))
-    event_id = None
-    if proposal_ids:
-        from . import supervision
-        event_id = supervision.emit(store.home(home), 'reviewer', receipt['review_run_id'], 'background-skill-review',
-                                    _digest([receipt['review_run_id'], receipt.get('report_ids', []), proposal_ids]),
-                                    {'purpose': 'background-skill-review', 'review_run_id': receipt['review_run_id'], 'report_ids': receipt.get('report_ids', []), 'proposal_ids': proposal_ids})
+    if receipt.get('dispatch_state') not in ('report-committed', 'final'): raise store.Refusal('report is not committed')
+    event_id = _review_event(home, receipt)
     with store.lock(store.home(home)):
         receipt = _receipt(home, review_run_id)
-        if receipt.get('dispatch_state') == 'final': return receipt
-        receipt.update(dispatch_state='final', outcome=outcome, closed_at=time.time(), event_id=event_id)
-        store.atomic_json(paths(home)['receipts'] / f"{receipt['review_run_id']}.json", receipt)
-    if receipt.get('coverage', {}).get('followup_id'): mark_material_reviewed(home, receipt['coverage']['followup_id'])
-    elif (packet_id := receipt.get('packet_id')):
-        mark_material_reviewed(home, read_packet(home, packet_id)['coverage']['followup_id'])
-    return receipt
+        if receipt.get('dispatch_state') != 'final':
+            receipt.update(dispatch_state='final', outcome=outcome, closed_at=time.time(), event_id=event_id)
+            store.atomic_json(paths(home)['receipts'] / f"{receipt['review_run_id']}.json", receipt)
+    mark_material_reviewed(home, read_packet(home, receipt['packet_id'])['coverage']['followup_id'])
+    return _receipt(home, review_run_id)
