@@ -20,12 +20,12 @@ def launch(home, intent, *, omp_binary='omp'):
     """Atomically reserve, collect, and mark one receipt ready for native dispatch."""
     with reviewer.run_lease(home):
         config = reviewer.read_config(home)
-        model = resolve_model(config, omp_binary)
         instructions = Path(reviewer.INSTRUCTION_FILE).read_bytes()
         started = time.time()
         deadline_epoch_ms = int((started + config['limits']['max_runtime_seconds']) * 1000)
         run = reviewer.reserve_run(home, intent, config_snapshot=config, instruction_snapshot=instructions,
                                    started_at=started, deadline_epoch_ms=deadline_epoch_ms)
+        model = resolve_model(config, omp_binary)
         packet = reviewer.select_packet(home, cutoff=started, config_snapshot=config,
                                         retrospective_review_run_ids=tuple(intent.get('retrospective_review_run_ids', ())))
         return reviewer.begin_run(home, run, packet, model=model)

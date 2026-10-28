@@ -9,117 +9,134 @@ import pytest
 from support import command, lab
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
-from agd_lib import observability, reviewer, tasks, workers
+from agd_lib import observability, reviewer, reviewer_runner, store, supervision, tasks, workers
 
 
-def ended_worker(home, task_id, incarnation, text, status):
-    brief = home / f'{task_id}.md'
-    brief.write_text('Inspect value.txt.\n')
+def ended_worker(home, task_id, incarnation, rows, status=1):
+    brief = home / f'{task_id}.md'; brief.write_text('Inspect value.txt.\n')
     task = command(home, 'task', 'create', task_id, '--project', 'sample', '--brief', str(brief))
     task.update(executor='worker', incarnation=incarnation, phase='running', worker_alive=False)
     tasks.save(home, task)
     binding = observability.worker_binding(home, task_id, incarnation)
-    session_id, timestamp = str(uuid.uuid4()), '2026-01-01T00:00:00.000Z'
-    rows = [
-        {'type': 'session', 'version': 3, 'id': session_id, 'timestamp': timestamp, 'cwd': str(home)},
-        {'type': 'message', 'id': str(uuid.uuid4()), 'parentId': None, 'timestamp': timestamp,
-         'message': {'role': 'user', 'content': text, 'timestamp': 1767225600000}},
-    ]
-    Path(binding['session_dir'], f'{session_id}.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
-    note = tasks.task_file(home, task_id).parent / 'runner-exit.txt'
-    note.write_text(f'worker process exited {status}')
+    session_id = str(uuid.uuid4())
+    header = {'type': 'session', 'version': 3, 'id': session_id, 'timestamp': '2026-01-01T00:00:00.000Z', 'cwd': str(home)}
+    Path(binding['session_dir'], f'{session_id}.jsonl').write_text('\n'.join(json.dumps(row) for row in [header, *rows]) + '\n')
+    note = tasks.task_file(home, task_id).parent / 'runner-exit.txt'; note.write_text(f'worker process exited {status}')
     workers.event(home, task_id, incarnation, 'failed' if status else 'idle', 'runner-exit', note)
-    return task
+    return task, binding, session_id
 
 
-def test_packet_has_distinct_failure_and_counterexample_sources():
+def message(text, when=100.0, role='user', content=None):
+    return {'type': 'message', 'id': str(uuid.uuid4()), 'parentId': None, 'timestamp': when,
+            'message': {'role': role, 'content': text if content is None else content, 'timestamp': int(when * 1000)}}
+
+
+def packet(home, cutoff=None, limit=262144, retrospective=()):
+    cutoff = time.time() if cutoff is None else cutoff
+    config = reviewer.read_config(home); config['limits']['max_input_bytes'] = limit
+    return reviewer.select_packet(home, cutoff=cutoff, config_snapshot=config,
+                                  retrospective_review_run_ids=retrospective)
+
+
+def test_packet_collects_closed_failure_and_success_with_stable_cited_spans():
     with lab() as (home, _):
-        failed = ended_worker(home, 'failed', str(uuid.uuid4()), 'failure', 1)
-        succeeded = ended_worker(home, 'success', str(uuid.uuid4()), 'counterexample', 0)
-
-        packet = reviewer.select_packet(home, cutoff=time.time(), config_snapshot=reviewer.read_config(home))
-
-        native = [source for source in packet['sources'] if source['kind'] == 'native-jsonl']
-        assert {episode['task_id'] for episode in packet['episodes']} == {failed['id'], succeeded['id']}
+        failed, _, _ = ended_worker(home, 'failed', str(uuid.uuid4()), [message('failure')])
+        succeeded, _, _ = ended_worker(home, 'success', str(uuid.uuid4()), [message('counterexample')], 0)
+        first = packet(home); second = packet(home)
+        native = [source for source in first['sources'] if source['kind'] == 'native-jsonl']
+        assert {episode['task_id'] for episode in first['episodes']} == {failed['id'], succeeded['id']}
+        assert {excerpt['text'] for excerpt in first['excerpts']} == {'failure', 'counterexample'}
+        assert all(excerpt['message_id'] and excerpt['line_start'] <= excerpt['line_end'] for excerpt in first['excerpts'])
+        assert [source['source_id'] for source in first['sources']] == [source['source_id'] for source in second['sources']]
         assert len({source['source_id'] for source in native}) == 2
-        assert {excerpt['text'] for excerpt in packet['excerpts']} == {'failure', 'counterexample'}
 
 
-def test_packet_accepts_closed_prior_incarnation_but_not_live_current_one():
+def test_packet_excludes_late_rows_and_records_followup_basis():
     with lab() as (home, _):
-        old = str(uuid.uuid4())
-        ended_worker(home, 'retried', old, 'closed attempt', 1)
-        task = tasks.read(home, 'retried')
-        task.update(incarnation=str(uuid.uuid4()), worker_alive=True)
-        tasks.save(home, task)
-
-        packet = reviewer.select_packet(home, cutoff=time.time(), config_snapshot=reviewer.read_config(home))
-
-        assert [(episode['task_id'], episode['incarnation']) for episode in packet['episodes']] == [('retried', old)]
+        ended_worker(home, 'late', str(uuid.uuid4()), [message('before', 100), message('after', 300)])
+        event = next((tasks.task_file(home, 'late').parent / 'observations').glob('*.json'))
+        observed = json.loads(event.read_text()); observed['observed_at'] = 150.0; store.atomic_json(event, observed)
+        selected = packet(home, cutoff=200)
+        assert [row['text'] for row in selected['excerpts']] == ['before']
+        assert selected['coverage']['late_basis'][0]['reason'] == 'post-cutoff-native-row'
 
 
-def test_packet_freezes_bounded_excerpts_and_unknown_skill_usage():
+def test_packet_reports_unsupported_blocks_and_whole_packet_limit():
     with lab() as (home, _):
-        task = ended_worker(home, 'bounded', str(uuid.uuid4()), 'x' * 100, 1)
-        task['worker_skills'] = {'schema': 1, 'skills': [{'id': 'assigned', 'files': []}]}
-        tasks.save(home, task)
-        config = reviewer.read_config(home)
-        config['limits']['max_input_bytes'] = 64
-
-        packet = reviewer.select_packet(home, cutoff=time.time(), config_snapshot=config)
-
-        assert len(packet['excerpts'][0]['text'].encode()) <= 64
-        assert packet['skill_provenance'][0] == {'task_id': 'bounded', 'assigned': ['assigned'], 'usage': 'unknown'}
-        assert packet['coverage']['langfuse_index'] == 'unused'
+        ended_worker(home, 'bounded', str(uuid.uuid4()), [message('a' * 200, content=[{'type': 'text', 'text': 'ok'}, {'type': 'image'}])])
+        selected = packet(home, limit=10000)
+        assert len(reviewer._json_bytes({key: value for key, value in selected.items() if key != 'packet_id'})) <= 10000
+        assert any(row['reason'] == 'unsupported-content-block' for row in selected['coverage']['withheld'])
+        assert selected['coverage']['complete'] is False
 
 
-def test_reserved_receipt_freezes_snapshots_and_begin_only_completes_it():
+def test_packet_rejects_redirected_binding_and_reports_malformed_inputs():
     with lab() as (home, _):
-        intent = reviewer.enqueue_intent(home, kind='default')
-        config = reviewer.read_config(home)
-        run = reviewer.reserve_run(home, intent, config_snapshot=config, instruction_snapshot=b'frozen',
-                                   started_at=100.0, deadline_epoch_ms=200000)
-        packet = {'packet_id': 'a' * 64, 'sources': [], 'episodes': [], 'excerpts': [], 'coverage': {}}
-
-        begun = reviewer.begin_run(home, run, packet, model='native-model')
-
-        assert begun['review_run_id'] == run['review_run_id']
-        assert begun['started_at'] == 100.0
-        assert begun['deadline_epoch_ms'] == 200000
-        assert begun['counters'] == {'model_calls': 0}
-        assert begun['packet_id'] == 'a' * 64
-        with pytest.raises(Exception):
-            reviewer.begin_run(home, begun, packet, model='other-model')
+        task, binding, _ = ended_worker(home, 'unsafe', str(uuid.uuid4()), [message('secret')])
+        outside = home / 'outside'; outside.mkdir()
+        binding_path = Path(binding['session_dir']) / 'binding.json'
+        data = json.loads(binding_path.read_text()); data['session_dir'] = str(outside); store.atomic_json(binding_path, data)
+        malformed = home / 'data' / 'tasks' / 'broken'; malformed.mkdir(); (malformed / 'task.json').write_text('{bad')
+        selected = packet(home)
+        assert selected['episodes'] == []
+        assert any(row['reason'] == 'native-jsonl-unavailable' and row['task_id'] == task['id'] for row in selected['coverage']['unavailable'])
+        assert any(row['reason'] == 'task-record-malformed' for row in selected['coverage']['unavailable'])
 
 
-def test_reviewer_binding_uses_native_session_id_without_worker_environment(monkeypatch):
+def test_packet_freezes_catalog_and_assigned_manifest_without_claiming_usage():
     with lab() as (home, _):
-        monkeypatch.setenv('AGD_TASK_ID', 'unrelated')
-        monkeypatch.setenv('AGD_INCARNATION', str(uuid.uuid4()))
+        task, _, _ = ended_worker(home, 'skills', str(uuid.uuid4()), [message('evidence')])
+        skill = home / 'config' / 'worker-skills' / 'agd-test'; skill.mkdir(parents=True)
+        (skill / 'SKILL.md').write_text('---\nname: agd-test\ndescription: Test skill\n---\n')
+        snapshot = home / 'data' / 'tasks' / task['id'] / 'worker-skills' / 'agd-test'; snapshot.mkdir(parents=True)
+        (snapshot / 'SKILL.md').write_text((skill / 'SKILL.md').read_text())
+        manifest = {'schema': 1, 'harness': 'omp', 'roots': ['.omp/skills'], 'skills': [{'id': 'agd-test', 'source': str(skill), 'snapshot': str(snapshot), 'destination': str(Path(task['worktree']) / '.omp/skills/agd-test'), 'files': []}]}
+        store.atomic_json(tasks.task_file(home, task['id']).parent / 'worker-skills.json', manifest)
+        selected = packet(home)
+        assert any(row['id'] == 'agd-test' for row in selected['catalog'])
+        assert selected['skill_provenance'][0]['assigned'][0]['id'] == 'agd-test'
+        assert selected['skill_provenance'][0]['usage'] == 'unknown'
 
-        binding = observability.reviewer_binding(home, str(uuid.uuid4()), 'native-session')
 
-        assert binding['purpose'] == 'background-skill-review'
-        assert binding['native_session_id'] == 'native-session'
-        assert Path(binding['session_dir']).name == 'omp'
-        assert Path(binding['session_dir']).parent.name == binding['review_run_id']
-
-
-def test_runner_reserves_before_collecting_and_uses_frozen_instruction(monkeypatch):
-    from agd_lib import reviewer_runner
-
+def test_packet_collects_explicit_linked_decision_answer_as_partial_central_evidence():
     with lab() as (home, _):
+        task, _, _ = ended_worker(home, 'linked', str(uuid.uuid4()), [message('work')])
+        folder = tasks.task_file(home, task['id']).parent; decision = {'key': 'choice', 'status': 'resolved', 'incarnation': task['incarnation'], 'question': 'Which?', 'message_id': 'link-1', 'answer': 'decisions/choice.answer.json', 'resolved_at': 150.0}
+        (folder / 'decisions').mkdir(exist_ok=True); store.atomic_json(folder / 'decisions' / 'choice.json', decision); store.atomic_json(folder / 'decisions' / 'choice.answer.json', {'body': 'Use safe path.'})
+        selected = packet(home)
+        central = [source for source in selected['sources'] if source['kind'] == 'central-decision']
+        assert central and central[0]['linked_task_id'] == task['id']
+        assert selected['coverage']['central_feedback'] == 'active-partial'
+
+
+def test_retrospective_requires_closed_prior_receipt_and_excludes_later_runs():
+    with lab() as (home, _):
+        prior, later = str(uuid.uuid4()), str(uuid.uuid4())
+        receipts = reviewer.paths(home)['receipts']; receipts.mkdir(parents=True)
+        store.atomic_json(receipts / f'{prior}.json', {'schema': 1, 'purpose': 'background-skill-review', 'review_run_id': prior, 'dispatch_state': 'closed', 'closed_at': 100.0, 'packet_id': 'a' * 64})
+        store.atomic_json(receipts / f'{later}.json', {'schema': 1, 'purpose': 'background-skill-review', 'review_run_id': later, 'dispatch_state': 'closed', 'closed_at': 300.0, 'packet_id': 'b' * 64})
+        reviewer.publish_immutable(reviewer.paths(home)['packets'] / ('a' * 64 + '.json'), {'schema': 1, 'sources': [], 'excerpts': []})
+        selected = packet(home, cutoff=200, retrospective=(prior,))
+        assert selected['retrospective_episodes'][0]['review_run_id'] == prior
+        assert selected['coverage']['retrospective_excluded'] == [later]
+        with pytest.raises(store.Refusal):
+            packet(home, retrospective=(later,))
+
+
+def test_default_intents_coalesce_identical_scope_but_retrospectives_do_not():
+    with lab() as (home, _):
+        first = reviewer.enqueue_intent(home, kind='default'); second = reviewer.enqueue_intent(home, kind='default')
+        one = reviewer.enqueue_intent(home, kind='retrospective', retrospective_review_run_ids=('a',)); two = reviewer.enqueue_intent(home, kind='retrospective', retrospective_review_run_ids=('a',))
+        assert first['intent_id'] == second['intent_id']
+        assert one['intent_id'] != two['intent_id']
+
+
+def test_runner_persists_reservation_before_resolver_failure(monkeypatch):
+    with lab() as (home, _):
+        config = reviewer.read_config(home); config['review_model'] = 'configured'; store.atomic_json(reviewer.paths(home)['config'], config)
         intent = reviewer.enqueue_intent(home, kind='manual')
-        config = reviewer.read_config(home)
-        config['review_model'] = 'chosen-model'
-        monkeypatch.setattr(reviewer_runner.reviewer, 'read_config', lambda _: config)
-        monkeypatch.setattr(reviewer_runner.reviewer, 'select_packet',
-                            lambda *_args, **kwargs: {'packet_id': 'b' * 64, 'sources': [], 'episodes': [],
-                                                      'excerpts': [], 'coverage': {}, 'config_snapshot_sha256': kwargs['config_snapshot']})
-
-        run = reviewer_runner.launch(home, intent)
-
-        receipt = json.loads((reviewer.paths(home)['receipts'] / f"{run['review_run_id']}.json").read_text())
-        assert receipt['dispatch_state'] == 'begun'
-        assert receipt['model'] == 'chosen-model'
-        assert json.loads((reviewer.paths(home)['manifests'] / f"{receipt['instruction_snapshot_ref']}.json").read_text())['text'].startswith('# Background') 
+        monkeypatch.setattr(reviewer_runner, 'resolve_model', lambda *_: (_ for _ in ()).throw(store.Refusal('no model')))
+        with pytest.raises(store.Refusal, match='no model'):
+            reviewer_runner.launch(home, intent)
+        receipts = list(reviewer.paths(home)['receipts'].glob('*.json'))
+        assert len(receipts) == 1 and json.loads(receipts[0].read_text())['dispatch_state'] == 'reserved'
