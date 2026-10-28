@@ -25,7 +25,7 @@ def paths(home):
     root = store.home(home); data, state = root / 'data' / 'reviewer', root / 'state' / 'reviewer'
     return {'config': data / 'config.json', 'packets': data / 'packets', 'reports': data / 'reports', 'proposals': data / 'proposals',
             'manifests': data / 'manifests', 'triage': data / 'triage', 'intents': state / 'intents', 'receipts': state / 'receipts',
-            'pending': state / 'pending', 'checkpoints': state / 'checkpoints', 'followups': state / 'followups',
+            'pending': state / 'pending', 'checkpoints': state / 'checkpoints', 'followups': state / 'followups', 'candidates': state / 'candidates',
             'checkpoint': state / 'checkpoint.json', 'lock': state / 'run.lock'}
 
 
@@ -232,6 +232,18 @@ def _central(task_dir, task, cutoff, coverage):
     return sources, excerpts
 
 
+def _candidate_id(task_id, incarnation): return _digest({'task_id': task_id, 'incarnation': incarnation})
+
+
+def _candidate_is_reviewed(root, task_id, incarnation, session_dir):
+    try:
+        state = _read_json(paths(root)['candidates'] / f'{_candidate_id(task_id, incarnation)}.json')
+        if state.get('state') != 'reviewed': return False
+        return all(path.stat().st_size <= state['watermarks'][path.name] for path in session_dir.glob('*.jsonl'))
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
 def _cap(packet, limit):
     # Remove newest evidence until the complete broker object—not merely text—fits the frozen cap.
     while len(_json_bytes(packet)) > limit and packet['excerpts']:
@@ -256,11 +268,12 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
     episodes, sources, excerpts, provenance, seen = [], [], [], [], set()
     for observed_at, task, event, task_dir in _observation_candidates(root, cutoff, coverage):
         key = (task.get('id'), event.get('incarnation'))
-        if key in seen or len(episodes) >= config['limits']['max_candidates']: continue
+        if key in seen: continue
         try:
             binding = _read_json(root / 'data' / 'observability' / 'tasks' / key[0] / 'omp' / key[1] / 'binding.json'); session_dir = _fixed_session(root, key[0], key[1], binding); jsonls = sorted(session_dir.glob('*.jsonl'))
             if not jsonls: raise ValueError('no JSONL')
         except (OSError, ValueError, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'task_id': key[0], 'incarnation': key[1], 'reason': 'native-jsonl-unavailable'}); continue
+        if _candidate_is_reviewed(root, key[0], key[1], session_dir) or len(episodes) >= config['limits']['max_candidates']: continue
         seen.add(key); episodes.append({'task_id': key[0], 'incarnation': key[1], 'closed_at': observed_at, 'exit_observation_id': event.get('id')}); provenance.append({'task_id': key[0], 'assigned': _manifest(root, task_dir, task, coverage), 'usage': 'unknown'})
         for jsonl in jsonls:
             try:
@@ -306,12 +319,16 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
         if {item['review_run_id'] for item in retrospective} != requested: raise store.Refusal('unknown retrospective run')
     packet = {'schema': 1, 'purpose': 'background-skill-review', 'cutoff': cutoff, 'episodes': episodes, 'sources': sources, 'excerpts': excerpts, 'catalog': _catalog(root, coverage), 'skill_provenance': provenance, 'coverage': coverage, 'retrospective_review_run_ids': list(retrospective_review_run_ids), 'retrospective_episodes': retrospective, 'config_snapshot_sha256': _digest(config)}
     _cap(packet, config['limits']['max_input_bytes'])
+    candidates = [{'candidate_id': _candidate_id(episode['task_id'], episode['incarnation']), 'task_id': episode['task_id'], 'incarnation': episode['incarnation'],
+                   'watermarks': {Path(source['path']).name: source['byte_watermark'] for source in packet['sources']
+                                  if source.get('kind') == 'native-jsonl' and source.get('task_id') == episode['task_id'] and source.get('incarnation') == episode['incarnation']}}
+                  for episode in packet['episodes']]
     material_basis = _digest({'sources': [(source['source_id'], source.get('content_sha256'), source.get('answer_sha256')) for source in packet['sources']],
                               'excerpts': [excerpt['excerpt_id'] for excerpt in packet['excerpts']]})
     with store.lock(root):
         state_path = paths(root)['followups'] / f'{material_basis}.json'
         if not state_path.exists():
-            store.atomic_json(state_path, {'schema': 1, 'material_basis': material_basis, 'state': 'pending'})
+            store.atomic_json(state_path, {'schema': 1, 'material_basis': material_basis, 'state': 'pending', 'candidates': candidates})
     packet['coverage']['followup_id'] = material_basis
     _cap(packet, config['limits']['max_input_bytes'])
     packet_id = _digest(packet); publish_immutable(paths(root)['packets'] / f'{packet_id}.json', packet)
@@ -337,6 +354,11 @@ def mark_material_reviewed(home, material_basis):
         if state['state'] == 'pending':
             state = {**state, 'state': 'reviewed'}
             store.atomic_json(paths(home)['followups'] / f'{material_basis}.json', state)
+            for candidate in state.get('candidates', []):
+                if candidate.get('watermarks'):
+                    store.atomic_json(paths(home)['candidates'] / f"{candidate['candidate_id']}.json",
+                                      {'schema': 1, 'candidate_id': candidate['candidate_id'], 'state': 'reviewed',
+                                       'watermarks': candidate['watermarks']})
         return state
 
 

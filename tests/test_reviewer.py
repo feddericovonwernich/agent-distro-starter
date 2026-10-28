@@ -210,3 +210,24 @@ def test_material_state_consumes_once_without_recreating_same_basis():
         assert reviewer.material_state(home, basis)['state'] == 'reviewed'
         assert packet(home, cutoff=300)['coverage']['followup_id'] == basis
         assert reviewer.material_state(home, basis)['state'] == 'reviewed'
+
+
+def test_reviewed_candidates_advance_and_new_material_resurfaces_once():
+    with lab() as (home, _):
+        workers_data = [ended_worker(home, name, str(uuid.uuid4()), [message(name, 100)])
+                        for name in ('first', 'second', 'third')]
+        config = reviewer.read_config(home); config['limits']['max_candidates'] = 2
+        cutoff = time.time() + 100
+        first = reviewer.select_packet(home, cutoff=cutoff, config_snapshot=config)
+        assert [item['task_id'] for item in first['episodes']] == ['first', 'second']
+        reviewer.mark_material_reviewed(home, first['coverage']['followup_id'])
+        second = reviewer.select_packet(home, cutoff=cutoff + 1, config_snapshot=config)
+        assert [item['task_id'] for item in second['episodes']] == ['third']
+        reviewer.mark_material_reviewed(home, second['coverage']['followup_id'])
+        binding, session = workers_data[0][1:]
+        with (Path(binding['session_dir']) / f'{session}.jsonl').open('a') as stream:
+            stream.write(json.dumps(message('new first material', 150)) + '\n')
+        resurfaced = reviewer.select_packet(home, cutoff=cutoff + 2, config_snapshot=config)
+        assert [item['task_id'] for item in resurfaced['episodes']] == ['first']
+        reviewer.mark_material_reviewed(home, resurfaced['coverage']['followup_id'])
+        assert reviewer.select_packet(home, cutoff=cutoff + 3, config_snapshot=config)['episodes'] == []
