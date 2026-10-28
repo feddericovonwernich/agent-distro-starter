@@ -1,0 +1,246 @@
+import hashlib
+import json
+import os
+import re
+import shutil
+import tempfile
+from pathlib import Path
+
+from agd_lib import store
+
+
+Refusal = store.Refusal
+_RELEASES = {
+    'omp': ('https://api.github.com/repos/can1357/oh-my-pi/releases/latest', 'omp-linux-x64'),
+    'herdr': ('https://api.github.com/repos/herdrdev/herdr/releases/latest', 'herdr-linux-x86_64'),
+}
+
+
+def _receipt_path(home):
+    return Path(home) / 'data' / 'dependencies.json'
+
+
+def read_dependencies(home):
+    path = _receipt_path(home)
+    if not path.exists():
+        return {'schema': 1}
+    if path.is_symlink() or not path.is_file():
+        raise Refusal('dependency receipt is unsafe')
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise Refusal('dependency receipt is malformed') from error
+    if not isinstance(value, dict) or value.get('schema') != 1:
+        raise Refusal('dependency receipt is malformed')
+    for name, entry in value.items():
+        if name == 'schema':
+            continue
+        if not isinstance(entry, dict) or not isinstance(entry.get('source'), str):
+            raise Refusal('dependency receipt is malformed')
+    return value
+
+
+def write_dependencies(home, receipt):
+    if not isinstance(receipt, dict) or receipt.get('schema') != 1:
+        raise Refusal('dependency receipt is malformed')
+    for name, entry in receipt.items():
+        if name != 'schema' and (not isinstance(entry, dict) or not isinstance(entry.get('source'), str)):
+            raise Refusal('dependency receipt is malformed')
+    store.atomic_json(_receipt_path(home), receipt)
+
+
+def _result(run, argv):
+    try:
+        return run(argv, check=False)
+    except (OSError, store.DependencyError) as error:
+        raise Refusal(f'{Path(argv[0]).name} is unavailable') from error
+
+
+def _version(path, run, label):
+    result = _result(run, [str(path), '--version'])
+    text = (result.stdout or result.stderr or '').strip()
+    if result.returncode or not text:
+        raise Refusal(f'{label} version check failed')
+    return text
+
+
+def probe_omp(path, run):
+    version = _version(path, run, 'OMP')
+    models = _result(run, [str(path), 'models', '--json'])
+    try:
+        parsed = json.loads(models.stdout)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise Refusal('OMP models output is invalid') from error
+    if models.returncode or not isinstance(parsed, (list, dict)):
+        raise Refusal('OMP models output is invalid')
+    login = _result(run, [str(path), 'login', '--help'])
+    if login.returncode:
+        raise Refusal('OMP login capability is unavailable')
+    return {'path': str(path), 'version': version, 'capabilities': ['models-json', 'login']}
+
+
+def probe_herdr(path, session, run):
+    version = _version(path, run, 'Herdr')
+    sessions = _result(run, [str(path), 'session', 'list', '--json'])
+    try:
+        parsed = json.loads(sessions.stdout)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise Refusal('Herdr session list output is invalid') from error
+    if sessions.returncode or not isinstance(parsed, (list, dict)):
+        raise Refusal('Herdr session list output is invalid')
+    status = _result(run, [str(path), '--session', session, 'status', 'server'])
+    text = (status.stdout or status.stderr or '').strip().lower()
+    if status.returncode or text not in {'running', 'not running', 'not-running'}:
+        raise Refusal('Herdr named status output is invalid')
+    return {'path': str(path), 'version': version,
+            'capabilities': ['session-list-json', 'named-status']}
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _stable_release(fetch_json, tool):
+    release = fetch_json(_RELEASES[tool][0])
+    if not isinstance(release, dict) or release.get('draft') is not False or release.get('prerelease') is not False:
+        raise Refusal('latest release is not stable')
+    if not isinstance(release.get('tag_name'), str) or not release['tag_name']:
+        raise Refusal('release tag is missing')
+    if not isinstance(release.get('assets'), list):
+        raise Refusal('release assets are invalid')
+    return release
+
+
+def _selected_asset(release, tool):
+    name = _RELEASES[tool][1]
+    assets = [asset for asset in release['assets'] if isinstance(asset, dict) and asset.get('name') == name]
+    if len(assets) != 1 or not isinstance(assets[0].get('browser_download_url'), str):
+        raise Refusal('release asset is missing or ambiguous')
+    return assets[0]
+
+
+
+
+def _digest(release, asset, tool, stream_url):
+    value = asset.get('digest')
+    if value is None and tool == 'omp':
+        return _checksum_asset_from_stream(release, asset['name'], stream_url)
+    if not isinstance(value, str) or not re.fullmatch(r'sha256:[0-9a-f]{64}', value):
+        raise Refusal('release digest is malformed')
+    return value[7:]
+
+
+def _checksum_asset_from_stream(release, name, stream_url):
+    assets = [asset for asset in release['assets'] if isinstance(asset, dict) and asset.get('name') == 'SHA256SUMS.txt']
+    if len(assets) != 1 or not isinstance(assets[0].get('browser_download_url'), str):
+        raise Refusal('release digest is missing')
+    matcher = re.compile(rb'([0-9a-f]{64})  \*?' + re.escape(name.encode()))
+    matches, remainder = [], b''
+    for chunk in stream_url(assets[0]['browser_download_url']):
+        if not isinstance(chunk, bytes):
+            raise Refusal('release digest is malformed')
+        lines = (remainder + chunk).split(b'\n')
+        remainder = lines.pop()
+        matches.extend(match.group(1).decode() for line in lines if (match := matcher.fullmatch(line)))
+    if remainder:
+        match = matcher.fullmatch(remainder)
+        if match:
+            matches.append(match.group(1).decode())
+    if len(matches) != 1:
+        raise Refusal('release digest is malformed')
+    return matches[0]
+
+
+def _target(tool):
+    return Path(os.environ.get('HOME', '~')).expanduser() / '.local' / 'bin' / tool
+
+
+def _install(release, tool, stream_url, run):
+    asset = _selected_asset(release, tool)
+    expected = _digest(release, asset, tool, stream_url)
+    target = _target(tool)
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=target.parent, prefix=f'.{tool}-', delete=False) as output:
+            temporary = output.name
+            digest = hashlib.sha256()
+            for chunk in stream_url(asset['browser_download_url']):
+                if not isinstance(chunk, bytes):
+                    raise Refusal('download stream is invalid')
+                output.write(chunk)
+                digest.update(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        if digest.hexdigest() != expected:
+            raise Refusal('artifact digest differs from release digest')
+        os.chmod(temporary, 0o755)
+        probe = probe_omp if tool == 'omp' else lambda path, runner: probe_herdr(path, 'agd-probe', runner)
+        details = probe(temporary, run)
+        os.replace(temporary, target)
+        temporary = None
+        installed = _sha256(target)
+        return {'source': 'managed', **details, 'asset': asset['name'], 'tag': release['tag_name'],
+                'artifact_sha256': expected, 'installed_sha256': installed}
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def install_omp(home, fetch_json, stream_url, run):
+    return _install(_stable_release(fetch_json, 'omp'), 'omp', stream_url, run)
+
+
+def install_herdr(home, fetch_json, stream_url, run):
+    return _install(_stable_release(fetch_json, 'herdr'), 'herdr', stream_url, run)
+
+
+def validate_dependencies(home, run):
+    receipt = read_dependencies(home)
+    result = {'schema': 1}
+    for tool, entry in receipt.items():
+        if tool == 'schema':
+            continue
+        if tool not in _RELEASES or not isinstance(entry.get('path'), str):
+            raise Refusal('dependency receipt is malformed')
+        path = Path(entry['path'])
+        if entry['source'] == 'managed':
+            expected = entry.get('installed_sha256')
+            if not isinstance(expected, str) or _sha256(path) != expected:
+                raise Refusal('installed digest differs from receipt')
+        probe = probe_omp(path, run) if tool == 'omp' else probe_herdr(path, 'agd-probe', run)
+        result[tool] = {**entry, **probe}
+    return result
+
+
+def setup(home, backend, prompt, fetch_json, stream_url, run):
+    if backend not in {'tmux', 'herdr'}:
+        raise Refusal('selected backend is invalid')
+    tools = ['omp'] + (['herdr'] if backend == 'herdr' else [])
+    receipt = {'schema': 1}
+    changed = False
+    for tool in tools:
+        path = shutil.which(tool)
+        probe = probe_omp if tool == 'omp' else lambda item, runner: probe_herdr(item, 'agd-probe', runner)
+        existing = None
+        if path:
+            try:
+                existing = {'source': 'path', **probe(path, run)}
+            except Refusal:
+                pass
+        release = _stable_release(fetch_json, tool)
+        message = f'{tool} {release["tag_name"]} is available; install or update?'
+        if not prompt(message):
+            if existing is None:
+                raise Refusal(f'{tool} requirement is unmet')
+            receipt[tool] = existing
+            continue
+        receipt[tool] = _install(release, tool, stream_url, run)
+        changed = True
+    if changed:
+        write_dependencies(home, receipt)
+    return receipt
