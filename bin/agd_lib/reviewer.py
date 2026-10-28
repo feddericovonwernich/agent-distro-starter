@@ -25,8 +25,8 @@ def paths(home):
     root = store.home(home); data, state = root / 'data' / 'reviewer', root / 'state' / 'reviewer'
     return {'config': data / 'config.json', 'packets': data / 'packets', 'reports': data / 'reports', 'proposals': data / 'proposals',
             'revisions': data / 'revisions', 'manifests': data / 'manifests', 'triage': data / 'triage', 'intents': state / 'intents',
-            'receipts': state / 'receipts', 'pending': state / 'pending', 'checkpoints': state / 'checkpoints', 'followups': state / 'followups',
-            'candidates': state / 'candidates', 'checkpoint': state / 'checkpoint.json', 'lock': state / 'run.lock'}
+            'receipts': state / 'receipts', 'prepared': state / 'prepared', 'pending': state / 'pending', 'checkpoints': state / 'checkpoints',
+            'followups': state / 'followups', 'candidates': state / 'candidates', 'checkpoint': state / 'checkpoint.json', 'lock': state / 'run.lock'}
 
 
 def _private(path):
@@ -551,6 +551,31 @@ def _validate_report(home, receipt, packet, report):
                 raise store.Refusal('new skill draft')
     return report
 
+def _prepared_path(home, run_id, request_id):
+    return paths(home)['prepared'] / f'{run_id}-{request_id}.json'
+
+
+def _apply_prepared_locked(home, receipt, prepared):
+    for row in prepared['revisions']:
+        publish_immutable(paths(home)['revisions'] / f"{row['revision_hash']}.json", row)
+    for planned in prepared['proposals']:
+        path = proposal_path(home, planned['proposal_id'])
+        current = _read_json(path) if path.exists() else planned
+        known = {row['revision_hash'] for row in current['revisions']}
+        current['revisions'].extend(row for row in planned['revisions'] if row['revision_hash'] not in known)
+        current['head_revision'] = planned['head_revision']
+        store.atomic_json(path, current)
+    publish_immutable(report_path(home, prepared['result']['report_id']), prepared['record'])
+    request_id, result = prepared['request_id'], prepared['result']
+    receipt.setdefault('report_requests', {})[request_id] = prepared['input_digest']
+    receipt.setdefault('report_results', {})[request_id] = result
+    receipt['report_ids'] = list(dict.fromkeys([*receipt.get('report_ids', []), result['report_id']]))
+    receipt['proposal_ids'] = sorted(set([*receipt.get('proposal_ids', []), *result['proposal_ids']]))
+    receipt['output_bytes'] = sum(_read_json(path)['output_bytes'] for path in paths(home)['prepared'].glob(f"{receipt['review_run_id']}-*.json"))
+    receipt['dispatch_state'] = 'report-committed'
+    store.atomic_json(paths(home)['receipts'] / f"{receipt['review_run_id']}.json", receipt)
+    return result
+
 
 def submit_report(home, review_run_id, request_id, report):
     try: request_id = str(uuid.UUID(str(request_id)))
@@ -562,58 +587,45 @@ def submit_report(home, review_run_id, request_id, report):
     report_id = _digest({'review_run_id': receipt['review_run_id'], 'request_id': request_id, 'report': report})
     result = {'report_id': report_id, 'proposal_ids': []}
     with store.lock(store.home(home)):
-        receipt = _receipt(home, review_run_id)
-        requests = receipt.setdefault('report_requests', {})
-        if request_id in requests:
-            if requests[request_id] != _digest(report): raise store.Refusal('conflicting request reuse')
+        receipt = _receipt(home, review_run_id); digest = _digest(report)
+        if request_id in receipt.get('report_requests', {}):
+            if receipt['report_requests'][request_id] != digest: raise store.Refusal('conflicting request reuse')
             return receipt['report_results'][request_id]
-        proposals = list_proposals(home)
-        config = _read_json(paths(home)['manifests'] / f"{receipt['config_snapshot_ref']}.json")
-        used = sum(report_path(home, old).stat().st_size for old in receipt.get('report_ids', []) if report_path(home, old).exists())
-        # Reserve the report envelope before publishing any revision/header artifacts.
-        if used + len(_json_bytes(report)) + 2048 * len(report['findings']) > config['limits']['max_output_bytes']:
-            raise store.Refusal('cumulative report output exceeds limit')
+        path = _prepared_path(home, receipt['review_run_id'], request_id)
+        if path.exists():
+            prepared = _read_json(path)
+            if prepared['input_digest'] != digest: raise store.Refusal('conflicting request reuse')
+            return _apply_prepared_locked(home, receipt, prepared)
+        proposals, revisions, proposal_ids = list_proposals(home), [], []
         for finding in report['findings']:
-            fingerprint = _finding_fingerprint(finding)
-            matches = [row for row in proposals if row['fingerprint'] == fingerprint]
-            proposal = matches[0] if len(matches) == 1 and any(
-                set(item['basis_source_ids']) & set(finding['citations']) or item['proposed_change'] == finding
-                for item in matches[0]['revisions']) else None
+            fingerprint = _finding_fingerprint(finding); matches = [row for row in proposals if row['fingerprint'] == fingerprint]
+            proposal = matches[0] if len(matches) == 1 and any(set(row['basis_source_ids']) & set(finding['citations']) or row['proposed_change'] == finding for row in matches[0]['revisions']) else None
             if proposal is None:
-                proposal_id = str(uuid.uuid4())
-                proposal = {'schema': 1, 'proposal_id': proposal_id, 'fingerprint': fingerprint, 'head_revision': None,
-                            'revisions': [], 'uncertain_distinct': bool(matches)}
+                proposal = {'schema': 1, 'proposal_id': str(uuid.uuid4()), 'fingerprint': fingerprint, 'head_revision': None, 'revisions': [], 'uncertain_distinct': bool(matches)}
                 proposals.append(proposal)
-            else: proposal_id = proposal['proposal_id']
-            revision = _revision_hash(proposal_id, finding)
+            revision = _revision_hash(proposal['proposal_id'], finding)
             if revision not in {row['revision_hash'] for row in proposal['revisions']}:
-                revision_row = {'schema': 1, 'proposal_id': proposal_id, 'revision_hash': revision, 'report_id': report_id,
-                                'packet_id': receipt['packet_id'], 'basis_source_ids': sorted(finding['citations']),
-                                'proposed_change': finding, 'observer': {'model': receipt['model'],
-                                'omp_version': receipt.get('omp_version'), 'instruction_snapshot_ref': receipt['instruction_snapshot_ref']},
-                                'resurfaced': bool(proposal['revisions'])}
-                publish_immutable(paths(home)['revisions'] / f'{revision}.json', revision_row)
-                proposal['revisions'].append(revision_row)
-                proposal['head_revision'] = revision
-                store.atomic_json(proposal_path(home, proposal_id), proposal)
-            result['proposal_ids'].append(proposal_id)
-        record = {'schema': 1, 'review_run_id': receipt['review_run_id'], 'request_id': request_id, 'report': report,
-                  'packet_id': receipt['packet_id'], 'proposal_ids': result['proposal_ids'],
-                  'observer': {'model': receipt['model'], 'omp_version': receipt.get('omp_version'),
-                               'instruction_snapshot_ref': receipt['instruction_snapshot_ref'],
-                               'catalog_versions': [{'id': row['id'], 'catalog_sha256': row['catalog_sha256']} for row in packet['catalog']]}}
-        config = _read_json(paths(home)['manifests'] / f"{receipt['config_snapshot_ref']}.json")
-        used = sum(report_path(home, old).stat().st_size for old in receipt.get('report_ids', []) if report_path(home, old).exists())
-        if used + len(_json_bytes(record)) > config['limits']['max_output_bytes']: raise store.Refusal('cumulative report output exceeds limit')
-        publish_immutable(report_path(home, report_id), record)
-        receipt['report_requests'][request_id] = _digest(report)
-        receipt.setdefault('report_results', {})[request_id] = result
-        receipt.setdefault('report_ids', []).append(report_id)
-        receipt.setdefault('proposal_ids', []).extend(result['proposal_ids'])
-        receipt['proposal_ids'] = sorted(set(receipt['proposal_ids']))
-        receipt['dispatch_state'] = 'report-committed'
-        store.atomic_json(paths(home)['receipts'] / f"{receipt['review_run_id']}.json", receipt)
-    return result
+                row = {'schema': 1, 'proposal_id': proposal['proposal_id'], 'revision_hash': revision, 'report_id': report_id, 'packet_id': receipt['packet_id'], 'basis_source_ids': sorted(finding['citations']), 'proposed_change': finding, 'observer': {'model': receipt['model'], 'omp_version': receipt.get('omp_version'), 'instruction_snapshot_ref': receipt['instruction_snapshot_ref']}, 'resurfaced': bool(proposal['revisions'])}
+                revisions.append(row); proposal['revisions'].append(row); proposal['head_revision'] = revision
+            proposal_ids.append(proposal['proposal_id'])
+        result = {'report_id': report_id, 'proposal_ids': proposal_ids}
+        record = {'schema': 1, 'review_run_id': receipt['review_run_id'], 'request_id': request_id, 'report': report, 'packet_id': receipt['packet_id'], 'proposal_ids': proposal_ids, 'revision_ids': [row['revision_hash'] for row in revisions], 'observer': {'model': receipt['model'], 'omp_version': receipt.get('omp_version'), 'instruction_snapshot_ref': receipt['instruction_snapshot_ref'], 'catalog_versions': [{'id': row['id'], 'catalog_sha256': row['catalog_sha256']} for row in packet['catalog']]}}
+        output_bytes = len(_json_bytes(record))
+        used = sum(_read_json(old)['output_bytes'] for old in paths(home)['prepared'].glob(f"{receipt['review_run_id']}-*.json"))
+        if used + output_bytes > _read_json(paths(home)['manifests'] / f"{receipt['config_snapshot_ref']}.json")['limits']['max_output_bytes']: raise store.Refusal('cumulative report output exceeds limit')
+        prepared = {'schema': 1, 'run_id': receipt['review_run_id'], 'request_id': request_id, 'input_digest': digest, 'result': result, 'record': record, 'output_bytes': output_bytes, 'revisions': revisions, 'proposals': proposals}
+        publish_immutable(path, prepared)
+        return _apply_prepared_locked(home, receipt, prepared)
+
+def recover_submissions(home, review_run_id):
+    with store.lock(store.home(home)):
+        receipt = _receipt(home, review_run_id)
+        for path in paths(home)['prepared'].glob(f"{receipt['review_run_id']}-*.json"):
+            prepared = _read_json(path)
+            if prepared['request_id'] not in receipt.get('report_requests', {}):
+                receipt = _receipt(home, review_run_id)
+                _apply_prepared_locked(home, receipt, prepared)
+    return _receipt(home, review_run_id)
 
 
 def dispose(home, proposal_id, status, reason, replacement_proposal_id, operator):
@@ -641,17 +653,18 @@ def _review_event(home, receipt):
         store.atomic_json(pending, {'schema': 1, 'id': event_id, 'kind': 'background-skill-review',
                                     'key': receipt['review_run_id'], 'observed_at': time.time(),
                                     'details': {'purpose': 'background-skill-review', 'review_run_id': receipt['review_run_id'],
-                                                'report_ids': receipt.get('report_ids', []), 'proposal_ids': proposal_ids}})
+                                                'report_ids': receipt.get('report_ids', []), 'proposal_ids': proposal_ids,
+                                                'report_count': len(receipt.get('report_ids', [])), 'proposal_count': len(proposal_ids)}})
     return event_id
 
 
 def finalize_run(home, review_run_id, outcome):
     if not isinstance(outcome, str) or not outcome: raise store.Refusal('outcome')
-    receipt = _receipt(home, review_run_id)
+    receipt = recover_submissions(home, review_run_id)
     if receipt.get('dispatch_state') not in ('report-committed', 'final'): raise store.Refusal('report is not committed')
-    event_id = _review_event(home, receipt)
     with store.lock(store.home(home)):
         receipt = _receipt(home, review_run_id)
+        event_id = _review_event(home, receipt)
         if receipt.get('dispatch_state') != 'final':
             receipt.update(dispatch_state='final', outcome=outcome, closed_at=time.time(), event_id=event_id)
             store.atomic_json(paths(home)['receipts'] / f"{receipt['review_run_id']}.json", receipt)
