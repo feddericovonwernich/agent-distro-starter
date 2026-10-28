@@ -61,4 +61,13 @@ def test_cli_reviewer_triage_preserves_foreign_owner_and_task_bytes():
         after_tasks = {str(p.relative_to(home/'data'/'tasks')): p.read_bytes() for p in (home/'data'/'tasks').rglob('*') if p.is_file()}
         assert before == (owner.read_bytes(), after_tasks, worker_skills.catalog(home), worker_skills.resolve(home))
 
+def test_invalid_retrospective_is_rejected_before_reviewer_writes():
+    from importlib.machinery import SourceFileLoader
+    import pytest
+    with lab() as (home, _):
+        module = SourceFileLoader('agd_cli', str(Path(__file__).resolve().parents[1] / 'bin' / 'agd')).load_module()
+        with pytest.raises(SystemExit):
+            module.parser().parse_args(['--home', str(home), 'reviewer', 'run', '--retrospective-review-run', 'not-a-uuid'])
+        assert not reviewer.paths(home)['intents'].exists() and not reviewer.paths(home)['receipts'].exists()
+
 
