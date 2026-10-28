@@ -2,11 +2,12 @@
 import argparse
 import shutil
 import subprocess
+import os
 import json
 import sys
 import uuid
 from pathlib import Path
-from agd_lib import projects, store, tasks, workers, supervision, worker_skills
+from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr, relay, observability
 
 
 def parser():
@@ -54,7 +55,7 @@ def parser():
         if action == 'ready':
             op.add_argument('--report', required=True)
         if action == 'approve':
-            op.add_argument('--action', required=True, choices=('local-merge', 'publish', 'discard', 'unattended'))
+            op.add_argument('--action', required=True, choices=('local-merge', 'publish', 'pr-publish', 'discard', 'unattended'))
             op.add_argument('--target', required=True)
             op.add_argument('--instruction', required=True)
         if action == 'land':
@@ -71,7 +72,8 @@ def parser():
     skills.add_parser('list')
     profiles = worker.add_parser('profiles').add_subparsers(dest='profile_operation', required=True)
     profiles.add_parser('list')
-    for action in ('launch', 'run', 'event', 'inspect', 'send', 'inbox', 'acknowledge', 'interrupt', 'stop', 'relaunch'):
+    for action in ('launch', 'run', 'event', 'inspect', 'send', 'inbox', 'acknowledge', 'interrupt', 'stop', 'relaunch',
+                   'publish-pr', 'verify-pr', 'relay-poll', 'relay-reply'):
         op = worker.add_parser(action)
         op.add_argument('id')
         if action == 'launch':
@@ -82,6 +84,7 @@ def parser():
             op.add_argument('--skill-mode', choices=('profile', 'curated'), default='profile')
             op.add_argument('--skill', action='append', default=[])
             op.add_argument('--approval')
+            op.add_argument('--pr-grant')
         if action in ('run', 'event'):
             op.add_argument('--incarnation', required=True)
         if action == 'event':
@@ -92,6 +95,22 @@ def parser():
             op.add_argument('--file', required=True)
         if action == 'acknowledge':
             op.add_argument('message_id')
+        if action == 'publish-pr':
+            op.add_argument('--incarnation', required=True)
+            op.add_argument('--grant', required=True)
+            op.add_argument('--title', required=True)
+            op.add_argument('--body', required=True)
+        if action == 'verify-pr':
+            op.add_argument('--incarnation', required=True)
+            op.add_argument('--grant', required=True)
+            op.add_argument('--report', required=True)
+        if action in ('relay-poll', 'relay-reply'):
+            op.add_argument('--incarnation', required=True)
+            op.add_argument('--grant', required=True)
+        if action == 'relay-reply':
+            op.add_argument('--lease', required=True)
+            op.add_argument('--action', choices=('start', 'complete', 'cancelled'), required=True)
+            op.add_argument('--payload')
     decision = sub.add_parser('decision').add_subparsers(dest='operation', required=True)
     resolve = decision.add_parser('resolve')
     resolve.add_argument('id')
@@ -108,6 +127,11 @@ def parser():
     events.add_parser('list')
     ack = events.add_parser('acknowledge')
     ack.add_argument('ids', nargs='+')
+    observability_command = sub.add_parser('observability').add_subparsers(dest='operation', required=True)
+    for action in ('enable', 'start', 'stop', 'status', 'disable'):
+        observability_command.add_parser(action)
+    central = observability_command.add_parser('central')
+    central.add_argument('omp_args', nargs=argparse.REMAINDER)
     return p
 
 
@@ -119,11 +143,19 @@ def main(args):
                 args.command == 'worker' and args.operation not in ('inspect', 'inbox', 'skills', 'profiles') or
                 args.command == 'decision' or
                 args.command == 'session' and args.operation == 'reconcile' or
-                args.command == 'events' and args.operation == 'acknowledge')
+                args.command == 'events' and args.operation == 'acknowledge' or
+                args.command == 'observability' and args.operation != 'status')
     if mutation:
-        worker_scoped = (args.command == 'worker' and args.operation in ('run', 'event', 'acknowledge') or
+        worker_scoped = (args.command == 'worker' and args.operation in ('run', 'event', 'acknowledge', 'publish-pr', 'verify-pr',
+                                                                           'relay-poll', 'relay-reply') or
                          args.command == 'task' and args.operation == 'ready')
         store.require_owner(home, worker_scoped)
+    if args.command == 'observability' and args.operation == 'central':
+        argv, env, warning = observability.central_argv(home, args.omp_args)
+        if warning:
+            print(warning, file=sys.stderr)
+        os.chdir(home)
+        os.execvpe(argv[0], argv, env)
     if args.command == 'init':
         if home == Path(__file__).resolve().parents[1]:
             fresh = not any((home/name).exists() or (home/name).is_symlink()
@@ -195,7 +227,9 @@ def main(args):
         if args.operation == 'ready':
             return tasks.ready(home, args.id, args.report)
         if args.operation == 'approve':
-            return tasks.approve(home, args.id, args.action, args.target, args.instruction)
+            return (tasks.grant_pr_publish(home, args.id, args.target, args.instruction)
+                    if args.action == 'pr-publish' else
+                    tasks.approve(home, args.id, args.action, args.target, args.instruction))
         if args.operation == 'land':
             return tasks.land(home, args.id, args.approval)
         if args.operation == 'cleanup':
@@ -210,7 +244,20 @@ def main(args):
             return worker_skills.profiles(home)
         if args.operation == 'launch':
             return workers.launch(home, args.id, args.harness, args.backend, args.unattended,
-                                  args.approval, args.profile, args.skill_mode, tuple(args.skill))
+                                  args.approval, args.profile, args.skill_mode, tuple(args.skill), args.pr_grant)
+        if args.operation == 'publish-pr':
+            title, body = pr.publication_texts(home, args.id, args.incarnation, args.grant,
+                                               args.title, args.body)
+            return pr.publish(home, args.id, args.incarnation, args.grant, title, body)
+        if args.operation == 'verify-pr':
+            return pr.verify_and_ready(home, args.id, args.incarnation, args.grant, Path(args.report))
+        if args.operation == 'relay-poll':
+            task = tasks.read(home, args.id)
+            return relay.poll(home, task, tasks.authorize_pr_publish(home, task, args.grant), args.incarnation)
+        if args.operation == 'relay-reply':
+            task = tasks.read(home, args.id)
+            return relay.reply_file(home, task, tasks.authorize_pr_publish(home, task, args.grant),
+                                    args.incarnation, args.lease, args.action, args.payload)
         if args.operation == 'run':
             return workers.run_worker(home, args.id, args.incarnation)
         if args.operation == 'event':
@@ -243,6 +290,8 @@ def main(args):
             return supervision.pending(home)
         if args.operation == 'acknowledge':
             return supervision.acknowledge(home, args.ids)
+    if args.command == 'observability':
+        return getattr(observability, args.operation)(home)
     raise ValueError('unsupported command')
 
 

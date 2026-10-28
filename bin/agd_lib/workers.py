@@ -4,7 +4,7 @@ import shutil
 import time
 import uuid
 from pathlib import Path
-from . import harnesses, projects, store, tasks, tmux, worker_skills
+from . import harnesses, observability, projects, store, tasks, tmux, worker_skills
 
 
 def backend(task):
@@ -39,7 +39,7 @@ def event(home, task_id, incarnation, kind, key, message):
 
 
 def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=False, approval_id=None,
-           profile=None, skill_mode='profile', skills=()):
+           profile=None, skill_mode='profile', skills=(), pr_grant=None):
     task = tasks.read(home, task_id)
     if task['phase'] != 'prepared' or task['executor'] != 'central':
         raise store.Refusal('task already launched or not prepared')
@@ -51,12 +51,27 @@ def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=Fal
         tasks.authorization(home, task, approval_id or '', 'unattended', task_id)
     if selected_backend not in ('tmux', 'herdr') or harness not in ('omp', 'cursor'):
         raise ValueError('unsupported backend or harness')
-    preflight = dict(task, harness=harness, backend=selected_backend)
+    if pr_grant:
+        grant = tasks.authorize_pr_publish(home, task, pr_grant)
+        from . import pr, relay
+        try:
+            repository = pr.github_repository(grant['remote_url'])
+            relay.start_project_service(home, task['project'], repository)
+        except (store.Refusal, store.DependencyError) as error:
+            store.atomic_json(tasks.task_file(home, task_id).parent/'relay-blocked.json',
+                              {'reason': str(error)[:400]})
+            raise
+        if profile is not None or skill_mode != 'profile' or skills:
+            raise store.Refusal('PR grant launch controls worker skills')
+        profile, skill_mode, skills = None, 'curated', ('agd-scoped-pr-relay',)
+    preflight = dict(task, harness=harness, backend=selected_backend, pr_grant=pr_grant)
     harnesses.launch_argv(preflight, tasks.task_file(home, task_id).parent/'brief.md', unattended)
     module = backend(preflight)
     if selected_backend == 'tmux' and not shutil.which('tmux'):
         raise store.DependencyError('tmux is not installed')
-    selection = worker_skills.resolve(home, profile=profile, skill_mode=skill_mode, skills=skills)
+    selection = ({'schema': 1, 'mode': 'curated', 'profile': None,
+                  'skills': ['agd-scoped-pr-relay']} if pr_grant else
+                 worker_skills.resolve(home, profile=profile, skill_mode=skill_mode, skills=skills))
     if selection['skills']:
         harnesses.worker_skill_roots(harness)
     if selected_backend == 'herdr':
@@ -65,10 +80,16 @@ def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=Fal
         current = tasks.read(home, task_id)
         if current['phase'] != 'prepared' or current['executor'] != 'central':
             raise store.Refusal('task launch raced another owner; no endpoint created')
-        selection = worker_skills.resolve(home, profile=profile, skill_mode=skill_mode, skills=skills)
+        if pr_grant:
+            tasks._authorize_pr_publish_locked(home, current, pr_grant)
+            selection = {'schema': 1, 'mode': 'curated', 'profile': None,
+                         'skills': ['agd-scoped-pr-relay']}
+            current['pr_grant'] = pr_grant
         manifest = None
         if selection['skills']:
-            manifest = worker_skills.prepare(home, dict(current, harness=harness), selection)
+            manifest = worker_skills.prepare(
+                home, dict(current, harness=harness), selection,
+                {'agd-scoped-pr-relay': worker_skills.scoped_pr_source()} if pr_grant else None)
         if selected_backend == 'herdr':
             module.prepare(home)
         task = current
@@ -78,6 +99,8 @@ def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=Fal
         incarnation = str(uuid.uuid4())
         task.update(executor='worker', incarnation=incarnation, phase='running', worker_alive=None,
                     unattended=unattended)
+        if harness == 'omp':
+            task['observability'] = observability.worker_binding_locked(home, task_id, incarnation)
         tasks.save(home, task)
     endpoint = module.create(home, task_id, incarnation, work,
                              ['env', f'AGD_TASK_ID={task_id}', f'AGD_INCARNATION={incarnation}',
@@ -104,14 +127,25 @@ def run_worker(home, task_id, incarnation):
     tasks.verify_workspace(home, task)
     if task.get('worker_skills'):
         worker_skills.verify(home, task)
-    env = dict(os.environ, AGD_HOME=str(home), AGD_TASK_ID=task_id, AGD_INCARNATION=incarnation)
-    env.pop('AGD_OWNER', None)
+    if task['harness'] == 'omp':
+        child_env, generation, warning = observability.managed_environment(home, 'worker', task, incarnation)
+        session_dir = Path(task['observability']['session_dir'])
+    else:
+        child_env = dict(os.environ, AGD_HOME=str(home), AGD_TASK_ID=task_id, AGD_INCARNATION=incarnation)
+        session_dir = None
+        warning = None
+    child_env.pop('AGD_OWNER', None)
     import subprocess
     from .supervision import process_start
-    args = harnesses.launch_argv(task, tasks.task_file(home, task_id).parent/'brief.md', task['unattended'])
+    args = harnesses.launch_argv(task, tasks.task_file(home, task_id).parent/'brief.md', task['unattended'],
+                                session_dir=session_dir)
     receipt = home/'state'/'tasks'/task_id/'runner.json'
     runner = dict(incarnation=incarnation, pid=os.getpid(), start=process_start(os.getpid()),
                   phase='spawning')
+    if warning:
+        runner['observability_warning'] = warning
+    if task['harness'] == 'omp':
+        runner['observability_generation'] = generation
     store.atomic_json(receipt, runner)
     with store.lock(home):
         current = tasks.read(home, task_id)
@@ -121,8 +155,11 @@ def run_worker(home, task_id, incarnation):
         tasks.save(home, current)
     child = None
     try:
-        child = subprocess.Popen(args, cwd=task['worktree'], env=env, stdin=None)
+        child = subprocess.Popen(args, cwd=task['worktree'], env=child_env, stdin=None)
         runner.update(phase='spawned', child_pid=child.pid, child_start=process_start(child.pid))
+        if task['harness'] == 'omp':
+            observability.record_process_generation(home, 'worker', generation, task_id, incarnation,
+                                                    child.pid, runner['child_start'])
         store.atomic_json(receipt, runner)
         status = child.wait()
     except Exception as error:
@@ -260,6 +297,10 @@ def relaunch(home, task_id):
         current = tasks.read(home, task_id)
         if current.get('incarnation') != task['prior_endpoint']['incarnation'] or current.get('worker_alive') is not False:
             raise store.Refusal('prior worker changed during relaunch; no endpoint created')
+        if current.get('pr_grant'):
+            tasks._authorize_pr_publish_locked(home, current, current['pr_grant'])
+        if task['harness'] == 'omp':
+            task['observability'] = observability.worker_binding_locked(home, task_id, incarnation)
         tasks.save(home, task)
     endpoint = backend(task).create(home, task_id, incarnation, work,
                                     ['env', f'AGD_TASK_ID={task_id}', f'AGD_INCARNATION={incarnation}',

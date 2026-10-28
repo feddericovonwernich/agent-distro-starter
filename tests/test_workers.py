@@ -1,9 +1,12 @@
 import os
 import sys
+import uuid
 from pathlib import Path
+from unittest.mock import patch
+
 from support import lab, command
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'bin'))
-from agd_lib import tasks
+from agd_lib import tasks, workers
 
 
 def test_old_worker_cannot_change_current_task():
@@ -45,6 +48,96 @@ def test_ready_worker_cannot_release_its_live_workspace():
         assert Path(task['worktree']).is_dir()
         assert tasks.read(home, 'live')['lease_id'] == task['lease_id']
 
+
+def test_omp_launch_persists_fresh_native_binding_before_endpoint_creation():
+    with lab() as (home, _):
+        brief = home / 'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'native', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        class Endpoint:
+            def create(self, _home, task_id, incarnation, _work, _argv):
+                saved = tasks.read(home, task_id)
+                assert saved['observability']['incarnation'] == incarnation
+                assert Path(saved['observability']['session_dir']).is_dir()
+                return {'task': task_id, 'incarnation': incarnation}
+        with patch.object(workers.shutil, 'which', return_value='/bin/true'), \
+             patch.object(workers, 'backend', return_value=Endpoint()):
+            launched = workers.launch(home, task['id'])
+        saved = tasks.read(home, task['id'])
+        assert uuid.UUID(saved['observability']['incarnation'])
+        assert saved['incarnation'] == launched['incarnation']
+
+
+
+def test_relaunch_keeps_prior_native_data_when_final_executable_is_true(monkeypatch):
+    with lab() as (home, _):
+        brief = home / 'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'retained', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        class Endpoint:
+            def create(self, _home, _task_id, incarnation, _work, _argv):
+                return {'incarnation': incarnation}
+            def inspect(self, _endpoint):
+                return {'presence': 'missing'}
+        monkeypatch.setattr(workers.shutil, 'which', lambda _name: '/bin/true')
+        monkeypatch.setattr(workers, 'backend', lambda _task: Endpoint())
+        first = workers.launch(home, task['id'])
+        monkeypatch.setenv('AGD_TASK_ID', task['id'])
+        monkeypatch.setenv('AGD_INCARNATION', first['incarnation'])
+        assert workers.run_worker(home, task['id'], first['incarnation']) == {'exit': 0}
+        first_dir = Path(first['observability']['session_dir'])
+        (first_dir / 'native.jsonl').write_bytes(b'old transcript\n')
+        artifact = first_dir / 'native-artifacts'; artifact.mkdir()
+        (artifact / 'blob').write_bytes(b'old artifact')
+        current = tasks.read(home, task['id'])
+        current['worker_alive'] = False
+        tasks.save(home, current)
+        second = workers.relaunch(home, task['id'])
+        assert second['observability']['session_dir'] != str(first_dir)
+        assert (first_dir / 'native.jsonl').read_bytes() == b'old transcript\n'
+        assert (artifact / 'blob').read_bytes() == b'old artifact'
+
+
+def test_two_live_worker_launches_keep_stale_receipts_per_task_incarnation():
+    import subprocess
+    import time
+    from test_projects import CLI
+    from agd_lib import observability
+
+    with lab() as (home, _):
+        executable = home / 'omp'
+        executable.write_text('#!/bin/sh\nsleep 3\n')
+        executable.chmod(0o755)
+        launched = []
+        for task_id in ('first', 'second'):
+            brief = home / f'{task_id}.md'
+            brief.write_text('Inspect value.txt.\n')
+            task = command(home, 'task', 'create', task_id, '--project', 'sample', '--brief', str(brief),
+                           '--kind', 'scout')
+            incarnation = str(uuid.uuid4())
+            task.update(executor='worker', incarnation=incarnation, harness='omp', backend='tmux',
+                        phase='running', worker_alive=None, unattended=False, endpoint={'incarnation': incarnation},
+                        observability=observability.worker_binding(home, task_id, incarnation))
+            tasks.save(home, task)
+            env = dict(os.environ, PATH=f'{home}:{os.environ["PATH"]}', AGD_TASK_ID=task_id,
+                       AGD_INCARNATION=incarnation)
+            launched.append(subprocess.Popen(
+                [str(CLI), '--home', str(home), 'worker', 'run', task_id, '--incarnation', incarnation],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env))
+        try:
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if len(observability.status(home)['workers']) == 2:
+                    break
+                time.sleep(.05)
+            observability.record_desired_generation(home, '1', 'enabled')
+            receipts = observability.status(home)['workers']
+            assert {(row['task_id'], row['incarnation']) for row in receipts} == {
+                (task_id, tasks.read(home, task_id)['incarnation']) for task_id in ('first', 'second')}
+            assert {row['state'] for row in receipts} == {'stale-restart-required'}
+        finally:
+            for process in launched:
+                assert process.wait(timeout=5) == 0, process.stderr.read()
 
 def test_relaunch_refuses_unknown_prior_process():
     with lab() as (home, project):
@@ -195,6 +288,65 @@ def test_relaunch_restores_frozen_skill_after_catalog_changes():
         assert (Path(task['worktree'])/'.omp'/'skills'/'agd-probe'/'SKILL.md').is_file()
 
 
+
+
+def test_granted_launch_uses_frozen_private_scoped_skill_and_prompt():
+    from unittest.mock import patch
+    from agd_lib import workers
+    with lab() as (home, project):
+        brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
+        task = command(home, 'task', 'create', 'granted', '--project', 'sample', '--brief', str(brief), '--kind', 'ship')
+        instruction = home/'grant.md'
+        instruction.write_text('Task granted may publish origin:agd/granted for task granted.\n')
+        grant = tasks.grant_pr_publish(home, 'granted', 'origin:agd/granted', instruction)
+        class FakeBackend:
+            def create(self, *_args): return {'created': True, 'incarnation': _args[2]}
+        with patch.object(workers.harnesses, 'launch_argv', return_value=['true']), \
+             patch.object(__import__('agd_lib.pr', fromlist=['github_repository']), 'github_repository',
+                          return_value='owner/repo'), \
+             patch.object(__import__('agd_lib.relay', fromlist=['start_project_service']), 'start_project_service'), \
+             patch.object(workers, 'backend', return_value=FakeBackend()), \
+             patch.object(workers.shutil, 'which', return_value='/bin/true'):
+            launched = workers.launch(home, 'granted', pr_grant=grant['id'])
+        manifest = launched['worker_skills']
+        assert manifest['skills'][0]['id'] == 'agd-scoped-pr-relay'
+        assert not (home/'config'/'worker-skills'/'agd-scoped-pr-relay').exists()
+        assert (Path(manifest['skills'][0]['snapshot'])/'SKILL.md').is_file()
+        scoped = dict(launched, worker_skills=manifest, pr_grant=grant['id'])
+        scoped['incarnation'] = 'worker-incarnation'
+        argv = __import__('agd_lib.harnesses', fromlist=['launch_argv']).launch_argv(
+            scoped, tasks.task_file(home, 'granted').parent/'brief.md')
+        text = argv[-1]
+        assert grant['id'] in text and '--incarnation $AGD_INCARNATION' in text
+        assert f'worker verify-pr granted' in text and str(home) in text
+        reply_path = tasks.task_file(home, 'granted').parent/'relay-reply.json'
+        assert reply_path == home/'data'/'tasks'/'granted'/'relay-reply.json'
+        assert '--action start' in text and '--action complete' in text and '--action cancelled' in text
+        assert 'start|complete|cancelled' not in text
+        assert f'--payload {reply_path}' in text
+        assert 'feedback received; repair pending' in text
+        current = tasks.read(home, 'granted')
+        current['worker_alive'] = False
+        tasks.save(home, current)
+        with patch.object(workers, 'inspect', return_value={'endpoint': {'presence': 'missing'}}), \
+             patch.object(workers, 'backend', return_value=FakeBackend()):
+            relaunched = workers.relaunch(home, 'granted')
+        assert relaunched['incarnation'] != launched['incarnation']
+        assert (Path(manifest['skills'][0]['snapshot'])/'SKILL.md').is_file()
+
+
+def test_granted_launch_refuses_non_github_remote_before_worker_creation():
+    import pytest
+    from agd_lib import store, workers
+    with lab() as (home, _project):
+        brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
+        command(home, 'task', 'create', 'nongithub', '--project', 'sample', '--brief', str(brief), '--kind', 'ship')
+        instruction = home/'grant.md'; instruction.write_text('Task nongithub grant origin:agd/nongithub.\n')
+        grant = tasks.grant_pr_publish(home, 'nongithub', 'origin:agd/nongithub', instruction)
+        with pytest.raises(store.Refusal, match='GitHub'):
+            workers.launch(home, 'nongithub', pr_grant=grant['id'])
+        assert tasks.read(home, 'nongithub')['phase'] == 'prepared'
+        assert (tasks.task_file(home, 'nongithub').parent/'relay-blocked.json').is_file()
 def test_concurrent_skill_launch_has_one_winner_without_orphans():
     from concurrent.futures import ThreadPoolExecutor
     from unittest.mock import patch

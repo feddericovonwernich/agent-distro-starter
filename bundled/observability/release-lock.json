@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "langfuse_version": "4.70.1",
+  "images": {
+    "collector": "otel/opentelemetry-collector-contrib:0.139.0@sha256:faf125d656fa47cea568b2f3b4494efd2525083bc75c1e96038bc23f05cd68fd",
+    "langfuse": "docker.langfuse.com/langfuse/langfuse:4.70.1@sha256:71b04842ecff8fe0dd15c7bbb1acd6e0555735e393a8108c43feb4b8d0adf9e6",
+    "langfuse_worker": "docker.langfuse.com/langfuse/langfuse-worker:4.70.1@sha256:3976a73de84a29999ff4573398e240127b8a92012421ce5eec61cd57f087d8ca",
+    "postgres": "postgres:17.6@sha256:00bc86618629af00d2937fdc5a5d63db3ff8450acf52f0636ec813c7f4902929",
+    "clickhouse": "clickhouse/clickhouse-server:25.12@sha256:8a790dd3468db22b1d4e7b18a176f378ff5ff6053b9c48dd4ea1fa71a24c5ba6",
+    "minio": "cgr.dev/chainguard/minio:latest@sha256:a1d2b3516a41296510f7fb49184c18b88287fa8f35cf3ce5c047289053b94964",
+    "redis": "redis:7@sha256:bd28fff4b665fdf1b73e8b5b73ec05d2f858f4fa3c8ea0d7c9bc09f7f6bf7039"
+  },
+  "evidence": {
+    "langfuse_compose": "https://raw.githubusercontent.com/langfuse/langfuse/v4.70.1/docker-compose.yml",
+    "langfuse_health": "https://raw.githubusercontent.com/langfuse/langfuse/v4.70.1/web/src/pages/api/public/health.ts",
+    "collector": "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/tag/v0.139.0"
+  }
+}

@@ -203,42 +203,75 @@ def process_start(pid):
 def watch(home, owner_pid, owner_start, generation):
     lock_path = home/'state'/'session.lock'
     lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with lock_path.open('a+') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise store.Refusal('another central watcher owns this home') from error
-        if process_start(owner_pid) != owner_start:
-            raise store.Refusal('central owner identity is no longer alive')
-        token = os.environ.get('AGD_OWNER')
-        if not token:
-            raise store.Refusal('central owner token required')
-        previous_path = home/'state'/'owner.json'
-        if previous_path.exists():
-            previous = json.loads(previous_path.read_text())
+    owned = False
+    try:
+        with lock_path.open('a+') as lock:
             try:
-                still_alive = process_start(previous['owner_pid']) == previous['owner_start']
-            except (FileNotFoundError, ProcessLookupError):
-                still_alive = False
-            if still_alive and (previous['owner_pid'] != owner_pid or previous.get('token') != token):
-                raise store.Refusal('prior central remains alive; foreign watcher cannot take over')
-        owner = dict(owner_pid=owner_pid, owner_start=owner_start, generation=generation,
-                     token=token, watcher_pid=os.getpid(), watcher_start=process_start(os.getpid()), heartbeat=time.time())
-        store.atomic_json(home/'state'/'owner.json', owner)
-        print(json.dumps({'type': 'ready', 'generation': generation}), flush=True)
-        seen = set()
-        while True:
-            try:
-                owner_alive = process_start(owner_pid) == owner_start
-            except (FileNotFoundError, ProcessLookupError):
-                owner_alive = False
-            if not owner_alive:
-                break
-            owner['heartbeat'] = time.time()
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise store.Refusal('another central watcher owns this home') from error
+            if process_start(owner_pid) != owner_start:
+                raise store.Refusal('central owner identity is no longer alive')
+            token = os.environ.get('AGD_OWNER')
+            if not token:
+                raise store.Refusal('central owner token required')
+            previous_path = home/'state'/'owner.json'
+            if previous_path.exists():
+                previous = json.loads(previous_path.read_text())
+                try:
+                    still_alive = process_start(previous['owner_pid']) == previous['owner_start']
+                except (FileNotFoundError, ProcessLookupError):
+                    still_alive = False
+                if still_alive and (previous['owner_pid'] != owner_pid or previous.get('token') != token):
+                    raise store.Refusal('prior central remains alive; foreign watcher cannot take over')
+            owned = True
+            owner = dict(owner_pid=owner_pid, owner_start=owner_start, generation=generation,
+                         token=token, watcher_pid=os.getpid(), watcher_start=process_start(os.getpid()), heartbeat=time.time())
             store.atomic_json(home/'state'/'owner.json', owner)
-            current = {event['id'] for event in reconcile(home)['pending']}
-            fresh = current - seen
-            if fresh:
-                print(json.dumps({'type': 'events', 'ids': sorted(fresh)}), flush=True)
-            seen = current
-            time.sleep(2)
+            print(json.dumps({'type': 'ready', 'generation': generation}), flush=True)
+            seen, next_review = set(), 0.0
+            from . import relay_reviews
+            while True:
+                try:
+                    owner_alive = process_start(owner_pid) == owner_start
+                except (FileNotFoundError, ProcessLookupError):
+                    owner_alive = False
+                if not owner_alive:
+                    break
+                owner['heartbeat'] = time.time()
+                store.atomic_json(home/'state'/'owner.json', owner)
+                current = {event['id'] for event in reconcile(home)['pending']}
+                fresh = current - seen
+                if fresh:
+                    print(json.dumps({'type': 'events', 'ids': sorted(fresh)}), flush=True)
+                seen = current
+                if time.monotonic() >= next_review:
+                    next_review = time.monotonic() + 15
+                    try:
+                        relay_reviews.tick(home)
+                    except Exception:
+                        emit(home, 'central', 'central', 'relay-review', 'tick',
+                             {'reason': 'central review tick unavailable'})
+                time.sleep(2)
+    finally:
+        if owned:
+            _stop_owned_relay_services(home)
+
+
+def _stop_owned_relay_services(home):
+    from . import relay
+    projects = Path(home) / 'state' / 'relay' / 'projects'
+    if not projects.is_dir() or projects.is_symlink():
+        return
+    for path in sorted(projects.iterdir()):
+        service = path / 'service.json'
+        if path.is_symlink() or not service.is_file() or service.is_symlink():
+            continue
+        try:
+            record = json.loads(service.read_text())
+            if (not isinstance(record, dict) or record.get('schema') != 1 or
+                    record.get('project') != path.name or record.get('root') != str(path)):
+                continue
+            relay.stop_project_service(home, path.name, 'central owner exited')
+        except (store.Refusal, OSError, json.JSONDecodeError):
+            pass
