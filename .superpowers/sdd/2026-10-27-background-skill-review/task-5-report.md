@@ -10,6 +10,10 @@ DONE_WITH_CONCERNS
 - Added production Bun JSONL host and Python parent lifecycle: reserve/freeze before selection, durable `no-work` return before capability/child work, child process group/deadline cleanup, sanitized environment, safe selector-only input, and model persistence transition.
 - Wired resolver capability URL and `persistModel` through the bridge fixture. The host resolves explicit/default models locally and only sends `provider/id` to Python.
 - Existing generic primary event handling was retained; it already renders the reviewer durable event as one ordinary follow-up.
+## Commit
+
+`be6c44e feat: expose reviewer inbox`
+
 
 ## Verification
 
