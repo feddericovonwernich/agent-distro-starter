@@ -149,16 +149,19 @@ def _render_content(content):
     return ''.join(texts), unsupported
 
 
-def _messages(session_path, cutoff):
+def _messages(session_path, cutoff, budget):
     if session_path.is_symlink() or not session_path.is_file(): raise store.Refusal('unsafe native JSONL')
     with session_path.open('rb') as stream:
         header_line = stream.readline()
         if not header_line: raise store.Refusal('empty native JSONL')
         header = json.loads(header_line); hasher = hashlib.sha256(header_line); watermark = len(header_line)
         if header.get('type') != 'session' or header.get('version') != 3 or not isinstance(header.get('id'), str): raise store.Refusal('native JSONL header is invalid')
-        rows, late, withheld, number = [], False, [], 1
+        rows, late, limited, withheld, number, retained = [], False, False, [], 1, 0
         while line := stream.readline():
             number += 1; start = watermark
+            if len(line) > budget:
+                limited = True
+                break
             try: row = json.loads(line)
             except json.JSONDecodeError: withheld.append({'reason': 'native-row-malformed', 'line_start': number}); continue
             try: at = _epoch(row.get('timestamp'))
@@ -166,13 +169,18 @@ def _messages(session_path, cutoff):
             if at > cutoff:
                 late = True
                 break
-            watermark += len(line); hasher.update(line)
             message = row.get('message') if isinstance(row, dict) else None
+            text, unsupported = _render_content(message.get('content')) if isinstance(message, dict) else (None, False)
+            if text and retained + len(text.encode()) > budget:
+                limited = True
+                break
+            watermark += len(line); hasher.update(line)
             if not isinstance(message, dict) or not isinstance(row.get('id'), str): continue
-            text, unsupported = _render_content(message.get('content'))
             if unsupported: withheld.append({'reason': 'unsupported-content-block', 'line_start': number, 'message_id': row['id']})
-            if text: rows.append({'message_id': row['id'], 'text': text, 'line_start': number, 'line_end': number, 'byte_start': start, 'byte_end': watermark})
-    return header['id'], watermark, hasher.hexdigest(), rows, late, withheld
+            if text:
+                retained += len(text.encode())
+                rows.append({'message_id': row['id'], 'text': text, 'line_start': number, 'line_end': number, 'byte_start': start, 'byte_end': watermark})
+    return header['id'], watermark, hasher.hexdigest(), rows, late, limited, withheld
 
 
 def _fixed_session(root, task_id, incarnation, binding):
@@ -256,11 +264,12 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
         seen.add(key); episodes.append({'task_id': key[0], 'incarnation': key[1], 'closed_at': observed_at, 'exit_observation_id': event.get('id')}); provenance.append({'task_id': key[0], 'assigned': _manifest(root, task_dir, task, coverage), 'usage': 'unknown'})
         for jsonl in jsonls:
             try:
-                sid, watermark, digest, rows, late, withheld = _messages(jsonl, cutoff)
+                sid, watermark, digest, rows, late, limited, withheld = _messages(jsonl, cutoff, config['limits']['max_input_bytes'])
                 source = {'kind': 'native-jsonl', 'task_id': key[0], 'incarnation': key[1], 'session_id': sid, 'path': str(jsonl.relative_to(root)), 'byte_watermark': watermark, 'content_sha256': digest}; source['source_id'] = _digest(source); sources.append(source)
                 for row in rows:
                     excerpt = {'source_id': source['source_id'], **row}; excerpt['excerpt_id'] = _digest(excerpt); excerpts.append(excerpt)
                 for row in withheld: _coverage(coverage, 'withheld', row)
+                if limited: _coverage(coverage, 'late_basis', {'task_id': key[0], 'session_id': sid, 'reason': 'input-limit'})
                 if late: _coverage(coverage, 'late_basis', {'task_id': key[0], 'session_id': sid, 'reason': 'post-cutoff-native-row'})
             except (OSError, store.Refusal, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'task_id': key[0], 'incarnation': key[1], 'reason': 'native-jsonl-malformed'})
         extra_sources, extra_excerpts = _central(task_dir, task, cutoff, coverage)
@@ -285,23 +294,50 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
             retrospective.append({'review_run_id': rid, 'closed_at': closed, 'source_count': len(jsonls)})
             for jsonl in jsonls:
                 try:
-                    sid, watermark, digest, rows, late, withheld = _messages(jsonl, cutoff)
+                    sid, watermark, digest, rows, late, limited, withheld = _messages(jsonl, cutoff, config['limits']['max_input_bytes'])
                     source = {'kind': 'reviewer-native-jsonl', 'review_run_id': rid, 'session_id': sid, 'path': str(jsonl.relative_to(root)), 'byte_watermark': watermark, 'content_sha256': digest}
                     source['source_id'] = _digest(source); sources.append(source)
                     for row in rows:
                         excerpt = {'source_id': source['source_id'], **row}; excerpt['excerpt_id'] = _digest(excerpt); excerpts.append(excerpt)
+                    if limited: _coverage(coverage, 'late_basis', {'review_run_id': rid, 'reason': 'input-limit'})
                     if late: _coverage(coverage, 'late_basis', {'review_run_id': rid, 'reason': 'post-cutoff-native-row'})
                     for row in withheld: _coverage(coverage, 'withheld', row)
                 except (OSError, store.Refusal, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'review_run_id': rid, 'reason': 'retrospective-native-jsonl-malformed'})
         if {item['review_run_id'] for item in retrospective} != requested: raise store.Refusal('unknown retrospective run')
-    material_basis = _digest({'sources': [(source['source_id'], source['content_sha256']) for source in sources if 'content_sha256' in source],
-                              'central': [(source['source_id'], source.get('answer_sha256')) for source in sources if source['kind'] == 'central-decision']})
-    publish_immutable(paths(root)['followups'] / f'{material_basis}.json', {'schema': 1, 'material_basis': material_basis, 'state': 'pending'})
-    coverage['followup_id'] = material_basis
     packet = {'schema': 1, 'purpose': 'background-skill-review', 'cutoff': cutoff, 'episodes': episodes, 'sources': sources, 'excerpts': excerpts, 'catalog': _catalog(root, coverage), 'skill_provenance': provenance, 'coverage': coverage, 'retrospective_review_run_ids': list(retrospective_review_run_ids), 'retrospective_episodes': retrospective, 'config_snapshot_sha256': _digest(config)}
-    _cap(packet, config['limits']['max_input_bytes']); packet_id = _digest(packet); publish_immutable(paths(root)['packets'] / f'{packet_id}.json', packet)
+    _cap(packet, config['limits']['max_input_bytes'])
+    material_basis = _digest({'sources': [(source['source_id'], source.get('content_sha256'), source.get('answer_sha256')) for source in packet['sources']],
+                              'excerpts': [excerpt['excerpt_id'] for excerpt in packet['excerpts']]})
+    with store.lock(root):
+        state_path = paths(root)['followups'] / f'{material_basis}.json'
+        if not state_path.exists():
+            store.atomic_json(state_path, {'schema': 1, 'material_basis': material_basis, 'state': 'pending'})
+    packet['coverage']['followup_id'] = material_basis
+    _cap(packet, config['limits']['max_input_bytes'])
+    packet_id = _digest(packet); publish_immutable(paths(root)['packets'] / f'{packet_id}.json', packet)
     store.atomic_json(checkpoint, {'scope': scope, 'packet_id': packet_id, 'material_basis': material_basis})
     packet['packet_id'] = packet_id; return packet
+
+
+def material_state(home, material_basis):
+    _hex_id(material_basis)
+    path = paths(home)['followups'] / f'{material_basis}.json'
+    try:
+        state = _read_json(path)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise store.Refusal('unknown reviewer material basis') from error
+    if state.get('schema') != 1 or state.get('material_basis') != material_basis or state.get('state') not in ('pending', 'reviewed'):
+        raise store.Refusal('invalid reviewer material state')
+    return state
+
+
+def mark_material_reviewed(home, material_basis):
+    with store.lock(store.home(home)):
+        state = material_state(home, material_basis)
+        if state['state'] == 'pending':
+            state = {**state, 'state': 'reviewed'}
+            store.atomic_json(paths(home)['followups'] / f'{material_basis}.json', state)
+        return state
 
 
 def enqueue_intent(home, *, kind, retrospective_review_run_ids=()):

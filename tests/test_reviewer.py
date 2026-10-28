@@ -187,3 +187,26 @@ def test_frozen_scope_reuses_packet_and_new_scope_creates_one_material_followup(
             stream.write(json.dumps(message('further material', 350)) + '\n')
         newer = packet(home, cutoff=500)
         assert newer['coverage']['followup_id'] != followup['coverage']['followup_id']
+
+
+def test_large_native_history_keeps_only_bounded_selected_evidence():
+    with lab() as (home, _):
+        rows = [message(f'{number}-' + 'x' * 400, 100) for number in range(100)]
+        task, _, _ = ended_worker(home, 'large', str(uuid.uuid4()), rows)
+        selected = packet(home, limit=12000)
+        assert len(selected['excerpts']) < len(rows)
+        assert sum(len(row['text'].encode()) for row in selected['excerpts']) < 12000
+        session = home / 'data' / 'observability' / 'tasks' / task['id'] / 'omp' / task['incarnation']
+        assert selected['sources'][0]['byte_watermark'] < next(session.glob('*.jsonl')).stat().st_size
+        assert any(row['reason'] == 'input-limit' for row in selected['coverage']['late_basis'])
+
+
+def test_material_state_consumes_once_without_recreating_same_basis():
+    with lab() as (home, _):
+        task, _, _ = ended_worker(home, 'material', str(uuid.uuid4()), [message('evidence', 100)])
+        first = packet(home, cutoff=200)
+        basis = first['coverage']['followup_id']
+        reviewer.mark_material_reviewed(home, basis)
+        assert reviewer.material_state(home, basis)['state'] == 'reviewed'
+        assert packet(home, cutoff=300)['coverage']['followup_id'] == basis
+        assert reviewer.material_state(home, basis)['state'] == 'reviewed'
