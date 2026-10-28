@@ -197,17 +197,6 @@ def test_default_intents_coalesce_identical_scope_but_retrospectives_do_not():
         assert one['intent_id'] != two['intent_id']
 
 
-def test_runner_persists_reservation_before_resolver_failure(monkeypatch):
-    with lab() as (home, _):
-        config = reviewer.read_config(home); config['review_model'] = 'configured'; store.atomic_json(reviewer.paths(home)['config'], config)
-        ended_worker(home, 'resolver', str(uuid.uuid4()), [message('review me', time.time() - 1)])
-        intent = reviewer.enqueue_intent(home, kind='manual')
-        monkeypatch.setattr(reviewer_runner, 'resolve_model', lambda *_: (_ for _ in ()).throw(store.Refusal('no model')))
-        with pytest.raises(store.Refusal, match='no model'):
-            reviewer_runner.launch(home, intent, observed_omp_version='fixture-test')
-        receipts = list(reviewer.paths(home)['receipts'].glob('*.json'))
-        assert len(receipts) == 1 and json.loads(receipts[0].read_text())['dispatch_state'] == 'reserved'
-
 
 def test_reserved_default_intent_is_consumed_before_next_identical_trigger():
     with lab() as (home, _):
@@ -529,7 +518,6 @@ def test_broker_only_exposes_frozen_packet_and_persists_report():
             {'id': str(uuid.uuid4()), 'op': 'reviewer_search', 'args': {'query': 'failure'}},
             {'id': str(uuid.uuid4()), 'op': 'reviewer_submit', 'args': {'report': build_report(selected)}},
             {'id': str(uuid.uuid4()), 'op': 'result', 'args': {}},
-            {'id': str(uuid.uuid4()), 'op': 'finish', 'args': {}},
         ]
         output = io.StringIO()
         reviewer_runner.serve_broker(home, run['review_run_id'],
@@ -540,7 +528,7 @@ def test_broker_only_exposes_frozen_packet_and_persists_report():
         assert responses[2]['ok'] is True
         assert json.loads(responses[3]['value'])['reportId'] == responses[4]['value']['reportId']
         assert reviewer.report_path(home, responses[4]['value']['reportId']).is_file()
-        assert reviewer._receipt(home, run['review_run_id'])['dispatch_state'] == 'final'
+        assert reviewer._receipt(home, run['review_run_id'])['dispatch_state'] == 'report-committed'
 
 
 def test_retrospective_rejects_mismatched_receipt_and_session_symlink(tmp_path):

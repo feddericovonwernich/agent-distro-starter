@@ -472,10 +472,24 @@ def begin_run(home, run, packet, *, model, observed_omp_version):
     packet_id = packet.get('packet_id') if isinstance(packet, dict) else None; _hex_id(packet_id); receipt = paths(home)['receipts'] / f'{run["review_run_id"]}.json'
     with store.lock(store.home(home)):
         stored = _read_json(receipt)
-        if stored != run or stored.get('dispatch_state') != 'reserved': raise store.Refusal('reviewer receipt is not reservable')
-        stored.update(packet_id=packet_id, model=model, omp_version=observed_omp_version, dispatch_state='begun')
+        if stored.get('dispatch_state') != 'reserved' or stored.get('review_run_id') != run['review_run_id']:
+            raise store.Refusal('reviewer receipt is not reservable')
+        if stored.get('packet_id') not in (None, packet_id): raise store.Refusal('reviewer packet mismatch')
+        stored['packet_id'] = packet_id
+        stored.update(model=model, omp_version=observed_omp_version, dispatch_state='begun')
         store.atomic_json(receipt, stored)
     return stored
+
+def close_run(home, review_run_id, outcome, *, error=None, packet=None):
+    """Persist a terminal non-report receipt without emitting a review event."""
+    if outcome not in ('no-work', 'failed', 'unknown'): raise store.Refusal('reviewer outcome')
+    with store.lock(store.home(home)):
+        receipt = _receipt(home, review_run_id)
+        if packet is not None: receipt['packet_id'] = packet['packet_id']
+        receipt.update(dispatch_state='final', outcome=outcome, closed_at=time.time())
+        if error: receipt['error'] = str(error)[:512]
+        store.atomic_json(paths(home)['receipts'] / f"{receipt['review_run_id']}.json", receipt)
+    return _receipt(home, review_run_id)
 
 
 def normalize(value):

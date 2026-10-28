@@ -5,9 +5,8 @@ const lines = createInterface({ input: process.stdin, crlfDelay: Infinity })[Sym
 const first = await lines.next();
 if (first.done) throw new Error('missing reviewer input');
 const input = JSON.parse(first.value);
-let sequence = 0;
 const rpc = async (op: string, args: unknown) => {
-  const id = `${++sequence}`;
+  const id = crypto.randomUUID();
   process.stdout.write(`${JSON.stringify({ id, op, args })}\n`);
   const reply = await lines.next();
   if (reply.done) throw new Error('broker closed');
