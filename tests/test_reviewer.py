@@ -435,3 +435,31 @@ def test_persisted_report_over_budget_refuses_before_revisions():
             reviewer.submit_report(home, run['review_run_id'], str(uuid.uuid4()), report)
         assert not reviewer.paths(home)['reports'].exists() and not reviewer.paths(home)['revisions'].exists()
 
+@pytest.mark.parametrize('boundary', ['prepared', 'revision', 'header', 'report', 'receipt'])
+def test_prepared_submission_recovers_real_write_boundaries(monkeypatch, boundary):
+    with lab() as (home, _):
+        run, selected = produced_run(home); report = build_report(selected); request = str(uuid.uuid4())
+        original_publish, original_atomic, fired = reviewer.publish_immutable, store.atomic_json, False
+        def publish(path, value):
+            nonlocal fired
+            original_publish(path, value)
+            if not fired and ((boundary == 'prepared' and Path(path).parent == reviewer.paths(home)['prepared']) or (boundary == 'revision' and Path(path).parent == reviewer.paths(home)['revisions']) or (boundary == 'report' and Path(path).parent == reviewer.paths(home)['reports'])):
+                fired = True; raise RuntimeError(boundary)
+        def atomic(path, value):
+            nonlocal fired
+            if boundary == 'receipt' and not fired and Path(path) == reviewer.paths(home)['receipts'] / f"{run['review_run_id']}.json":
+                fired = True; raise RuntimeError(boundary)
+            original_atomic(path, value)
+            if boundary == 'header' and not fired and Path(path).parent == reviewer.paths(home)['proposals']:
+                fired = True; raise RuntimeError(boundary)
+        monkeypatch.setattr(reviewer, 'publish_immutable', publish); monkeypatch.setattr(store, 'atomic_json', atomic)
+        with pytest.raises(RuntimeError): reviewer.submit_report(home, run['review_run_id'], request, report)
+        monkeypatch.setattr(reviewer, 'publish_immutable', original_publish); monkeypatch.setattr(store, 'atomic_json', original_atomic)
+        reviewer.recover_submissions(home, run['review_run_id'])
+        result = reviewer.submit_report(home, run['review_run_id'], request, report)
+        prepared = json.loads(next(reviewer.paths(home)['prepared'].glob('*')).read_text())
+        assert result == prepared['result'] and reviewer._receipt(home, run['review_run_id'])['output_bytes'] == prepared['output_bytes']
+        assert len(list(reviewer.paths(home)['reports'].glob('*.json'))) == 1
+        reviewer.finalize_run(home, run['review_run_id'], 'exited')
+        assert len(supervision.pending(home)) == 1
+
