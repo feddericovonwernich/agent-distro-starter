@@ -66,13 +66,31 @@ def _zoneinfo_next(schedule, base):
 
 
 def _transition_bases(schedule, base):
-    zone = ZoneInfo(schedule['timezone']); start = datetime.fromtimestamp(base, timezone.utc)
-    prior = start.astimezone(zone).utcoffset(); found = []
-    for day in range(1, 401):
-        point = start + timedelta(days=day); offset = point.astimezone(zone).utcoffset()
-        if offset != prior: found.append(point.timestamp() - 21600)
-        prior = offset
-    return found
+    zone = ZoneInfo(schedule['timezone']); start = int(base); prior = datetime.fromtimestamp(start, timezone.utc).astimezone(zone).utcoffset()
+    transitions, cursor = [], start
+    for _ in range(400):
+        end = cursor + 86400; offset = datetime.fromtimestamp(end, timezone.utc).astimezone(zone).utcoffset()
+        if offset != prior:
+            low, high = cursor, end
+            while high - low > 1:
+                middle = (low + high) // 2
+                if datetime.fromtimestamp(middle, timezone.utc).astimezone(zone).utcoffset() == prior: low = middle
+                else: high = middle
+            transitions.append(high)
+        cursor, prior = end, offset
+    hour, minute = map(int, schedule['calendar'].split(':')); bases = []
+    for transition in transitions:
+        date = datetime.fromtimestamp(transition, timezone.utc).astimezone(zone).date()
+        naive = datetime.combine(date, datetime.min.time()).replace(hour=hour, minute=minute)
+        candidates = []
+        for fold in (0, 1):
+            candidate = naive.replace(tzinfo=zone, fold=fold)
+            if candidate.astimezone(timezone.utc).astimezone(zone).replace(tzinfo=None) == naive: candidates.append(candidate.timestamp())
+        candidates = sorted(set(candidates))
+        if len(candidates) == 2: bases.extend((candidates[0] - 1, (candidates[0] + candidates[1]) / 2, candidates[1] + 1))
+        elif not candidates: bases.extend((transition - 1, transition, transition + 1))
+        else: bases.extend((candidates[0] - 1, transition + 1))
+    return sorted(set(bases))
 
 
 def native_calendar_agrees(schedule, base):

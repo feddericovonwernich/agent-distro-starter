@@ -111,12 +111,17 @@ def test_disable_is_idempotent_and_recovers_after_reload_failure(tmp_path):
     assert len(calls) == after
 
 
-def test_transition_mismatch_refuses_enable_before_writes(tmp_path, monkeypatch):
+def test_precise_fold_bracket_refuses_second_native_occurrence(tmp_path, monkeypatch):
     root, xdg, calls = home(tmp_path), tmp_path / 'xdg', []
     schedule = {'mode': 'calendar', 'timezone': 'Europe/Berlin', 'calendar': '02:00', 'interval_hours': None}
-    monkeypatch.setattr(reviewer_timer, '_transition_bases', lambda *_: [100.0])
-    monkeypatch.setattr(reviewer_timer, 'native_next_calendar', lambda *_: 999.0)
-    with pytest.raises(store.Refusal): reviewer_timer.enable(root, {'schedule': schedule, 'limits': dict(reviewer.DEFAULT_LIMITS)}, xdg_config_home=xdg, command_runner=calls.append, now=1)
+    between = utc('2027-10-31T00:30Z')
+    assert between in reviewer_timer._transition_bases(schedule, utc('2027-01-01T00:00Z'))
+    real = reviewer_timer.native_next_calendar
+    monkeypatch.setattr(reviewer_timer, 'native_next_calendar',
+                        lambda value, point: utc('2027-10-31T01:00Z') if point == between else reviewer_timer._zoneinfo_next(value, point))
+    with pytest.raises(store.Refusal):
+        reviewer_timer.enable(root, {'schedule': schedule, 'limits': dict(reviewer.DEFAULT_LIMITS)},
+                              xdg_config_home=xdg, command_runner=calls.append, now=utc('2027-01-01T00:00Z'))
     assert not xdg.exists() and calls == []
 
 
