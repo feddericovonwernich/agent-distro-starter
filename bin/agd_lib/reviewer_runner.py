@@ -173,7 +173,9 @@ def _durable_result(home, review_run_id):
 def serve_broker(home, review_run_id, stdin, stdout):
     """Serve only frozen packet evidence and receipt transitions over JSONL."""
     receipt = reviewer._receipt(home, review_run_id)
-    config = json.loads((reviewer.paths(home)['manifests'] / f"{receipt['config_snapshot_ref']}.json").read_text())
+    try: config = reviewer.validate_config(reviewer._read_json(reviewer.paths(home)['manifests'] / f"{receipt['config_snapshot_ref']}.json"))
+    except (OSError, ValueError, json.JSONDecodeError, store.Refusal) as error: raise store.Refusal('invalid frozen config manifest') from error
+    if reviewer._digest(config) != receipt['config_snapshot_ref']: raise store.Refusal('frozen config manifest digest mismatch')
     limit, packet, sources, excerpts = config['limits']['max_input_bytes'], None, set(), []
     if receipt.get('dispatch_state') in ('begun', 'report-committed'):
         packet = reviewer.read_packet(home, receipt['packet_id']); sources = {item['source_id'] for item in packet['sources']}; excerpts = [item for item in packet['excerpts'] if item['source_id'] in sources]

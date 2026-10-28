@@ -531,6 +531,20 @@ def test_broker_only_exposes_frozen_packet_and_persists_report():
         assert reviewer._receipt(home, run['review_run_id'])['dispatch_state'] == 'report-committed'
 
 
+def test_broker_refuses_symlinked_config_manifest_before_consuming_request_budget():
+    with lab() as (home, _):
+        run, _ = produced_run(home)
+        config = reviewer.read_config(home); config['limits']['max_input_bytes'] += 1
+        outside = home / 'attacker-config.json'; outside.write_text(json.dumps(config))
+        manifest = reviewer.paths(home)['manifests'] / f"{run['config_snapshot_ref']}.json"
+        manifest.unlink(); manifest.symlink_to(outside)
+        request = {'id': str(uuid.uuid4()), 'op': 'packet', 'args': {}}
+        with pytest.raises(store.Refusal):
+            reviewer_runner.serve_broker(home, run['review_run_id'], io.StringIO(json.dumps(request) + '\n'), io.StringIO())
+        receipt = reviewer._receipt(home, run['review_run_id'])
+        assert receipt['counters'].get('input_bytes', 0) == 0 and not receipt.get('broker_replies')
+
+
 def test_retrospective_rejects_mismatched_receipt_and_session_symlink(tmp_path):
     with lab() as (home, _):
         run, selected = produced_run(home)
