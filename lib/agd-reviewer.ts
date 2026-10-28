@@ -11,11 +11,11 @@ export type Native = {
   ai: { streamSimple: StreamFn; AssistantMessageEventStream: new () => OuterStream };
   core: { Agent: new (options: unknown) => unknown };
   sdk: { Settings: { init(options: unknown): Promise<Settings> }; discoverAuthStorage(agentDir: string, options: unknown): Promise<unknown>; ModelRegistry: new (...args: unknown[]) => Registry; SessionManager: { create(cwd: string, sessionDir: string): Manager }; AgentSession: new (options: unknown) => Session };
-  resolver: { resolveCliModel(options: unknown): { model: Model | undefined } };
+  resolver: { getModelMatchPreferences(settings: Settings): unknown; resolveAllowedModels(registry: Registry, settings: Settings, preferences: unknown): Promise<Model[]>; resolveModelRoleValue(role: unknown, allowed: Model[], options: unknown): { model: Model | undefined }; resolveCliModel(options: unknown): { model: Model | undefined; error?: string }; formatModelString(model: Model): string };
   telemetry: { initTelemetryExport(): Promise<void>; isTelemetryExportEnabled(): boolean; createTelemetryExportConfig(options: unknown): unknown; flushTelemetryExport(): Promise<void> };
 };
 export interface Broker { rpc(op: string, args: unknown): Promise<unknown>; reserveModelCall(): Promise<void>; settleModelCall(): Promise<void>; persistNativeSessionId(id: string): Promise<void>; persistModel(id: string): Promise<void>; finalResult(): Promise<{ reportId: string }>; }
-export interface ReviewerInput { cwd: string; agentDir: string; sessionDir: string; reviewRunId: string; receipt: { deadline_epoch_ms: number; omp_version: string }; modelSelector: string | null; fixtureModel?: Model; reviewPrompt: string; broker: Broker; native: Native; }
+export interface ReviewerInput { cwd: string; agentDir: string; sessionDir: string; reviewRunId: string; receipt: { deadline_epoch_ms: number; omp_version: string }; modelSelector: string | null; reviewPrompt: string; broker: Broker; native: Native; }
 
 function reviewerTools(broker: Broker) {
   return new Map(['reviewer_excerpt', 'reviewer_search', 'reviewer_submit'].map(name => [name, {
@@ -37,20 +37,27 @@ function cappedStreamFn(native: StreamFn, broker: Broker, ai: Native['ai']): Str
   };
 }
 
-function resolveModel(input: ReviewerInput, settings: Settings, registry: Registry): Model {
-  if (input.fixtureModel) return input.fixtureModel;
-  const selector = input.modelSelector;
-  if (selector === null && settings.getModelRole('default') === undefined) throw new Error('configured default model role is unavailable');
-  const resolved = input.native.resolver.resolveCliModel({ cliProvider: undefined, cliModel: selector ?? 'default', modelRegistry: registry, settings });
-  if (!resolved.model || !resolved.model.provider || !resolved.model.id) throw new Error('configured reviewer model is unavailable');
-  return resolved.model;
+async function resolveModel(input: ReviewerInput, settings: Settings, registry: Registry): Promise<Model> {
+  const resolver = input.native.resolver; const preferences = resolver.getModelMatchPreferences(settings);
+  let model: Model | undefined;
+  if (input.modelSelector !== null) {
+    const resolved = resolver.resolveCliModel({ cliProvider: undefined, cliModel: input.modelSelector, modelRegistry: registry, settings, preferences });
+    if (resolved.error) throw new Error(resolved.error);
+    model = resolved.model;
+  } else {
+    const role = settings.getModelRole('default');
+    if (role === undefined) throw new Error('configured default model role is unavailable');
+    model = resolver.resolveModelRoleValue(role, await resolver.resolveAllowedModels(registry, settings, preferences), { settings, matchPreferences: preferences }).model;
+  }
+  if (!model || !model.provider || !model.id) throw new Error('configured reviewer model is unavailable');
+  return model;
 }
 
 export async function runReviewer(input: ReviewerInput, streamFn: StreamFn = input.native.ai.streamSimple): Promise<{ reportId: string }> {
   const { sdk, core, ai, telemetry } = input.native; await telemetry.initTelemetryExport();
   const settings = await sdk.Settings.init({ cwd: input.cwd, agentDir: input.agentDir, readOnly: true, overrides: { 'compaction.enabled': false, 'compaction.midTurnEnabled': false, 'compaction.autoContinue': false, 'compaction.asyncEnabled': false, 'compaction.idleEnabled': false, 'retry.enabled': false, 'retry.maxRetries': 0, 'retry.modelFallback': false, 'retry.usageAwareFallback': false, 'advisor.enabled': false, 'autolearn.enabled': false, 'autolearn.autoContinue': false } });
   const auth = await sdk.discoverAuthStorage(input.agentDir, { cwd: input.cwd, settings });
-  const registry = new sdk.ModelRegistry(auth, undefined, { settings }); const model = resolveModel(input, settings, registry);
+  const registry = new sdk.ModelRegistry(auth, undefined, { settings }); const model = await resolveModel(input, settings, registry);
   await input.broker.persistModel(`${model.provider}/${model.id}`);
   const manager = sdk.SessionManager.create(input.cwd, input.sessionDir); await input.broker.persistNativeSessionId(manager.getSessionId());
   const tools = reviewerTools(input.broker); const capped = cappedStreamFn(streamFn, input.broker, ai);

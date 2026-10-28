@@ -17,9 +17,9 @@ def assert_runtime_capability():
         raise store.DependencyError('bun is unavailable')
     script = """const agent='@oh-my-pi/pi-coding-agent', aiName='@oh-my-pi/pi-ai', coreName='@oh-my-pi/pi-agent-core';
 const [root,sdk,ai,core,telemetry,resolver]=await Promise.all([import(agent),import(agent+'/sdk'),import(aiName),import(coreName),import(agent+'/telemetry-export'),import(agent+'/config/model-resolver')]);
-for(const [name,value] of Object.entries({Settings:sdk.Settings,ModelRegistry:sdk.ModelRegistry,AgentSession:sdk.AgentSession,SessionManager:sdk.SessionManager,Agent:core.Agent,AssistantMessageEventStream:ai.AssistantMessageEventStream,initTelemetryExport:telemetry.initTelemetryExport,resolveModelRoleValue:resolver.resolveModelRoleValue}))if(!value)throw new Error('unsupported OMP export: '+name);
+for(const [name,value] of Object.entries({Settings:sdk.Settings,ModelRegistry:sdk.ModelRegistry,AgentSession:sdk.AgentSession,SessionManager:sdk.SessionManager,Agent:core.Agent,AssistantMessageEventStream:ai.AssistantMessageEventStream,initTelemetryExport:telemetry.initTelemetryExport,getModelMatchPreferences:resolver.getModelMatchPreferences,resolveAllowedModels:resolver.resolveAllowedModels,resolveModelRoleValue:resolver.resolveModelRoleValue,resolveCliModel:resolver.resolveCliModel,formatModelString:resolver.formatModelString}))if(!value)throw new Error('unsupported OMP export: '+name);
 if(typeof root.VERSION!=='string'&&typeof root.version!=='string')throw new Error('unsupported OMP version export');
-console.log(JSON.stringify({ai_url:import.meta.resolve(aiName),core_url:import.meta.resolve(coreName),sdk_url:import.meta.resolve(agent+'/sdk'),telemetry_url:import.meta.resolve(agent+'/telemetry-export'),omp_version:root.VERSION||root.version}));"""
+console.log(JSON.stringify({ai_url:import.meta.resolve(aiName),core_url:import.meta.resolve(coreName),sdk_url:import.meta.resolve(agent+'/sdk'),telemetry_url:import.meta.resolve(agent+'/telemetry-export'),resolver_url:import.meta.resolve(agent+'/config/model-resolver'),omp_version:root.VERSION||root.version}));"""
     env = {key: os.environ[key] for key in ('PATH', 'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME') if key in os.environ}
     try: result = subprocess.run([binary, '-e', script], capture_output=True, text=True, timeout=10, env=env)
     except subprocess.TimeoutExpired as error: raise store.DependencyError('installed OMP runtime capability timed out') from error
@@ -29,7 +29,7 @@ console.log(JSON.stringify({ai_url:import.meta.resolve(aiName),core_url:import.m
         capability = json.loads(result.stdout)
     except json.JSONDecodeError as error:
         raise store.DependencyError('installed OMP runtime capability malformed') from error
-    if not all(isinstance(capability.get(key), str) and capability[key] for key in ('ai_url', 'core_url', 'sdk_url', 'telemetry_url', 'omp_version')):
+    if not all(isinstance(capability.get(key), str) and capability[key] for key in ('ai_url', 'core_url', 'sdk_url', 'telemetry_url', 'resolver_url', 'omp_version')):
         raise store.DependencyError('installed OMP runtime capability malformed')
     return capability
 
