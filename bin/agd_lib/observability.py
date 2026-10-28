@@ -155,6 +155,38 @@ def worker_binding(home, task_id, incarnation):
         return worker_binding_locked(home, task_id, incarnation)
 
 
+def reviewer_session_dir(home, review_run_id):
+    """Provision only the reviewer native directory; binding awaits the real ID."""
+    home = _home(home)
+    try: review_run_id = str(uuid.UUID(review_run_id))
+    except (ValueError, TypeError, AttributeError) as error: raise ValueError('invalid reviewer run ID') from error
+    with store.lock(home):
+        return str(_private_directory(_private_directory(home, 'data', 'observability', 'reviewer', review_run_id), 'omp'))
+
+def reviewer_binding(home, review_run_id, native_session_id):
+    """Create the reviewer-owned native session receipt after native allocation."""
+    home = _home(home)
+    try:
+        review_run_id = str(uuid.UUID(review_run_id))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise ValueError('invalid reviewer run ID') from error
+    if not isinstance(native_session_id, str) or not native_session_id or '/' in native_session_id:
+        raise ValueError('invalid native reviewer session ID')
+    with store.lock(home):
+        directory = _private_directory(home, 'data', 'observability', 'reviewer', review_run_id)
+        session_dir = _private_directory(directory, 'omp')
+        receipt = directory / 'binding.json'
+        expected = {'schema': 1, 'purpose': 'background-skill-review', 'review_run_id': review_run_id,
+                    'native_session_id': native_session_id, 'session_dir': str(session_dir)}
+        value = _read_json(receipt)
+        if value is None:
+            store.atomic_json(receipt, expected)
+            return expected
+        if value != expected:
+            raise store.Refusal('reviewer binding is immutable')
+        return value
+
+
 def managed_environment(home, role, task, incarnation):
     home = _home(home)
     config = read_config(home)
@@ -199,6 +231,37 @@ def managed_environment(home, role, task, incarnation):
         OTEL_RESOURCE_ATTRIBUTES=','.join(f'{key}={value}' for key, value in attributes.items()),
         OTEL_SERVICE_NAME='agent-distro',
     )
+    warning = None if read_status(home)['runtime'] == 'healthy' else 'observability is degraded; continuing without confirmed Collector health'
+    return env, config['generation'], warning
+
+
+def reviewer_environment(home, review_run_id):
+    """Return the managed native environment for one reviewer run."""
+    home = _home(home)
+    try:
+        review_run_id = str(uuid.UUID(review_run_id))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise ValueError('invalid reviewer run ID') from error
+    config = read_config(home)
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith('OTEL_') and key not in {'AGD_TASK_ID', 'AGD_INCARNATION', 'AGD_MANAGED_CENTRAL', 'AGD_OWNER'}}
+    env['AGD_HOME'] = str(home)
+    if config['mode'] == 'disabled':
+        return env, config['generation'], None
+    allocation, project_id = config.get('ports'), config.get('project_id')
+    if not isinstance(allocation, dict) or not isinstance(allocation.get('otlp_http_port'), int) or not isinstance(project_id, str) or not project_id:
+        raise store.Refusal('observability configuration is malformed')
+    endpoint = f"http://127.0.0.1:{allocation['otlp_http_port']}"
+    attributes = {'service.name': 'agent-distro', 'agd.home_id': config['home_id'], 'agd.distro_id': config['home_id'],
+                  'agd.langfuse_project': project_id, 'agd.role': 'reviewer', 'agd.session_scope': 'background-skill-review',
+                  'agd.review_run_id': review_run_id, 'purpose': 'background-skill-review'}
+    env.update(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=endpoint + '/v1/traces', OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=endpoint + '/v1/logs',
+               OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=endpoint + '/v1/metrics', OTEL_EXPORTER_OTLP_TRACES_PROTOCOL='http/protobuf',
+               OTEL_EXPORTER_OTLP_LOGS_PROTOCOL='http/protobuf', OTEL_EXPORTER_OTLP_METRICS_PROTOCOL='http/protobuf',
+               OTEL_TRACES_EXPORTER='otlp', OTEL_LOGS_EXPORTER='otlp', OTEL_METRICS_EXPORTER='otlp',
+               OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT='true',
+               OTEL_RESOURCE_ATTRIBUTES=','.join(f'{key}={value}' for key, value in attributes.items()),
+               OTEL_SERVICE_NAME='agent-distro')
     warning = None if read_status(home)['runtime'] == 'healthy' else 'observability is degraded; continuing without confirmed Collector health'
     return env, config['generation'], warning
 

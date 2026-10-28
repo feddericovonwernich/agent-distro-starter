@@ -77,13 +77,15 @@ def resolve(home, task_id, key, answer):
         if decision['status'] != 'open' or decision['incarnation'] != task.get('incarnation', 'central'):
             raise store.Refusal('decision is resolved or belongs to a previous worker')
         answer_path = folder/'decisions'/f'{key}.answer.json'
-        store.atomic_json(answer_path, {'body': text})
+        resolved_at = time.time()
+        store.atomic_json(answer_path, {'body': text, 'task_id': task_id, 'incarnation': task.get('incarnation', 'central'),
+                                        'resolved_at': resolved_at})
         if task.get('executor') == 'worker':
             message_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f'{task_id}:{task["incarnation"]}:decision:{key}'))
             store.atomic_json(folder/'inbox'/f'{message_id}.json',
                               {'id': message_id, 'body': text, 'incarnation': task['incarnation']})
             decision['message_id'] = message_id
-        decision.update(status='resolved', answer=str(answer_path.relative_to(folder)))
+        decision.update(status='resolved', answer=str(answer_path.relative_to(folder)), resolved_at=resolved_at)
         store.atomic_json(path, decision)
     return decision
 

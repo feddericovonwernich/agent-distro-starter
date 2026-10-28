@@ -1,7 +1,16 @@
 # Changelog
 
 ## Unreleased
+- Verified the bounded reviewer against real OMP 18.3.2 public modules: provider-free scripted AgentSession persistence, restricted tools, disabled telemetry, and enabled loopback-only OTLP purpose/run metadata; approved disposable user-systemd lifecycle evidence is recorded.
+- Hardened reviewer deadline enforcement across collection, capability discovery, and child dispatch; reviewer immutable records now refuse unsafe symlink and non-regular paths.
 
+- Added reviewer CLI inspection, human triage, manual native-run dispatch, and durable no-work receipts. Timer activation remains an explicit command and is never automatic.
+- Added the inert reviewer scheduling kernel and owned per-user systemd unit rendering. Calendar schedules use systemd's native IANA/DST semantics, interval schedules use a fixed UTC-hour anchor, and no configuration or initialization action activates a timer.
+- Added immutable reviewer reports and proposal revisions, audited human-only triage, idempotent final batch events, and final-packet-only candidate consumption. New-skill drafts remain stored inertly outside discovery roots.
+- Hardened reviewer native JSONL collection to preserve bounded physical offsets and hashes across malformed, non-object, late, and skipped rows; finalized retrospective packets include committed reports.
+- Made reviewer report submission crash-recoverable through retained request-keyed prepared records with exact output reservations; identical finalized-request retries return their committed receipt.
+- Require an explicitly observed OMP runtime version before a reviewer receipt can begin immutable report production; catalog provenance now hashes raw skill bytes and flags bounded invalid/truncated excerpts.
+- Added private, immutable reviewer evidence packets selected from closed worker incarnations, with bounded native JSONL excerpts, frozen config/instructions, provenance and explicit unknown-coverage records. Reviewer model hosting, reports, timers, and CLI commands remain unavailable.
 - Added a private project registry, explicit trust/deletion approval, pinned Treehouse task leases, readiness, exact-head landing, publication evidence and guarded cleanup.
 - Added private worker skill catalogs, exact profile/curated selection, frozen task snapshots, OMP native materialization, collision/exclusion guards, and lifecycle integrity checks. Cursor nonempty provisioning remains fail-closed pending authenticated live verification.
 - Seed a new empty private home with the reviewed default worker-skill profile without changing existing homes.

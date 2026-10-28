@@ -380,7 +380,7 @@ def test_status_reports_binding_materialization_and_durable_bytes():
     with lab() as (home, _):
         binding = observability.worker_binding(home, 'task-a', INCARNATION)
         session = Path(binding['session_dir'])
-        queue = observability.paths(home)['queue']; queue.mkdir(parents=True); (queue/'item').write_bytes(b'abc')
+        queue = observability._private_directory(home, 'state', 'observability', 'collector', 'queue'); (queue/'item').write_bytes(b'abc')
         status = observability.status(home)
         assert status['bindings'][0]['state'] == 'native session not materialized'
         assert status['bindings'][0]['session_dir'] == str(session)

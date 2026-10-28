@@ -78,6 +78,11 @@ test('session switch replaces only its owned watcher', async () => {
     const nextDeadline = Date.now() + 5000;
     while (deliveries.length < 2 && Date.now() < nextDeadline) await Bun.sleep(50);
     expect(deliveries[1]).toEqual({ deliverAs: 'followUp' });
+    writeFileSync(join(home, 'state', 'events', '33333333-3333-4333-8333-333333333333.json'),
+      JSON.stringify({ schema: 1, id: '33333333-3333-4333-8333-333333333333', kind: 'background-skill-review', key: '00000000-0000-4000-8000-000000000030', observed_at: Date.now(), details: { purpose: 'background-skill-review', review_run_id: '00000000-0000-4000-8000-000000000030', report_ids: [], proposal_ids: [], report_count: 0, proposal_count: 0 } }));
+    const reviewerDeadline = Date.now() + 5000;
+    while (deliveries.length < 3 && Date.now() < reviewerDeadline) await Bun.sleep(50);
+    expect(deliveries[2]).toEqual({ deliverAs: 'followUp' });
     // The watcher is a real subprocess; wait for its persisted replacement PID before stopping it.
     process.kill(second.watcher_pid, 'SIGTERM');
     let replacement: number | undefined;
