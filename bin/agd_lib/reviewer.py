@@ -297,8 +297,13 @@ def enqueue_intent(home, *, kind, retrospective_review_run_ids=()):
         if kind in ('default', 'timer'):
             for path in paths(root)['intents'].glob('*.json') if paths(root)['intents'].exists() else ():
                 existing = _read_json(path)
-                if {key: existing.get(key) for key in scope} == scope: return existing
-        intent = {'schema': 1, 'intent_id': str(uuid.uuid4()), **scope, 'created_at': time.time()}; publish_immutable(paths(root)['intents'] / f'{intent["intent_id"]}.json', intent); return intent
+                pending = paths(root)['pending'] / f'{existing["intent_id"]}.json'
+                if {key: existing.get(key) for key in scope} == scope and pending.exists() and _read_json(pending).get('state') == 'pending':
+                    return existing
+        intent = {'schema': 1, 'intent_id': str(uuid.uuid4()), **scope, 'created_at': time.time()}
+        publish_immutable(paths(root)['intents'] / f'{intent["intent_id"]}.json', intent)
+        store.atomic_json(paths(root)['pending'] / f'{intent["intent_id"]}.json', {'intent_id': intent['intent_id'], 'state': 'pending'})
+        return intent
 
 
 @contextlib.contextmanager
@@ -315,7 +320,10 @@ def reserve_run(home, intent, *, config_snapshot, instruction_snapshot, started_
     if not isinstance(intent, dict) or not isinstance(intent.get('intent_id'), str) or not isinstance(instruction_snapshot, bytes) or not isinstance(started_at, (int, float)) or type(deadline_epoch_ms) is not int: raise store.Refusal('invalid reviewer reservation')
     run_id = str(uuid.uuid4()); config_ref, instruction_ref = _digest(config), hashlib.sha256(instruction_snapshot).hexdigest(); publish_immutable(paths(home)['manifests'] / f'{config_ref}.json', config); publish_immutable(paths(home)['manifests'] / f'{instruction_ref}.json', {'text': instruction_snapshot.decode('utf-8'), 'raw_utf8_sha256': instruction_ref})
     run = {'schema': 1, 'purpose': 'background-skill-review', 'review_run_id': run_id, 'intent': intent, 'config_snapshot_ref': config_ref, 'instruction_snapshot_ref': instruction_ref, 'started_at': started_at, 'deadline_epoch_ms': deadline_epoch_ms, 'counters': {'model_calls': 0}, 'dispatch_state': 'reserved'}
-    with store.lock(store.home(home)): publish_immutable(paths(home)['receipts'] / f'{run_id}.json', run)
+    with store.lock(store.home(home)):
+        publish_immutable(paths(home)['receipts'] / f'{run_id}.json', run)
+        pending = paths(home)['pending'] / f'{intent["intent_id"]}.json'
+        if pending.exists(): store.atomic_json(pending, {'intent_id': intent['intent_id'], 'state': 'consumed', 'review_run_id': run_id})
     return run
 
 

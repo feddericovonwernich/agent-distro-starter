@@ -159,3 +159,11 @@ def test_runner_persists_reservation_before_resolver_failure(monkeypatch):
             reviewer_runner.launch(home, intent)
         receipts = list(reviewer.paths(home)['receipts'].glob('*.json'))
         assert len(receipts) == 1 and json.loads(receipts[0].read_text())['dispatch_state'] == 'reserved'
+
+
+def test_reserved_default_intent_is_consumed_before_next_identical_trigger():
+    with lab() as (home, _):
+        intent = reviewer.enqueue_intent(home, kind='default')
+        reviewer.reserve_run(home, intent, config_snapshot=reviewer.read_config(home), instruction_snapshot=b'frozen',
+                             started_at=1.0, deadline_epoch_ms=2)
+        assert reviewer.enqueue_intent(home, kind='default')['intent_id'] != intent['intent_id']
