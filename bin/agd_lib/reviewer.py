@@ -325,20 +325,25 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
     if coverage['central_feedback'] == 'unknown': coverage['unknown'].append({'category': 'central-feedback', 'reason': 'no explicit retained links'})
     retrospective = []
     if retrospective_review_run_ids:
-        requested = set(retrospective_review_run_ids)
+        try: requested = {str(uuid.UUID(item)) for item in retrospective_review_run_ids}
+        except (ValueError, TypeError, AttributeError) as error: raise store.Refusal('invalid retrospective run') from error
+        if set(retrospective_review_run_ids) != requested: raise store.Refusal('invalid retrospective run')
         for receipt_path in sorted(paths(root)['receipts'].glob('*.json')):
             receipt = _read_json(receipt_path); rid = receipt.get('review_run_id'); closed = receipt.get('closed_at')
-            if isinstance(rid, str) and isinstance(closed, (int, float)) and closed > cutoff: coverage['retrospective_excluded'].append(rid)
+            try: canonical_rid = str(uuid.UUID(rid))
+            except (ValueError, TypeError, AttributeError) as error: raise store.Refusal('retrospective receipt ID is invalid') from error
+            if canonical_rid != rid or receipt_path.stem != rid: raise store.Refusal('retrospective receipt ID is invalid')
+            if isinstance(closed, (int, float)) and closed > cutoff: coverage['retrospective_excluded'].append(rid)
             if rid not in requested: continue
             if receipt.get('dispatch_state') != 'final' or not isinstance(closed, (int, float)) or closed > cutoff: raise store.Refusal('retrospective run is not finalized before cutoff')
-            binding_path = root / 'data' / 'observability' / 'reviewer' / rid / 'binding.json'
             try:
-                binding = _read_json(binding_path)
-                session_dir = root / 'data' / 'observability' / 'reviewer' / rid / 'omp'
-                if binding.get('review_run_id') != rid or binding.get('session_dir') != str(session_dir) or session_dir.is_symlink() or not session_dir.is_dir(): raise ValueError('binding')
+                session_dir = observability._existing_private_directory(root, 'data', 'observability', 'reviewer', rid, 'omp')
+                if session_dir is None: raise ValueError('session')
+                binding = _read_json(session_dir.parent / 'binding.json')
+                if binding.get('review_run_id') != rid or binding.get('session_dir') != str(session_dir): raise ValueError('binding')
                 jsonls = sorted(session_dir.glob('*.jsonl'))
                 if not jsonls: raise ValueError('session')
-            except (OSError, ValueError, json.JSONDecodeError) as error: raise store.Refusal('retrospective native evidence is unavailable') from error
+            except (OSError, ValueError, store.Refusal, json.JSONDecodeError) as error: raise store.Refusal('retrospective native evidence is unavailable') from error
             retrospective.append({'review_run_id': rid, 'closed_at': closed, 'source_count': len(jsonls)})
             for jsonl in jsonls:
                 try:
@@ -354,14 +359,11 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
             for report_id in receipt.get('report_ids', []):
                 try:
                     report = _read_json(report_path(root, report_id))
-                    source = {'kind': 'reviewer-report', 'review_run_id': rid, 'report_id': report_id,
-                              'content_sha256': hashlib.sha256(_json_bytes(report)).hexdigest()}
+                    source = {'kind': 'reviewer-report', 'review_run_id': rid, 'report_id': report_id, 'content_sha256': hashlib.sha256(_json_bytes(report)).hexdigest()}
                     source['source_id'] = _digest(source); sources.append(source)
-                    excerpt = {'source_id': source['source_id'], 'message_id': report_id, 'text': json.dumps(report, sort_keys=True),
-                               'line_start': 1, 'line_end': 1, 'byte_start': 0, 'byte_end': len(_json_bytes(report))}
+                    excerpt = {'source_id': source['source_id'], 'message_id': report_id, 'text': json.dumps(report, sort_keys=True), 'line_start': 1, 'line_end': 1, 'byte_start': 0, 'byte_end': len(_json_bytes(report))}
                     excerpt['excerpt_id'] = _digest(excerpt); excerpts.append(excerpt)
-                except (OSError, ValueError, json.JSONDecodeError):
-                    _coverage(coverage, 'unavailable', {'review_run_id': rid, 'reason': 'committed-report-unavailable'})
+                except (OSError, ValueError, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'review_run_id': rid, 'reason': 'committed-report-unavailable'})
         if {item['review_run_id'] for item in retrospective} != requested: raise store.Refusal('unknown retrospective run')
     coverage['followup_id'] = '0' * 64  # reserve final metadata before the sole shared cap
     packet = {'schema': 1, 'purpose': 'background-skill-review', 'cutoff': cutoff, 'episodes': episodes, 'sources': sources, 'excerpts': excerpts, 'catalog': _catalog(root, coverage), 'skill_provenance': provenance, 'coverage': coverage, 'retrospective_review_run_ids': list(retrospective_review_run_ids), 'retrospective_episodes': retrospective, 'config_snapshot_sha256': _digest(config)}
@@ -449,7 +451,7 @@ def reserve_run(home, intent, *, config_snapshot, instruction_snapshot, started_
     config = validate_config(config_snapshot)
     if not isinstance(intent, dict) or not isinstance(intent.get('intent_id'), str) or not isinstance(instruction_snapshot, bytes) or not isinstance(started_at, (int, float)) or type(deadline_epoch_ms) is not int: raise store.Refusal('invalid reviewer reservation')
     run_id = str(uuid.uuid4()); config_ref, instruction_ref = _digest(config), hashlib.sha256(instruction_snapshot).hexdigest(); publish_immutable(paths(home)['manifests'] / f'{config_ref}.json', config); publish_immutable(paths(home)['manifests'] / f'{instruction_ref}.json', {'text': instruction_snapshot.decode('utf-8'), 'raw_utf8_sha256': instruction_ref})
-    run = {'schema': 1, 'purpose': 'background-skill-review', 'review_run_id': run_id, 'intent': intent, 'config_snapshot_ref': config_ref, 'instruction_snapshot_ref': instruction_ref, 'started_at': started_at, 'deadline_epoch_ms': deadline_epoch_ms, 'counters': {'model_calls': 0}, 'dispatch_state': 'reserved'}
+    run = {'schema': 1, 'purpose': 'background-skill-review', 'review_run_id': run_id, 'intent': intent, 'config_snapshot_ref': config_ref, 'instruction_snapshot_ref': instruction_ref, 'started_at': started_at, 'deadline_epoch_ms': deadline_epoch_ms, 'counters': {'model_calls': 0, 'input_bytes': 0, 'provider_inflight': 0}, 'dispatch_state': 'reserved'}
     with store.lock(store.home(home)):
         publish_immutable(paths(home)['receipts'] / f'{run_id}.json', run)
         pending = paths(home)['pending'] / f'{intent["intent_id"]}.json'

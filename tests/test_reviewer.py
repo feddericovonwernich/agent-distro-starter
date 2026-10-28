@@ -541,3 +541,36 @@ def test_broker_only_exposes_frozen_packet_and_persists_report():
         assert responses[3]['value']['reportId'] == responses[4]['value']['reportId']
         assert reviewer.report_path(home, responses[4]['value']['reportId']).is_file()
         assert reviewer._receipt(home, run['review_run_id'])['dispatch_state'] == 'final'
+
+
+def test_retrospective_rejects_mismatched_receipt_and_session_symlink(tmp_path):
+    with lab() as (home, _):
+        run, selected = produced_run(home)
+        reviewer.submit_report(home, run['review_run_id'], str(uuid.uuid4()), build_report(selected))
+        final = reviewer.finalize_run(home, run['review_run_id'], 'done')
+        observability.reviewer_binding(home, run['review_run_id'], 'native-retrospective')
+        receipt = reviewer.paths(home)['receipts'] / f"{run['review_run_id']}.json"
+        broken = json.loads(receipt.read_text()); broken['review_run_id'] = '../traversal'; store.atomic_json(receipt, broken)
+        with pytest.raises(store.Refusal):
+            packet(home, retrospective=(run['review_run_id'],))
+        store.atomic_json(receipt, final)
+        session = home / 'data' / 'observability' / 'reviewer' / run['review_run_id'] / 'omp'
+        outside = tmp_path / 'outside'; session.rename(outside); session.symlink_to(outside, target_is_directory=True)
+        with pytest.raises(store.Refusal):
+            packet(home, retrospective=(run['review_run_id'],))
+
+
+def test_broker_replay_charges_input_once_and_keeps_receipt_dispatchable():
+    with lab() as (home, _):
+        run, _ = produced_run(home); request_id = str(uuid.uuid4())
+        assert reviewer_runner._replay_or_reserve_input(home, run['review_run_id'], request_id, 'packet', {}, 'abc', 6) == 'abc'
+        assert reviewer_runner._replay_or_reserve_input(home, run['review_run_id'], request_id, 'packet', {}, 'abc', 6) == 'abc'
+        assert reviewer._receipt(home, run['review_run_id'])['counters']['input_bytes'] == len(json.dumps('abc').encode())
+        with pytest.raises(store.Refusal, match='cumulative'):
+            reviewer_runner._replay_or_reserve_input(home, run['review_run_id'], str(uuid.uuid4()), 'search', {}, 'abc', 6)
+        requests = [{'id': str(uuid.uuid4()), 'op': 'reserve', 'args': {}}, {'id': str(uuid.uuid4()), 'op': 'settle', 'args': {}}]
+        output = io.StringIO()
+        reviewer_runner.serve_broker(home, run['review_run_id'], io.StringIO(''.join(json.dumps(row) + '\n' for row in requests)), output)
+        receipt = reviewer._receipt(home, run['review_run_id'])
+        assert receipt['dispatch_state'] == 'begun'
+        assert receipt['counters']['model_calls'] == 1 and receipt['counters']['provider_inflight'] == 0

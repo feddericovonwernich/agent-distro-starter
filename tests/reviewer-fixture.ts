@@ -19,12 +19,17 @@ export async function startBridge() {
   };
   const hello = JSON.parse(await next());
   const native = { ai: await import(hello.aiUrl), core: await import(hello.coreUrl), sdk: await import(hello.sdkUrl), telemetry: await import(hello.telemetryUrl) };
-  const rpc = async (op: string, args: unknown) => {
-    const id = crypto.randomUUID();
-    proc.stdin.write(`${JSON.stringify({ id, op, args })}\n`);
-    const reply = JSON.parse(await next());
-    if (reply.id !== id || !reply.ok) throw new Error(reply.error || 'bridge refusal');
-    return reply.value;
+  let queue = Promise.resolve();
+  const rpc = (op: string, args: unknown) => {
+    const request = queue.then(async () => {
+      const id = crypto.randomUUID();
+      proc.stdin.write(`${JSON.stringify({ id, op, args })}\n`);
+      const reply = JSON.parse(await next());
+      if (reply.id !== id || !reply.ok) throw new Error(reply.error || 'bridge refusal');
+      return reply.value;
+    });
+    queue = request.then(() => undefined, () => undefined);
+    return request;
   };
   return { hello, native, broker: {
     rpc,
@@ -32,7 +37,7 @@ export async function startBridge() {
     settleModelCall: async () => { await rpc('settle', {}); },
     persistNativeSessionId: async (id: string) => { await rpc('session', { id }); },
     finalResult: async () => reportResult(await rpc('result', {})),
-  }, close: async () => { proc.stdin.end(); await proc.exited; await lines.return?.(); } };
+  }, close: async () => { proc.stdin.end(); await Promise.race([proc.exited, Bun.sleep(5000).then(() => { if (proc.exitCode === null) proc.kill(); return proc.exited; })]); await lines.return?.(); } };
 }
 
 export function scriptedStream(ai: { AssistantMessageEventStream: new () => { push(event: unknown): void; end(result: unknown): void } }, turns: unknown[][], observed: string[], messages: unknown[][]) {

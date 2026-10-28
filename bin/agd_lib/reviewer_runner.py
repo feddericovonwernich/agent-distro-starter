@@ -1,5 +1,6 @@
 """Reviewer collection lifecycle and the trusted JSONL evidence broker."""
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -19,7 +20,9 @@ const [root,sdk,ai,core,telemetry,resolver]=await Promise.all([import(agent),imp
 for(const [name,value] of Object.entries({Settings:sdk.Settings,ModelRegistry:sdk.ModelRegistry,AgentSession:sdk.AgentSession,SessionManager:sdk.SessionManager,Agent:core.Agent,AssistantMessageEventStream:ai.AssistantMessageEventStream,initTelemetryExport:telemetry.initTelemetryExport,resolveModelRoleValue:resolver.resolveModelRoleValue}))if(!value)throw new Error('unsupported OMP export: '+name);
 if(typeof root.VERSION!=='string'&&typeof root.version!=='string')throw new Error('unsupported OMP version export');
 console.log(JSON.stringify({ai_url:import.meta.resolve(aiName),core_url:import.meta.resolve(coreName),sdk_url:import.meta.resolve(agent+'/sdk'),telemetry_url:import.meta.resolve(agent+'/telemetry-export'),omp_version:root.VERSION||root.version}));"""
-    result = subprocess.run([binary, '-e', script], capture_output=True, text=True)
+    env = {key: os.environ[key] for key in ('PATH', 'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME') if key in os.environ}
+    try: result = subprocess.run([binary, '-e', script], capture_output=True, text=True, timeout=10, env=env)
+    except subprocess.TimeoutExpired as error: raise store.DependencyError('installed OMP runtime capability timed out') from error
     if result.returncode:
         raise store.DependencyError(f'installed OMP runtime capability unavailable: {result.stderr.strip()}')
     try:
@@ -66,11 +69,27 @@ def _request_id(value):
         raise store.Refusal('invalid broker request ID') from error
 
 
-def _broker_text(value, limit):
-    body = json.dumps(value, sort_keys=True, ensure_ascii=False)
-    if len(body.encode()) > limit:
-        raise store.Refusal('broker response exceeds frozen input limit')
-    return body
+def _broker_text(value):
+    return json.dumps(value, sort_keys=True, ensure_ascii=False)
+
+
+def _replay_or_reserve_input(home, review_run_id, request_id, op, args, value, limit):
+    digest = reviewer._digest({'op': op, 'args': args})
+    with store.lock(store.home(home)):
+        receipt = reviewer._receipt(home, review_run_id)
+        replies = receipt.setdefault('broker_replies', {})
+        prior = replies.get(request_id)
+        if prior:
+            if prior.get('digest') != digest: raise store.Refusal('conflicting broker request reuse')
+            return prior['value']
+        encoded = _broker_text(value)
+        counters = receipt.setdefault('counters', {})
+        used = counters.get('input_bytes', 0)
+        if not isinstance(used, int) or used + len(encoded.encode()) > limit: raise store.Refusal('cumulative broker input limit exceeded')
+        counters['input_bytes'] = used + len(encoded.encode())
+        replies[request_id] = {'digest': digest, 'value': value}
+        store.atomic_json(reviewer.paths(home)['receipts'] / f'{review_run_id}.json', receipt)
+    return value
 
 
 def serve_broker(home, review_run_id, stdin, stdout):
@@ -91,32 +110,43 @@ def serve_broker(home, review_run_id, stdin, stdout):
             op, args = request.get('op'), request.get('args')
             if not isinstance(op, str) or not isinstance(args, dict): raise store.Refusal('invalid broker request')
             if op == 'packet':
-                value = _broker_text(packet, limit)
+                value = _replay_or_reserve_input(home, review_run_id, request_id, op, args, _broker_text(packet), limit)
             elif op == 'reviewer_excerpt':
                 source_id = args.get('source_id')
                 if source_id not in sources: raise store.Refusal('source is outside packet')
-                value = _broker_text([item for item in excerpts if item['source_id'] == source_id], limit)
+                value = _replay_or_reserve_input(home, review_run_id, request_id, op, args, _broker_text([item for item in excerpts if item['source_id'] == source_id]), limit)
             elif op == 'reviewer_search':
                 query = args.get('query')
                 if not isinstance(query, str) or not query or len(query.encode()) > 256: raise store.Refusal('invalid packet search')
-                value = _broker_text([item for item in excerpts if query.casefold() in item['text'].casefold()], limit)
+                value = _replay_or_reserve_input(home, review_run_id, request_id, op, args, _broker_text([item for item in excerpts if query.casefold() in item['text'].casefold()]), limit)
             elif op == 'reviewer_submit':
                 report = args.get('report')
-                result = reviewer.submit_report(home, review_run_id, str(uuid.uuid4()), report)
-                value = {'reportId': result['report_id']}
+                result = reviewer.submit_report(home, review_run_id, request_id, report)
+                value = _replay_or_reserve_input(home, review_run_id, request_id, op, args, {'reportId': result['report_id']}, limit)
             elif op == 'reserve':
                 if time.time() * 1000 >= receipt['deadline_epoch_ms']: raise store.Refusal('review deadline exceeded')
                 with store.lock(store.home(home)):
-                    current = reviewer._receipt(home, review_run_id)
-                    if current['counters']['model_calls'] >= config['limits']['max_model_calls']: raise store.Refusal('model-call limit exceeded')
-                    current['counters']['model_calls'] += 1; current['dispatch_state'] = 'reserved-provider'
-                    store.atomic_json(reviewer.paths(home)['receipts'] / f'{review_run_id}.json', current)
-                value = {'model_calls': current['counters']['model_calls']}
+                    current = reviewer._receipt(home, review_run_id); counters = current.setdefault('counters', {}); replies = current.setdefault('broker_replies', {})
+                    digest = reviewer._digest({'op': op, 'args': args}); prior = replies.get(request_id)
+                    if prior:
+                        if prior.get('digest') != digest: raise store.Refusal('conflicting broker request reuse')
+                        value = prior['value']
+                    else:
+                        if counters.get('model_calls', 0) >= config['limits']['max_model_calls']: raise store.Refusal('model-call limit exceeded')
+                        counters['model_calls'] = counters.get('model_calls', 0) + 1; counters['provider_inflight'] = counters.get('provider_inflight', 0) + 1
+                        value = {'model_calls': counters['model_calls']}; replies[request_id] = {'digest': digest, 'value': value}
+                        store.atomic_json(reviewer.paths(home)['receipts'] / f'{review_run_id}.json', current)
             elif op == 'settle':
                 with store.lock(store.home(home)):
-                    current = reviewer._receipt(home, review_run_id); current['dispatch_state'] = 'settled'
-                    store.atomic_json(reviewer.paths(home)['receipts'] / f'{review_run_id}.json', current)
-                value = {'dispatch_state': 'settled'}
+                    current = reviewer._receipt(home, review_run_id); counters = current.setdefault('counters', {}); replies = current.setdefault('broker_replies', {})
+                    digest = reviewer._digest({'op': op, 'args': args}); prior = replies.get(request_id)
+                    if prior:
+                        if prior.get('digest') != digest: raise store.Refusal('conflicting broker request reuse')
+                        value = prior['value']
+                    else:
+                        counters['provider_inflight'] = max(0, counters.get('provider_inflight', 0) - 1)
+                        value = {'provider_inflight': counters['provider_inflight']}; replies[request_id] = {'digest': digest, 'value': value}
+                        store.atomic_json(reviewer.paths(home)['receipts'] / f'{review_run_id}.json', current)
             elif op == 'session':
                 native_session_id = args.get('id')
                 value = observability.reviewer_binding(home, review_run_id, native_session_id)
