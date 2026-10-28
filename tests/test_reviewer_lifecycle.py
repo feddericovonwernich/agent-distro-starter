@@ -40,3 +40,25 @@ def test_nonzero_fake_child_records_safe_terminal_diagnostic(monkeypatch):
         raw = json.dumps(result)
         assert result['dispatch_state'] == 'final' and result['error']['code'] == 'nonzero'
         assert 'SECRET' not in raw and 'token@example' not in raw
+
+def test_cli_reviewer_triage_preserves_foreign_owner_and_task_bytes():
+    from test_reviewer import produced_run, build_report
+    from agd_lib import worker_skills
+    import os, json, uuid
+    from support import command
+    with lab() as (home, _):
+        run, packet = produced_run(home)
+        submitted = reviewer.submit_report(home, run['review_run_id'], str(uuid.uuid4()), build_report(packet))
+        reviewer.finalize_run(home, run['review_run_id'], 'exited')
+        owner = home / 'state' / 'owner.json'; owner.write_text(json.dumps({'pid': os.getpid(), 'started': 'foreign', 'token': str(uuid.uuid4())}))
+        task_bytes = {str(p.relative_to(home/'data'/'tasks')): p.read_bytes() for p in (home/'data'/'tasks').rglob('*') if p.is_file()}
+        before = (owner.read_bytes(), task_bytes, worker_skills.catalog(home), worker_skills.resolve(home))
+        report = command(home, 'reviewer', 'reports', 'show', submitted['report_id'])
+        proposal = command(home, 'reviewer', 'proposals', 'show', submitted['proposal_ids'][0])
+        disposed = command(home, 'reviewer', 'proposals', 'dispose', submitted['proposal_ids'][0], '--status', 'accepted')
+        assert report['review_run_id'] == run['review_run_id'] and report['report']['findings']
+        assert proposal['history'] == [] and disposed['current'] == 'accepted'
+        after_tasks = {str(p.relative_to(home/'data'/'tasks')): p.read_bytes() for p in (home/'data'/'tasks').rglob('*') if p.is_file()}
+        assert before == (owner.read_bytes(), after_tasks, worker_skills.catalog(home), worker_skills.resolve(home))
+
+
