@@ -156,6 +156,17 @@ def test_old_incarnation_collects_only_its_resolved_central_feedback():
         old_feedback = [row['text'] for row in selected['excerpts'] if row['text'] in ('old answer\n', 'new answer\n')]
         assert old_feedback == ['old answer\n']
 
+def test_retrospective_includes_committed_finalized_report():
+    with lab() as (home, _):
+        run, selected = produced_run(home)
+        submitted = reviewer.submit_report(home, run['review_run_id'], str(uuid.uuid4()), build_report(selected))
+        binding = observability.reviewer_binding(home, run['review_run_id'], 'native-review')
+        Path(binding['session_dir'], 'native-review.jsonl').write_text('\n'.join(json.dumps(row) for row in [
+            {'type': 'session', 'version': 3, 'id': 'native-review', 'timestamp': '1970-01-01T00:00:00Z'}, message('review native', time.time())]) + '\n')
+        reviewer.finalize_run(home, run['review_run_id'], 'exited')
+        retrospective = packet(home, cutoff=time.time() + 1, retrospective=(run['review_run_id'],))
+        assert any(source['kind'] == 'reviewer-report' and source['report_id'] == submitted['report_id'] for source in retrospective['sources'])
+
 
 def test_retrospective_requires_closed_prior_receipt_and_excludes_later_runs():
     with lab() as (home, _):
