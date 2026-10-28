@@ -113,7 +113,8 @@ def test_packet_freezes_catalog_and_assigned_manifest_without_claiming_usage():
     with lab() as (home, _):
         task, _, _ = ended_worker(home, 'skills', str(uuid.uuid4()), [message('evidence')])
         skill = home / 'config' / 'worker-skills' / 'agd-test'; skill.mkdir(parents=True)
-        (skill / 'SKILL.md').write_text('---\nname: agd-test\ndescription: Test skill\n---\n' + 'x' * 600)
+        raw = b'---\r\nname: agd-test\r\ndescription: Caf\xc3\xa9 skill\r\n---\r\n' + ('\xc3\xa9'.encode() * 400)
+        (skill / 'SKILL.md').write_bytes(raw)
         task.update(harness='omp')
         tasks.save(home, task)
         worker_skills = __import__('agd_lib.worker_skills', fromlist=['prepare'])
@@ -121,7 +122,9 @@ def test_packet_freezes_catalog_and_assigned_manifest_without_claiming_usage():
         selected = packet(home)
         assert any(row['id'] == 'agd-test' for row in selected['catalog'])
         catalog_entry = next(row for row in selected['catalog'] if row['id'] == 'agd-test')
-        assert catalog_entry['snapshot_truncated'] is True and catalog_entry['snapshot_total_bytes'] > len(catalog_entry['snapshot_excerpt'].encode())
+        assert catalog_entry['catalog_sha256'] == __import__('hashlib').sha256(raw).hexdigest()
+        assert catalog_entry['snapshot_truncated'] is True and catalog_entry['snapshot_total_bytes'] == len(raw)
+        assert catalog_entry['snapshot_excerpt'] == raw[:256].decode('utf-8', 'replace')
         assert selected['skill_provenance'][0]['assigned'][0]['id'] == 'agd-test'
         assert selected['skill_provenance'][0]['usage'] == 'unknown'
 
@@ -199,7 +202,7 @@ def test_runner_persists_reservation_before_resolver_failure(monkeypatch):
         intent = reviewer.enqueue_intent(home, kind='manual')
         monkeypatch.setattr(reviewer_runner, 'resolve_model', lambda *_: (_ for _ in ()).throw(store.Refusal('no model')))
         with pytest.raises(store.Refusal, match='no model'):
-            reviewer_runner.launch(home, intent)
+            reviewer_runner.launch(home, intent, observed_omp_version='fixture-test')
         receipts = list(reviewer.paths(home)['receipts'].glob('*.json'))
         assert len(receipts) == 1 and json.loads(receipts[0].read_text())['dispatch_state'] == 'reserved'
 
@@ -463,3 +466,14 @@ def test_prepared_submission_recovers_real_write_boundaries(monkeypatch, boundar
         reviewer.finalize_run(home, run['review_run_id'], 'exited')
         assert len(supervision.pending(home)) == 1
 
+
+def test_begin_run_requires_and_persists_observed_runtime_version():
+    with lab() as (home, _):
+        intent = reviewer.enqueue_intent(home, kind='manual'); config = reviewer.read_config(home)
+        run = reviewer.reserve_run(home, intent, config_snapshot=config, instruction_snapshot=b'fixture', started_at=time.time(), deadline_epoch_ms=1)
+        selected = reviewer.select_packet(home, cutoff=time.time(), config_snapshot=config)
+        with pytest.raises(store.Refusal):
+            reviewer.begin_run(home, run, selected, model='real/model', observed_omp_version='')
+        assert not reviewer.paths(home)['prepared'].exists() and not reviewer.paths(home)['reports'].exists()
+        begun = reviewer.begin_run(home, run, selected, model='real/model', observed_omp_version='omp 1.2.3')
+        assert begun['omp_version'] == 'omp 1.2.3'

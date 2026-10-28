@@ -16,7 +16,7 @@ def resolve_model(config, omp_binary):
     return model
 
 
-def launch(home, intent, *, omp_binary='omp'):
+def launch(home, intent, *, omp_binary='omp', observed_omp_version):
     """Atomically reserve, collect, and mark one receipt ready for native dispatch."""
     with reviewer.run_lease(home):
         config = reviewer.read_config(home)
@@ -28,4 +28,4 @@ def launch(home, intent, *, omp_binary='omp'):
         model = resolve_model(config, omp_binary)
         packet = reviewer.select_packet(home, cutoff=started, config_snapshot=config,
                                         retrospective_review_run_ids=tuple(intent.get('retrospective_review_run_ids', ())))
-        return reviewer.begin_run(home, run, packet, model=model)
+        return reviewer.begin_run(home, run, packet, model=model, observed_omp_version=observed_omp_version)
