@@ -3,6 +3,8 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { runReviewer } from '../lib/agd-reviewer';
 import { call, scriptedStream, startBridge } from './reviewer-fixture';
+process.env.OPENAI_API_KEY ??= 'provider-free-fixture';
+
 
 test('native loop persists actual bridge report', async () => {
   const bridge = await startBridge();

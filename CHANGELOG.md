@@ -1,7 +1,7 @@
 # Changelog
 
 ## Unreleased
-- Documented bounded background skill review operations, frozen native evidence and human-only triage. Real native reviewer inventory/persistence remains blocked by the installed OMP/pi-natives runtime mismatch; user-systemd activation remains unavailable without separately approved disposable-home proof.
+- Verified the bounded reviewer against real OMP 18.3.2 public modules: provider-free scripted AgentSession persistence, restricted tools, disabled telemetry, and enabled loopback-only OTLP purpose/run metadata; approved disposable user-systemd lifecycle evidence is recorded.
 - Hardened reviewer deadline enforcement across collection, capability discovery, and child dispatch; reviewer immutable records now refuse unsafe symlink and non-regular paths.
 
 - Added reviewer CLI inspection, human triage, manual native-run dispatch, and durable no-work receipts. Timer activation remains an explicit command and is never automatic.
