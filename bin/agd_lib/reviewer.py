@@ -219,21 +219,21 @@ def _manifest(home, task_dir, task, coverage):
         return []
 
 
-def _central(task_dir, task, cutoff, coverage):
+def _central(task_dir, task_id, incarnation, cutoff, coverage):
     sources, excerpts = [], []; folder = task_dir / 'decisions'
     if not folder.exists(): return sources, excerpts
     for path in sorted(folder.glob('*.json')):
         if path.name.endswith('.answer.json'): continue
         try:
             decision = _read_json(path); at = decision.get('resolved_at')
-            if decision.get('incarnation') != task.get('incarnation') or decision.get('status') != 'resolved' or not isinstance(at, (int, float)) or at > cutoff or not isinstance(decision.get('answer'), str): continue
+            if decision.get('incarnation') != incarnation or decision.get('status') != 'resolved' or not isinstance(at, (int, float)) or at > cutoff or not isinstance(decision.get('answer'), str): continue
             answer = task_dir / decision['answer']
             answer_value = _read_json(answer); body = answer_value.get('body')
-            if answer_value.get('task_id') != task['id'] or answer_value.get('incarnation') != task['incarnation'] or answer_value.get('resolved_at') != at or not isinstance(body, str): raise ValueError('answer')
-            source = {'kind': 'central-decision', 'linked_task_id': task['id'], 'incarnation': task['incarnation'], 'decision_key': decision.get('key'), 'resolved_at': at, 'decision_sha256': hashlib.sha256(path.read_bytes()).hexdigest(), 'answer_sha256': hashlib.sha256(answer.read_bytes()).hexdigest(), 'byte_watermark': answer.stat().st_size}
+            if answer_value.get('task_id') != task_id or answer_value.get('incarnation') != incarnation or answer_value.get('resolved_at') != at or not isinstance(body, str): raise ValueError('answer')
+            source = {'kind': 'central-decision', 'linked_task_id': task_id, 'incarnation': incarnation, 'decision_key': decision.get('key'), 'resolved_at': at, 'decision_sha256': hashlib.sha256(path.read_bytes()).hexdigest(), 'answer_sha256': hashlib.sha256(answer.read_bytes()).hexdigest(), 'byte_watermark': answer.stat().st_size}
             source['source_id'] = _digest(source); sources.append(source)
             excerpt = {'source_id': source['source_id'], 'message_id': decision.get('message_id', decision.get('key')), 'text': body, 'line_start': 1, 'line_end': 1, 'byte_start': 0, 'byte_end': len(body.encode())}; excerpt['excerpt_id'] = _digest(excerpt); excerpts.append(excerpt)
-        except (OSError, ValueError, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'task_id': task.get('id'), 'reason': 'linked-central-decision-unavailable'})
+        except (OSError, ValueError, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'task_id': task_id, 'reason': 'linked-central-decision-unavailable'})
     return sources, excerpts
 
 
@@ -260,7 +260,7 @@ def _candidate_material(root, task, event, task_dir, jsonls, cutoff, limit, cove
             if limited: _coverage(coverage, 'late_basis', {'task_id': key[0], 'session_id': sid, 'reason': 'input-limit'})
             if late: _coverage(coverage, 'late_basis', {'task_id': key[0], 'session_id': sid, 'reason': 'post-cutoff-native-row'})
         except (OSError, store.Refusal, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'task_id': key[0], 'incarnation': key[1], 'reason': 'native-jsonl-malformed'})
-    extra_sources, extra_excerpts = _central(task_dir, task, cutoff, coverage)
+    extra_sources, extra_excerpts = _central(task_dir, key[0], key[1], cutoff, coverage)
     if extra_sources: sources.extend(extra_sources); excerpts.extend(extra_excerpts); coverage['central_feedback'] = 'active-partial'; coverage['complete'] = False
     admitted = {'sources': sources, 'excerpts': excerpts, 'coverage': {'late_basis': []}}
     _cap(admitted, limit)
@@ -300,7 +300,11 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
         except (OSError, ValueError, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'task_id': key[0], 'incarnation': key[1], 'reason': 'native-jsonl-unavailable'}); continue
         candidate_sources, candidate_excerpts, candidate_basis = _candidate_material(
             root, task, event, task_dir, jsonls, cutoff, config['limits']['max_input_bytes'], coverage)
-        if _candidate_is_reviewed(root, key[0], key[1], candidate_basis) or len(episodes) >= config['limits']['max_candidates']: continue
+        try: reviewed = set(_read_json(paths(root)['candidates'] / f'{_candidate_id(*key)}.json').get('reviewed_excerpt_ids', []))
+        except (OSError, ValueError, json.JSONDecodeError): reviewed = set()
+        candidate_excerpts = [excerpt for excerpt in candidate_excerpts if f"{excerpt['message_id']}:{hashlib.sha256(excerpt['text'].encode()).hexdigest()}" not in reviewed]
+        candidate_sources = [source for source in candidate_sources if any(excerpt['source_id'] == source['source_id'] for excerpt in candidate_excerpts)]
+        if not candidate_excerpts or len(episodes) >= config['limits']['max_candidates']: continue
         seen.add(key); episodes.append({'task_id': key[0], 'incarnation': key[1], 'closed_at': observed_at, 'exit_observation_id': event.get('id')}); provenance.append({'task_id': key[0], 'assigned': _manifest(root, task_dir, task, coverage), 'usage': 'unknown'})
         sources.extend(candidate_sources); excerpts.extend(candidate_excerpts); candidate_versions[key] = candidate_basis
     if coverage['central_feedback'] == 'unknown': coverage['unknown'].append({'category': 'central-feedback', 'reason': 'no explicit retained links'})
@@ -344,25 +348,28 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
                 except (OSError, ValueError, json.JSONDecodeError):
                     _coverage(coverage, 'unavailable', {'review_run_id': rid, 'reason': 'committed-report-unavailable'})
         if {item['review_run_id'] for item in retrospective} != requested: raise store.Refusal('unknown retrospective run')
+    coverage['followup_id'] = '0' * 64  # reserve final metadata before the sole shared cap
     packet = {'schema': 1, 'purpose': 'background-skill-review', 'cutoff': cutoff, 'episodes': episodes, 'sources': sources, 'excerpts': excerpts, 'catalog': _catalog(root, coverage), 'skill_provenance': provenance, 'coverage': coverage, 'retrospective_review_run_ids': list(retrospective_review_run_ids), 'retrospective_episodes': retrospective, 'config_snapshot_sha256': _digest(config)}
     _cap(packet, config['limits']['max_input_bytes'])
-    # Only the final immutable packet admits candidate material.  A retained
-    # source with no retained excerpt was not reviewed and must resurface.
-    candidates = [{'candidate_id': _candidate_id(episode['task_id'], episode['incarnation']),
-                   'material_basis': candidate_versions[(episode['task_id'], episode['incarnation'])]}
-                  for episode in packet['episodes']
-                  if any(source.get('kind') == 'native-jsonl' and source.get('task_id') == episode['task_id']
-                         and source.get('incarnation') == episode['incarnation']
-                         and any(excerpt['source_id'] == source['source_id'] for excerpt in packet['excerpts'])
-                         for source in packet['sources'])]
+    candidates = []
+    for episode in packet['episodes']:
+        retained = [f"{excerpt['message_id']}:{hashlib.sha256(excerpt['text'].encode()).hexdigest()}" for excerpt in packet['excerpts'] if any(
+            source['source_id'] == excerpt['source_id']
+            and ((source.get('kind') == 'native-jsonl' and source.get('task_id') == episode['task_id'] and source.get('incarnation') == episode['incarnation'])
+                 or (source.get('kind') == 'central-decision' and source.get('linked_task_id') == episode['task_id'] and source.get('incarnation') == episode['incarnation']))
+            for source in packet['sources'])]
+        if retained:
+            candidates.append({'candidate_id': _candidate_id(episode['task_id'], episode['incarnation']),
+                               'material_basis': _digest(retained), 'excerpt_ids': retained})
+    packet['episodes'] = [episode for episode in packet['episodes'] if any(
+        candidate['candidate_id'] == _candidate_id(episode['task_id'], episode['incarnation']) for candidate in candidates)]
     material_basis = _digest({'sources': [(source['source_id'], source.get('content_sha256'), source.get('answer_sha256')) for source in packet['sources']],
                               'excerpts': [excerpt['excerpt_id'] for excerpt in packet['excerpts']]})
+    packet['coverage']['followup_id'] = material_basis
     with store.lock(root):
         state_path = paths(root)['followups'] / f'{material_basis}.json'
         if not state_path.exists():
             store.atomic_json(state_path, {'schema': 1, 'material_basis': material_basis, 'state': 'pending', 'candidates': candidates})
-    packet['coverage']['followup_id'] = material_basis
-    _cap(packet, config['limits']['max_input_bytes'])
     packet_id = _digest(packet); publish_immutable(paths(root)['packets'] / f'{packet_id}.json', packet)
     store.atomic_json(checkpoint, {'scope': scope, 'packet_id': packet_id, 'material_basis': material_basis})
     packet['packet_id'] = packet_id; return packet
@@ -388,9 +395,12 @@ def mark_material_reviewed(home, material_basis):
             store.atomic_json(paths(home)['followups'] / f'{material_basis}.json', state)
         for candidate in state.get('candidates', []):
             if isinstance(candidate.get('material_basis'), str):
-                store.atomic_json(paths(home)['candidates'] / f"{candidate['candidate_id']}.json",
-                                  {'schema': 1, 'candidate_id': candidate['candidate_id'], 'state': 'reviewed',
-                                   'material_basis': candidate['material_basis']})
+                path = paths(home)['candidates'] / f"{candidate['candidate_id']}.json"
+                try: prior = _read_json(path)
+                except (OSError, ValueError, json.JSONDecodeError): prior = {}
+                excerpts = sorted(set(prior.get('reviewed_excerpt_ids', [])) | set(candidate.get('excerpt_ids', [])))
+                store.atomic_json(path, {'schema': 1, 'candidate_id': candidate['candidate_id'], 'state': 'reviewed',
+                                         'material_basis': candidate['material_basis'], 'reviewed_excerpt_ids': excerpts})
         return state
 
 

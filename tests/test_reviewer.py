@@ -249,15 +249,29 @@ def test_shared_cap_does_not_consume_clipped_candidate_material():
         reviewer.mark_material_reviewed(home, second['coverage']['followup_id'])
         assert reviewer.select_packet(home, cutoff=cutoff + 2, config_snapshot=config)['episodes'] == []
 
+def test_shared_cap_revisits_only_clipped_candidate_excerpt_without_starving_next():
+    with lab() as (home, _):
+        ended_worker(home, 'a', str(uuid.uuid4()), [message('a' * 2500, 100)])
+        ended_worker(home, 'b', str(uuid.uuid4()), [message('b1' * 1200, 100), message('b2' * 1200, 101)])
+        ended_worker(home, 'c', str(uuid.uuid4()), [message('c' * 2500, 100)])
+        config = reviewer.read_config(home); config['limits'].update(max_candidates=3, max_input_bytes=17000)
+        first = reviewer.select_packet(home, cutoff=time.time() + 100, config_snapshot=config)
+        b_first = [row['text'] for row in first['excerpts'] if any(source['source_id'] == row['source_id'] and source.get('task_id') == 'b' for source in first['sources'])]
+        assert b_first == ['b1' * 1200]
+        reviewer.mark_material_reviewed(home, first['coverage']['followup_id'])
+        second = reviewer.select_packet(home, cutoff=time.time() + 101, config_snapshot=config)
+        b_second = [row['text'] for row in second['excerpts'] if any(source['source_id'] == row['source_id'] and source.get('task_id') == 'b' for source in second['sources'])]
+        assert b_second == ['b2' * 1200]
+
 
 def test_reviewed_oversized_candidate_does_not_repeat_its_admitted_prefix():
     with lab() as (home, _):
         ended_worker(home, 'oversized', str(uuid.uuid4()), [message('x' * 1000) for _ in range(40)])
-        config = reviewer.read_config(home); config['limits']['max_input_bytes'] = 12000
-        cutoff = time.time() + 100
+        config = reviewer.read_config(home); config['limits']['max_input_bytes'] = 12000; cutoff = time.time() + 100
         first = reviewer.select_packet(home, cutoff=cutoff, config_snapshot=config)
         reviewer.mark_material_reviewed(home, first['coverage']['followup_id'])
-        assert reviewer.select_packet(home, cutoff=cutoff + 1, config_snapshot=config)['episodes'] == []
+        next_packet = reviewer.select_packet(home, cutoff=cutoff + 1, config_snapshot=config)
+        assert [row['message_id'] for row in next_packet['excerpts']] != [row['message_id'] for row in first['excerpts']]
 
 
 def test_same_size_native_rewrite_resurfaces_reviewed_candidate_once():
