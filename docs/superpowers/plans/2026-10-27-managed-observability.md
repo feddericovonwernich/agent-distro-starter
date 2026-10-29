@@ -223,7 +223,7 @@ Add parser/dispatch only after methods exist; mutators use existing owner gate a
 
 ```sh
 TMP_HOME=$(mktemp -d)
-bin/agd --home "$TMP_HOME" init
+bin/agd --home "$TMP_HOME" init --backend tmux
 bin/agd --home "$TMP_HOME" observability enable
 bin/agd --home "$TMP_HOME" observability status
 bin/agd --home "$TMP_HOME" observability stop

@@ -323,13 +323,14 @@ def _herdr_create(home: Path, launch_id: str, endpoint_token: str, managed: list
     if checkpoint:
         checkpoint(endpoint)
     command_env = {key: value for key, value in env.items()
-                   if key != 'HERDR_ENV' and isinstance(key, str) and isinstance(value, str)
-                   and os.environ.get(key) != value}
+                   if key != 'HERDR_ENV' and isinstance(key, str) and isinstance(value, str)}
     command_env.update(AGD_HERDR_SESSION=session, AGD_LAUNCH_ID=launch_id,
                        AGD_ENDPOINT_TOKEN=endpoint_token)
+    for key, value in command_env.items():
+        _herdr_call(endpoint, 'pane', 'run', endpoint['pane'],
+                    f'export {key}={shlex.quote(value)}')
     _herdr_call(endpoint, 'pane', 'run', endpoint['pane'],
-                'unset HERDR_ENV; export ' + ' '.join(f'{key}={shlex.quote(value)}' for key, value in command_env.items())
-                + '; exec ' + shlex.join(managed))
+                'unset HERDR_ENV; exec ' + shlex.join(managed))
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         process = _herdr_response(_herdr_call(endpoint, 'pane', 'process-info', '--pane', endpoint['pane']))['process_info']

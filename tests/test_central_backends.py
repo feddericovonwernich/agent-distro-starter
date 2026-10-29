@@ -261,9 +261,11 @@ def test_herdr_central_uses_named_receipted_session_and_restores_focus(tmp_path,
     monkeypatch.setattr(launcher, 'subprocess', SimpleNamespace(DEVNULL=subprocess.DEVNULL,
                         Popen=lambda argv, **kwargs: calls.append((argv, kwargs))), raising=False)
     monkeypatch.setattr(launcher, '_prove_herdr_server', lambda *_: None, raising=False)
+    monkeypatch.setenv('CENTRAL_SAME_VALUE', 'present')
 
     endpoint = launcher._backend_create('herdr', home, 'launch-id', 'token', ['/opt/agd'],
-                                        {'PATH': '/bin', 'CENTRAL_SENTINEL': 'present', 'HERDR_ENV': 'foreign'}, ['/opt/omp'])
+                                        {'PATH': '/bin', 'CENTRAL_SENTINEL': 'present',
+                                         'CENTRAL_SAME_VALUE': 'present', 'HERDR_ENV': 'foreign'}, ['/opt/omp'])
     receipt = {'backend': 'herdr', 'launch_id': 'launch-id', 'endpoint_token': 'token',
                'expected_process_argv': ['/opt/omp'], 'endpoint': endpoint}
     assert endpoint['session'] == session
@@ -277,9 +279,10 @@ def test_herdr_central_uses_named_receipted_session_and_restores_focus(tmp_path,
     env = launcher._attach_env(home, receipt, {'HERDR_ENV': '1', 'PATH': '/bin'})
     assert env['AGD_HERDR_SESSION'] == session
     assert 'HERDR_ENV' not in env
-    pane_run = next(argv for argv in calls if isinstance(argv, list) and argv[3:6] == ['pane', 'run', 'pane-1'])
-    assert 'CENTRAL_SENTINEL=present' in pane_run[-1]
-    assert 'HERDR_ENV=' not in pane_run[-1]
+    pane_runs = [argv[-1] for argv in calls if isinstance(argv, list) and argv[3:6] == ['pane', 'run', 'pane-1']]
+    assert 'export CENTRAL_SENTINEL=present' in pane_runs
+    assert 'export CENTRAL_SAME_VALUE=present' in pane_runs
+    assert not any('HERDR_ENV=' in command for command in pane_runs)
     monkeypatch.setattr(launcher.store, 'run', lambda argv, **kwargs: SimpleNamespace(
         returncode=0, stdout=json.dumps([{'name': session}]), stderr=''))
     with __import__('pytest').raises(store.Refusal, match='unreceipted'):

@@ -79,7 +79,7 @@ Managed observability is opt-in and needs Docker Engine 29.6.0, Docker Compose v
 
 ```sh
 export PATH=/tmp/agd-treehouse-v3.1.6:$PATH
-bin/agd --home "$AGD_HOME" init
+bin/agd --home "$AGD_HOME" init --backend tmux
 bin/agd --home "$AGD_HOME" observability enable
 bin/agd --home "$AGD_HOME" observability status
 bin/agd --home "$AGD_HOME" observability stop

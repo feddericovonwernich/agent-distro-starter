@@ -96,7 +96,7 @@ Exception: `session start` is the long-lived watcher process; it emits newline-d
 Proposed domain commands (introduced by their owning tasks):
 
 ```text
-agd init
+agd init --backend tmux|herdr
 agd doctor [--harness omp|cursor] [--backend tmux|herdr]
 agd project add ID --source URL_OR_PATH [--base BRANCH]
 agd project register ID --path PATH [--base BRANCH]

@@ -24,7 +24,7 @@
 
 **Files:** Create `install.sh`, `tests/test_install.py`; modify `README.md`, `docs/compatibility.md`, `CHANGELOG.md`.
 
-**Interfaces:** The public command is `bash -c 'installer=$(curl -fsSL https://raw.githubusercontent.com/feddericovonwernich/agent-distro-starter/main/install.sh) && bash -c "$installer"'`. The fetch must succeed before executing Bash. The script reads a single name from `/dev/tty`, clones `https://github.com/feddericovonwernich/agent-distro-starter.git` into `./NAME`, runs `./NAME/bin/agd init`, and exits nonzero without changing an existing target.
+**Interfaces:** The public command is `bash -c 'installer=$(curl -fsSL https://raw.githubusercontent.com/feddericovonwernich/agent-distro-starter/main/install.sh) && bash -c "$installer"'`. The fetch must succeed before executing Bash. The script reads a single name from `/dev/tty`, clones `https://github.com/feddericovonwernich/agent-distro-starter.git` into `./NAME`, runs `./NAME/bin/agd init --backend tmux`, and exits nonzero without changing an existing target.
 
 - [ ] **Step 1: Write one behavioral check before the script.** Create `tests/test_install.py`:
 
@@ -99,7 +99,7 @@ read -r -p 'Distro name: ' name </dev/tty
 [[ $name =~ ^[a-z][a-z0-9-]{0,47}$ ]] || { echo 'Invalid distro name' >&2; exit 1; }
 [[ ! -e $name && ! -L $name ]] || { echo 'Destination exists' >&2; exit 1; }
 git clone -- https://github.com/feddericovonwernich/agent-distro-starter.git "$name"
-(cd -- "./$name" && bin/agd --home "$PWD" init)
+(cd -- "./$name" && bin/agd --home "$PWD" init --backend tmux)
 printf 'Distro ready: cd -- ./%q\n' "$name"
 ```
 
