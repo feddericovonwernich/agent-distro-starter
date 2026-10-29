@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import stat
+import tarfile
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -12,13 +13,19 @@ from agd_lib import store
 
 
 Refusal = store.Refusal
+_TREEHOUSE_URL = ('https://github.com/kunchenguid/treehouse/releases/download/v3.1.6/'
+                  'treehouse-v3.1.6-linux-amd64.tar.gz')
+_TREEHOUSE_DIGEST = 'e89891caf913b3b228387c7dccf53ff908327fca47839b7957681084578cb1a1'
+_TREEHOUSE_ASSET = 'treehouse-v3.1.6-linux-amd64.tar.gz'
 _RELEASES = {
     'omp': ('https://api.github.com/repos/can1357/oh-my-pi/releases/latest', 'omp-linux-x64'),
     'herdr': ('https://api.github.com/repos/herdrdev/herdr/releases/latest', 'herdr-linux-x86_64'),
+    'treehouse': (_TREEHOUSE_URL, _TREEHOUSE_ASSET),
 }
 _CAPABILITIES = {
     'omp': ['models-json', 'login'],
     'herdr': ['session-list-json', 'named-status'],
+    'treehouse': ['version'],
 }
 
 
@@ -154,6 +161,13 @@ def probe_herdr(path, session, run):
     return {'path': str(path), 'version': version, 'capabilities': _CAPABILITIES['herdr']}
 
 
+def probe_treehouse(path, run):
+    version = _version(path, run, 'Treehouse')
+    if version != 'v3.1.6':
+        raise Refusal('Treehouse version check failed')
+    return {'path': str(path), 'version': version, 'capabilities': _CAPABILITIES['treehouse']}
+
+
 def _sha256(path):
     digest = hashlib.sha256()
     with Path(path).open('rb') as stream:
@@ -267,6 +281,67 @@ def install_herdr(home, fetch_json, stream_url, run):
     return _install(_stable_release(fetch_json, 'herdr'), 'herdr', stream_url, run)
 
 
+def _extract_treehouse(archive_path, expected_digest, destination):
+    if _sha256(archive_path) != expected_digest:
+        raise Refusal('Treehouse archive digest differs from pinned digest')
+    temporary = None
+    try:
+        with tarfile.open(archive_path, 'r:gz') as archive:
+            members = iter(archive)
+            member = next(members, None)
+            if (member is None or next(members, None) is not None or member.name != 'treehouse'
+                    or not member.isreg() or member.issym() or member.islnk()):
+                raise Refusal('Treehouse archive is unsafe')
+            source = archive.extractfile(member)
+            if source is None:
+                raise Refusal('Treehouse archive is unsafe')
+            with source, tempfile.NamedTemporaryFile(dir=destination.parent, prefix='.treehouse-',
+                                                      delete=False) as output:
+                temporary = output.name
+                shutil.copyfileobj(source, output)
+                output.flush()
+                os.fsync(output.fileno())
+        os.chmod(temporary, 0o755)
+        version = store.run([temporary, '--version'], check=False)
+        if version.returncode or (version.stdout or version.stderr or '').strip() != 'v3.1.6':
+            raise Refusal('Treehouse version check failed')
+        os.replace(temporary, destination)
+        temporary = None
+    except (OSError, tarfile.TarError) as error:
+        raise Refusal('Treehouse archive is invalid') from error
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def install_treehouse(home, stream_url):
+    target = _target('treehouse')
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    archive = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=target.parent, prefix='.treehouse-', delete=False) as output:
+            archive = output.name
+            digest = hashlib.sha256()
+            for chunk in stream_url(_TREEHOUSE_URL):
+                if not isinstance(chunk, bytes):
+                    raise Refusal('Treehouse download stream is invalid')
+                output.write(chunk)
+                digest.update(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        if digest.hexdigest() != _TREEHOUSE_DIGEST:
+            raise Refusal('Treehouse archive digest differs from pinned digest')
+        _extract_treehouse(archive, _TREEHOUSE_DIGEST, target)
+        installed = _sha256(target)
+        return {'source': 'managed', 'path': str(target), 'version': 'v3.1.6',
+                'capabilities': _CAPABILITIES['treehouse'], 'asset': _TREEHOUSE_ASSET,
+                'tag': 'v3.1.6', 'artifact_sha256': _TREEHOUSE_DIGEST,
+                'installed_sha256': installed}
+    finally:
+        if archive and os.path.exists(archive):
+            os.unlink(archive)
+
+
 def validate_dependencies(home, run):
     receipt = read_dependencies(home)
     result = {'schema': 1}
@@ -276,7 +351,12 @@ def validate_dependencies(home, run):
         path = Path(entry['path'])
         if entry['source'] == 'managed' and _sha256(path) != entry['installed_sha256']:
             raise Refusal('installed digest differs from receipt')
-        probe = probe_omp(path, run) if tool == 'omp' else probe_herdr(path, 'agd-probe', run)
+        if tool == 'omp':
+            probe = probe_omp(path, run)
+        elif tool == 'herdr':
+            probe = probe_herdr(path, 'agd-probe', run)
+        else:
+            probe = probe_treehouse(path, run)
         result[tool] = {**entry, **probe}
     return _validate_receipt(result)
 

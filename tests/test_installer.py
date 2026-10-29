@@ -1,7 +1,9 @@
 import hashlib
+import io
 import json
 import os
 import sys
+import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,9 +12,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
 
 from agd_lib import installer
-from agd_lib.installer import (Refusal, install_herdr, install_omp, probe_herdr,
-                               probe_omp, read_dependencies, setup,
-                               validate_dependencies, write_dependencies)
+from agd_lib.installer import (Refusal, _extract_treehouse, install_herdr, install_omp,
+                               install_treehouse, probe_herdr, probe_omp, read_dependencies,
+                               setup, validate_dependencies, write_dependencies)
 
 
 def result(stdout='', stderr='', returncode=0):
@@ -44,6 +46,83 @@ def stream(body):
     def stream_url(url):
         yield body
     return stream_url
+
+
+def make_archive(path, members):
+    with tarfile.open(path, 'w:gz') as archive:
+        for member in members:
+            info = tarfile.TarInfo(member[0])
+            if len(member) == 2:
+                info.size = len(member[1])
+                archive.addfile(info, io.BytesIO(member[1]))
+            else:
+                info.type, info.linkname = member[1:]
+                archive.addfile(info)
+
+
+def test_treehouse_extracts_only_the_pinned_regular_member(tmp_path, monkeypatch):
+    archive = tmp_path/'treehouse.tgz'
+    destination = tmp_path/'treehouse'
+    make_archive(archive, [('treehouse', b'executable')])
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return result('v3.1.6\n')
+
+    monkeypatch.setattr(installer.store, 'run', run)
+    _extract_treehouse(archive, hashlib.sha256(archive.read_bytes()).hexdigest(), destination)
+    assert destination.read_bytes() == b'executable'
+    assert destination.stat().st_mode & 0o777 == 0o755
+    assert calls == [[str(destination.parent / calls[0][0].split('/')[-1]), '--version']]
+
+
+def test_treehouse_extract_refuses_unsafe_members_or_wrong_digest(tmp_path, monkeypatch):
+    monkeypatch.setattr(installer.store, 'run', lambda *args, **kwargs: result('v3.1.6\n'))
+    cases = [
+        [('treehouse', b'x'), ('other', b'x')],
+        [('treehouse', tarfile.SYMTYPE, 'other')],
+        [('/treehouse', b'x')],
+        [('dir/../treehouse', b'x')],
+    ]
+    for number, members in enumerate(cases):
+        archive = tmp_path/f'unsafe-{number}.tgz'
+        make_archive(archive, members)
+        with pytest.raises(Refusal, match='archive'):
+            _extract_treehouse(archive, hashlib.sha256(archive.read_bytes()).hexdigest(),
+                               tmp_path/f'treehouse-{number}')
+    archive = tmp_path/'valid.tgz'
+    make_archive(archive, [('treehouse', b'x')])
+    with pytest.raises(Refusal, match='digest'):
+        _extract_treehouse(archive, '0' * 64, tmp_path/'wrong-digest')
+
+
+def test_treehouse_install_uses_public_pinned_archive_and_records_hashes(tmp_path, monkeypatch):
+    assert installer._TREEHOUSE_URL == (
+        'https://github.com/kunchenguid/treehouse/releases/download/v3.1.6/'
+        'treehouse-v3.1.6-linux-amd64.tar.gz')
+    assert installer._TREEHOUSE_DIGEST == 'e89891caf913b3b228387c7dccf53ff908327fca47839b7957681084578cb1a1'
+    archive = tmp_path/'treehouse.tgz'
+    make_archive(archive, [('treehouse', b'executable')])
+    monkeypatch.setattr(installer, '_TREEHOUSE_DIGEST',
+                        hashlib.sha256(archive.read_bytes()).hexdigest())
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setattr(installer.store, 'run', lambda *args, **kwargs: result('v3.1.6\n'))
+    urls = []
+
+    def stream_url(url):
+        urls.append(url)
+        yield from [archive.read_bytes()]
+
+    installed = install_treehouse(tmp_path, stream_url)
+    assert urls == [installer._TREEHOUSE_URL]
+    assert installed['artifact_sha256'] == hashlib.sha256(archive.read_bytes()).hexdigest()
+    assert installed['installed_sha256'] == hashlib.sha256(b'executable').hexdigest()
+    write_dependencies(tmp_path, {'schema': 1, 'treehouse': installed})
+    assert validate_dependencies(
+        tmp_path, lambda argv, check=False: result('v3.1.6\n')
+        if argv[1:] == ['--version'] else (_ for _ in ()).throw(AssertionError(argv))
+    )['treehouse']['version'] == 'v3.1.6'
 
 
 def test_omp_rejects_missing_api_digest(tmp_path):
