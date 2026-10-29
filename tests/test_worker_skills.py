@@ -4,6 +4,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
 
 
@@ -27,6 +29,134 @@ def add_skill(home, name, description='Use this skill.'):
     (skill/'SKILL.md').write_text(
         f'---\nname: {name}\ndescription: {description}\n---\nInstructions.\n')
     return skill
+
+
+PONYTAIL_SKILL = b'''---
+name: ponytail
+description: >-
+  Lazy senior developer.
+  Prefer the simplest solution.
+argument-hint: "[lite|full|ultra]"
+license: MIT
+---
+Instructions stay byte-for-byte upstream.
+'''
+
+SYSTEMATIC_SKILL = b'''---
+name: systematic-debugging
+description: Find the root cause before changing code.
+---
+Debug carefully.
+'''
+
+
+def native_skills(home, *, ponytail_name='ponytail',
+                  superpowers_name='systematic-debugging'):
+    from support import write_native_plugins
+    write_native_plugins(home, {
+        'ponytail@ponytail': {
+            ponytail_name: {
+                'SKILL.md': PONYTAIL_SKILL.replace(
+                    b'name: ponytail', f'name: {ponytail_name}'.encode()),
+                'references/mode.md': b'full\n',
+            },
+        },
+        'superpowers@superpowers-dev': {
+            superpowers_name: {
+                'SKILL.md': SYSTEMATIC_SKILL.replace(
+                    b'name: systematic-debugging',
+                    f'name: {superpowers_name}'.encode()),
+                'root-cause-tracing.md': b'trace backwards\n',
+            },
+        },
+    })
+
+
+def test_catalog_accepts_original_upstream_metadata():
+    from agd_lib import worker_skills
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory)
+        native_skills(home)
+
+        rows = {row['id']: row for row in worker_skills.catalog(home)}
+        ponytail = rows['ponytail']
+
+        assert ponytail['description'] == (
+            'Lazy senior developer. Prefer the simplest solution.')
+        assert Path(ponytail['source'], 'SKILL.md').read_bytes() == PONYTAIL_SKILL
+        assert Path(ponytail['source'], 'references/mode.md').is_relative_to(
+            Path(ponytail['source']))
+        assert ponytail['origin'] == {
+            'kind': 'plugin', 'plugin_id': 'ponytail@ponytail',
+            'version': '5.3.3', 'relative_path': 'skills/ponytail',
+        }
+
+
+def test_catalog_refuses_native_name_collisions_and_unsafe_sources():
+    from agd_lib import store, worker_skills
+
+    def duplicate_plugins(home):
+        native_skills(home, ponytail_name='shared', superpowers_name='shared')
+
+    def plugin_custom_collision(home):
+        native_skills(home)
+        add_skill(home, 'ponytail')
+
+    def directory_name_mismatch(home):
+        native_skills(home, ponytail_name='different')
+        skill = next((home / 'data/omp/home/.omp/plugins/cache/plugins').glob(
+            'ponytail*')) / 'skills/different'
+        skill.rename(skill.parent / 'ponytail')
+
+    def traversal_name(home):
+        native_skills(home)
+        skill = next((home / 'data/omp/home/.omp/plugins/cache/plugins').glob(
+            'ponytail*')) / 'skills/ponytail/SKILL.md'
+        skill.write_text('---\nname: ../escape\ndescription: unsafe\n---\n')
+
+    def symlink_source(home):
+        native_skills(home)
+        root = next((home / 'data/omp/home/.omp/plugins/cache/plugins').glob(
+            'ponytail*')) / 'skills'
+        (root / 'ponytail').rename(root / 'real')
+        (root / 'ponytail').symlink_to(root / 'real', target_is_directory=True)
+
+    def special_file(home):
+        native_skills(home)
+        root = next((home / 'data/omp/home/.omp/plugins/cache/plugins').glob(
+            'ponytail*')) / 'skills/ponytail'
+        os.mkfifo(root / 'unsafe')
+
+    for arrange in (duplicate_plugins, plugin_custom_collision,
+                    directory_name_mismatch, traversal_name, symlink_source,
+                    special_file):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            arrange(home)
+            with pytest.raises(store.Refusal):
+                worker_skills.catalog(home)
+
+
+def test_resolve_records_schema_two_sources_and_supports_none():
+    from agd_lib import worker_skills
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory)
+        native_skills(home)
+
+        selected = worker_skills.resolve(
+            home, skill_mode='curated', skills=('ponytail',))
+
+        assert selected['schema'] == 2
+        assert selected['skills'] == ['ponytail']
+        assert set(selected['sources']) == {'ponytail'}
+        assert selected['sources']['ponytail']['origin']['plugin_id'] == (
+            'ponytail@ponytail')
+        assert any(row['path'] == 'SKILL.md'
+                   for row in selected['sources']['ponytail']['files'])
+        assert worker_skills.resolve(home, skill_mode='none') == {
+            'schema': 2, 'mode': 'none', 'profile': None,
+            'skills': [], 'sources': {},
+        }
 
 
 def write_profiles(home, value):
@@ -53,12 +183,16 @@ def test_profile_defaults_and_curated_selection_are_exact_and_sorted():
         add_skill(home, 'agd-alpha', 'Alpha instructions.')
         write_profiles(home, {'default_profile': 'implementer', 'profiles': {
             'implementer': {'skills': ['agd-zebra', 'agd-alpha']}}})
-        assert worker_skills.resolve(home) == {
-            'schema': 1, 'mode': 'profile', 'profile': 'implementer',
-            'skills': ['agd-alpha', 'agd-zebra']}
-        assert worker_skills.resolve(home, skill_mode='curated',
-                                    skills=('agd-zebra',)) == {
-            'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-zebra']}
+        resolved = worker_skills.resolve(home)
+        assert resolved['schema'] == 2
+        assert resolved['mode'] == 'profile'
+        assert resolved['profile'] == 'implementer'
+        assert resolved['skills'] == ['agd-alpha', 'agd-zebra']
+        assert set(resolved['sources']) == {'agd-alpha', 'agd-zebra'}
+        curated = worker_skills.resolve(
+            home, skill_mode='curated', skills=('agd-zebra',))
+        assert curated['skills'] == ['agd-zebra']
+        assert set(curated['sources']) == {'agd-zebra'}
 
 
 def test_invalid_worker_skill_configuration_refuses_instead_of_degrading():
@@ -106,9 +240,10 @@ def test_worker_skill_and_profile_lists_are_deterministic_json():
         add_skill(home, 'agd-alpha', 'Alpha instructions.')
         write_profiles(home, {'default_profile': 'implementer', 'profiles': {
             'implementer': {'skills': ['agd-zebra', 'agd-alpha']}}})
-        assert command(home, 'worker', 'skills', 'list') == [
-            {'id': 'agd-alpha', 'description': 'Alpha instructions.'},
-            {'id': 'agd-zebra', 'description': 'Zebra instructions.'}]
+        rows = command(home, 'worker', 'skills', 'list')
+        assert [(row['id'], row['description'], row['origin']) for row in rows] == [
+            ('agd-alpha', 'Alpha instructions.', {'kind': 'custom'}),
+            ('agd-zebra', 'Zebra instructions.', {'kind': 'custom'})]
         assert command(home, 'worker', 'profiles', 'list') == {
             'default_profile': 'implementer',
             'profiles': {'implementer': {'skills': ['agd-zebra', 'agd-alpha']}}}
@@ -193,8 +328,11 @@ def test_prepare_freezes_and_materializes_a_skill_bundle():
         resource.chmod(0o755)
         task = {'id': 'freeze', 'worktree': str(worktree), 'harness': 'omp',
                 'lease_id': 'lease'}
-        manifest = worker_skills.prepare(home, task, {
-            'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
+        selection = worker_skills.resolve(
+            home, skill_mode='curated', skills=('agd-probe',))
+        manifest = worker_skills.prepare(home, task, selection)
+        assert manifest['schema'] == 2
+        assert manifest['skills'][0]['origin'] == {'kind': 'custom'}
         generated = worktree/'.omp'/'skills'/'agd-probe'/'references'/'token.txt'
         common = (worktree/run(['git', 'rev-parse', '--git-common-dir'], cwd=worktree).stdout.strip()).resolve()
         exclude = common/'info'/'exclude'
@@ -352,15 +490,11 @@ def test_pending_snapshot_retry_refuses_changed_catalog_source():
                 raise AssertionError('snapshot failure injection did not run')
         finally:
             worker_skills._copy_tree = original
-        worker_skills.prepare(home, task, {
-            'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
         (skill/'SKILL.md').write_text('changed\n')
-        try:
+        with pytest.raises(store.Refusal):
             worker_skills.prepare(home, task, {
-                'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
-        except store.Refusal:
-            return
-        raise AssertionError('changed source was accepted after pending snapshot')
+                'schema': 1, 'mode': 'curated', 'profile': None,
+                'skills': ['agd-probe']})
 
 
 def test_retry_repairs_exclude_after_registry_write_failure():
@@ -761,32 +895,54 @@ def test_cleanup_retry_after_artifact_removal_before_return():
         assert tasks.cleanup(home, 'cleanup-skill')['phase'] == 'cleaned'
 
 DEFAULT_WORKER_SKILLS = [
-    'agd-ponytail',
-    'agd-ponytail-audit',
-    'agd-ponytail-debt',
-    'agd-ponytail-gain',
-    'agd-ponytail-help',
-    'agd-ponytail-review',
-    'agd-superpowers-systematic-debugging',
-    'agd-superpowers-test-driven-development',
-    'agd-superpowers-verification-before-completion',
+    'ponytail',
+    'ponytail-audit',
+    'ponytail-debt',
+    'ponytail-gain',
+    'ponytail-help',
+    'ponytail-review',
+    'systematic-debugging',
+    'test-driven-development',
+    'verification-before-completion',
 ]
 
 
-def test_init_seeds_default_worker_profile_from_bundled_catalog():
+def default_native_skills(home):
+    from support import write_native_plugins
+    ponytail = {
+        name: {'SKILL.md': (
+            f'---\nname: {name}\ndescription: {name} instructions.\n---\n').encode()}
+        for name in DEFAULT_WORKER_SKILLS[:6]
+    }
+    superpowers = {
+        name: {'SKILL.md': (
+            f'---\nname: {name}\ndescription: {name} instructions.\n---\n').encode()}
+        for name in DEFAULT_WORKER_SKILLS[6:]
+    }
+    write_native_plugins(home, {
+        'ponytail@ponytail': ponytail,
+        'superpowers@superpowers-dev': superpowers,
+    })
+
+
+def test_init_seeds_default_worker_profile_from_native_catalog():
     from agd_lib import worker_skills
     from test_projects import command
     with tempfile.TemporaryDirectory() as directory:
         home = Path(directory)
         command(home, 'init', '--backend', 'tmux')
-        expected = {
-            'schema': 1, 'mode': 'profile', 'profile': 'default',
-            'skills': DEFAULT_WORKER_SKILLS}
-        assert worker_skills.resolve(home) == expected
+        default_native_skills(home)
+        resolved = worker_skills.resolve(home)
+        assert resolved['schema'] == 2
+        assert resolved['mode'] == 'profile'
+        assert resolved['profile'] == 'default'
+        assert resolved['skills'] == DEFAULT_WORKER_SKILLS
+        assert set(resolved['sources']) == set(DEFAULT_WORKER_SKILLS)
         assert command(home, 'worker', 'profiles', 'list') == {
             'default_profile': 'default',
             'profiles': {'default': {'skills': DEFAULT_WORKER_SKILLS}}}
-        assert [row['id'] for row in command(home, 'worker', 'skills', 'list')] == DEFAULT_WORKER_SKILLS
+        assert [row['id'] for row in command(
+            home, 'worker', 'skills', 'list')] == DEFAULT_WORKER_SKILLS
 
 
 def test_init_seeds_checkout_home_with_tracked_files():
@@ -798,10 +954,10 @@ def test_init_seeds_checkout_home_with_tracked_files():
         run(['git', 'clone', '--no-local', ROOT, home])
         shutil.copy2(ROOT/'bin'/'agd', home/'bin'/'agd')
         shutil.copy2(ROOT/'bin'/'agd_lib'/'worker_skills.py', home/'bin'/'agd_lib'/'worker_skills.py')
-        shutil.copytree(ROOT/'bundled', home/'bundled', dirs_exist_ok=True)
         env = dict(os.environ, TREEHOUSE_ROOT=str(home.parent/'pool'))
         env.pop('AGD_HOME', None)
         run([home/'bin'/'agd', 'init', '--backend', 'tmux'], cwd=home, env=env)
+        default_native_skills(home)
         assert worker_skills.resolve(home)['skills'] == DEFAULT_WORKER_SKILLS
 
 
@@ -840,5 +996,5 @@ if __name__ == '__main__':
     test_unsafe_git_exclusion_metadata_refuses_before_prepare_mutates()
     test_cleanup_retry_after_pre_remove_failure_releases_owned_artifacts()
     test_returned_lease_requires_completed_skill_removal_journal()
-    test_init_seeds_default_worker_profile_from_bundled_catalog()
+    test_init_seeds_default_worker_profile_from_native_catalog()
     test_init_seeds_checkout_home_with_tracked_files()

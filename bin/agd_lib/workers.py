@@ -68,12 +68,12 @@ def launch(home, task_id, harness='omp', selected_backend=None, unattended=False
         profile, skill_mode, skills = None, 'curated', ('agd-scoped-pr-relay',)
     preflight = dict(task, harness=harness, backend=selected_backend, pr_grant=pr_grant)
     harnesses.launch_argv(preflight, tasks.task_file(home, task_id).parent/'brief.md', unattended)
-    module = backend(preflight)
-    if selected_backend == 'tmux' and not shutil.which('tmux'):
-        raise store.DependencyError('tmux is not installed')
     selection = ({'schema': 1, 'mode': 'curated', 'profile': None,
                   'skills': ['agd-scoped-pr-relay']} if pr_grant else
                  worker_skills.resolve(home, profile=profile, skill_mode=skill_mode, skills=skills))
+    module = backend(preflight)
+    if selected_backend == 'tmux' and not shutil.which('tmux'):
+        raise store.DependencyError('tmux is not installed')
     if selection['skills']:
         harnesses.worker_skill_roots(harness)
     if selected_backend == 'herdr':

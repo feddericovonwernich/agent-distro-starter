@@ -3,22 +3,22 @@ import os
 import stat
 from pathlib import Path
 
-from . import store
+from . import omp_runtime, store
 
 
 _CONFIG_KEYS = {'default_profile', 'profiles'}
 _PROFILE_KEYS = {'skills'}
 DEFAULT_PROFILE = 'default'
 DEFAULT_SKILLS = (
-    'agd-ponytail',
-    'agd-ponytail-audit',
-    'agd-ponytail-debt',
-    'agd-ponytail-gain',
-    'agd-ponytail-help',
-    'agd-ponytail-review',
-    'agd-superpowers-systematic-debugging',
-    'agd-superpowers-test-driven-development',
-    'agd-superpowers-verification-before-completion',
+    'ponytail',
+    'ponytail-audit',
+    'ponytail-debt',
+    'ponytail-gain',
+    'ponytail-help',
+    'ponytail-review',
+    'systematic-debugging',
+    'test-driven-development',
+    'verification-before-completion',
 )
 
 
@@ -73,6 +73,53 @@ def _id(value, what):
         raise store.Refusal(f'{what} has an invalid ID') from error
 
 
+def _quoted(value, skill_id):
+    if value.startswith('"'):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise store.Refusal(
+                f'worker skills: {skill_id}: invalid quoted metadata') from error
+        if not isinstance(decoded, str):
+            _refusal(f'{skill_id}: metadata must be a string')
+        return decoded
+    if value.startswith("'"):
+        if len(value) < 2 or not value.endswith("'"):
+            _refusal(f'{skill_id}: invalid quoted metadata')
+        return value[1:-1].replace("''", "'")
+    if value[:1] in '[{&*!' or value != value.strip():
+        _refusal(f'{skill_id}: unsupported structured frontmatter')
+    return value
+
+
+def _block(lines, index, indicator, skill_id):
+    values = []
+    while index < len(lines) and (not lines[index] or lines[index][0].isspace()):
+        line = lines[index]
+        if line and not line.startswith('  '):
+            _refusal(f'{skill_id}: block metadata needs two-space indentation')
+        values.append(line[2:] if line else '')
+        index += 1
+    if not values:
+        _refusal(f'{skill_id}: block metadata is empty')
+    if indicator.startswith('>'):
+        paragraphs, current = [], []
+        for line in values:
+            if line:
+                current.append(line)
+            elif current:
+                paragraphs.append(' '.join(current))
+                current = []
+        if current:
+            paragraphs.append(' '.join(current))
+        value = '\n'.join(paragraphs)
+    else:
+        value = '\n'.join(values)
+    if not indicator.endswith('-'):
+        value += '\n'
+    return value, index
+
+
 def _frontmatter(path, skill_id):
     try:
         lines = path.read_text().splitlines()
@@ -84,32 +131,36 @@ def _frontmatter(path, skill_id):
         end = lines.index('---', 1)
     except ValueError:
         _refusal(f'{skill_id}: SKILL.md frontmatter is unterminated')
-    values = {}
-    for line in lines[1:end]:
-        if ': ' not in line:
+    values, seen, index = {}, set(), 1
+    while index < end:
+        line = lines[index]
+        if not line or line[0].isspace() or ':' not in line:
             _refusal(f'{skill_id}: unsupported frontmatter')
-        key, value = line.split(': ', 1)
-        if key not in ('name', 'description') or key in values or not value:
+        key, separator, raw = line.partition(':')
+        if (not separator or not key or key in seen
+                or any(not (character.isalnum() or character in '_-')
+                       for character in key)):
             _refusal(f'{skill_id}: unsupported frontmatter')
+        seen.add(key)
+        value = raw[1:] if raw.startswith(' ') else raw
+        index += 1
+        if value in ('>', '>-', '>+', '|', '|-', '|+'):
+            value, index = _block(lines[:end], index, value, skill_id)
+        elif not value:
+            _refusal(f'{skill_id}: unsupported frontmatter')
+        else:
+            value = _quoted(value, skill_id)
         if key == 'name':
-            if value != value.strip() or value.startswith('"'):
+            if value != value.strip() or any(character in value for character in '"\n'):
                 _refusal(f'{skill_id}: name must be a plain ID')
             values[key] = _id(value, f'{skill_id} name')
-        elif value.startswith('"'):
-            try:
-                decoded = json.loads(value)
-            except json.JSONDecodeError as error:
-                raise store.Refusal(f'worker skills: {skill_id}: invalid description') from error
-            if not isinstance(decoded, str):
-                _refusal(f'{skill_id}: description must be a string')
-            values[key] = decoded
-        else:
+        elif key == 'description':
             values[key] = value
-    if set(values) != {'name', 'description'} or not values['description'].strip() or '\n' in values['description']:
-        _refusal(f'{skill_id}: frontmatter needs a nonempty single-line name and description')
+    if set(values) != {'name', 'description'} or not values['description'].strip():
+        _refusal(f'{skill_id}: frontmatter needs a nonempty name and description')
     if values['name'] != skill_id:
         _refusal(f'{skill_id}: catalog directory and frontmatter name differ')
-    return values['description']
+    return values['description'].strip()
 
 
 def _bundle(path, skill_id):
@@ -146,18 +197,42 @@ def _bundle(path, skill_id):
 
 
 def catalog(home: Path) -> list[dict]:
-    root = _private_path(home, 'config', 'worker-skills')
-    if not root.exists():
-        return []
-    if root.is_symlink() or not root.is_dir():
-        _refusal('catalog must be a real directory')
-    result = []
-    for path in sorted(root.iterdir(), key=lambda item: item.name):
+    home = Path(home)
+    result = {}
+
+    def add(path, origin):
         skill_id = _id(path.name, 'catalog entry')
-        if not skill_id.startswith('agd-'):
-            _refusal(f'{skill_id}: provisioned skill IDs must start agd-')
-        result.append({'id': skill_id, 'description': _bundle(path, skill_id)})
-    return result
+        row = {'id': skill_id, 'description': _bundle(path, skill_id),
+               'source': str(path.resolve()), 'origin': origin}
+        if skill_id in result:
+            _refusal(f'duplicate catalog skill {skill_id}')
+        result[skill_id] = row
+
+    project = home / '.omp'
+    registry = project / 'plugins' / 'installed_plugins.json'
+    if (registry.exists() or registry.is_symlink() or project.is_symlink()
+            or (project / 'plugins').is_symlink()):
+        for plugin_id, plugin in sorted(omp_runtime.installed_plugins(home).items()):
+            for skill_root in plugin['skill_roots']:
+                for path in sorted(skill_root.iterdir(), key=lambda item: item.name):
+                    identity = os.lstat(path)
+                    if stat.S_ISREG(identity.st_mode):
+                        continue
+                    if not stat.S_ISDIR(identity.st_mode) or stat.S_ISLNK(identity.st_mode):
+                        _refusal(f'{plugin_id}: skill root contains an unsafe entry')
+                    add(path, {
+                        'kind': 'plugin', 'plugin_id': plugin_id,
+                        'version': plugin['version'],
+                        'relative_path': str(path.relative_to(plugin['path'])),
+                    })
+
+    custom = _private_path(home, 'config', 'worker-skills')
+    if custom.exists():
+        if custom.is_symlink() or not custom.is_dir():
+            _refusal('catalog must be a real directory')
+        for path in sorted(custom.iterdir(), key=lambda item: item.name):
+            add(path, {'kind': 'custom'})
+    return [result[skill_id] for skill_id in sorted(result)]
 
 
 def profiles(home: Path) -> dict:
@@ -186,36 +261,53 @@ def profiles(home: Path) -> dict:
 
 def resolve(home: Path, *, profile: str | None = None, skill_mode: str = 'profile',
             skills: tuple[str, ...] = ()) -> dict:
-    if skill_mode not in ('profile', 'curated'):
+    if skill_mode not in ('profile', 'curated', 'none'):
         _refusal('unsupported skill mode')
     if profile is not None and skill_mode != 'profile':
-        _refusal('profiles and curated skills cannot be combined')
-    if skill_mode == 'profile' and skills:
+        _refusal('profiles and selected skills cannot be combined')
+    if skill_mode in ('profile', 'none') and skills:
         _refusal('individual skills require curated mode')
     if skill_mode == 'curated' and not skills:
         _refusal('curated mode requires at least one skill')
+    if skill_mode == 'none':
+        return {'schema': 2, 'mode': 'none', 'profile': None,
+                'skills': [], 'sources': {}}
     config_path = _private_path(home, 'config', 'workers.json')
     if skill_mode == 'profile' and profile is None and not config_path.exists():
-        return {'schema': 1, 'mode': 'none', 'profile': None, 'skills': []}
-    available = {entry['id'] for entry in catalog(home)}
+        return {'schema': 2, 'mode': 'none', 'profile': None,
+                'skills': [], 'sources': {}}
+    rows = {entry['id']: entry for entry in catalog(home)}
     if skill_mode == 'curated':
         selected = [_id(value, 'selected skill') for value in skills]
         if len(selected) != len(set(selected)):
             _refusal('duplicate selected skill')
-        missing = set(selected) - available
+        missing = set(selected) - set(rows)
         if missing:
             _refusal(f'unknown selected skill: {sorted(missing)[0]}')
-        return {'schema': 1, 'mode': 'curated', 'profile': None, 'skills': sorted(selected)}
-    config = profiles(home)
-    requested = _id(profile, 'profile') if profile is not None else config['default_profile']
-    if requested not in config['profiles']:
-        _refusal(f'unknown profile: {requested}')
-    for name, item in config['profiles'].items():
-        missing = set(item['skills']) - available
-        if missing:
-            _refusal(f'{name}: missing catalog skill {sorted(missing)[0]}')
-    return {'schema': 1, 'mode': 'profile', 'profile': requested,
-            'skills': sorted(config['profiles'][requested]['skills'])}
+        selected_profile = None
+    else:
+        config = profiles(home)
+        selected_profile = (
+            _id(profile, 'profile') if profile is not None
+            else config['default_profile'])
+        if selected_profile not in config['profiles']:
+            _refusal(f'unknown profile: {selected_profile}')
+        for name, item in config['profiles'].items():
+            missing = set(item['skills']) - set(rows)
+            if missing:
+                _refusal(f'{name}: missing catalog skill {sorted(missing)[0]}')
+        selected = config['profiles'][selected_profile]['skills']
+    selected = sorted(selected)
+    sources = {
+        skill_id: {
+            'source': rows[skill_id]['source'],
+            'origin': rows[skill_id]['origin'],
+            'files': _files(Path(rows[skill_id]['source'])),
+        }
+        for skill_id in selected
+    }
+    return {'schema': 2, 'mode': skill_mode, 'profile': selected_profile,
+            'skills': selected, 'sources': sources}
 
 
 def _sha256(path):
@@ -305,31 +397,13 @@ def _create_json(path, value):
     return published
 
 def seed_defaults(home: Path) -> bool:
-    source_root = Path(__file__).resolve().parents[2]/'bundled'/'worker-skills'
-    try:
-        source_identity = os.lstat(source_root)
-    except OSError as error:
-        raise store.Refusal('worker skills: bundled worker skills are unavailable') from error
-    if stat.S_ISLNK(source_identity.st_mode) or not stat.S_ISDIR(source_identity.st_mode):
-        _refusal('bundled worker skills must be a real directory')
-    config = _private_path(home, 'config')
-    catalog_root = config/'worker-skills'
-    config_path = config/'workers.json'
-    if catalog_root.exists() or catalog_root.is_symlink() or config_path.exists() or config_path.is_symlink():
+    config_path = _private_path(home, 'config', 'workers.json')
+    if config_path.exists() or config_path.is_symlink():
         return False
-    for skill_id in DEFAULT_SKILLS:
-        _bundle(source_root/skill_id, skill_id)
-    try:
-        catalog_root.mkdir()
-    except FileExistsError:
-        return False
-    for skill_id in DEFAULT_SKILLS:
-        _copy_tree(source_root/skill_id, catalog_root/skill_id)
-    if not _create_json(config_path, {
-            'default_profile': DEFAULT_PROFILE,
-            'profiles': {DEFAULT_PROFILE: {'skills': list(DEFAULT_SKILLS)}}}):
-        return False
-    return True
+    return _create_json(config_path, {
+        'default_profile': DEFAULT_PROFILE,
+        'profiles': {DEFAULT_PROFILE: {'skills': list(DEFAULT_SKILLS)}},
+    })
 
 
 def scoped_pr_source():
@@ -345,11 +419,14 @@ def _manifest(home, task):
         _refusal('worker skill journal is missing')
     data = _json(path)
     from . import harnesses
-    if (not isinstance(data, dict) or data.get('schema') != 1 or
+    if (not isinstance(data, dict) or data.get('schema') not in (1, 2) or
             data.get('harness') != task.get('harness') or
             data.get('roots') != list(harnesses.worker_skill_roots(task['harness'])) or
             not isinstance(data.get('skills'), list)):
         _refusal('invalid worker skill journal')
+    selection = data.get('selection')
+    if not isinstance(selection, dict) or selection.get('schema') != data['schema']:
+        _refusal('invalid worker skill journal selection')
     snapshot_root = _snapshot(home, task)
     root = Path(task['worktree'])/data['roots'][0]
     for parent in (root.parent, root):
@@ -359,10 +436,18 @@ def _manifest(home, task):
         if not isinstance(record, dict) or _id(record.get('id'), 'journal skill') != record['id']:
             _refusal('invalid worker skill journal record')
         source = Path(record.get('source', ''))
-        scoped = record['id'] == 'agd-scoped-pr-relay' and task.get('pr_grant')
-        expected = Path(__file__).resolve().parents[2]/'bundled'/'worker-skills'/record['id'] if scoped else _private_path(home, 'config', 'worker-skills', record['id'])
-        if source != expected:
-            _refusal('worker skill source path escaped catalog')
+        if data['schema'] == 1:
+            scoped = record['id'] == 'agd-scoped-pr-relay' and task.get('pr_grant')
+            expected = Path(__file__).resolve().parents[2]/'bundled'/'worker-skills'/record['id'] if scoped else _private_path(home, 'config', 'worker-skills', record['id'])
+            if source != expected:
+                _refusal('worker skill source path escaped catalog')
+        else:
+            descriptor = selection.get('sources', {}).get(record['id'])
+            if (not isinstance(descriptor, dict)
+                    or descriptor.get('source') != str(source)
+                    or descriptor.get('origin') != record.get('origin')
+                    or descriptor.get('files') != record.get('files')):
+                _refusal('worker skill source descriptor changed')
         if Path(record.get('snapshot', '')) != snapshot_root/record['id']:
             _refusal('worker skill snapshot path escaped task data')
         if Path(record.get('destination', '')) != root/record['id']:
@@ -423,16 +508,22 @@ def _exclude_info(task):
 
 
 def prepare(home: Path, task: dict, selection: dict, sources=None) -> dict:
-    if selection.get('schema') != 1 or not isinstance(selection.get('skills'), list):
+    schema = selection.get('schema')
+    if schema not in (1, 2) or not isinstance(selection.get('skills'), list):
         _refusal('invalid worker skill selection')
+    if schema == 2 and (
+            not isinstance(selection.get('sources'), dict)
+            or set(selection['sources']) != set(selection['skills'])):
+        _refusal('invalid worker skill source descriptors')
     _exclude_info(task)
     journal = _journal(home, task)
     if journal.exists():
         existing = _manifest(home, task)
         if existing.get('selection') != selection:
             _refusal('pending worker skill journal selects different skills')
-        for record in existing['skills']:
-            _check(record, Path(record['source']))
+        if existing.get('state') == 'pending':
+            for record in existing['skills']:
+                _check(record, Path(record['source']))
         ensure(home, task)
         return _manifest(home, task)
     frozen = _snapshot(home, task)
@@ -443,7 +534,8 @@ def prepare(home: Path, task: dict, selection: dict, sources=None) -> dict:
     root = Path(task['worktree'])/roots[0]
     records = []
     sources = sources or {}
-    available = {row['id'] for row in catalog(home)} | set(sources)
+    rows = {row['id']: row for row in catalog(home)}
+    available = set(rows) | set(sources)
     for skill_id in selection['skills']:
         if skill_id not in available:
             _refusal(f'missing catalog skill {skill_id}')
@@ -455,14 +547,30 @@ def prepare(home: Path, task: dict, selection: dict, sources=None) -> dict:
             if ancestor.parent == ancestor:
                 break
             ancestor = ancestor.parent
-        source = Path(sources.get(skill_id) or _private_path(home, 'config', 'worker-skills', skill_id))
+        if schema == 2:
+            descriptor = selection['sources'][skill_id]
+            row = rows.get(skill_id)
+            if (not isinstance(descriptor, dict)
+                    or set(descriptor) != {'source', 'origin', 'files'}
+                    or row is None or descriptor['source'] != row['source']
+                    or descriptor['origin'] != row['origin']
+                    or descriptor['files'] != _files(Path(row['source']))):
+                _refusal(f'invalid source descriptor for {skill_id}')
+            source = Path(descriptor['source'])
+        else:
+            source = Path(sources.get(skill_id) or _private_path(
+                home, 'config', 'worker-skills', skill_id))
+            descriptor = {'files': _files(source)}
         destination = root/skill_id
         if destination.exists() or destination.is_symlink():
             _refusal(f'worker skill destination exists: {destination}')
         frozen_skill = frozen/skill_id
-        records.append({'id': skill_id, 'source': str(source), 'snapshot': str(frozen_skill),
-                        'destination': str(destination), 'files': _files(source)})
-    manifest = {'schema': 1, 'selection': selection, 'harness': task['harness'],
+        record = {'id': skill_id, 'source': str(source), 'snapshot': str(frozen_skill),
+                  'destination': str(destination), 'files': descriptor['files']}
+        if schema == 2:
+            record['origin'] = descriptor['origin']
+        records.append(record)
+    manifest = {'schema': schema, 'selection': selection, 'harness': task['harness'],
                 'roots': list(roots), 'skills': records, 'state': 'pending',
                 'excludes': [str(Path(record['destination']).relative_to(task['worktree']))
                              for record in records]}

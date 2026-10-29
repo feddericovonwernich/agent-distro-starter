@@ -1,6 +1,4 @@
-Ponytail and Superpowers central skills/extensions are not redistributed from this tree. Fresh setup installs the official OMP project plugins from `DietrichGebert/ponytail` and `obra/superpowers`; OMP's native project registry records the resolved versions and payloads. Those plugins execute upstream code and retain their upstream licenses.
-
-The legacy transformed worker bundles remain temporarily tracked until the plugin-backed worker catalog cutover; each still carries its applicable upstream MIT license. They are not central discovery sources.
+Ponytail and Superpowers skills/extensions are not redistributed from this tree. Fresh setup installs the official OMP project plugins from `DietrichGebert/ponytail` and `obra/superpowers`; OMP's native user cache and project registry record the resolved versions and payloads under the distro. Central discovery and worker catalog resolution both use those exact upstream payloads. The plugins execute upstream code and retain their upstream licenses.
 
 ## Open Relay skills
 

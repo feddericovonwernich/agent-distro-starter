@@ -26,30 +26,27 @@ After guided installation, run `project add ID --source URL_OR_PATH --base main`
 
 ### Worker skill catalog
 
-An `init` seeds an empty external private home, or a checkout home with no private `config`, `projects`, `data`, or `state`, with the `default` profile and nine reviewed bundles tracked in `bundled/worker-skills/`. Existing private-home state is untouched; init never upgrades or overwrites private worker files. Optional private-home configuration at `config/workers.json` defines a `default_profile` and flat `profiles`, whose `skills` arrays refer to bundles in `config/worker-skills/ID/`. A bundle has a regular `SKILL.md` with simple `---` frontmatter containing its exact lowercase `agd-` ID and a nonempty one-line description; its resources may be regular files or directories only. `worker skills list` and `worker profiles list` return deterministic JSON. Launch with the implicit default, `--profile NAME`, or `--skill-mode curated --skill ID`; curated selection needs at least one skill and cannot be combined with a profile. Without configuration, an implicit launch records no provisioned skills; a requested unknown profile or curated skill is refused rather than silently downgraded.
+`init` writes a `default` profile naming the canonical Ponytail skills (`ponytail`, `ponytail-audit`, `ponytail-debt`, `ponytail-gain`, `ponytail-help`, `ponytail-review`) and Superpowers skills (`systematic-debugging`, `test-driven-development`, `verification-before-completion`). It does not copy upstream files. `worker skills list` resolves exact skill directories from the validated project-scoped OMP plugin registrations installed during setup. A default-profile task refuses before allocation when those registrations are absent or invalid. Explicit `--skill-mode none` selects no ordinary worker skills.
 
-If seeding is interrupted after the catalog appears but before `workers.json`, init preserves it rather than retrying or overwriting it; inspect the catalog, then either write the matching profile manually or remove it deliberately before a manual opt-in.
+Optional `config/workers.json` profiles refer to canonical plugin names or custom skills under `config/worker-skills/NAME/`. Plugin and custom sources share one namespace; any duplicate name refuses without precedence or aliasing. Existing prefixed names such as `agd-ponytail` are not migrated. A custom skill is a real directory containing a regular `SKILL.md`; its frontmatter name must exactly match the directory. Descriptions may be plain, quoted, folded, or literal scalar text. Resources may contain regular files and directories only; symlinks, hard links, special files, traversal names, and `.git` content refuse.
 
-For an existing home, opt in only when requested: copy the chosen reviewed bundle directories from `bundled/worker-skills/` without replacing existing directories, then save a matching `workers.json`. For the reviewed default set, use `{"default_profile":"default","profiles":{"default":{"skills":["agd-ponytail","agd-ponytail-audit","agd-ponytail-debt","agd-ponytail-gain","agd-ponytail-help","agd-ponytail-review","agd-superpowers-systematic-debugging","agd-superpowers-test-driven-development","agd-superpowers-verification-before-completion"]}}}`. The Relay integration adds five upstream central skills under `.agents/skills`; ordinary workers still receive only these nine reviewed default bundles. A valid `pr-publish` grant adds the sole AGD-authored `agd-scoped-pr-relay` bundle for that task. Pinned upstream SHAs and license notices are in `third_party/PROVENANCE.md`.
-
-Both paths are relative to the effective private home (`AGD_HOME` when set), not the tracked distro checkout. A minimal catalog is:
-
+A minimal custom profile is:
 
 ```json
-{"default_profile":"implementer","profiles":{"implementer":{"skills":["agd-review"]}}}
+{"default_profile":"implementer","profiles":{"implementer":{"skills":["review"]}}}
 ```
 
-Save that as `config/workers.json`, then create `config/worker-skills/agd-review/SKILL.md`:
+Save that as `config/workers.json`, then create `config/worker-skills/review/SKILL.md`:
 
 ```markdown
 ---
-name: agd-review
+name: review
 description: Review changes carefully.
 ---
 Read references/checklist.txt before reviewing.
 ```
 
-`config/worker-skills/agd-review/references/checklist.txt` is a regular relative resource. Bundles are instructions, not permissions to publish, merge, run unattended, or clean up.
+`config/worker-skills/review/references/checklist.txt` is a regular relative resource. Catalog entries are instructions, not permissions to publish, merge, run unattended, or clean up. The valid `pr-publish` path adds only the separate AGD-authored `agd-scoped-pr-relay` adapter.
 
 Provisioning refuses an existing destination, native-name alias or ancestor collision, symlinked parent, tracked path, or unsafe bundle entry. It freezes complete regular-file copies with hashes and modes; relaunch verifies/restores that snapshot and never re-resolves the mutable catalog. Exact generated paths are shared-Git-common-directory `info/exclude` entries with locked ownership: sibling worktrees and user lines are preserved, and a managed entry is released only after its last owner. Cleanup retains snapshots/journals, retries uncertain return state, and a discard retry must reuse its exact recorded approval.
 

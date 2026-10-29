@@ -2,6 +2,7 @@
 
 ## Unreleased
 - Isolated OMP settings, authentication, sessions, caches, and plugin data inside each distro with a synthetic local OMP `HOME`; fresh setup now installs official project-scoped Ponytail and Superpowers plugins and validates their native registrations.
+- Source the default worker catalog from validated native Ponytail and Superpowers plugin payloads under canonical upstream names; preserve exact skill bytes/resources, refuse source collisions, and stop redistributing transformed upstream worker bundles.
 - Polish guided installation with colored stages and prompts, quieter cloning, a clear start command, and pretty terminal JSON; retain plain/compact redirected output and remove OMP login/model configuration prompts.
 - Preserve Herdr's native pane marker when starting the central agent so it can launch Herdr workers; continue filtering caller-supplied markers and sanitizing the outer attach client.
 - Export the central owner token during OMP session start and switch so agent commands can mutate their own home while foreign commands remain read-only.

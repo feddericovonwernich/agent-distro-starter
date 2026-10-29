@@ -1,8 +1,67 @@
+import json
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from test_projects import command, run
 
+
+
+PLUGIN_SPECS = {
+    'ponytail@ponytail': ('ponytail', 'DietrichGebert/ponytail',
+                          '@dietrichgebert/ponytail', '5.3.3'),
+    'superpowers@superpowers-dev': ('superpowers-dev', 'obra/superpowers',
+                                    'superpowers', '7.0.1'),
+}
+
+
+def write_native_plugins(home, plugin_skills=None):
+    """Write deterministic native OMP plugin state and payloads under home."""
+    home = Path(home)
+    plugin_skills = plugin_skills or {}
+    registry = {'version': 2, 'plugins': {}}
+    lock = {'plugins': {}, 'settings': {}}
+    marketplaces = {'version': 1, 'marketplaces': []}
+    config = home / 'data/omp/home/.omp'
+    project_plugins = home / '.omp/plugins'
+    project_plugins.mkdir(parents=True, exist_ok=True)
+    for plugin_id, (market, publisher, package, version) in PLUGIN_SPECS.items():
+        payload = config / 'plugins/cache/plugins' / f'{market}___fixture___{version}'
+        skill_root = payload / 'skills'
+        skill_root.mkdir(parents=True)
+        for skill_name, files in plugin_skills.get(plugin_id, {}).items():
+            skill = skill_root / skill_name
+            skill.mkdir()
+            for relative, content in files.items():
+                target = skill / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(content if isinstance(content, bytes) else content.encode())
+        (payload / 'package.json').write_text(json.dumps({
+            'name': package, 'version': version, 'pi': {'skills': ['./skills']},
+        }))
+        registry['plugins'][plugin_id] = [{
+            'scope': 'project', 'installPath': str(payload), 'version': version,
+            'installedAt': '2026-01-01T00:00:00Z',
+            'lastUpdated': '2026-01-01T00:00:00Z',
+        }]
+        lock['plugins'][package] = {
+            'version': version, 'enabledFeatures': None, 'enabled': True,
+        }
+        catalog = config / 'plugins/cache/marketplaces' / market / 'marketplace.json'
+        catalog.parent.mkdir(parents=True)
+        catalog.write_text('{}')
+        marketplaces['marketplaces'].append({
+            'name': market, 'sourceType': 'github', 'sourceUri': publisher,
+            'catalogPath': str(catalog), 'addedAt': '2026-01-01T00:00:00Z',
+            'updatedAt': '2026-01-01T00:00:00Z',
+        })
+    registry_path = project_plugins / 'installed_plugins.json'
+    registry_path.write_text(json.dumps(registry))
+    (project_plugins / 'omp-plugins.lock.json').write_text(json.dumps(lock))
+    (config / 'plugins/project_registries.json').write_text(json.dumps({
+        'version': 1, 'registries': [str(registry_path)],
+    }))
+    (config / 'marketplaces.json').write_text(json.dumps(marketplaces))
+    return registry
 
 @contextmanager
 def lab():
