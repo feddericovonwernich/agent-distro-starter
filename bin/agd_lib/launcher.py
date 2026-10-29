@@ -163,11 +163,20 @@ def _backend_inspect(home: Path, receipt: dict) -> dict:
 
 def _backend_create(home: Path, launch_id: str, endpoint_token: str, managed: list[str],
                     env: dict[str, str], argv: list[str]) -> dict:
-    raise store.Refusal('central backend is unavailable')
+    backend = resolve_backend(home, None)
+    module = __import__(f'agd_lib.{backend}', fromlist=['create_central'])
+    create = getattr(module, 'create_central', None)
+    if not callable(create):
+        raise store.Refusal('central backend is unavailable')
+    return create(home, launch_id, endpoint_token, managed, env, argv)
 
 
 def _backend_attach(home: Path, receipt: dict) -> list[str]:
-    raise store.Refusal('central backend is unavailable')
+    module = __import__(f'agd_lib.{receipt["backend"]}', fromlist=['attach_argv'])
+    attach = getattr(module, 'attach_argv', None)
+    if not callable(attach):
+        raise store.Refusal('central backend is unavailable')
+    return attach(home, receipt)
 
 
 def active_backend(home: Path, inherited_env: Mapping[str, str] | None = None) -> str | None:
