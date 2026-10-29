@@ -69,6 +69,74 @@ def test_omp_launch_persists_fresh_native_binding_before_endpoint_creation():
 
 
 
+def test_omitted_backend_inherits_active_central_and_explicit_tmux_stays_local(monkeypatch):
+    from agd_lib import launcher
+    with lab() as (home, _):
+        brief = home / 'brief.md'; brief.write_text('Inspect value.txt.\n')
+        inherited = command(home, 'task', 'create', 'inherited', '--project', 'sample',
+                            '--brief', str(brief), '--kind', 'scout')
+        explicit = command(home, 'task', 'create', 'explicit', '--project', 'sample',
+                           '--brief', str(brief), '--kind', 'scout')
+        seen = []
+
+        class Endpoint:
+            def available(self): pass
+            def prepare(self, _home): pass
+            def create(self, _home, task_id, incarnation, _work, _argv):
+                return {'task': task_id, 'incarnation': incarnation}
+
+        monkeypatch.setenv('AGD_LAUNCH_ID', 'matching-launch')
+        monkeypatch.setenv('AGD_ENDPOINT_TOKEN', 'matching-token')
+        monkeypatch.setattr(launcher, 'active_backend',
+                            lambda actual_home, env: seen.append((actual_home, env)) or 'herdr')
+        monkeypatch.setattr(workers, 'backend', lambda _task: Endpoint())
+        monkeypatch.setattr(workers.shutil, 'which', lambda _name: '/bin/true')
+
+        launched = workers.launch(home, 'inherited')
+        assert launched['backend'] == 'herdr'
+        assert tasks.read(home, 'inherited')['lease_id'] == inherited['lease_id']
+        assert seen == [(home, dict(os.environ))]
+
+        monkeypatch.setattr(launcher, 'active_backend',
+                            lambda *_: (_ for _ in ()).throw(AssertionError('explicit backend inherited')))
+        overridden = workers.launch(home, 'explicit', selected_backend='tmux')
+        assert overridden['backend'] == 'tmux'
+        assert tasks.read(home, 'explicit')['lease_id'] == explicit['lease_id']
+
+
+def test_inactive_central_falls_back_to_saved_backend_without_mutating_task_on_refusal(monkeypatch):
+    import pytest
+    from agd_lib import launcher, store
+    with lab() as (home, _):
+        brief = home / 'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'fallback', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        saved = home/'data'/'launcher.json'
+        saved.write_text('{"schema": 1, "backend": "herdr", '
+                         '"herdr_session": "agd-00000000000000000000000000000000"}\n')
+        monkeypatch.setattr(launcher, 'active_backend', lambda *_: None)
+
+        class Endpoint:
+            def available(self): pass
+            def prepare(self, _home): pass
+            def create(self, _home, task_id, incarnation, _work, _argv):
+                return {'task': task_id, 'incarnation': incarnation}
+
+        monkeypatch.setattr(workers, 'backend', lambda _task: Endpoint())
+        assert workers.launch(home, 'fallback')['backend'] == 'herdr'
+        current = tasks.read(home, 'fallback')
+        assert current['lease_id'] == task['lease_id']
+        assert current['endpoint']['task'] == 'fallback'
+
+        refused = command(home, 'task', 'create', 'refused', '--project', 'sample',
+                          '--brief', str(brief), '--kind', 'scout')
+        monkeypatch.setattr(launcher, 'active_backend',
+                            lambda *_: (_ for _ in ()).throw(store.Refusal('inherited central is invalid')))
+        with pytest.raises(store.Refusal, match='inherited central'):
+            workers.launch(home, 'refused')
+        assert tasks.read(home, 'refused') == refused
+
+
 def test_relaunch_keeps_prior_native_data_when_final_executable_is_true(monkeypatch):
     with lab() as (home, _):
         brief = home / 'brief.md'; brief.write_text('Inspect value.txt.\n')

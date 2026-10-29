@@ -4,7 +4,7 @@ import shutil
 import time
 import uuid
 from pathlib import Path
-from . import harnesses, observability, projects, store, tasks, tmux, worker_skills
+from . import harnesses, launcher, observability, projects, store, tasks, tmux, worker_skills
 
 
 def backend(task):
@@ -38,7 +38,7 @@ def event(home, task_id, incarnation, kind, key, message):
     return observation
 
 
-def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=False, approval_id=None,
+def launch(home, task_id, harness='omp', selected_backend=None, unattended=False, approval_id=None,
            profile=None, skill_mode='profile', skills=(), pr_grant=None):
     task = tasks.read(home, task_id)
     if task['phase'] != 'prepared' or task['executor'] != 'central':
@@ -49,6 +49,8 @@ def launch(home, task_id, harness='omp', selected_backend='tmux', unattended=Fal
     work = tasks.verify_workspace(home, task)
     if unattended:
         tasks.authorization(home, task, approval_id or '', 'unattended', task_id)
+    if selected_backend is None:
+        selected_backend = launcher.active_backend(home, dict(os.environ)) or launcher.resolve_backend(home, None)
     if selected_backend not in ('tmux', 'herdr') or harness not in ('omp', 'cursor'):
         raise ValueError('unsupported backend or harness')
     if pr_grant:

@@ -85,7 +85,7 @@ def parser():
         op.add_argument('id')
         if action == 'launch':
             op.add_argument('--harness', choices=('omp', 'cursor'), default='omp')
-            op.add_argument('--backend', choices=('tmux', 'herdr'), default='tmux')
+            op.add_argument('--backend', choices=('tmux', 'herdr'))
             op.add_argument('--unattended', action='store_true')
             op.add_argument('--profile')
             op.add_argument('--skill-mode', choices=('profile', 'curated'), default='profile')
