@@ -364,13 +364,15 @@ def test_enabled_environment_uses_configured_project_and_distro_identity_without
         rendered = observability.render_stack(home)
         observability._save_state(home, 'enabled', 'healthy', rendered)
         observability.paths(home)['secrets'].unlink()
-        env, _generation, _warning = observability.managed_environment(home, 'worker', {'id': 'task-a'}, INCARNATION)
+        env, _generation, _warning = observability.managed_environment(
+            home, 'worker', {'id': 'task-a', 'worktree': str(home)}, INCARNATION)
         assert env['OTEL_TRACES_EXPORTER'] == 'otlp'
         assert not observability.paths(home)['secrets'].exists()
         rendered = observability.render_stack(home)
         observability._save_state(home, 'enabled', 'healthy', rendered)
         project_id = observability.read_config(home)['project_id']
-        env, _generation, _warning = observability.managed_environment(home, 'worker', {'id': 'task-a'}, INCARNATION)
+        env, _generation, _warning = observability.managed_environment(
+            home, 'worker', {'id': 'task-a', 'worktree': str(home)}, INCARNATION)
         attributes = dict(item.split('=', 1) for item in env['OTEL_RESOURCE_ATTRIBUTES'].split(','))
         assert attributes['agd.distro_id'] == attributes['agd.home_id']
         assert attributes['agd.langfuse_project'] == project_id

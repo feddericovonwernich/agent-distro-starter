@@ -1,4 +1,6 @@
 /.worktrees/
+/.omp/plugins/
+/.omp/plugin-overrides.json
 /config/
 /projects/
 /data/

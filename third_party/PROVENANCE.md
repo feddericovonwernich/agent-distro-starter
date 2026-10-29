@@ -1,12 +1,6 @@
-PONYTAIL_SHA=16352ac229eb08a9598dcae48fe9f2b342567d86
-SUPERPOWERS_SHA=2ce8aa15d05bd57213e6f746f953aafb7ded7a8b
+Ponytail and Superpowers central skills/extensions are not redistributed from this tree. Fresh setup installs the official OMP project plugins from `DietrichGebert/ponytail` and `obra/superpowers`; OMP's native project registry records the resolved versions and payloads. Those plugins execute upstream code and retain their upstream licenses.
 
-Central skills are copied from each pinned upstream skills/ directory without runtime extensions, hooks, plugin manifests, or install scripts. Worker bundles contain only approved skill payloads plus the applicable upstream MIT LICENSE notice.
-
-Central `.agents/skills/ponytail-help/SKILL.md` is adapted to the native OMP
-distribution (canonical skill IDs and no Ponytail plugin, hook, band,
-marketplace, environment-activation, or config claims); all other copied
-central skill bodies remain verbatim from the pinned sources.
+The legacy transformed worker bundles remain temporarily tracked until the plugin-backed worker catalog cutover; each still carries its applicable upstream MIT license. They are not central discovery sources.
 
 ## Open Relay skills
 

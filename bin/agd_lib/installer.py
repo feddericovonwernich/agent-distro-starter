@@ -116,6 +116,9 @@ def _version(path, run, label):
 
 def probe_omp(path, run):
     version = _version(path, run, 'OMP')
+    match = re.search(r'(?:^|[/ v])(\d+)\.(\d+)\.(\d+)(?:\D|$)', version)
+    if match is None or tuple(map(int, match.groups())) < (18, 14, 0):
+        raise Refusal('OMP 18.14.0 or newer is required for native project plugins')
     models = _result(run, [str(path), 'models', '--json'])
     try:
         parsed = json.loads(models.stdout)
@@ -374,7 +377,7 @@ def validate_dependencies(home, run):
     return _validate_receipt(result)
 
 
-def setup(home, backend, prompt, fetch_json, stream_url, run):
+def setup(home, backend, prompt, fetch_json, stream_url, run, *, install_plugins=None):
     if backend not in {'tmux', 'herdr'}:
         raise Refusal('selected backend is invalid')
     prior = read_dependencies(home)
@@ -425,4 +428,6 @@ def setup(home, backend, prompt, fetch_json, stream_url, run):
             release, tool, stream_url, _omp_runner(home, run) if tool == 'omp' else run)
     write_dependencies(home, receipt)
     omp_runtime.initialize(home, receipt['omp']['path'], run=run)
+    (install_plugins or omp_runtime.install_plugins)(
+        Path(home), receipt['omp']['path'], run=run)
     return receipt

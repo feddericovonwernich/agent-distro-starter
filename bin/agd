@@ -244,7 +244,7 @@ def main(args):
         if args.installer_operation == 'shell':
             shell = os.environ.get('SHELL') or '/bin/sh'
             os.chdir(home)
-            os.execvpe(shell, [shell, '-i'], omp_runtime.environment(home, os.environ))
+            os.execvpe(shell, [shell, '-i'], os.environ)
         def fetch_json(url):
             with urlopen(url) as response:
                 return json.load(response)

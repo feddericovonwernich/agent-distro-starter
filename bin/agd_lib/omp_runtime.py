@@ -1,10 +1,24 @@
 """Native OMP storage and execution boundary for one distro."""
+import json
 import os
 import stat
 from pathlib import Path
 from typing import Mapping
 
 from . import store
+
+PLUGIN_SPECS = {
+    'ponytail@ponytail': {
+        'marketplace': 'ponytail',
+        'source': 'DietrichGebert/ponytail',
+        'package': '@dietrichgebert/ponytail',
+    },
+    'superpowers@superpowers-dev': {
+        'marketplace': 'superpowers-dev',
+        'source': 'obra/superpowers',
+        'package': 'superpowers',
+    },
+}
 
 
 def _root(home) -> Path:
@@ -21,6 +35,10 @@ def _root(home) -> Path:
     return root / 'data' / 'omp'
 
 
+def _config(home) -> Path:
+    return _root(home) / 'home' / '.omp'
+
+
 def agent_dir(home) -> Path:
     return _root(home) / 'agent'
 
@@ -28,7 +46,7 @@ def agent_dir(home) -> Path:
 def runtime_directories(home) -> tuple[Path, ...]:
     runtime = _root(home)
     return (
-        runtime / 'config',
+        runtime / 'home',
         runtime / 'agent',
         runtime / 'xdg' / 'data',
         runtime / 'xdg' / 'state',
@@ -37,19 +55,12 @@ def runtime_directories(home) -> tuple[Path, ...]:
 
 
 def environment(home, inherited: Mapping[str, str]) -> dict[str, str]:
-    """Return a copy of inherited with every OMP storage control made local."""
+    """Return inherited with every OMP storage control fixed to this distro."""
     runtime = _root(home)
     result = dict(inherited)
-    effective_home = Path(result.get('HOME') or Path.home())
-    if not effective_home.is_absolute():
-        raise store.Refusal('OMP runtime requires an absolute HOME')
-    result.setdefault('HOME', str(effective_home))
-    config = runtime / 'config'
-    relative_config = os.path.relpath(config, effective_home)
-    if (effective_home / relative_config).resolve() != config.resolve():
-        raise store.Refusal('OMP config root cannot be confined to the distro')
     result.update(
-        PI_CONFIG_DIR=relative_config,
+        HOME=str(runtime / 'home'),
+        PI_CONFIG_DIR='.omp',
         PI_CODING_AGENT_DIR=str(runtime / 'agent'),
         OMP_PROFILE='default',
         PI_PROFILE='default',
@@ -97,3 +108,190 @@ def validate_native_args(arguments) -> None:
             break
         if argument in forbidden or any(argument.startswith(flag + '=') for flag in forbidden):
             raise store.Refusal('fixed distro OMP runtime refuses profile or project escape controls')
+
+
+def _read_json(path: Path, label: str, *, optional=False):
+    try:
+        identity = path.lstat()
+    except FileNotFoundError:
+        if optional:
+            return None
+        raise store.Refusal(f'native plugin {label} is missing')
+    if stat.S_ISLNK(identity.st_mode) or not stat.S_ISREG(identity.st_mode):
+        raise store.Refusal(f'native plugin {label} is unsafe')
+    try:
+        return json.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise store.Refusal(f'native plugin {label} is malformed') from error
+
+
+def _confined(path_value, root: Path, label: str, *, directory=True) -> Path:
+    if not isinstance(path_value, str):
+        raise store.Refusal(f'native plugin {label} is malformed')
+    path = Path(path_value)
+    try:
+        resolved = path.resolve(strict=True)
+        relative = resolved.relative_to(root.resolve(strict=True))
+    except (OSError, ValueError) as error:
+        raise store.Refusal(f'native plugin {label} escapes the distro') from error
+    if path != resolved:
+        raise store.Refusal(f'native plugin {label} uses a non-canonical path')
+    current = root.resolve(strict=True)
+    for part in relative.parts:
+        current /= part
+        identity = current.lstat()
+        if stat.S_ISLNK(identity.st_mode):
+            raise store.Refusal(f'native plugin {label} uses a symlink')
+    identity = resolved.lstat()
+    expected = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected(identity.st_mode):
+        raise store.Refusal(f'native plugin {label} has the wrong type')
+    return resolved
+
+def _confined_json(path: Path, root: Path, label: str, *, optional=False):
+    if optional and not path.exists() and not path.is_symlink():
+        return None
+    _confined(str(path), root, label, directory=False)
+    return _read_json(path, label, optional=optional)
+
+
+
+
+def _marketplaces(home: Path, required_ids) -> dict[str, dict]:
+    value = _confined_json(
+        _config(home) / 'marketplaces.json', _root(home),
+        'marketplace registry')
+    if (not isinstance(value, dict) or set(value) != {'version', 'marketplaces'}
+            or value.get('version') != 1 or not isinstance(value['marketplaces'], list)):
+        raise store.Refusal('native plugin marketplace registry is malformed')
+    by_name = {}
+    for row in value['marketplaces']:
+        if not isinstance(row, dict) or not isinstance(row.get('name'), str):
+            raise store.Refusal('native plugin marketplace registry is malformed')
+        by_name.setdefault(row['name'], []).append(row)
+    result = {}
+    for plugin_id in required_ids:
+        spec = PLUGIN_SPECS[plugin_id]
+        rows = by_name.get(spec['marketplace'], [])
+        if len(rows) != 1:
+            raise store.Refusal(f'native plugin marketplace {spec["marketplace"]} is missing or ambiguous')
+        row = rows[0]
+        if row.get('sourceType') != 'github' or row.get('sourceUri') != spec['source']:
+            raise store.Refusal(f'native plugin marketplace {spec["marketplace"]} has a conflicting publisher')
+        _confined(row.get('catalogPath'), _root(home), 'marketplace catalog', directory=False)
+        result[plugin_id] = row
+    return result
+
+
+def _registry(home: Path, *, optional=False):
+    root = store.home(home)
+    plugins = root / '.omp' / 'plugins'
+    registry_path = plugins / 'installed_plugins.json'
+    value = _confined_json(registry_path, root, 'project registry', optional=optional)
+    if value is None:
+        return None
+    if (not isinstance(value, dict) or set(value) != {'version', 'plugins'}
+            or value.get('version') != 2 or not isinstance(value['plugins'], dict)):
+        raise store.Refusal('native plugin project registry is malformed')
+    index = _confined_json(_config(root) / 'plugins' / 'project_registries.json',
+                           root, 'project registry index')
+    if (not isinstance(index, dict) or set(index) != {'version', 'registries'}
+            or index.get('version') != 1
+            or index.get('registries') != [str(registry_path)]):
+        raise store.Refusal('native plugin project registry index is malformed')
+    return value
+
+
+def installed_plugins(home, required_ids=None) -> dict[str, dict]:
+    root = store.home(home)
+    required = tuple(PLUGIN_SPECS if required_ids is None else required_ids)
+    if any(plugin_id not in PLUGIN_SPECS for plugin_id in required):
+        raise ValueError('unsupported required plugin')
+    _marketplaces(root, required)
+    registry = _registry(root)
+    plugins = root / '.omp' / 'plugins'
+    lock = _confined_json(plugins / 'omp-plugins.lock.json', root,
+                          'runtime lockfile')
+    if (not isinstance(lock, dict) or set(lock) != {'plugins', 'settings'}
+            or not isinstance(lock['plugins'], dict) or not isinstance(lock['settings'], dict)):
+        raise store.Refusal('native plugin runtime lockfile is malformed')
+    overrides = _confined_json(
+        root / '.omp' / 'plugin-overrides.json', root,
+        'project overrides', optional=True) or {}
+    if (not isinstance(overrides, dict) or set(overrides) - {'disabled', 'features', 'settings'}
+            or not isinstance(overrides.get('disabled', []), list)
+            or not isinstance(overrides.get('features', {}), dict)
+            or not isinstance(overrides.get('settings', {}), dict)):
+        raise store.Refusal('native plugin project overrides are malformed')
+    result = {}
+    for plugin_id in required:
+        spec = PLUGIN_SPECS[plugin_id]
+        entries = registry['plugins'].get(plugin_id)
+        project_entries = ([entry for entry in entries if isinstance(entry, dict)
+                            and entry.get('scope') == 'project']
+                           if isinstance(entries, list) else [])
+        if len(project_entries) != 1 or len(entries) != 1:
+            raise store.Refusal(f'native plugin {plugin_id} registration is missing or ambiguous')
+        entry = project_entries[0]
+        if entry.get('enabled', True) is not True or not isinstance(entry.get('version'), str):
+            raise store.Refusal(f'native plugin {plugin_id} is disabled or malformed')
+        payload = _confined(entry.get('installPath'), _root(root),
+                            f'{plugin_id} payload')
+        manifest = _read_json(payload / 'package.json', f'{plugin_id} manifest')
+        pi = manifest.get('pi') if isinstance(manifest, dict) else None
+        skill_values = pi.get('skills') if isinstance(pi, dict) else None
+        if (manifest.get('name') != spec['package'] or manifest.get('version') != entry['version']
+                or not isinstance(skill_values, list) or not skill_values
+                or any(not isinstance(value, str) for value in skill_values)):
+            raise store.Refusal(f'native plugin {plugin_id} manifest is malformed')
+        state = lock['plugins'].get(spec['package'])
+        if (not isinstance(state, dict) or state.get('version') != entry['version']
+                or state.get('enabled') is not True
+                or state.get('enabledFeatures') not in (None, [])):
+            raise store.Refusal(f'native plugin {plugin_id} runtime state is disabled or malformed')
+        if (spec['package'] in overrides.get('disabled', [])
+                or overrides.get('features', {}).get(spec['package']) not in (None, [])):
+            raise store.Refusal(f'native plugin {plugin_id} is disabled by project overrides')
+        skill_roots = tuple(_confined(str((payload / value).resolve()), payload,
+                                      f'{plugin_id} skill root')
+                            for value in skill_values)
+        result[plugin_id] = {
+            'id': plugin_id,
+            'version': entry['version'],
+            'path': payload,
+            'skill_roots': skill_roots,
+        }
+    return result
+
+
+def install_plugins(home, executable: str, *, run=store.run) -> dict[str, dict]:
+    root = store.home(home)
+    registry = _registry(root, optional=True)
+    registered = set() if registry is None else set(registry['plugins'])
+    marketplace_value = _confined_json(
+        _config(root) / 'marketplaces.json', _root(root),
+        'marketplace registry', optional=True)
+    existing_markets = {}
+    if marketplace_value is not None:
+        if (not isinstance(marketplace_value, dict) or marketplace_value.get('version') != 1
+                or not isinstance(marketplace_value.get('marketplaces'), list)):
+            raise store.Refusal('native plugin marketplace registry is malformed')
+        for row in marketplace_value['marketplaces']:
+            if not isinstance(row, dict) or not isinstance(row.get('name'), str):
+                raise store.Refusal('native plugin marketplace registry is malformed')
+            existing_markets.setdefault(row['name'], []).append(row)
+    env = environment(root, os.environ)
+    for plugin_id, spec in PLUGIN_SPECS.items():
+        rows = existing_markets.get(spec['marketplace'], [])
+        if rows and (len(rows) != 1 or rows[0].get('sourceType') != 'github'
+                     or rows[0].get('sourceUri') != spec['source']):
+            raise store.Refusal(f'native plugin marketplace {spec["marketplace"]} has a conflicting publisher')
+        if not rows:
+            run([executable, 'plugin', 'marketplace', 'add', spec['source']],
+                cwd=root, env=env, timeout=300)
+        if plugin_id in registered:
+            installed_plugins(root, (plugin_id,))
+            continue
+        run([executable, 'plugin', 'install', '--scope', 'project', plugin_id],
+            cwd=root, env=env, timeout=300)
+    return installed_plugins(root)

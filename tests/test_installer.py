@@ -23,7 +23,7 @@ def result(stdout='', stderr='', returncode=0):
 
 def fake_run(argv, check=False, **_kwargs):
     if argv[1:] == ['--version']:
-        return result('v3.1.6\n' if Path(argv[0]).name == 'treehouse' else 'v1.2.3\n')
+        return result('v3.1.6\n' if Path(argv[0]).name == 'treehouse' else 'omp/18.14.0\n')
     if argv[1:] == ['models', '--json']:
         return result('[]')
     if argv[1:] == ['login', '--help']:
@@ -260,7 +260,7 @@ def test_receipt_rehashes_managed_and_reprobes_existing_entries(tmp_path):
                'installed_sha256': hashlib.sha256(b'bytes').hexdigest()}}
     write_dependencies(tmp_path, receipt)
     assert read_dependencies(tmp_path) == receipt
-    assert validate_dependencies(tmp_path, fake_run)['omp']['version'] == 'v1.2.3'
+    assert validate_dependencies(tmp_path, fake_run)['omp']['version'] == 'omp/18.14.0'
     omp.write_bytes(b'changed')
     with pytest.raises(Refusal, match='installed digest'):
         validate_dependencies(tmp_path, fake_run)
@@ -305,7 +305,8 @@ def test_setup_persists_compatible_declined_dependencies_and_preserves_prior_on_
     before = {'schema': 1, 'omp': {'source': 'existing', 'path': str(omp), 'version': 'old',
               'capabilities': ['models-json', 'login']}}
     write_dependencies(tmp_path, before)
-    got = setup(tmp_path, 'tmux', lambda _: False, lambda _: selected, stream(b'executable'), fake_run)
+    got = setup(tmp_path, 'tmux', lambda _: False, lambda _: selected, stream(b'executable'), fake_run,
+                install_plugins=lambda *_args, **_kwargs: {})
     assert got['omp']['source'] == 'existing'
     assert got['treehouse']['source'] == 'existing'
     assert read_dependencies(tmp_path) == got
@@ -328,8 +329,8 @@ def test_setup_preserves_valid_managed_receipt_when_update_declined(tmp_path, mo
                'tag': 'v1', 'artifact_sha256': '0' * 64, 'installed_sha256': digest}
     write_dependencies(tmp_path, {'schema': 1, 'omp': managed})
     got = setup(tmp_path, 'tmux', lambda _: False, lambda _: release('omp-linux-x64'),
-                stream(b'executable'), fake_run)
-    assert got['omp'] == {**managed, 'version': 'v1.2.3'}
+                stream(b'executable'), fake_run, install_plugins=lambda *_args, **_kwargs: {})
+    assert got['omp'] == {**managed, 'version': 'omp/18.14.0'}
 
 
 def test_setup_refuses_managed_receipt_tampering_or_path_mismatch(tmp_path, monkeypatch):
@@ -392,6 +393,11 @@ def test_setup_initializes_native_local_omp_directories(tmp_path, monkeypatch):
     monkeypatch.setattr(installer.shutil, 'which',
                         lambda name: str(binaries[name]) if name in binaries else None)
     calls = []
+    plugin_calls = []
+    monkeypatch.setattr(
+        installer.omp_runtime, 'install_plugins',
+        lambda home, executable, **kwargs: plugin_calls.append(
+            (home, executable, kwargs)) or {'installed': True})
 
     def run(argv, **kwargs):
         calls.append((argv, kwargs))
@@ -414,3 +420,14 @@ def test_setup_initializes_native_local_omp_directories(tmp_path, monkeypatch):
     assert initialization[0][1]['cwd'] == tmp_path
     assert initialization[0][1]['env']['OMP_PROFILE'] == 'default'
     assert all(path.is_dir() for path in installer.omp_runtime.runtime_directories(tmp_path))
+    assert plugin_calls == [(tmp_path, str(binaries['omp']), {'run': run})]
+
+
+def test_probe_omp_requires_native_plugin_capability_floor():
+    def run(argv, **_kwargs):
+        if argv[1:] == ['--version']:
+            return result('omp/18.13.3\n')
+        return fake_run(argv)
+
+    with pytest.raises(Refusal, match='18.14.0'):
+        probe_omp('/opt/omp', run)
