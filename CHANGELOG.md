@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Documented guided Linux x86-64 installation, verified dependency receipts, explicit OMP authentication boundary, backend-aware central start, pane-bound Herdr workers, and retention-first refusal behavior.
 - Verified the bounded reviewer against real OMP 18.3.2 public modules: provider-free scripted AgentSession persistence, restricted tools, disabled telemetry, and enabled loopback-only OTLP purpose/run metadata; approved disposable user-systemd lifecycle evidence is recorded.
 - Hardened reviewer deadline enforcement across collection, capability discovery, and child dispatch; reviewer immutable records now refuse unsafe symlink and non-regular paths.
 
@@ -26,3 +27,4 @@
 - Added per-process managed-observability generation receipts, explicit stale-restart status, retained exited receipts, and local Collector diagnostics that keep current queue fullness, historical admission failures, and sanitized disk/file-storage failures distinct from unknown delivery state.
 - Documented managed-observability operations, prerequisites, loopback ownership, native-session authority, sensitive full-content handling, queue/delivery limits, degradation and Cursor exclusion; recorded disposable two-home native OMP-to-Collector-to-Langfuse acceptance.
 - Hardened managed-observability config provenance, read-only status inspection, native binding visibility, and managed resource identity.
+- Verified guided local installation and public central start through isolated tmux and Herdr PTYs, including canonical clone boundary, retained reattachment, conflict refusal, and owned-runtime cleanup.

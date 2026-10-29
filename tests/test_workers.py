@@ -69,6 +69,136 @@ def test_omp_launch_persists_fresh_native_binding_before_endpoint_creation():
 
 
 
+def _proven_central(home, monkeypatch, backend='herdr'):
+    import hashlib
+    import time
+    from agd_lib import launcher, store, supervision
+
+    token = 'worker-inheritance-token'
+    start = supervision.process_start(os.getpid())
+    receipt = {
+        'schema': 1, 'launch_id': str(uuid.uuid4()), 'endpoint_token': token,
+        'backend': backend, 'phase': 'ready', 'endpoint': {'id': 'central'},
+        'managed_command': ['agd', 'observability', 'central'], 'expected_process_argv': ['/opt/omp'],
+        'owner': {'pid': os.getpid(), 'start': start},
+        'watcher': {'pid': os.getpid(), 'start': start},
+    }
+    store.atomic_json(home/'state'/'owner.json', {
+        'owner_pid': os.getpid(), 'owner_start': start, 'token': token,
+        'watcher_pid': os.getpid(), 'watcher_start': start, 'heartbeat': time.time(),
+    })
+    store.atomic_json(home/'state'/'central-launcher.json', receipt)
+
+    def inspect(_home, current):
+        return {'endpoint': current['endpoint'], 'foreground': {
+            'launch_id': current['launch_id'], 'endpoint_token': current['endpoint_token'],
+            'pid': os.getpid(), 'start': start, 'argv': current['expected_process_argv']}}
+
+    monkeypatch.setattr(launcher, '_backend_inspect', inspect)
+    return receipt, {
+        'AGD_HOME': str(home), 'AGD_LAUNCHER_BACKEND': backend,
+        'AGD_LAUNCH_ID': receipt['launch_id'],
+        'AGD_ENDPOINT_TOKEN_HASH': hashlib.sha256(token.encode()).hexdigest(),
+    }
+
+
+def _prepared_task(home, task_id):
+    brief = home / f'{task_id}.md'
+    brief.write_text('Inspect value.txt.\n')
+    task = command(home, 'task', 'create', task_id, '--project', 'sample',
+                   '--brief', str(brief), '--kind', 'scout')
+    task['endpoint'] = {'preserved': task_id}
+    tasks.save(home, task)
+    return tasks.read(home, task_id)
+
+
+def test_omitted_backend_inherits_proven_central_and_explicit_override_stays_local(monkeypatch):
+    from agd_lib import launcher
+    with lab() as (home, _):
+        inherited = _prepared_task(home, 'inherited')
+        explicit = _prepared_task(home, 'explicit')
+        receipt, environment = _proven_central(home, monkeypatch)
+
+        class Endpoint:
+            def available(self): pass
+            def prepare(self, _home): pass
+            def create(self, _home, task_id, incarnation, _work, _argv):
+                return {'task': task_id, 'incarnation': incarnation}
+
+        for key in environment:
+            monkeypatch.setenv(key, environment[key])
+        monkeypatch.setattr(workers, 'backend', lambda _task: Endpoint())
+        monkeypatch.setattr(workers.shutil, 'which', lambda _name: '/bin/true')
+        assert workers.launch(home, 'inherited')['backend'] == 'herdr'
+        assert tasks.read(home, 'inherited')['lease_id'] == inherited['lease_id']
+        assert (home/'state'/'central-launcher.json').read_bytes() == launcher._bytes(receipt)
+
+        monkeypatch.setenv('AGD_LAUNCH_ID', 'mismatched-but-explicit-override')
+        assert workers.launch(home, 'explicit', selected_backend='tmux')['backend'] == 'tmux'
+        assert tasks.read(home, 'explicit')['lease_id'] == explicit['lease_id']
+
+
+def test_omitted_backend_refusals_preserve_worker_and_central_records(monkeypatch):
+    import pytest
+    from agd_lib import launcher, store
+
+    def refuse(task_id, change, message):
+        with lab() as (home, _):
+            task = _prepared_task(home, task_id)
+            receipt, environment = _proven_central(home, monkeypatch)
+            for key, value in environment.items():
+                monkeypatch.setenv(key, value)
+            change(home, receipt)
+            before_receipt = (home/'state'/'central-launcher.json').read_bytes()
+            before_config = (home/'data'/'launcher.json').read_bytes()
+            with pytest.raises(store.Refusal, match=message):
+                workers.launch(home, task_id)
+            assert tasks.read(home, task_id) == task
+            assert (home/'state'/'central-launcher.json').read_bytes() == before_receipt
+            assert (home/'data'/'launcher.json').read_bytes() == before_config
+
+    def mismatched(home, _receipt):
+        (home/'data'/'launcher.json').write_text(
+            '{"schema": 1, "backend": "tmux", "herdr_session": "agd-00000000000000000000000000000000"}\n')
+        monkeypatch.setenv('AGD_LAUNCH_ID', 'different')
+    refuse('mismatched', mismatched, 'inherited launcher environment differs')
+    refuse('malformed', lambda home, _receipt: (home/'state'/'central-launcher.json').write_bytes(b'{'),
+           'launcher receipt is malformed')
+    refuse('interrupted', lambda home, receipt: store.atomic_json(
+        home/'state'/'central-launcher.json', {**receipt, 'phase': 'spawned'}),
+           'central launch was interrupted')
+    refuse('stale-owner', lambda home, _receipt: store.atomic_json(home/'state'/'owner.json', {
+        'owner_pid': os.getpid(), 'owner_start': 'stale', 'token': 'worker-inheritance-token',
+        'watcher_pid': os.getpid(), 'watcher_start': 'stale', 'heartbeat': 0}),
+           'central owner identity changed')
+
+    def replaced(_home, _receipt):
+        monkeypatch.setattr(launcher, '_backend_inspect',
+                            lambda _home, current: {'endpoint': {'id': 'replaced'}, 'foreground': {
+                                'launch_id': current['launch_id'], 'endpoint_token': current['endpoint_token'],
+                                'pid': os.getpid(), 'start': current['owner']['start'],
+                                'argv': current['expected_process_argv']}})
+    refuse('replaced-endpoint', replaced, 'central endpoint continuity is unproven')
+
+
+def test_omitted_backend_falls_back_to_saved_backend(monkeypatch):
+    with lab() as (home, _):
+        task = _prepared_task(home, 'fallback')
+        (home/'data'/'launcher.json').write_text(
+            '{"schema": 1, "backend": "herdr", "herdr_session": "agd-00000000000000000000000000000000"}\n')
+
+        class Endpoint:
+            def available(self): pass
+            def prepare(self, _home): pass
+            def create(self, _home, task_id, incarnation, _work, _argv):
+                return {'task': task_id, 'incarnation': incarnation}
+
+        monkeypatch.setattr(workers, 'backend', lambda _task: Endpoint())
+        launched = workers.launch(home, 'fallback')
+        assert launched['backend'] == 'herdr'
+        assert tasks.read(home, 'fallback')['lease_id'] == task['lease_id']
+
+
 def test_relaunch_keeps_prior_native_data_when_final_executable_is_true(monkeypatch):
     with lab() as (home, _):
         brief = home / 'brief.md'; brief.write_text('Inspect value.txt.\n')

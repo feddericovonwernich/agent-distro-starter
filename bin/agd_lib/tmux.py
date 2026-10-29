@@ -1,8 +1,9 @@
 import hashlib
+import os
 import shlex
 import uuid
 from pathlib import Path
-from . import store
+from . import store, supervision
 
 
 def prefix(home):
@@ -91,3 +92,90 @@ def close(endpoint):
         return {'presence': 'missing'}
     call(endpoint, 'kill-pane', '-t', endpoint['pane'])
     return {'presence': inspect(endpoint)['presence']}
+
+
+
+
+def _foreground(pid):
+    argv = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')[:-1]
+    return supervision.process_start(pid), [arg.decode() for arg in argv], os.readlink(f'/proc/{pid}/fd/0')
+
+
+def _central_endpoint(receipt):
+    endpoint = receipt.get('endpoint')
+    if (not isinstance(endpoint, dict)
+            or set(endpoint) != {'server_pid', 'window', 'pane', 'tty', 'token', 'launch_id'}
+            or not all(isinstance(endpoint.get(key), str) and endpoint[key]
+                       for key in endpoint)):
+        raise store.Refusal('tmux central endpoint is malformed')
+    if endpoint['token'] != receipt.get('endpoint_token') or endpoint['launch_id'] != receipt.get('launch_id'):
+        raise store.Refusal('tmux central endpoint identity differs')
+    return endpoint
+
+
+def create_central(home: Path, launch_id: str, endpoint_token: str, managed_argv: list[str],
+                   launch_env: dict[str, str], expected_omp_argv: list[str]) -> dict:
+    if (not all(isinstance(arg, str) for arg in managed_argv)
+            or not all(isinstance(arg, str) for arg in expected_omp_argv)
+            or not all(isinstance(key, str) and isinstance(value, str) for key, value in launch_env.items())):
+        raise store.Refusal('tmux central command is malformed')
+    cmd, session = prefix(home), 'agd'
+    if store.run([*cmd, 'has-session', '-t', session], check=False).returncode:
+        store.run([*cmd, 'new-session', '-d', '-s', session, '-n', 'anchor', '-c', str(home)], timeout=10)
+    server_pid = store.run([*cmd, 'display-message', '-p', '#{pid}']).stdout.strip()
+    command = shlex.join(['exec', 'env', *[f'{key}={value}' for key, value in sorted(launch_env.items())], *managed_argv])
+    window, pane, tty = store.run([*cmd, 'new-window', '-d', '-P', '-F', '#{window_id} #{pane_id} #{pane_tty}', '-t', session,
+                                   '-n', 'central', '-c', str(home), command]).stdout.strip().split()
+    endpoint = {'server_pid': server_pid, 'window': window, 'pane': pane, 'tty': tty,
+                'token': endpoint_token, 'launch_id': launch_id}
+    store.atomic_json(home / 'state' / 'central-tmux-pending.json', endpoint)
+    return endpoint
+
+
+def finalize_central(home: Path, receipt: dict) -> None:
+    endpoint = _central_endpoint(receipt)
+    try:
+        store.run([*prefix(home), 'set-option', '-p', '-t', endpoint['pane'],
+                   '@agd_central_token', endpoint['token']], timeout=10)
+    except Exception as error:
+        raise store.Refusal(f'tmux central pane started but token is unconfirmed: {endpoint}') from error
+
+
+def inspect_central(home: Path, receipt: dict) -> dict:
+    endpoint = _central_endpoint(receipt)
+    cmd = prefix(home)
+    server = store.run([*cmd, 'display-message', '-p', '#{pid}'], check=False)
+    if server.returncode or server.stdout.strip() != endpoint['server_pid']:
+        raise store.Refusal('tmux central server is missing or replaced')
+    token = store.run([*cmd, 'show-options', '-p', '-v', '-t', endpoint['pane'],
+                       '@agd_central_token'], check=False)
+    if token.returncode or token.stdout.strip() != endpoint['token']:
+        raise store.Refusal('tmux central pane token differs')
+    pane = store.run([*cmd, 'list-panes', '-F',
+                      '#{window_id} #{pane_id} #{pane_tty} #{pane_pid} #{pane_dead}',
+                      '-t', endpoint['window']], check=False)
+    if pane.returncode:
+        raise store.Refusal('tmux central window is missing')
+    try:
+        window, pane_id, tty, pid, dead = pane.stdout.strip().split()
+        if window != endpoint['window'] or pane_id != endpoint['pane'] or tty != endpoint['tty']:
+            raise store.Refusal('tmux central pane membership differs')
+        if dead != '0':
+            raise ValueError
+        pid = int(pid)
+        start, argv, process_tty = _foreground(pid)
+        if process_tty != tty:
+            raise store.Refusal('tmux central foreground tty differs')
+    except (OSError, ValueError, UnicodeDecodeError) as error:
+        raise store.Refusal('tmux central foreground is unavailable') from error
+    return {'endpoint': endpoint, 'foreground': {'launch_id': receipt['launch_id'],
+            'endpoint_token': receipt['endpoint_token'], 'pid': pid,
+            'start': start, 'argv': argv, 'tty': tty}}
+
+
+def attach_argv(home: Path, receipt: dict) -> list[str]:
+    endpoint = _central_endpoint(receipt)
+    cmd = prefix(home)
+    store.run([*cmd, 'select-window', '-t', endpoint['window']], timeout=10)
+    store.run([*cmd, 'select-pane', '-t', endpoint['pane']], timeout=10)
+    return [*cmd, 'switch-client' if os.environ.get('TMUX') else 'attach-session', '-t', 'agd']

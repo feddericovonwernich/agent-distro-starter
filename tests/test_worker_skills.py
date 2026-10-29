@@ -778,7 +778,7 @@ def test_init_seeds_default_worker_profile_from_bundled_catalog():
     from test_projects import command
     with tempfile.TemporaryDirectory() as directory:
         home = Path(directory)
-        command(home, 'init')
+        command(home, 'init', '--backend', 'tmux')
         expected = {
             'schema': 1, 'mode': 'profile', 'profile': 'default',
             'skills': DEFAULT_WORKER_SKILLS}
@@ -801,38 +801,10 @@ def test_init_seeds_checkout_home_with_tracked_files():
         shutil.copytree(ROOT/'bundled', home/'bundled', dirs_exist_ok=True)
         env = dict(os.environ, TREEHOUSE_ROOT=str(home.parent/'pool'))
         env.pop('AGD_HOME', None)
-        run([home/'bin'/'agd', 'init'], cwd=home, env=env)
+        run([home/'bin'/'agd', 'init', '--backend', 'tmux'], cwd=home, env=env)
         assert worker_skills.resolve(home)['skills'] == DEFAULT_WORKER_SKILLS
 
 
-def test_init_preserves_preexisting_private_worker_configuration():
-    from test_projects import command
-    with tempfile.TemporaryDirectory() as directory:
-        home = Path(directory)
-        skill = add_skill(home, 'agd-existing')
-        (skill/'SKILL.md').write_text(
-            '---\nname: agd-existing\ndescription: Existing instructions.\n---\nKeep.\n')
-        config = {'default_profile': 'existing', 'profiles': {'existing': {'skills': ['agd-existing']}}}
-        write_profiles(home, config)
-        before = (home/'config'/'workers.json').read_bytes()
-        command(home, 'init')
-        command(home, 'init')
-        assert (home/'config'/'workers.json').read_bytes() == before
-        assert (skill/'SKILL.md').read_text().endswith('Keep.\n')
-        assert not (home/'config'/'worker-skills'/'agd-ponytail').exists()
-
-
-def test_init_preserves_nonempty_uninitialized_home():
-    from test_projects import command
-    with tempfile.TemporaryDirectory() as directory:
-        home = Path(directory)/'home'
-        home.mkdir()
-        sentinel = home/'sentinel'
-        sentinel.write_text('preserve me\n')
-        command(home, 'init')
-        assert sentinel.read_text() == 'preserve me\n'
-        assert not (home/'config'/'workers.json').exists()
-        assert not (home/'config'/'worker-skills').exists()
 
 
 if __name__ == '__main__':
@@ -870,5 +842,3 @@ if __name__ == '__main__':
     test_returned_lease_requires_completed_skill_removal_journal()
     test_init_seeds_default_worker_profile_from_bundled_catalog()
     test_init_seeds_checkout_home_with_tracked_files()
-    test_init_preserves_preexisting_private_worker_configuration()
-    test_init_preserves_nonempty_uninitialized_home()

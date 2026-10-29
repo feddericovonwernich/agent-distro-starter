@@ -16,7 +16,7 @@ def lab():
         run(['git', 'add', 'value.txt'], cwd=seed)
         run(['git', 'commit', '-m', 'initial'], cwd=seed)
         run(['git', 'clone', '--bare', seed, origin])
-        command(home, 'init')
+        command(home, 'init', '--backend', 'tmux')
         command(home, 'project', 'add', 'sample', '--source', str(origin))
         project = home/'projects'/'sample'
         run(['git', 'config', 'user.name', 'Distro Test'], cwd=project)

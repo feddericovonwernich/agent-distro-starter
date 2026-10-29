@@ -4,19 +4,26 @@ import shutil
 import subprocess
 import os
 import json
+import pwd
 import sys
 import uuid
-import pwd
 from pathlib import Path
-from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr, relay, observability, reviewer, reviewer_runner, reviewer_timer
+from urllib.request import urlopen
+from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr, relay, observability, reviewer, reviewer_runner, reviewer_timer, launcher, installer
 
 
 def parser():
     p = argparse.ArgumentParser(prog='agd')
     p.add_argument('--home')
     sub = p.add_subparsers(dest='command', required=True)
-    sub.add_parser('init')
+    init = sub.add_parser('init')
+    init.add_argument('--backend', choices=('tmux', 'herdr'), required=True)
+    start = sub.add_parser('start')
+    start.add_argument('--backend', choices=('tmux', 'herdr'))
     doctor = sub.add_parser('doctor')
+    installer_command = sub.add_parser('installer').add_subparsers(dest='installer_operation', required=True)
+    installer_setup = installer_command.add_parser('setup')
+    installer_setup.add_argument('--backend', choices=('tmux', 'herdr'), required=True)
     doctor.add_argument('--harness', choices=('omp', 'cursor'), default='omp')
     doctor.add_argument('--backend', choices=('tmux', 'herdr'), default='tmux')
     project = sub.add_parser('project').add_subparsers(dest='operation', required=True)
@@ -79,7 +86,7 @@ def parser():
         op.add_argument('id')
         if action == 'launch':
             op.add_argument('--harness', choices=('omp', 'cursor'), default='omp')
-            op.add_argument('--backend', choices=('tmux', 'herdr'), default='tmux')
+            op.add_argument('--backend', choices=('tmux', 'herdr'))
             op.add_argument('--unattended', action='store_true')
             op.add_argument('--profile')
             op.add_argument('--skill-mode', choices=('profile', 'curated'), default='profile')
@@ -148,7 +155,7 @@ def parser():
 
 def main(args):
     home = store.home(args.home)
-    mutation = (args.command == 'init' or
+    mutation = (args.command in ('init', 'installer') or
                 args.command == 'project' and args.operation not in ('list', 'inspect') or
                 args.command == 'task' and args.operation not in ('list', 'status') or
                 args.command == 'worker' and args.operation not in ('inspect', 'inbox', 'skills', 'profiles') or
@@ -183,13 +190,37 @@ def main(args):
             else:
                 still_fresh = fresh and lock_only and all(
                     path.name == 'state' for path in home.iterdir())
+            if not still_fresh:
+                raise store.Refusal('fresh non-symlink launcher home required')
             for name in ('config', 'projects', 'data/projects', 'data/tasks', 'state'):
                 (home/name).mkdir(parents=True, exist_ok=True, mode=0o700)
-            if not (home/'data'/'home.json').exists():
-                store.atomic_json(home/'data'/'home.json', {'schema': 1, 'home_id': str(uuid.uuid4())})
-            if still_fresh:
-                worker_skills.seed_defaults(home)
+            store.atomic_json(home/'data'/'home.json', {'schema': 1, 'home_id': str(uuid.uuid4())})
+            launcher.initialize(home, args.backend)
+            worker_skills.seed_defaults(home)
         return {'home': str(home)}
+    if args.command == 'start':
+        inherited = dict(os.environ)
+        selected = (args.backend if args.backend is not None else
+                    launcher.active_backend(home, inherited) or launcher.resolve_backend(home, None))
+        dependencies = installer.validate_dependencies(home, store.run)
+        if 'omp' not in dependencies or selected == 'herdr' and 'herdr' not in dependencies:
+            raise store.Refusal('selected launcher dependency is unavailable')
+        if selected == 'tmux':
+            store.run(['tmux', '-V'])
+        target = launcher.prepare_start(home, selected, inherited,
+                                        launcher._backend_create, launcher._backend_inspect,
+                                        launcher._backend_attach)
+        os.execvpe(target.attach_argv[0], target.attach_argv, target.env)
+    if args.command == 'installer':
+        def fetch_json(url):
+            with urlopen(url) as response:
+                return json.load(response)
+        def stream_url(url):
+            with urlopen(url) as response:
+                yield from iter(lambda: response.read(1024 * 1024), b'')
+        def prompt(message):
+            return input(f'{message} [y/N] ').strip().lower() in ('y', 'yes')
+        return installer.setup(home, args.backend, prompt, fetch_json, stream_url, store.run)
     if args.command == 'doctor':
         names = ['git', 'treehouse', 'omp' if args.harness == 'omp' else 'cursor-agent',
                  args.backend]

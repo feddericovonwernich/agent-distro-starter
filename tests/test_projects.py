@@ -32,7 +32,7 @@ def test_project_lifecycle():
         run(['git', 'add', 'value.txt'], cwd=seed)
         run(['git', 'commit', '-m', 'initial'], cwd=seed)
         run(['git', 'clone', '--bare', seed, origin])
-        command(home, 'init')
+        command(home, 'init', '--backend', 'tmux')
         info = command(home, 'project', 'add', 'sample', '--source', str(origin), '--base', 'main')
         project = home/'projects'/'sample'
         assert info['path'] == str(project)
@@ -66,6 +66,8 @@ def test_project_lifecycle():
         assert command(home, 'project', 'remove', 'sample', '--delete-clone',
                        '--approval', approval['id'])['clone_deleted']
         assert not project.exists()
+
+
 
 
 if __name__ == '__main__':

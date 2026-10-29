@@ -19,6 +19,10 @@ export function centralWarning(managed: boolean) {
   return managed ? undefined : 'This bare OMP session is unmanaged: AGD does not control its transcript location or telemetry export. Start `agd observability central` for a managed central session.';
 }
 
+export function launcherOwnerToken(endpointToken: string | undefined, randomOwner: string) {
+  return endpointToken || randomOwner;
+}
+
 function startEvidence(pid: number): string {
   return readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ', 2)[1].split(' ')[19];
 }
@@ -41,6 +45,7 @@ async function readSessionHealth(): Promise<Health> {
   return { delegatedWork: health.delegatedWork, watcherHealthy: health.watcherHealthy };
 }
 
+
 type Context = { isIdle: () => boolean; ui: {
   setStatus: (key: string, text: string | undefined) => void;
   notify: (message: string, type?: 'info' | 'warning' | 'error') => void;
@@ -51,8 +56,7 @@ type ExtensionAPI = {
 };
 
 export default function primary(api: ExtensionAPI) {
-  const token = randomUUID();
-  process.env.AGD_OWNER = token;
+  const token = launcherOwnerToken(process.env.AGD_ENDPOINT_TOKEN, randomUUID());
   let generation = 0;
   let child: ChildProcess | null = null;
   let startup = '';
@@ -108,7 +112,8 @@ export default function primary(api: ExtensionAPI) {
     const ownerStart = startEvidence(process.pid);
     const watcher = spawn(cli, ['--home', home, 'session', 'start',
       '--owner-pid', String(process.pid), '--owner-start', ownerStart,
-      '--generation', String(active)], { stdio: ['ignore', 'pipe', 'pipe'] });
+      '--generation', String(active)], { stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, AGD_OWNER: token } });
     child = watcher;
     let pending = '';
     watcher.stdout?.on('data', (chunk: Buffer) => {

@@ -17,7 +17,7 @@ def test_distinct_leases_and_preserved_project():
         run(['git', 'add', 'value.txt'], cwd=seed)
         run(['git', 'commit', '-m', 'initial'], cwd=seed)
         run(['git', 'clone', '--bare', seed, origin])
-        command(home, 'init')
+        command(home, 'init', '--backend', 'tmux')
         command(home, 'project', 'add', 'sample', '--source', str(origin))
         brief = home/'brief.md'
         brief.write_text('Change the file and report the checks.\n')
