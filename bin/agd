@@ -7,7 +7,6 @@ import json
 import pwd
 import sys
 import uuid
-import pwd
 from pathlib import Path
 from urllib.request import urlopen
 from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr, relay, observability, reviewer, reviewer_runner, reviewer_timer, launcher, installer
