@@ -40,7 +40,7 @@ for(const [name,value] of Object.entries({Agent:core.Agent,streamSimple:ai.strea
 console.log(JSON.stringify({ai_url:import.meta.resolve(modules.ai),core_url:import.meta.resolve(modules.core),sdk_url:import.meta.resolve(modules.sdk),registry_url:import.meta.resolve(modules.registry),manager_url:import.meta.resolve(modules.manager),session_url:import.meta.resolve(modules.session),telemetry_url:import.meta.resolve(modules.telemetry),resolver_url:import.meta.resolve(modules.resolver),omp_version:process.argv[1]}));"""
     base_env = {key: os.environ[key] for key in ('PATH', 'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME') if key in os.environ}
     env = omp_runtime.environment(home, base_env) if home is not None else base_env
-    try: result = subprocess.run([binary, '-e', script, manifest['version']], capture_output=True, text=True, cwd=root, timeout=min(10, remaining), env=env)
+    try: result = subprocess.run([binary, '--no-env-file', '-e', script, manifest['version']], capture_output=True, text=True, cwd=root, timeout=min(10, remaining), env=env)
     except subprocess.TimeoutExpired as error: raise store.DependencyError('installed OMP runtime capability timed out') from error
     if result.returncode: raise store.DependencyError(f'installed OMP runtime capability unavailable: {result.stderr.strip()}')
     try: capability = json.loads(result.stdout)
@@ -58,7 +58,18 @@ console.log(JSON.stringify({ai_url:import.meta.resolve(modules.ai),core_url:impo
 
 
 
-def run_native_reviewer(home, intent, *, agent_dir, omp_binary='omp'):
+def _runtime_boundary(home, review_run_id):
+    runtime = reviewer.paths(home)['runtime'] / review_run_id
+    plugins = runtime / '.omp' / 'plugins'
+    reviewer._private(plugins)
+    reviewer.publish_immutable(
+        plugins / 'installed_plugins.json', {'version': 2, 'plugins': {}})
+    reviewer.publish_immutable(
+        plugins / 'omp-plugins.lock.json', {'plugins': {}, 'settings': {}})
+    return runtime
+
+
+def run_native_reviewer(home, intent, *, omp_binary='omp'):
     """Run one selector-only native child while retaining the private lease."""
     with reviewer.run_lease(home):
         config, started = reviewer.read_config(home), time.time()
@@ -76,7 +87,7 @@ def run_native_reviewer(home, intent, *, agent_dir, omp_binary='omp'):
             return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='timeout', packet=packet)
         if not packet['excerpts']:
             return reviewer.close_run(home, run['review_run_id'], 'no-work', packet=packet)
-        directory = Path(agent_dir)
+        directory = omp_runtime.agent_dir(home)
         if directory.is_symlink() or not directory.is_dir(): return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='agent-dir', packet=packet)
         try: capability = assert_runtime_capability(run['deadline_epoch_ms'], home=home, omp_binary=omp_binary)
         except Exception:
@@ -91,8 +102,9 @@ def run_native_reviewer(home, intent, *, agent_dir, omp_binary='omp'):
                 receipt.update(packet_id=packet['packet_id'], omp_version=capability['omp_version'])
                 store.atomic_json(reviewer.paths(home)['receipts'] / f"{run['review_run_id']}.json", receipt)
             env, _, _ = observability.reviewer_environment(home, run['review_run_id'])
+            runtime = _runtime_boundary(home, run['review_run_id'])
             payload = {'urls': {key: capability[f'{key}_url'] for key in ('ai', 'core', 'sdk', 'registry', 'manager', 'session', 'telemetry', 'resolver')},
-                       'input': {'cwd': str(store.home(home)), 'agentDir': str(directory.resolve()), 'sessionDir': observability.reviewer_session_dir(home, run['review_run_id']),
+                       'input': {'cwd': str(runtime), 'agentDir': str(directory.resolve()), 'sessionDir': observability.reviewer_session_dir(home, run['review_run_id']),
                                  'reviewRunId': run['review_run_id'], 'receipt': {'deadline_epoch_ms': run['deadline_epoch_ms'], 'omp_version': capability['omp_version']},
                                  'modelSelector': config['review_model'], 'reviewPrompt': reviewer._read_json(reviewer.paths(home)['manifests'] / f"{run['instruction_snapshot_ref']}.json")['text']}}
         except Exception:
@@ -101,7 +113,7 @@ def run_native_reviewer(home, intent, *, agent_dir, omp_binary='omp'):
         if not bun: return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='bun', packet=packet)
         stderr = bytearray()
         try:
-            process = subprocess.Popen([bun, str(Path(__file__).resolve().parents[2] / 'lib' / 'agd-reviewer-host.ts')], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, start_new_session=True)
+            process = subprocess.Popen([bun, '--no-env-file', str(Path(__file__).resolve().parents[2] / 'lib' / 'agd-reviewer-host.ts')], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=runtime, start_new_session=True)
         except OSError: return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='spawn', packet=packet)
         def drain():
             for chunk in iter(lambda: process.stderr.read(256), ''):
@@ -135,9 +147,9 @@ def run_native_reviewer(home, intent, *, agent_dir, omp_binary='omp'):
             return reviewer.close_run(home, run['review_run_id'], outcome, error_code='completion', diagnostic=bytes(stderr), packet=packet)
         return reviewer.finalize_run(home, run['review_run_id'], 'exited')
 
-def launch_timer(home, *, agent_dir, now=None):
+def launch_timer(home, *, now=None):
     intent = reviewer.timer_intent(home, now=now)
-    return None if intent is None else run_native_reviewer(home, intent, agent_dir=agent_dir)
+    return None if intent is None else run_native_reviewer(home, intent)
 
 
 def _request_id(value):

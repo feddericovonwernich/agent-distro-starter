@@ -31,7 +31,7 @@ test('native reviewer exports run attributes only to loopback OTLP', async () =>
     expect(payloads.every(payload => payload.type?.startsWith('application/x-protobuf'))).toBe(true);
     const values = new Map<string, string>();
     for (const payload of payloads) for (const [key, value] of spanAttributes(payload.encoding === 'gzip' ? Bun.gunzipSync(payload.body) : payload.body)) values.set(key, value);
-    expect(values.get('purpose')).toBe('background-skill-review');
+    expect(values.get('purpose'), JSON.stringify([...values])).toBe('background-skill-review');
     const marker = stdout.match(/^AGD_REVIEW_RUN_ID=([0-9a-f-]+)$/m)?.[1];
     expect(marker).toBeString();
     expect(values.get('review_run_id')).toBe(marker);

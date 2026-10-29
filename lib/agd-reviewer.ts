@@ -15,7 +15,7 @@ export type Native = {
   manager: { SessionManager: { create(cwd: string, sessionDir: string): Manager } };
   session: { AgentSession: new (options: unknown) => Session };
   resolver: { getModelMatchPreferences(settings: Settings): unknown; resolveAllowedModels(registry: Registry, settings: Settings, preferences: unknown): Promise<Model[]>; resolveModelRoleValue(role: unknown, allowed: Model[], options: unknown): { model: Model | undefined }; resolveCliModel(options: unknown): { model: Model | undefined; error?: string }; formatModelString(model: Model): string };
-  telemetry: { initTelemetryExport(): Promise<void>; isTelemetryExportEnabled(): boolean; createTelemetryExportConfig(options: unknown): unknown; flushTelemetryExport(): Promise<void> };
+  telemetry: { initTelemetryExport(exportEnabled: boolean): Promise<void>; isTelemetryExportEnabled(): boolean; createTelemetryExportConfig(options: unknown): unknown; flushTelemetryExport(): Promise<void> };
 };
 export interface Broker { rpc(op: string, args: unknown): Promise<unknown>; reserveModelCall(): Promise<void>; settleModelCall(): Promise<void>; persistNativeSessionId(id: string): Promise<void>; persistModel(id: string): Promise<void>; finalResult(): Promise<{ reportId: string }>; }
 export interface ReviewerInput { cwd: string; agentDir: string; sessionDir: string; reviewRunId: string; receipt: { deadline_epoch_ms: number; omp_version: string }; modelSelector: string | null; reviewPrompt: string; broker: Broker; native: Native; }
@@ -57,7 +57,7 @@ async function resolveModel(input: ReviewerInput, settings: Settings, registry: 
 }
 
 export async function runReviewer(input: ReviewerInput, streamFn: StreamFn = input.native.ai.streamSimple): Promise<{ reportId: string }> {
-  const { sdk, registry: registryApi, manager: managerApi, session: sessionApi, core, ai, telemetry } = input.native; await telemetry.initTelemetryExport();
+  const { sdk, registry: registryApi, manager: managerApi, session: sessionApi, core, ai, telemetry } = input.native; await telemetry.initTelemetryExport(true);
   const settings = await sdk.Settings.init({ cwd: input.cwd, agentDir: input.agentDir, readOnly: true, overrides: { 'compaction.enabled': false, 'compaction.midTurnEnabled': false, 'compaction.autoContinue': false, 'compaction.asyncEnabled': false, 'compaction.idleEnabled': false, 'retry.enabled': false, 'retry.maxRetries': 0, 'retry.modelFallback': false, 'retry.usageAwareFallback': false, 'advisor.enabled': false, 'autolearn.enabled': false, 'autolearn.autoContinue': false } });
   const auth = await sdk.discoverAuthStorage(input.agentDir, { cwd: input.cwd, settings });
   const registry = new registryApi.ModelRegistry(auth, undefined, { settings }); const model = await resolveModel(input, settings, registry);

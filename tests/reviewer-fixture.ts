@@ -27,7 +27,9 @@ export async function startBridge() {
     const request = queue.then(async () => {
       const id = crypto.randomUUID();
       proc.stdin.write(`${JSON.stringify({ id, op, args })}\n`);
-      const reply = JSON.parse(await next());
+      const reply = JSON.parse(await next().catch(error => {
+        throw new Error(`${op}: ${String(error)}`);
+      }));
       if (reply.id !== id || !reply.ok) throw new Error(reply.error || 'bridge refusal');
       return reply.value;
     });

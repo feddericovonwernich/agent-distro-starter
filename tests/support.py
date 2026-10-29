@@ -39,6 +39,7 @@ def write_native_plugins(home, plugin_skills=None):
     marketplaces = {'version': 1, 'marketplaces': []}
     config = home / 'data/omp/home/.omp'
     project_plugins = home / '.omp/plugins'
+    (home / 'data/omp/agent').mkdir(parents=True, exist_ok=True)
     project_plugins.mkdir(parents=True, exist_ok=True)
     for plugin_id, (market, publisher, package, version) in PLUGIN_SPECS.items():
         payload = config / 'plugins/cache/plugins' / f'{market}___fixture___{version}'

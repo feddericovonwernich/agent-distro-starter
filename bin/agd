@@ -361,10 +361,12 @@ def main(args):
     if args.command == 'reviewer':
         if args.reviewer_op == 'run':
             if args.timer and args.retrospective_review_run: raise store.Refusal('timer runs cannot be retrospective')
-            agent_dir = Path(__file__).resolve().parents[1] / '.omp'
-            if args.timer: return reviewer_runner.launch_timer(home, agent_dir=agent_dir)
+            if args.timer: return reviewer_runner.launch_timer(home)
             selected = tuple(args.retrospective_review_run)
-            return reviewer_runner.run_native_reviewer(home, reviewer.enqueue_intent(home, kind='retrospective' if selected else 'manual', retrospective_review_run_ids=selected), agent_dir=agent_dir)
+            return reviewer_runner.run_native_reviewer(
+                home, reviewer.enqueue_intent(
+                    home, kind='retrospective' if selected else 'manual',
+                    retrospective_review_run_ids=selected))
         if args.reviewer_op == 'status':
             return {'timer': reviewer_timer._read_record(home), 'runs': len(list(reviewer.paths(home)['receipts'].glob('*.json')))}
         if args.reviewer_op == 'reports':
