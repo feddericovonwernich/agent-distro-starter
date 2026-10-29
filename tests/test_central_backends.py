@@ -226,7 +226,8 @@ def test_herdr_central_uses_named_receipted_session_and_restores_focus(tmp_path,
         if argv == ['herdr', 'session', 'list', '--json']:
             return SimpleNamespace(returncode=0, stdout='[]', stderr='')
         if argv[-2:] == ['status', 'server']:
-            return SimpleNamespace(returncode=0, stdout='status: running\ncompatible: yes\nprotocol: 20\nsocket: /tmp/herdr.sock\n', stderr='')
+            return SimpleNamespace(returncode=0, stdout=('status: running\nversion: 0.9.5\nendpoint_compatible: yes\n'
+                                                        'private_protocol: 22\nprivate_protocol_compatible: yes\nsocket: /tmp/herdr.sock\n'), stderr='')
         command = tuple(argv[3:])
         if command == ('workspace', 'focus', 'workspace-1'):
             focus.append(('workspace', 'workspace-1'))
@@ -288,6 +289,103 @@ def test_herdr_central_uses_named_receipted_session_and_restores_focus(tmp_path,
     with __import__('pytest').raises(store.Refusal, match='unreceipted'):
         launcher._backend_create('herdr', home, 'other', 'token', ['/opt/agd'], {'PATH': '/bin'}, ['/opt/omp'])
 
+def test_initial_owner_waits_for_transient_herdr_foreground_inspection(monkeypatch):
+    from agd_lib import launcher, store
+
+    owner = {'owner_pid': 1}
+    outcomes = iter([store.Refusal('Herdr foreground process is unverified'), owner])
+
+    def prove(*_):
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(launcher, '_prove', prove)
+    assert launcher._await_initial_owner(Path('/'), {}, object()) == owner
+
+
+def test_herdr_available_accepts_current_status(monkeypatch):
+    import stat
+    from agd_lib import herdr
+
+    class Socket:
+        st_mode, st_dev, st_ino = stat.S_IFSOCK, 9, 10
+
+
+    class SocketPath:
+        def __init__(self, _):
+            pass
+
+        def is_absolute(self):
+            return True
+
+        def stat(self):
+            return Socket()
+    monkeypatch.setenv('HERDR_ENV', '1')
+    monkeypatch.setenv('AGD_HERDR_SESSION', 'agd-test')
+    monkeypatch.setattr(herdr.store, 'run', lambda *_args, **_kwargs: SimpleNamespace(
+        returncode=0, stdout=('status: running\nversion: 0.9.5\nendpoint_compatible: yes\n'
+                              'private_protocol: 22\nprivate_protocol_compatible: yes\nsocket: /tmp/herdr.sock\n')))
+    monkeypatch.setattr(herdr, 'Path', SocketPath)
+    assert herdr.available()['protocol'] == '22'
+
+def test_current_herdr_status_requires_version(monkeypatch):
+    import stat
+    from agd_lib import herdr, launcher, store
+
+    class Socket:
+        st_mode, st_dev, st_ino = stat.S_IFSOCK, 9, 10
+
+    class SocketPath:
+        def __init__(self, _):
+            pass
+
+        def is_absolute(self):
+            return True
+
+        def stat(self):
+            return Socket()
+
+    monkeypatch.setenv('HERDR_ENV', '1')
+    monkeypatch.setenv('AGD_HERDR_SESSION', 'agd-test')
+    monkeypatch.setattr(herdr.store, 'run', lambda *_args, **_kwargs: SimpleNamespace(
+        returncode=0, stdout=('status: running\nendpoint_compatible: yes\nprivate_protocol: 22\n'
+                              'private_protocol_compatible: yes\nsocket: /tmp/herdr.sock\n')))
+    monkeypatch.setattr(herdr, 'Path', SocketPath)
+    monkeypatch.setattr(launcher, 'Path', SocketPath)
+    with __import__('pytest').raises(store.DependencyError, match='incompatible'):
+        herdr.available()
+    with __import__('pytest').raises(store.Refusal, match='not running'):
+        launcher._herdr_status('agd-test')
+
+def test_not_running_herdr_status_refuses_cleanly(monkeypatch):
+    import stat
+    from agd_lib import herdr, launcher, store
+
+    class Socket:
+        st_mode, st_dev, st_ino = stat.S_IFSOCK, 9, 10
+
+    class SocketPath:
+        def __init__(self, _):
+            pass
+
+        def is_absolute(self):
+            return True
+
+        def stat(self):
+            return Socket()
+
+    monkeypatch.setenv('HERDR_ENV', '1')
+    monkeypatch.setenv('AGD_HERDR_SESSION', 'agd-test')
+    monkeypatch.setattr(herdr.store, 'run', lambda *_args, **_kwargs: SimpleNamespace(
+        returncode=0, stdout='status: not running\nsocket: /tmp/herdr.sock\n'))
+    monkeypatch.setattr(herdr, 'Path', SocketPath)
+    monkeypatch.setattr(launcher, 'Path', SocketPath)
+    with __import__('pytest').raises(store.DependencyError, match='session is not running'):
+        herdr.available()
+    with __import__('pytest').raises(store.Refusal, match='session is not running'):
+        launcher._herdr_status('agd-test')
 
 def test_herdr_start_checkpoints_socket_before_workspace_failure(tmp_path, monkeypatch):
     import json

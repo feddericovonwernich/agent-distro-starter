@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from agd_lib import observability, store, supervision
+from agd_lib import installer, observability, store, supervision
 
 
 @dataclass(frozen=True)
@@ -161,10 +161,10 @@ def _await_initial_owner(home: Path, receipt: dict, inspect) -> dict:
         try:
             return _prove(home, receipt, inspect)
         except store.Refusal as error:
-            if str(error) != 'central owner is missing' or time.monotonic() >= deadline:
+            if (str(error) not in {'central owner is missing', 'Herdr foreground process is unverified'}
+                    or time.monotonic() >= deadline):
                 raise
             time.sleep(.05)
-
 
 
 
@@ -220,16 +220,21 @@ def _herdr_status(session: str) -> dict:
         result = store.run(['herdr', '--session', session, 'status', 'server'], check=False, timeout=10)
     except subprocess.TimeoutExpired as error:
         raise store.Refusal('Herdr server did not respond') from error
+    if result.returncode:
+        raise store.Refusal('Herdr session is not running')
+    try:
+        installer._parse_herdr_status(result.stdout)
+    except store.Refusal as error:
+        raise store.Refusal('Herdr session is not running') from error
     fields = dict(line.split(': ', 1) for line in result.stdout.splitlines() if ': ' in line)
-    if (result.returncode or fields.get('status') != 'running' or fields.get('compatible') != 'yes'
-            or not fields.get('protocol')):
+    if fields.get('status') != 'running':
         raise store.Refusal('Herdr session is not running')
     socket = Path(fields.get('socket', ''))
     if not socket.is_absolute():
         raise store.Refusal('Herdr server socket is unverified')
     identity = _socket_identity(socket)
     return {'session': session, 'socket': str(socket), 'device': identity.st_dev,
-            'inode': identity.st_ino, 'protocol': fields['protocol']}
+            'inode': identity.st_ino, 'protocol': fields.get('protocol') or fields['private_protocol']}
 
 
 def _herdr_call(endpoint: dict, *args, check=True):

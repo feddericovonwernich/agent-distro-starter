@@ -6,7 +6,7 @@ import stat
 import subprocess
 import uuid
 from pathlib import Path
-from . import store
+from . import installer, store
 
 
 def available():
@@ -21,9 +21,13 @@ def available():
         raise store.DependencyError('selected Herdr server did not respond') from error
     if result.returncode:
         raise store.DependencyError('selected Herdr session is not running')
+    try:
+        installer._parse_herdr_status(result.stdout)
+    except store.Refusal as error:
+        raise store.DependencyError('selected Herdr server is incompatible') from error
     fields = dict(line.split(': ', 1) for line in result.stdout.splitlines() if ': ' in line)
-    if fields.get('status') != 'running' or fields.get('compatible') != 'yes' or not fields.get('protocol'):
-        raise store.DependencyError('selected Herdr server is incompatible')
+    if fields.get('status') != 'running':
+        raise store.DependencyError('selected Herdr session is not running')
     socket = Path(fields.get('socket', ''))
     if not socket.is_absolute():
         raise store.DependencyError('selected Herdr server socket is unverified')
@@ -34,7 +38,7 @@ def available():
     if not stat.S_ISSOCK(identity.st_mode):
         raise store.DependencyError('selected Herdr server socket is unverified')
     return {'session': session, 'socket': str(socket), 'device': identity.st_dev,
-            'inode': identity.st_ino, 'protocol': fields['protocol']}
+            'inode': identity.st_ino, 'protocol': fields.get('protocol') or fields['private_protocol']}
 
 
 def call(endpoint, *args, check=True):
