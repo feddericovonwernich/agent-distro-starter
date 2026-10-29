@@ -198,13 +198,15 @@ def main(args):
             worker_skills.seed_defaults(home)
         return {'home': str(home)}
     if args.command == 'start':
-        selected = launcher.resolve_backend(home, args.backend)
+        inherited = dict(os.environ)
+        selected = (args.backend if args.backend is not None else
+                    launcher.active_backend(home, inherited) or launcher.resolve_backend(home, None))
         dependencies = installer.validate_dependencies(home, store.run)
         if 'omp' not in dependencies or selected == 'herdr' and 'herdr' not in dependencies:
             raise store.Refusal('selected launcher dependency is unavailable')
         if selected == 'tmux':
             store.run(['tmux', '-V'])
-        target = launcher.prepare_start(home, selected, dict(os.environ),
+        target = launcher.prepare_start(home, selected, inherited,
                                         launcher._backend_create, launcher._backend_inspect,
                                         launcher._backend_attach)
         os.execvpe(target.attach_argv[0], target.attach_argv, target.env)

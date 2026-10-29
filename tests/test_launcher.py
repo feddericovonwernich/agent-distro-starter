@@ -144,6 +144,60 @@ def test_start_refuses_missing_dependencies_before_reservation(tmp_path):
     assert not (home / 'state' / 'central-launcher.json').exists()
 
 
+def test_start_prefers_proven_active_backend_before_saved_config(tmp_path, monkeypatch):
+    import runpy
+    import sys
+    import pytest
+
+    sys.path.insert(0, str(ROOT / 'bin'))
+    from agd_lib import installer, launcher, store, supervision
+
+    module = runpy.run_path(str(CLI), run_name='agd_cli')
+    home = tmp_path / 'home'
+    home.mkdir()
+    launcher.initialize(home, 'tmux')
+    start = supervision.process_start(os.getpid())
+    endpoint = {'id': 'central'}
+    receipt = {
+        'schema': 1, 'launch_id': '00000000-0000-0000-0000-000000000001', 'endpoint_token': 'token',
+        'backend': 'herdr', 'phase': 'ready', 'endpoint': endpoint, 'managed_command': ['agd'],
+        'expected_process_argv': ['/opt/omp'], 'owner': {'pid': os.getpid(), 'start': start},
+        'watcher': {'pid': os.getpid(), 'start': start},
+    }
+    store.atomic_json(home / 'state' / 'central-launcher.json', receipt)
+    store.atomic_json(home / 'state' / 'owner.json', {
+        'owner_pid': os.getpid(), 'owner_start': start, 'token': 'token',
+        'watcher_pid': os.getpid(), 'watcher_start': start, 'heartbeat': __import__('time').time(),
+    })
+    monkeypatch.setattr(launcher, '_backend_inspect', lambda _, actual_receipt: {
+        'endpoint': actual_receipt['endpoint'],
+        'foreground': {'launch_id': actual_receipt['launch_id'], 'endpoint_token': actual_receipt['endpoint_token'],
+                       'pid': os.getpid(), 'start': start, 'argv': actual_receipt['expected_process_argv']},
+    })
+    monkeypatch.setattr(launcher, '_backend_attach', lambda _, __: ['attach-herdr'])
+    selected = []
+    monkeypatch.setattr(installer, 'validate_dependencies',
+                        lambda *_: selected.append('validated') or {'schema': 1, 'omp': {}})
+    args = module['parser']().parse_args(['--home', str(home), 'start'])
+    with pytest.raises(store.Refusal, match='selected launcher dependency'):
+        module['main'](args)
+    assert selected == ['validated']
+
+    monkeypatch.setattr(installer, 'validate_dependencies',
+                        lambda *_: {'schema': 1, 'omp': {}, 'herdr': {}})
+    executed = {}
+    def fake_exec(*exec_args):
+        executed['argv'] = exec_args
+        raise AssertionError
+    monkeypatch.setattr(module['os'], 'execvpe', fake_exec)
+    with pytest.raises(AssertionError):
+        module['main'](args)
+    assert executed['argv'][1] == ['attach-herdr']
+
+    conflicting = module['parser']().parse_args(['--home', str(home), 'start', '--backend', 'tmux'])
+    with pytest.raises(store.Refusal, match='explicit backend differs'):
+        module['main'](conflicting)
+
 def test_prepare_start_refuses_unsafe_launcher_config(tmp_path, monkeypatch):
     import sys
     sys.path.insert(0, str(ROOT / 'bin'))
