@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Polish guided installation with colored stages and prompts, quieter cloning, a clear start command, and pretty terminal JSON; retain plain/compact redirected output and remove OMP login/model configuration prompts.
 - Preserve Herdr's native pane marker when starting the central agent so it can launch Herdr workers; continue filtering caller-supplied markers and sanitizing the outer attach client.
 - Export the central owner token during OMP session start and switch so agent commands can mutate their own home while foreign commands remain read-only.
 - Restored Herdr central startup and worker controls with Herdr 0.9.5 status fields and transient pane-process reporting during initial ownership proof.

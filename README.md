@@ -12,9 +12,11 @@ bash -c 'installer=$(curl -fsSL https://raw.githubusercontent.com/feddericovonwe
 
 The interactive installer asks for a lowercase name and central backend (`tmux` or `herdr`), refuses an existing destination, clones the canonical origin into `./NAME`, and preserves that origin. It initializes the clone's ignored private home and records the selected backend plus a generated non-default Herdr session name.
 
+The installer groups setup into numbered stages with terminal colors and a final start command. Set `NO_COLOR` to disable colors; dumb terminals and redirected streams stay plain. `bin/agd` pretty-prints JSON on a terminal and keeps redirected JSON compact for scripts.
+
 It can use APT only for missing Git, Python 3.12+, and selected `tmux`, after one explicit sudo prompt; blank or non-affirmative answers mean no elevation. OMP and Herdr are reused when compatible or installed/updated only after consent to the displayed latest stable release, exact Linux x86-64 asset, and published digest. Treehouse is reused when compatible or installed as **v3.1.6** after SHA-256 verification: `e89891caf913b3b228387c7dccf53ff908327fca47839b7957681084578cb1a1`. Managed downloads are atomically installed in `~/.local/bin`, and their source, version, capabilities, artifact hash, and installed hash are recorded in the private home.
 
-The installer optionally runs `omp login [provider]` in your terminal. It does not receive or store provider secrets; `omp models --json` only lists configured/selectable models and is not authentication proof. It then starts an interactive nested shell in the clone with `~/.local/bin` first on `PATH`; exiting that shell returns to the caller.
+Provider login and model configuration belong to OMP, not this installer: there are no login or model-selection prompts. Read-only dependency compatibility probes do not prove authentication. After setup, the installer starts an interactive nested shell in the clone with `~/.local/bin` first on `PATH`; exiting that shell returns to the caller.
 
 If the calling shell already defines `AGD_HOME`, unset it to use this clone's private home. Then:
 

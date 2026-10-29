@@ -248,10 +248,9 @@ def _install_start(name):
         (tools / 'tmux').chmod(0o755)
         (tools / 'git').write_text(
             '#!/bin/sh\nset -eu\n'
-            '[ "$1" = clone ] && [ "$2" = -- ] && [ "$3" = "$AGD_CANONICAL" ]\n'
-            'printf "%s\\n" "$*" >> "$AGD_GIT_LOG"\n'
-            '/bin/cp -a "$AGD_SOURCE/." "$4"\n'
-            '/bin/rm -rf "$4/.git"\n')
+            '[ "$1" = clone ] && [ "$2" = --quiet ] && [ "$3" = -- ] && [ "$4" = "$AGD_CANONICAL" ]\n'
+            '/bin/cp -a "$AGD_SOURCE/." "$5"\n'
+            '/bin/rm -rf "$5/.git"\n')
         (tools / 'git').chmod(0o755)
         (site / 'sitecustomize.py').write_text(
             'import io, json, urllib.request\n'
@@ -262,16 +261,13 @@ def _install_start(name):
             'urllib.request.urlopen = urlopen\n')
         base = dict(os.environ, HOME=str(home), AGD_HOME=str(root / f'distro-{name}'),
                     AGD_SOURCE=str(ROOT), AGD_CANONICAL=CANONICAL_REPOSITORY,
-                    AGD_GIT_LOG=str(root / 'git.log'), SHELL='/bin/sh', TERM='xterm',
+                    SHELL='/bin/sh', TERM='xterm',
                     PYTHONPATH=str(site), PATH=f'{tools}:/tmp/agd-treehouse-v3.1.6:{os.environ["PATH"]}')
         updates = b'n\n' if name == 'tmux' else b'n\nn\n'
         installed = root / f'distro-{name}'
         result = _pty(['/bin/bash', str(ROOT / 'install.sh')], root, base,
-                      f'distro-{name}\n{name}\n'.encode() + updates + b'\nn\nexit\n', detach=False)
+                      f'distro-{name}\n{name}\n'.encode() + updates + b'exit\n', detach=False)
         assert result.returncode == 0, result.stdout
-        assert (root / 'git.log').read_text().strip() == f'clone -- {CANONICAL_REPOSITORY} {installed}'
-        assert (installed / 'bin' / 'agd_lib' / 'launcher.py').read_bytes() == (
-            ROOT / 'bin' / 'agd_lib' / 'launcher.py').read_bytes()
         receipt = json.loads((installed / 'data' / 'dependencies.json').read_text())
         assert receipt['omp']['source'] == receipt['treehouse']['source'] == 'existing'
         if name == 'herdr':

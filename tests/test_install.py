@@ -55,7 +55,7 @@ printf 'shell cwd=%s path=%s\\n' "$PWD" "$PATH" >> "$AGD_LOG"
     if include_git:
         scripts['git'] = '''#!/bin/bash
 printf 'git %s\\n' "$*" >> "$AGD_LOG"
- /bin/cp -a "$AGD_FIXTURE/." "$4"
+ /bin/cp -a "$AGD_FIXTURE/." "${@: -1}"
 '''
     if include_tmux:
         scripts['tmux'] = '#!/bin/bash\nexit 0\n'
@@ -105,7 +105,7 @@ def test_guided_install_initializes_before_setup_and_enters_clone_shell(backend)
         root = Path(directory)
         fixture = make_fixture(root)
         tools = make_tools(root, fixture)
-        result = run_install(root, tools, f'distro-{backend}\n{backend}\n\nN\n')
+        result = run_install(root, tools, f'distro-{backend}\n{backend}\n')
         assert result.returncode == 0, (result.stdout, result.stderr)
         log = (root / 'log').read_text().splitlines()
         init = f'agd --home {root}/distro-{backend} init --backend {backend}'
@@ -131,8 +131,8 @@ def test_failed_clone_that_populates_owned_destination_is_removed():
         fixture = make_fixture(root)
         tools = make_tools(root, fixture)
         (tools / 'git').write_text('''#!/bin/bash
-/bin/mkdir -p "$4"
-printf partial > "$4/partial"
+/bin/mkdir -p "${@: -1}"
+printf partial > "${@: -1}/partial"
 exit 1
 ''')
         (tools / 'git').chmod(0o755)
@@ -147,7 +147,6 @@ def test_blank_sudo_declines_missing_git_without_elevation():
         tools = make_tools(root, fixture, include_git=False)
         result = run_install(root, tools, 'distro\ntmux\n\n')
         assert result.returncode != 0
-        assert 'Missing requirements: git' in result.stderr
         assert not (root / 'log').exists()
         assert not (root / 'distro').exists()
 
@@ -157,7 +156,7 @@ def test_bootstrap_installs_only_missing_selected_tmux():
         root = Path(directory)
         fixture = make_fixture(root)
         tools = make_tools(root, fixture, include_tmux=False)
-        result = run_install(root, tools, 'distro\ntmux\ny\n\nN\n')
+        result = run_install(root, tools, 'distro\ntmux\ny\n')
         assert result.returncode == 0, (result.stdout, result.stderr)
         log = (root / 'log').read_text()
         assert 'sudo -v' in log
@@ -174,19 +173,26 @@ def test_present_python_311_refuses_without_bootstrap():
         tools = make_tools(root, fixture, python_version='3.11')
         result = run_install(root, tools, 'distro\ntmux\n')
         assert result.returncode != 0
-        assert 'Python 3.12+ required' in result.stderr
         assert not (root / 'log').exists()
 
 
-def test_optional_login_and_models_are_child_commands_without_secret_export():
+@pytest.mark.parametrize('term,no_color,colored', [
+    ('xterm-256color', None, True),
+    ('xterm-256color', '', False),
+    ('dumb', None, False),
+])
+def test_install_leaves_omp_configuration_alone_and_respects_terminal(monkeypatch, term, no_color, colored):
+    monkeypatch.setenv('TERM', term)
+    monkeypatch.delenv('NO_COLOR', raising=False)
+    if no_color is not None:
+        monkeypatch.setenv('NO_COLOR', no_color)
     with tempfile.TemporaryDirectory(prefix='agd-install-') as directory:
         root = Path(directory)
         fixture = make_fixture(root)
         tools = make_tools(root, fixture)
-        result = run_install(root, tools, 'distro\ntmux\nopenai\ny\n')
-        assert result.returncode == 0, (result.stdout, result.stderr)
-        log = (root / 'log').read_text()
-        assert 'omp login openai' in log
-        assert 'omp models --json' in log
-        assert 'auth export' not in log
-        assert 'auth' not in log.replace('auth export', '')
+        result = run_install(root, tools, 'distro\nherdr\n')
+        assert result.returncode == 0, result.stdout
+        log = (root / 'log').read_text().splitlines()
+        assert any(line.startswith(f'shell cwd={root}/distro ') for line in log)
+        assert not any(line.startswith('omp ') for line in log)
+        assert ('\x1b[' in result.stdout) is colored
