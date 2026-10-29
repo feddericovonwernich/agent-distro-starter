@@ -104,26 +104,26 @@ def test_catalog_refuses_native_name_collisions_and_unsafe_sources():
 
     def directory_name_mismatch(home):
         native_skills(home, ponytail_name='different')
-        skill = next((home / 'data/omp/home/.omp/plugins/cache/plugins').glob(
+        skill = next((home / 'data/omp/config/plugins/cache/plugins').glob(
             'ponytail*')) / 'skills/different'
         skill.rename(skill.parent / 'ponytail')
 
     def traversal_name(home):
         native_skills(home)
-        skill = next((home / 'data/omp/home/.omp/plugins/cache/plugins').glob(
+        skill = next((home / 'data/omp/config/plugins/cache/plugins').glob(
             'ponytail*')) / 'skills/ponytail/SKILL.md'
         skill.write_text('---\nname: ../escape\ndescription: unsafe\n---\n')
 
     def symlink_source(home):
         native_skills(home)
-        root = next((home / 'data/omp/home/.omp/plugins/cache/plugins').glob(
+        root = next((home / 'data/omp/config/plugins/cache/plugins').glob(
             'ponytail*')) / 'skills'
         (root / 'ponytail').rename(root / 'real')
         (root / 'ponytail').symlink_to(root / 'real', target_is_directory=True)
 
     def special_file(home):
         native_skills(home)
-        root = next((home / 'data/omp/home/.omp/plugins/cache/plugins').glob(
+        root = next((home / 'data/omp/config/plugins/cache/plugins').glob(
             'ponytail*')) / 'skills/ponytail'
         os.mkfifo(root / 'unsafe')
 
@@ -963,7 +963,7 @@ def test_task_snapshot_survives_plugin_removal():
         snapshot = home/'data/tasks/survivor/worker-skills/systematic-debugging'
         expected = (snapshot/'SKILL.md').read_bytes()
         shutil.rmtree(home/'.omp/plugins')
-        shutil.rmtree(home/'data/omp/home/.omp')
+        shutil.rmtree(home/'data/omp/config')
         shutil.rmtree(destination)
 
         worker_skills.ensure(home, tasks.read(home, 'survivor'))

@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -57,7 +58,7 @@ def test_native_runner_uses_local_agent_empty_project_and_safe_diagnostic(monkey
         assert captured['cwd'] == captured['payload']['input']['cwd'] == str(runtime)
         assert captured['payload']['input']['agentDir'] == str(omp_runtime.agent_dir(home))
         assert captured['agent'] == str(omp_runtime.agent_dir(home))
-        assert captured['home'] == str(home/'data/omp/home')
+        assert captured['home'] == os.environ['HOME']
         assert json.loads((runtime/'.omp/plugins/installed_plugins.json').read_text()) == {
             'version': 2, 'plugins': {}}
         assert json.loads((runtime/'.omp/plugins/omp-plugins.lock.json').read_text()) == {

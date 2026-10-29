@@ -37,7 +37,7 @@ def write_native_plugins(home, plugin_skills=None):
     registry = {'version': 2, 'plugins': {}}
     lock = {'plugins': {}, 'settings': {}}
     marketplaces = {'version': 1, 'marketplaces': []}
-    config = home / 'data/omp/home/.omp'
+    config = home / 'data/omp/config'
     project_plugins = home / '.omp/plugins'
     (home / 'data/omp/agent').mkdir(parents=True, exist_ok=True)
     project_plugins.mkdir(parents=True, exist_ok=True)

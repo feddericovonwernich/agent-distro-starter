@@ -36,7 +36,7 @@ def _root(home) -> Path:
 
 
 def _config(home) -> Path:
-    return _root(home) / 'home' / '.omp'
+    return _root(home) / 'config'
 
 
 def agent_dir(home) -> Path:
@@ -46,7 +46,7 @@ def agent_dir(home) -> Path:
 def runtime_directories(home) -> tuple[Path, ...]:
     runtime = _root(home)
     return (
-        runtime / 'home',
+        runtime / 'config',
         runtime / 'agent',
         runtime / 'xdg' / 'data',
         runtime / 'xdg' / 'state',
@@ -56,11 +56,27 @@ def runtime_directories(home) -> tuple[Path, ...]:
 
 def environment(home, inherited: Mapping[str, str]) -> dict[str, str]:
     """Return inherited with every OMP storage control fixed to this distro."""
-    runtime = _root(home)
+    root = store.home(home)
+    runtime = _root(root)
+    for directory in runtime_directories(root):
+        current = root
+        for part in directory.relative_to(root).parts:
+            current /= part
+            try:
+                identity = current.lstat()
+            except FileNotFoundError:
+                break
+            if stat.S_ISLNK(identity.st_mode) or not stat.S_ISDIR(identity.st_mode):
+                raise store.Refusal('OMP runtime root is unsafe')
+    effective_home = inherited.get('HOME') or str(Path.home())
+    if not Path(effective_home).is_absolute():
+        raise store.Refusal('OMP runtime requires an absolute HOME')
+    config_dir = os.path.relpath(_config(root), effective_home)
+    if (Path(effective_home) / config_dir).resolve() != _config(root).resolve():
+        raise store.Refusal('OMP config path does not resolve inside the distro')
     result = dict(inherited)
     result.update(
-        HOME=str(runtime / 'home'),
-        PI_CONFIG_DIR='.omp',
+        PI_CONFIG_DIR=config_dir,
         PI_CODING_AGENT_DIR=str(runtime / 'agent'),
         OMP_PROFILE='default',
         PI_PROFILE='default',
