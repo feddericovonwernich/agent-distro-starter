@@ -27,3 +27,4 @@
 - Added per-process managed-observability generation receipts, explicit stale-restart status, retained exited receipts, and local Collector diagnostics that keep current queue fullness, historical admission failures, and sanitized disk/file-storage failures distinct from unknown delivery state.
 - Documented managed-observability operations, prerequisites, loopback ownership, native-session authority, sensitive full-content handling, queue/delivery limits, degradation and Cursor exclusion; recorded disposable two-home native OMP-to-Collector-to-Langfuse acceptance.
 - Hardened managed-observability config provenance, read-only status inspection, native binding visibility, and managed resource identity.
+- Verified guided local installation and public central start through isolated tmux and Herdr PTYs, including canonical clone boundary, retained reattachment, conflict refusal, and owned-runtime cleanup.

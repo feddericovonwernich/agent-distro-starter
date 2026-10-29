@@ -370,6 +370,8 @@ def setup(home, backend, prompt, fetch_json, stream_url, run):
     receipt = {'schema': 1}
     for tool in tools:
         path = shutil.which(tool)
+        if path:
+            path = Path(path).resolve()
         if tool == 'omp':
             probe = probe_omp
         elif tool == 'herdr':

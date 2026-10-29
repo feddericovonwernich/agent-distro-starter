@@ -129,6 +129,50 @@ def test_prepare_start_correlates_only_exact_ready_endpoint(tmp_path, monkeypatc
         launcher.prepare_start(home, None, {}, fake_create, fake_inspect, fake_attach)
 
 
+def test_prepare_start_waits_only_for_unpublished_owner(tmp_path, monkeypatch):
+    import sys
+    sys.path.insert(0, str(ROOT / 'bin'))
+    import pytest
+    from agd_lib import launcher, observability, store, supervision
+
+    home = tmp_path / 'h'
+    home.mkdir()
+    launcher.initialize(home, 'tmux')
+    argv = ['/opt/omp', '--cwd', str(home)]
+    monkeypatch.setattr(observability, 'central_argv', lambda *_: (argv, {}, None))
+    calls = {'inspect': 0}
+
+    def create(_backend, actual_home, launch_id, endpoint_token, *_):
+        calls.update(home=actual_home, launch_id=launch_id, token=endpoint_token)
+        return {'id': 'central', 'launch_id': launch_id, 'endpoint_token': endpoint_token}
+
+    def inspect(_home, receipt):
+        calls['inspect'] += 1
+        if calls['inspect'] == 2:
+            start = supervision.process_start(os.getpid())
+            store.atomic_json(home / 'state' / 'owner.json', {
+                'owner_pid': os.getpid(), 'owner_start': start, 'token': receipt['endpoint_token'],
+                'watcher_pid': os.getpid(), 'watcher_start': start, 'heartbeat': __import__('time').time(),
+            })
+        return {'endpoint': {'id': 'central', 'launch_id': receipt['launch_id'],
+                             'endpoint_token': receipt['endpoint_token']},
+                'foreground': {'launch_id': receipt['launch_id'], 'endpoint_token': receipt['endpoint_token'],
+                               'pid': os.getpid(), 'start': supervision.process_start(os.getpid()), 'argv': argv}}
+
+    assert launcher.prepare_start(home, None, {}, create, inspect,
+                                  lambda _home, _receipt: ['attach']).attach_argv == ['attach']
+    assert calls['inspect'] == 2
+
+    (home / 'state' / 'central-launcher.json').unlink()
+    (home / 'state' / 'owner.json').unlink()
+    calls['inspect'] = 0
+    with pytest.raises(store.Refusal, match='continuity'):
+        launcher.prepare_start(home, None, {}, create,
+                               lambda _home, receipt: {**inspect(_home, receipt), 'endpoint': {}},
+                               lambda _home, _receipt: ['attach'])
+    assert calls['inspect'] == 1
+
+
 def test_start_refuses_missing_dependencies_before_reservation(tmp_path):
     home = tmp_path / 'h'
     fake = tmp_path / 'bin'

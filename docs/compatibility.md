@@ -47,3 +47,7 @@ The following is the acceptance matrix for the bounded reviewer. “Executable c
 | 11 | Explicit retained central links only; active/unknown/unrelated evidence is excluded/coverage-limited, never proximity-inferred. | **Executable coverage** | `tests/test_reviewer.py` covers cutoff, explicit-link, and coverage behavior. |
 
 Observed scheduling and reviewer evidence is recorded above. The compatibility matrix has real native acceptance for rows 1 and 4 and approved disposable user-systemd activation for row 5. No provider call was made by the scripted reviewer acceptance.
+
+## Guided installation and start acceptance
+
+On Linux x86-64 with Treehouse v3.1.6 at `/tmp/agd-treehouse-v3.1.6`, `tests/test_backends.py install-start-tmux` and `install-start-herdr` each ran tracked local `install.sh` through a fake Git/network boundary that asserted the canonical repository URL, copied the current test revision, declined compatible OMP/Herdr updates, and used real installed runtime tools. Each isolated temporary HOME/project/session then proved a ready central owner and watcher, PTY attach/detach/reattach, unchanged retained receipt, explicit conflicting-backend refusal, and owned tmux/Herdr cleanup.

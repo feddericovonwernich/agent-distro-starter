@@ -288,8 +288,15 @@ def central_argv(home, omp_args):
     binary = shutil.which('omp')
     if not binary:
         raise store.DependencyError('omp is not installed')
+    binary = str(Path(binary).resolve())
+    argv = [binary, '--cwd', str(home), '--session-dir', str(paths(home)['central_sessions']), *omp_args]
+    if Path(binary).read_text(errors='ignore').split('\n', 1)[0] == '#!/usr/bin/env bun':
+        bun = shutil.which('bun')
+        if not bun:
+            raise store.DependencyError('bun is unavailable')
+        argv[:0] = [str(Path(bun).resolve())]
     record_process_generation(home, 'central', generation)
-    return [binary, '--cwd', str(home), '--session-dir', str(paths(home)['central_sessions']), *omp_args], env, warning
+    return argv, env, warning
 
 
 def _home(value):

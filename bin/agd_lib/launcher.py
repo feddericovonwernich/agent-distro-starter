@@ -155,6 +155,18 @@ def _prove(home: Path, receipt: dict, inspect) -> dict:
         raise store.Refusal('central owner snapshot differs')
     return owner
 
+def _await_initial_owner(home: Path, receipt: dict, inspect) -> dict:
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            return _prove(home, receipt, inspect)
+        except store.Refusal as error:
+            if str(error) != 'central owner is missing' or time.monotonic() >= deadline:
+                raise
+            time.sleep(.05)
+
+
+
 
 
 
@@ -226,9 +238,13 @@ def _herdr_inspect(home: Path, receipt: dict) -> dict:
         pid, start, argv = process['pid'], process.get('start'), process.get('argv')
     else:
         foreground = process.get('foreground_processes')
-        if not isinstance(foreground, list) or len(foreground) != 1 or not isinstance(foreground[0], dict):
+        if not isinstance(foreground, list):
             raise store.Refusal('Herdr foreground process is unverified')
-        pid, argv = foreground[0].get('pid'), foreground[0].get('argv')
+        matched = [item for item in foreground if isinstance(item, dict)
+                   and item.get('argv') == receipt['expected_process_argv']]
+        if len(matched) != 1:
+            raise store.Refusal('Herdr foreground process is unverified')
+        pid, argv = matched[0].get('pid'), matched[0]['argv']
         start = supervision.process_start(pid) if isinstance(pid, int) else None
     if not isinstance(start, str) or not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv):
         raise store.Refusal('Herdr foreground process is unverified')
@@ -292,7 +308,17 @@ def _herdr_create(home: Path, launch_id: str, endpoint_token: str, managed: list
     _herdr_call(endpoint, 'pane', 'run', endpoint['pane'],
                 'export ' + ' '.join(f'{key}={shlex.quote(value)}' for key, value in command_env.items())
                 + '; exec ' + shlex.join(managed))
-    return endpoint
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        process = _herdr_response(_herdr_call(endpoint, 'pane', 'process-info', '--pane', endpoint['pane']))['process_info']
+        if process.get('argv') == argv and isinstance(process.get('pid'), int):
+            return endpoint
+        foreground = process.get('foreground_processes')
+        if isinstance(foreground, list) and any(
+                isinstance(item, dict) and item.get('argv') == argv for item in foreground):
+            return endpoint
+        time.sleep(.05)
+    raise store.Refusal('Herdr central process did not start')
 
 
 def _attach_env(home: Path, receipt: dict, inherited_env: Mapping[str, str] | None) -> dict[str, str]:
@@ -405,7 +431,7 @@ def prepare_start(home: Path, explicit_backend: str | None, inherited_env: Mappi
         _advance(home, reserved, spawned)
     if create is _backend_create:
         _backend_finalize(home, spawned)
-    owner = _prove(home, spawned, inspect)
+    owner = _await_initial_owner(home, spawned, inspect)
     ready = {**spawned, 'phase': 'ready',
              'owner': {'pid': owner['owner_pid'], 'start': owner['owner_start']},
              'watcher': {'pid': owner['watcher_pid'], 'start': owner['watcher_start']}}

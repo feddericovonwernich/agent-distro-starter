@@ -123,7 +123,7 @@ def create_central(home: Path, launch_id: str, endpoint_token: str, managed_argv
     if store.run([*cmd, 'has-session', '-t', session], check=False).returncode:
         store.run([*cmd, 'new-session', '-d', '-s', session, '-n', 'anchor', '-c', str(home)], timeout=10)
     server_pid = store.run([*cmd, 'display-message', '-p', '#{pid}']).stdout.strip()
-    command = shlex.join(['env', *[f'{key}={value}' for key, value in sorted(launch_env.items())], *managed_argv])
+    command = shlex.join(['exec', 'env', *[f'{key}={value}' for key, value in sorted(launch_env.items())], *managed_argv])
     window, pane, tty = store.run([*cmd, 'new-window', '-d', '-P', '-F', '#{window_id} #{pane_id} #{pane_tty}', '-t', session,
                                    '-n', 'central', '-c', str(home), command]).stdout.strip().split()
     endpoint = {'server_pid': server_pid, 'window': window, 'pane': pane, 'tty': tty,

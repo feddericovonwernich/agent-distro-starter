@@ -1,7 +1,13 @@
+import fcntl
 import importlib
 import json
+import os
+import pty
+import select
+import subprocess
 import sys
 import tempfile
+import termios
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -181,11 +187,151 @@ def check_herdr_timeout_preserves_unknown_state():
             raise AssertionError('timed-out server query was accepted')
 
 
+CANONICAL_REPOSITORY = 'https://github.com/feddericovonwernich/agent-distro-starter.git'
+
+
+def _pty(argv, cwd, env, initial=b'', detach=True, detacher=None, detach_bytes=b'\x03'):
+    master, slave = pty.openpty()
+
+    def terminal():
+        os.setsid()
+        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+    process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=slave, stdout=slave, stderr=slave,
+                               preexec_fn=terminal)
+    slave_name = os.ttyname(slave)
+    os.close(slave)
+    if initial:
+        os.write(master, initial)
+    output = bytearray()
+    deadline = time.monotonic() + 30
+    while process.poll() is None and time.monotonic() < deadline:
+        if select.select([master], [], [], .1)[0]:
+            try:
+                output.extend(os.read(master, 4096))
+            except OSError:
+                break
+        if detach and (Path(env['AGD_HOME']) / 'state' / 'central-launcher.json').is_file():
+            receipt = json.loads((Path(env['AGD_HOME']) / 'state' / 'central-launcher.json').read_text())
+            if receipt.get('phase') == 'ready':
+                if detacher:
+                    detach = not detacher(slave_name)
+                else:
+                    os.write(master, detach_bytes)
+                    detach = False
+    while process.poll() is None and time.monotonic() < deadline:
+        if select.select([master], [], [], .1)[0]:
+            try:
+                output.extend(os.read(master, 4096))
+            except OSError:
+                break
+    if process.poll() is None:
+        process.kill()
+        raise AssertionError(f'PTY command did not detach: {argv!r}')
+    while select.select([master], [], [], 0)[0]:
+        try:
+            output.extend(os.read(master, 4096))
+        except OSError:
+            break
+    os.close(master)
+    return subprocess.CompletedProcess(argv, process.returncode, output.decode(errors='replace'), '')
+
+
+def _install_start(name):
+    assert name in ('tmux', 'herdr')
+    with tempfile.TemporaryDirectory(prefix='a') as directory:
+        root = Path(directory)
+        home, tools, site = root / 'home', root / 'tools', root / 'site'
+        tools.mkdir()
+        site.mkdir()
+        (tools / 'tmux').write_text('#!/bin/sh\nexec /usr/bin/tmux "$@"\n')
+        (tools / 'tmux').chmod(0o755)
+        (tools / 'git').write_text(
+            '#!/bin/sh\nset -eu\n'
+            '[ "$1" = clone ] && [ "$2" = -- ] && [ "$3" = "$AGD_CANONICAL" ]\n'
+            'printf "%s\\n" "$*" >> "$AGD_GIT_LOG"\n'
+            'mkdir "$4"\n'
+            '/bin/cp -a "$AGD_SOURCE/." "$4"\n'
+            '/bin/rm -rf "$4/.git"\n')
+        (tools / 'git').chmod(0o755)
+        (site / 'sitecustomize.py').write_text(
+            'import io, json, urllib.request\n'
+            'def urlopen(url):\n'
+            '    if url.endswith("/releases/latest"):\n'
+            '        return io.BytesIO(json.dumps({"draft":False,"prerelease":False,"tag_name":"test","assets":[]}).encode())\n'
+            '    raise AssertionError(f"unexpected network URL: {url}")\n'
+            'urllib.request.urlopen = urlopen\n')
+        base = dict(os.environ, HOME=str(home), AGD_HOME=str(root / f'distro-{name}'),
+                    AGD_SOURCE=str(ROOT), AGD_CANONICAL=CANONICAL_REPOSITORY,
+                    AGD_GIT_LOG=str(root / 'git.log'), SHELL='/bin/sh', TERM='xterm',
+                    PYTHONPATH=str(site), PATH=f'{tools}:/tmp/agd-treehouse-v3.1.6:{os.environ["PATH"]}')
+        updates = b'n\n' if name == 'tmux' else b'n\nn\n'
+        installed = root / f'distro-{name}'
+        result = _pty(['/bin/bash', str(ROOT / 'install.sh')], root, base,
+                      f'distro-{name}\n{name}\n'.encode() + updates + b'\nn\nexit\n', detach=False)
+        assert result.returncode == 0, result.stdout
+        assert (root / 'git.log').read_text().strip() == f'clone -- {CANONICAL_REPOSITORY} {installed}'
+        assert (installed / 'bin' / 'agd_lib' / 'launcher.py').read_bytes() == (
+            ROOT / 'bin' / 'agd_lib' / 'launcher.py').read_bytes()
+        receipt = json.loads((installed / 'data' / 'dependencies.json').read_text())
+        assert receipt['omp']['source'] == receipt['treehouse']['source'] == 'existing'
+        if name == 'herdr':
+            assert receipt['herdr']['source'] == 'existing'
+        def detach_tmux(tty):
+            return subprocess.run(['tmux', '-L', 'agd-' + __import__('hashlib').sha256(
+                str(installed.resolve()).encode()).hexdigest()[:16], 'detach-client', '-t', tty],
+                env=base, capture_output=True).returncode == 0
+
+        try:
+            first = _pty([str(installed / 'bin' / 'agd'), '--home', str(installed), 'start'],
+                         installed, {**base, 'AGD_HOME': str(installed)},
+                         detacher=detach_tmux if name == 'tmux' else None)
+            assert first.returncode == (0 if name == 'tmux' else -2), first.stdout
+            ready = json.loads((installed / 'state' / 'central-launcher.json').read_text())
+            assert ready['phase'] == 'ready' and ready['owner'] and ready['watcher']
+            second = _pty([str(installed / 'bin' / 'agd'), '--home', str(installed), 'start'],
+                          installed, {**base, 'AGD_HOME': str(installed)},
+                          detacher=detach_tmux if name == 'tmux' else None)
+            assert second.returncode == (0 if name == 'tmux' else -2), second.stdout
+            assert json.loads((installed / 'state' / 'central-launcher.json').read_text()) == ready
+            conflict = subprocess.run([str(installed / 'bin' / 'agd'), '--home', str(installed), 'start',
+                                       '--backend', 'herdr' if name == 'tmux' else 'tmux'],
+                                      cwd=installed, env={**base, 'AGD_HOME': str(installed)},
+                                      text=True, capture_output=True)
+            assert conflict.returncode == 3
+            assert json.loads((installed / 'state' / 'central-launcher.json').read_text()) == ready
+        finally:
+            if name == 'tmux':
+                subprocess.run(['tmux', '-L', 'agd-' + __import__('hashlib').sha256(
+                    str(installed.resolve()).encode()).hexdigest()[:16], 'kill-server'], env=base,
+                               capture_output=True)
+            else:
+                session = json.loads((installed / 'data' / 'launcher.json').read_text())['herdr_session']
+                stopped = subprocess.run(['herdr', '--session', session, 'server', 'stop'], env=base,
+                                         text=True, capture_output=True)
+                assert stopped.returncode == 0, stopped.stderr
+
+
+def check_install_start_tmux():
+    _install_start('tmux')
+
+
+def check_install_start_herdr():
+    _install_start('herdr')
+
+
 if __name__ == '__main__':
-    check_backend(sys.argv[1])
-    if sys.argv[1] == 'herdr':
-        check_herdr_recovery()
-        check_herdr_preflight()
-        check_herdr_blank_pane_is_not_worker()
-        check_herdr_missing_socket_is_unavailable()
-        check_herdr_timeout_preserves_unknown_state()
+    checks = {
+        'install-start-tmux': check_install_start_tmux,
+        'install-start-herdr': check_install_start_herdr,
+    }
+    if sys.argv[1] in checks:
+        checks[sys.argv[1]]()
+    else:
+        check_backend(sys.argv[1])
+        if sys.argv[1] == 'herdr':
+            check_herdr_recovery()
+            check_herdr_preflight()
+            check_herdr_blank_pane_is_not_worker()
+            check_herdr_missing_socket_is_unavailable()
+            check_herdr_timeout_preserves_unknown_state()
