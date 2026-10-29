@@ -114,6 +114,7 @@ def _parse_herdr_status(text):
     fields = {}
     for line in text.splitlines():
         key, separator, value = line.partition(': ')
+        value = value.strip()
         if not separator or not key or not value or key in fields:
             raise Refusal('Herdr named status output is invalid')
         fields[key] = value

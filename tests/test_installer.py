@@ -130,9 +130,11 @@ def test_probes_require_documented_machine_output(tmp_path):
     incompatible = current.replace('private_protocol_compatible: yes', 'private_protocol_compatible: no')
     duplicate = current + 'socket: /tmp/other.sock\n'
     malformed = 'status: running\nprotocol: \ncompatible: yes\nsocket: relative.sock\n'
+    whitespace_legacy = legacy.replace('protocol: 20', 'protocol:   ')
+    whitespace_current = current.replace('version: v0.9.5', 'version:   ')
     with pytest.raises(Refusal, match='models'):
         probe_omp(omp, bad_models)
-    for output in (incompatible, duplicate, malformed):
+    for output in (incompatible, duplicate, malformed, whitespace_legacy, whitespace_current):
         with pytest.raises(Refusal, match='status'):
             probe_herdr(herdr, 'agd-test', status_runner(output))
 
