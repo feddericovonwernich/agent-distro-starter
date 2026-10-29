@@ -157,6 +157,7 @@ export default function primary(api: ExtensionAPI) {
   }
 
   async function startSession(_event: unknown, context: Context) {
+    process.env.AGD_OWNER = token;
     sessionContext = context;
     context.ui.setStatus('agd', 'Distro · starting');
     const active = ++generation;
