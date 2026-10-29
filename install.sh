@@ -63,4 +63,4 @@ owned=false
 trap - EXIT HUP INT TERM
 cd -- "$clone"
 export PATH="$HOME/.local/bin:$PATH"
-exec "${SHELL:-/bin/sh}" -i
+exec bin/agd --home "$PWD" installer shell

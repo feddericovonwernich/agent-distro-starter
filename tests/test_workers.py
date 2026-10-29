@@ -397,14 +397,15 @@ def test_relaunch_restores_frozen_skill_after_catalog_changes():
     os.environ['PATH'] = '/tmp/agd-treehouse-v3.1.6:' + os.environ['PATH']
     with lab() as (home, project):
         brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
-        task = command(home, 'task', 'create', 'frozen', '--project', 'sample',
-                       '--brief', str(brief), '--kind', 'scout')
         add_skill(home, 'agd-probe')
-        selection = {'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']}
-        manifest = worker_skills.prepare(home, dict(task, harness='omp'), selection)
-        task.update(executor='worker', incarnation='old', harness='omp', backend='tmux',
-                    phase='running', worker_alive=False, endpoint={'old': True, 'incarnation': 'old'}, unattended=False,
-                    worker_skills=manifest)
+        task = command(
+            home, 'task', 'create', 'frozen', '--project', 'sample',
+            '--brief', str(brief), '--kind', 'scout', '--skill-mode',
+            'curated', '--skill', 'agd-probe')
+        task.update(executor='worker', incarnation='old', backend='tmux',
+                    phase='running', worker_alive=False,
+                    endpoint={'old': True, 'incarnation': 'old'},
+                    unattended=False)
         tasks.save(home, task)
         shutil.rmtree(home/'config'/'worker-skills'/'agd-probe')
         shutil.rmtree(Path(task['worktree'])/'.omp'/'skills'/'agd-probe')
@@ -425,7 +426,9 @@ def test_granted_launch_uses_frozen_private_scoped_skill_and_prompt():
     from agd_lib import workers
     with lab() as (home, project):
         brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
-        task = command(home, 'task', 'create', 'granted', '--project', 'sample', '--brief', str(brief), '--kind', 'ship')
+        task = command(
+            home, 'task', 'create', 'granted', '--project', 'sample',
+            '--brief', str(brief), '--kind', 'ship', '--skill-mode', 'none')
         instruction = home/'grant.md'
         instruction.write_text('Task granted may publish origin:agd/granted for task granted.\n')
         grant = tasks.grant_pr_publish(home, 'granted', 'origin:agd/granted', instruction)
@@ -470,7 +473,9 @@ def test_granted_launch_refuses_non_github_remote_before_worker_creation():
     from agd_lib import store, workers
     with lab() as (home, _project):
         brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
-        command(home, 'task', 'create', 'nongithub', '--project', 'sample', '--brief', str(brief), '--kind', 'ship')
+        command(
+            home, 'task', 'create', 'nongithub', '--project', 'sample',
+            '--brief', str(brief), '--kind', 'ship', '--skill-mode', 'none')
         instruction = home/'grant.md'; instruction.write_text('Task nongithub grant origin:agd/nongithub.\n')
         grant = tasks.grant_pr_publish(home, 'nongithub', 'origin:agd/nongithub', instruction)
         with pytest.raises(store.Refusal, match='GitHub'):
@@ -485,13 +490,16 @@ def test_concurrent_skill_launch_has_one_winner_without_orphans():
     os.environ['PATH'] = '/tmp/agd-treehouse-v3.1.6:' + os.environ['PATH']
     with lab() as (home, project):
         brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
-        command(home, 'task', 'create', 'race', '--project', 'sample', '--brief', str(brief), '--kind', 'scout')
         add_skill(home, 'agd-probe')
+        command(
+            home, 'task', 'create', 'race', '--project', 'sample',
+            '--brief', str(brief), '--kind', 'scout', '--skill-mode',
+            'curated', '--skill', 'agd-probe')
         class Fake:
             def create(self, *args): return {'incarnation': args[2]}
         def attempt():
             try:
-                return workers.launch(home, 'race', profile=None, skill_mode='curated', skills=('agd-probe',))
+                return workers.launch(home, 'race')
             except Exception as error:
                 return error
         with patch.object(workers.harnesses, 'launch_argv', return_value=['true']), \

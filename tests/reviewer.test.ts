@@ -11,6 +11,13 @@ test('native loop persists actual bridge report', async () => {
   if (process.env.AGD_TELEMETRY_MARKER === '1') console.log(`AGD_REVIEW_RUN_ID=${bridge.hello.input.reviewRunId}`);
 
   try {
+    expect(Object.keys(bridge.hello.projectPlugins.plugins).sort()).toEqual([
+      'ponytail@ponytail', 'superpowers@superpowers-dev',
+    ]);
+    expect(bridge.hello.reviewerPlugins).toEqual({ version: 2, plugins: {} });
+    expect(bridge.hello.input.cwd).not.toBe(bridge.hello.distroHome);
+    expect(bridge.hello.input.cwd).toContain('/state/reviewer/runtime/');
+    expect(bridge.hello.input.agentDir).toContain('/data/omp/agent');
     const observed: string[] = [], messages: unknown[][] = [];
     const result = await runReviewer({ ...bridge.hello.input, broker: bridge.broker, native: bridge.native }, scriptedStream(bridge.native.ai, [[call('reviewer_search', { query: 'failure' })], [call('reviewer_submit', { report: bridge.hello.report })], []], observed, messages));
     expect([...observed].sort()).toEqual(['reviewer_excerpt', 'reviewer_search', 'reviewer_submit']);

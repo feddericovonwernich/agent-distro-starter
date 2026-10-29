@@ -19,7 +19,12 @@ def make_fixture(root):
     (fixture / 'bin' / 'agd').write_text('''#!/bin/bash
 set -eu
 printf 'agd %s\n' "$*" >> "$AGD_LOG"
-if [ "${AGD_FAIL_SETUP:-}" = 1 ] && [ "$3" = installer ]; then exit 1; fi
+if [ "${AGD_FAIL_SETUP:-}" = 1 ] && [ "$3" = installer ]; then
+  mkdir -p "$2/.omp/plugins" "$2/data/omp/config/plugins/cache/plugins/ponytail-partial"
+  printf partial > "$2/.omp/plugins/installed_plugins.json"
+  exit 1
+fi
+if [ "$3" = installer ] && [ "$4" = shell ]; then exec "$SHELL" -i; fi
 ''')
     (fixture / 'bin' / 'agd').chmod(0o755)
     return fixture
@@ -114,7 +119,7 @@ def test_guided_install_initializes_before_setup_and_enters_clone_shell(backend)
         assert any(line.startswith(f'shell cwd={root}/distro-{backend} ') for line in log)
 
 
-def test_failed_owned_clone_is_removed_after_setup_refusal():
+def test_failed_owned_clone_with_partial_plugin_state_is_removed():
     with tempfile.TemporaryDirectory(prefix='agd-install-') as directory:
         root = Path(directory)
         fixture = make_fixture(root)

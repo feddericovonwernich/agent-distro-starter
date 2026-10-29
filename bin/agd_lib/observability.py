@@ -13,7 +13,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-from . import store
+from . import omp_runtime, store
 
 
 def paths(home):
@@ -197,7 +197,8 @@ def managed_environment(home, role, task, incarnation):
             raise ValueError('invalid task')
         task_id = store.validate_id(task.get('id'))
         incarnation = _incarnation(incarnation)
-    env = {key: value for key, value in os.environ.items() if not key.startswith('OTEL_')}
+    env = omp_runtime.environment(
+        home, {key: value for key, value in os.environ.items() if not key.startswith('OTEL_')})
     env['AGD_HOME'] = str(home)
     if role == 'central':
         env['AGD_MANAGED_CENTRAL'] = '1'
@@ -243,8 +244,9 @@ def reviewer_environment(home, review_run_id):
     except (ValueError, TypeError, AttributeError) as error:
         raise ValueError('invalid reviewer run ID') from error
     config = read_config(home)
-    env = {key: value for key, value in os.environ.items()
-           if not key.startswith('OTEL_') and key not in {'AGD_TASK_ID', 'AGD_INCARNATION', 'AGD_MANAGED_CENTRAL', 'AGD_OWNER'}}
+    env = omp_runtime.environment(
+        home, {key: value for key, value in os.environ.items()
+               if not key.startswith('OTEL_') and key not in {'AGD_TASK_ID', 'AGD_INCARNATION', 'AGD_MANAGED_CENTRAL', 'AGD_OWNER'}})
     env['AGD_HOME'] = str(home)
     if config['mode'] == 'disabled':
         return env, config['generation'], None
@@ -268,6 +270,7 @@ def reviewer_environment(home, review_run_id):
 
 def central_argv(home, omp_args):
     home = _home(home)
+    omp_runtime.validate_native_args(omp_args)
     forbidden = {'--cwd', '--session-dir', '--continue', '-c', '--resume', '-r', '--session',
                  '--no-session', '--fork', '--from-claude', '--from-codex'}
     for argument in omp_args:

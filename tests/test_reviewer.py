@@ -110,24 +110,40 @@ def test_packet_rejects_redirected_binding_and_reports_malformed_inputs():
         assert any(row['reason'] == 'task-record-malformed' for row in selected['coverage']['unavailable'])
 
 
-def test_packet_freezes_catalog_and_assigned_manifest_without_claiming_usage():
+def test_packet_freezes_native_catalog_and_assigned_manifest_without_mutation():
     with lab() as (home, _):
-        task, _, _ = ended_worker(home, 'skills', str(uuid.uuid4()), [message('evidence')])
-        skill = home / 'config' / 'worker-skills' / 'agd-test'; skill.mkdir(parents=True)
-        raw = b'---\r\nname: agd-test\r\ndescription: Caf\xc3\xa9 skill\r\n---\r\n' + ('\xc3\xa9'.encode() * 400)
-        (skill / 'SKILL.md').write_bytes(raw)
-        task.update(harness='omp')
-        tasks.save(home, task)
-        worker_skills = __import__('agd_lib.worker_skills', fromlist=['prepare'])
-        worker_skills.prepare(home, task, {'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-test']})
+        source = Path(next(
+            row['source'] for row in worker_skills.catalog(home)
+            if row['id'] == 'systematic-debugging'))
+        raw = (b'---\r\nname: systematic-debugging\r\n'
+               b'description: Caf\xc3\xa9 debugging\r\n---\r\n'
+               + '\xc3\xa9'.encode() * 400)
+        (source/'SKILL.md').write_bytes(raw)
+        task, _, _ = ended_worker(
+            home, 'skills', str(uuid.uuid4()), [message('evidence')])
+        assigned = next(
+            row for row in task['worker_skills']['skills']
+            if row['id'] == 'systematic-debugging')
+        watched = [
+            home/'.omp/plugins/installed_plugins.json',
+            home/'.omp/plugins/omp-plugins.lock.json',
+            home/'config/workers.json',
+            source/'SKILL.md',
+            Path(assigned['snapshot'])/'SKILL.md',
+        ]
+        before = {str(path): path.read_bytes() for path in watched}
         selected = packet(home)
-        assert any(row['id'] == 'agd-test' for row in selected['catalog'])
-        catalog_entry = next(row for row in selected['catalog'] if row['id'] == 'agd-test')
+        catalog_entry = next(
+            row for row in selected['catalog']
+            if row['id'] == 'systematic-debugging')
         assert catalog_entry['catalog_sha256'] == __import__('hashlib').sha256(raw).hexdigest()
-        assert catalog_entry['snapshot_truncated'] is True and catalog_entry['snapshot_total_bytes'] == len(raw)
+        assert catalog_entry['snapshot_truncated'] is True
+        assert catalog_entry['snapshot_total_bytes'] == len(raw)
         assert catalog_entry['snapshot_excerpt'] == raw[:256].decode('utf-8', 'replace')
-        assert selected['skill_provenance'][0]['assigned'][0]['id'] == 'agd-test'
+        assert 'systematic-debugging' in {
+            row['id'] for row in selected['skill_provenance'][0]['assigned']}
         assert selected['skill_provenance'][0]['usage'] == 'unknown'
+        assert before == {str(path): path.read_bytes() for path in watched}
 
 
 def test_packet_collects_explicit_linked_decision_answer_as_partial_central_evidence():

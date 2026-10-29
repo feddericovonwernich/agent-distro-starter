@@ -112,8 +112,8 @@ def check_herdr_preflight():
                 '--brief', str(brief), '--kind', 'scout')
         store.atomic_json(home/'state'/'herdr-workspace.json',
                           {**herdr.available(), 'workspace': 'not-a-workspace'})
-        command(home, 'worker', 'launch', 'stale', '--harness', 'omp',
-                '--backend', 'herdr', expected=3)
+        command(home, 'worker', 'launch', 'stale', '--backend', 'herdr',
+                expected=3)
         assert tasks.read(home, 'stale')['phase'] == 'prepared'
 
 

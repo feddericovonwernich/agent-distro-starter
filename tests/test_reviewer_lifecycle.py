@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -7,13 +8,14 @@ from agd_lib import reviewer, reviewer_runner
 from support import lab
 
 
-def test_native_runner_persists_no_work_without_capability_or_agent_dir(monkeypatch):
+def test_native_runner_persists_no_work_without_capability_probe(monkeypatch):
     with lab() as (home, _):
         checkpoint = reviewer.paths(home)['checkpoint']; checkpoint.parent.mkdir(parents=True, exist_ok=True)
         checkpoint.write_bytes(b'{"anchor":0,"last_due":0}')
         before = checkpoint.read_bytes()
         monkeypatch.setattr(reviewer_runner, 'assert_runtime_capability', lambda *_: (_ for _ in ()).throw(AssertionError('capability called')))
-        result = reviewer_runner.run_native_reviewer(home, reviewer.enqueue_intent(home, kind='manual'), agent_dir=home / 'missing')
+        result = reviewer_runner.run_native_reviewer(
+            home, reviewer.enqueue_intent(home, kind='manual'))
         stored = reviewer._receipt(home, result['review_run_id'])
         assert result['state'] == stored['state'] == 'no-work'
         assert stored['dispatch_state'] == 'final' and checkpoint.read_bytes() == before
@@ -25,18 +27,42 @@ def test_reviewer_session_directory_does_not_bind_pending_id():
         directory = Path(__import__('agd_lib.observability', fromlist=['reviewer_session_dir']).reviewer_session_dir(home, run))
         assert directory.is_dir() and not (directory.parent / 'binding.json').exists()
 
-def test_nonzero_fake_child_records_safe_terminal_diagnostic(monkeypatch):
+def test_native_runner_uses_local_agent_empty_project_and_safe_diagnostic(monkeypatch):
     with lab() as (home, _):
         from test_reviewer import ended_worker, message
         import uuid
         ended_worker(home, 'native', str(uuid.uuid4()), [message('evidence')])
-        agent = home / 'agent'; agent.mkdir()
+        from agd_lib import omp_runtime
+        capture = home / 'capture.json'
         fake = home / 'fake-bun'
-        fake.write_text('#!/usr/bin/env python3\nimport sys\nsys.stderr.write(\"SECRET=https://token@example.invalid\\\\n\")\nsys.exit(7)\n')
+        fake.write_text(
+            '#!/usr/bin/env python3\n'
+            'import json, os, sys\n'
+            f'capture = {str(capture)!r}\n'
+            'payload = json.loads(sys.stdin.readline())\n'
+            'open(capture, \"w\").write(json.dumps({\"argv\": sys.argv[1:], '
+            '\"cwd\": os.getcwd(), \"payload\": payload, '
+            '\"home\": os.environ.get(\"HOME\"), '
+            '\"agent\": os.environ.get(\"PI_CODING_AGENT_DIR\")}))\n'
+            'sys.stderr.write(\"SECRET=https://token@example.invalid\\\\n\")\n'
+            'sys.exit(7)\n')
         fake.chmod(0o700)
         monkeypatch.setattr(reviewer_runner, 'assert_runtime_capability', lambda *_args, **_kwargs: {'omp_version':'fake','ai_url':'x','core_url':'x','sdk_url':'x','registry_url':'x','manager_url':'x','session_url':'x','telemetry_url':'x','resolver_url':'x'})
         monkeypatch.setattr(reviewer_runner.shutil, 'which', lambda _: str(fake))
-        result = reviewer_runner.run_native_reviewer(home, reviewer.enqueue_intent(home, kind='manual'), agent_dir=agent)
+        result = reviewer_runner.run_native_reviewer(
+            home, reviewer.enqueue_intent(home, kind='manual'))
+        assert capture.exists(), result.get('error')
+        captured = json.loads(capture.read_text())
+        runtime = home/'state/reviewer/runtime'/result['review_run_id']
+        assert captured['argv'][0] == '--no-env-file'
+        assert captured['cwd'] == captured['payload']['input']['cwd'] == str(runtime)
+        assert captured['payload']['input']['agentDir'] == str(omp_runtime.agent_dir(home))
+        assert captured['agent'] == str(omp_runtime.agent_dir(home))
+        assert captured['home'] == os.environ['HOME']
+        assert json.loads((runtime/'.omp/plugins/installed_plugins.json').read_text()) == {
+            'version': 2, 'plugins': {}}
+        assert json.loads((runtime/'.omp/plugins/omp-plugins.lock.json').read_text()) == {
+            'plugins': {}, 'settings': {}}
         raw = json.dumps(result)
         assert result['dispatch_state'] == 'final' and result['error']['code'] == 'nonzero'
         assert 'SECRET' not in raw and 'token@example' not in raw
@@ -75,10 +101,11 @@ def test_preparation_failure_is_terminal_without_child(monkeypatch):
     from test_reviewer import ended_worker, message
     import uuid
     with lab() as (home, _):
-        ended_worker(home, 'native', str(uuid.uuid4()), [message('evidence')]); agent=home/'agent'; agent.mkdir()
+        ended_worker(home, 'native', str(uuid.uuid4()), [message('evidence')])
         monkeypatch.setattr(reviewer_runner, 'assert_runtime_capability', lambda *_args, **_kwargs: {'omp_version':'fake','ai_url':'x','core_url':'x','sdk_url':'x','registry_url':'x','manager_url':'x','session_url':'x','telemetry_url':'x','resolver_url':'x'})
         monkeypatch.setattr(reviewer_runner.observability, 'reviewer_environment', lambda *_: (_ for _ in ()).throw(RuntimeError('secret preparation failure')))
-        result=reviewer_runner.run_native_reviewer(home, reviewer.enqueue_intent(home, kind='manual'), agent_dir=agent)
+        result = reviewer_runner.run_native_reviewer(
+            home, reviewer.enqueue_intent(home, kind='manual'))
         assert result['dispatch_state']=='final' and result['outcome']=='failed' and result['error']['code']=='preparation'
         assert 'secret' not in json.dumps(result)
 
@@ -99,13 +126,14 @@ def test_runner_expired_after_collection_skips_capability_and_child(monkeypatch)
     from test_reviewer import ended_worker, message
     import uuid
     with lab() as (home, _):
-        ended_worker(home, 'native', str(uuid.uuid4()), [message('evidence')]); agent = home / 'agent'; agent.mkdir()
+        ended_worker(home, 'native', str(uuid.uuid4()), [message('evidence')])
         monkeypatch.setattr(reviewer_runner.reviewer, 'select_packet',
                             lambda *_args, **_kwargs: {'packet_id': 'a' * 64, 'excerpts': [{}]})
         monkeypatch.setattr(reviewer_runner.reviewer, 'deadline_remaining_seconds', lambda _: 0)
         monkeypatch.setattr(reviewer_runner, 'assert_runtime_capability',
                             lambda *_: (_ for _ in ()).throw(AssertionError('capability called')))
-        result = reviewer_runner.run_native_reviewer(home, reviewer.enqueue_intent(home, kind='manual'), agent_dir=agent)
+        result = reviewer_runner.run_native_reviewer(
+            home, reviewer.enqueue_intent(home, kind='manual'))
         assert result['dispatch_state'] == 'final' and result['outcome'] == 'failed' and result['error']['code'] == 'timeout'
 
 

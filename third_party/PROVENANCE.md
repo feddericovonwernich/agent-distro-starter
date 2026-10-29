@@ -1,12 +1,4 @@
-PONYTAIL_SHA=16352ac229eb08a9598dcae48fe9f2b342567d86
-SUPERPOWERS_SHA=2ce8aa15d05bd57213e6f746f953aafb7ded7a8b
-
-Central skills are copied from each pinned upstream skills/ directory without runtime extensions, hooks, plugin manifests, or install scripts. Worker bundles contain only approved skill payloads plus the applicable upstream MIT LICENSE notice.
-
-Central `.agents/skills/ponytail-help/SKILL.md` is adapted to the native OMP
-distribution (canonical skill IDs and no Ponytail plugin, hook, band,
-marketplace, environment-activation, or config claims); all other copied
-central skill bodies remain verbatim from the pinned sources.
+Ponytail and Superpowers skills/extensions are not redistributed from this tree. Fresh setup installs the official OMP project plugins from `DietrichGebert/ponytail` and `obra/superpowers`; OMP's native user cache and project registry record the resolved versions and payloads under the distro. Central discovery and worker catalog resolution both use those exact upstream payloads. The plugins execute upstream code and retain their upstream licenses.
 
 ## Open Relay skills
 
@@ -15,7 +7,7 @@ Commit: `dac2865837bcab9444a8636053f4f1406a3f9291`
 License: Apache-2.0 (upstream `LICENSE`, SHA-256 `736cb7537e55ce92c53ebab962988e66e38dbf050f620abd65cbb85de524ab4e`)
 Archive SHA-256: `1c2ef0722ef66993270a03fa5c73f389b52582a77930c290d1b54d3ad119d76e`
 
-The five canonical Open Relay skill trees are copied verbatim under `.agents/skills/`. No upstream Open Relay skill is shipped as a worker bundle: the raw upstream worker instructions are not compatible with AGD's guarded worker model or `agd-` bundle namespace. Workers will receive a separate AGD-owned `agd-scoped-pr-relay` adapter when that capability is implemented.
+The five canonical Open Relay skill trees are copied verbatim under `.agents/skills/` for central procedures. No upstream Open Relay skill is shipped as a worker bundle. A valid scoped-PR grant materializes the separate AGD-authored `agd-scoped-pr-relay` adapter into a task created with no ordinary worker skills; it is not an upstream-name alias.
 
 The tracked `third_party/OPEN_RELAY_LICENSE` contains the upstream Apache-2.0 license text applicable to the copied central skill files; its SHA-256 is `736cb7537e55ce92c53ebab962988e66e38dbf050f620abd65cbb85de524ab4e`. The central files have these SHA-256 values:
 

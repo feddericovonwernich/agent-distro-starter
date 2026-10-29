@@ -9,7 +9,7 @@ import sys
 import uuid
 from pathlib import Path
 from urllib.request import urlopen
-from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr, relay, observability, reviewer, reviewer_runner, reviewer_timer, launcher, installer
+from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr, relay, observability, reviewer, reviewer_runner, reviewer_timer, launcher, installer, omp_runtime
 
 
 def parser():
@@ -24,6 +24,9 @@ def parser():
     installer_command = sub.add_parser('installer').add_subparsers(dest='installer_operation', required=True)
     installer_setup = installer_command.add_parser('setup')
     installer_setup.add_argument('--backend', choices=('tmux', 'herdr'), required=True)
+    installer_command.add_parser('shell')
+    omp = sub.add_parser('omp')
+    omp.add_argument('omp_args', nargs=argparse.REMAINDER)
     doctor.add_argument('--harness', choices=('omp', 'cursor'), default='omp')
     doctor.add_argument('--backend', choices=('tmux', 'herdr'), default='tmux')
     project = sub.add_parser('project').add_subparsers(dest='operation', required=True)
@@ -52,6 +55,11 @@ def parser():
     create.add_argument('--brief', required=True)
     create.add_argument('--base')
     create.add_argument('--kind', choices=('ship', 'scout'), default='ship')
+    create.add_argument('--harness', choices=('omp', 'cursor'), default='omp')
+    create.add_argument('--profile')
+    create.add_argument('--skill-mode', choices=('profile', 'curated', 'none'),
+                        default='profile')
+    create.add_argument('--skill', action='append', default=[])
     status = task.add_parser('status')
     status.add_argument('id')
     task.add_parser('list')
@@ -85,12 +93,8 @@ def parser():
         op = worker.add_parser(action)
         op.add_argument('id')
         if action == 'launch':
-            op.add_argument('--harness', choices=('omp', 'cursor'), default='omp')
             op.add_argument('--backend', choices=('tmux', 'herdr'))
             op.add_argument('--unattended', action='store_true')
-            op.add_argument('--profile')
-            op.add_argument('--skill-mode', choices=('profile', 'curated'), default='profile')
-            op.add_argument('--skill', action='append', default=[])
             op.add_argument('--approval')
             op.add_argument('--pr-grant')
         if action in ('run', 'event'):
@@ -152,6 +156,24 @@ def parser():
     for action in ('enable', 'disable', 'status'): timer_p.add_parser(action)
     return p
 
+def parse_args(argv=None):
+    values = list(sys.argv[1:] if argv is None else argv)
+    index = 0
+    while index < len(values):
+        argument = values[index]
+        if argument == '--home':
+            index += 2
+            continue
+        if argument.startswith('--home='):
+            index += 1
+            continue
+        if argument == 'omp':
+            parsed = parser().parse_args(values[:index + 1])
+            parsed.omp_args = values[index + 1:]
+            return parsed
+        break
+    return parser().parse_args(values)
+
 
 def main(args):
     home = store.home(args.home)
@@ -168,6 +190,12 @@ def main(args):
                                                                            'relay-poll', 'relay-reply') or
                          args.command == 'task' and args.operation == 'ready')
         store.require_owner(home, worker_scoped)
+    if args.command == 'omp':
+        omp_runtime.validate_native_args(args.omp_args)
+        executable = omp_runtime.executable(home)
+        os.chdir(home)
+        os.execvpe(executable, [executable, *args.omp_args],
+                   omp_runtime.environment(home, os.environ))
     if args.command == 'observability' and args.operation == 'central':
         argv, env, warning = observability.central_argv(home, args.omp_args)
         if warning:
@@ -200,8 +228,10 @@ def main(args):
         return {'home': str(home)}
     if args.command == 'start':
         inherited = dict(os.environ)
-        selected = (args.backend if args.backend is not None else
-                    launcher.active_backend(home, inherited) or launcher.resolve_backend(home, None))
+        active = launcher.active_backend(home, inherited)
+        if args.backend is not None and active is not None and args.backend != active:
+            raise store.Refusal('explicit backend differs from active central')
+        selected = args.backend or active or launcher.resolve_backend(home, None)
         dependencies = installer.validate_dependencies(home, store.run)
         if 'omp' not in dependencies or selected == 'herdr' and 'herdr' not in dependencies:
             raise store.Refusal('selected launcher dependency is unavailable')
@@ -212,6 +242,12 @@ def main(args):
                                         launcher._backend_attach)
         os.execvpe(target.attach_argv[0], target.attach_argv, target.env)
     if args.command == 'installer':
+        if args.installer_operation == 'shell':
+            shell = os.environ.get('SHELL') or '/bin/sh'
+            os.chdir(home)
+            os.execvpe(
+                shell, [shell, '-i'],
+                omp_runtime.environment(home, os.environ))
         def fetch_json(url):
             with urlopen(url) as response:
                 return json.load(response)
@@ -262,7 +298,10 @@ def main(args):
             return projects.approve(home, args.id, args.action, args.instruction)
     if args.command == 'task':
         if args.operation == 'create':
-            return tasks.create(home, args.id, args.project, args.brief, args.base, args.kind)
+            return tasks.create(
+                home, args.id, args.project, args.brief, args.base, args.kind,
+                harness=args.harness, profile=args.profile,
+                skill_mode=args.skill_mode, skills=tuple(args.skill))
         if args.operation == 'status':
             return dict(tasks.read(home, args.id), open_decisions=supervision.decisions(home, args.id))
         if args.operation == 'list':
@@ -288,8 +327,8 @@ def main(args):
         if args.operation == 'profiles':
             return worker_skills.profiles(home)
         if args.operation == 'launch':
-            return workers.launch(home, args.id, args.harness, args.backend, args.unattended,
-                                  args.approval, args.profile, args.skill_mode, tuple(args.skill), args.pr_grant)
+            return workers.launch(home, args.id, args.backend, args.unattended,
+                                  args.approval, args.pr_grant)
         if args.operation == 'publish-pr':
             title, body = pr.publication_texts(home, args.id, args.incarnation, args.grant,
                                                args.title, args.body)
@@ -324,10 +363,12 @@ def main(args):
     if args.command == 'reviewer':
         if args.reviewer_op == 'run':
             if args.timer and args.retrospective_review_run: raise store.Refusal('timer runs cannot be retrospective')
-            agent_dir = Path(__file__).resolve().parents[1] / '.omp'
-            if args.timer: return reviewer_runner.launch_timer(home, agent_dir=agent_dir)
+            if args.timer: return reviewer_runner.launch_timer(home)
             selected = tuple(args.retrospective_review_run)
-            return reviewer_runner.run_native_reviewer(home, reviewer.enqueue_intent(home, kind='retrospective' if selected else 'manual', retrospective_review_run_ids=selected), agent_dir=agent_dir)
+            return reviewer_runner.run_native_reviewer(
+                home, reviewer.enqueue_intent(
+                    home, kind='retrospective' if selected else 'manual',
+                    retrospective_review_run_ids=selected))
         if args.reviewer_op == 'status':
             return {'timer': reviewer_timer._read_record(home), 'runs': len(list(reviewer.paths(home)['receipts'].glob('*.json')))}
         if args.reviewer_op == 'reports':
@@ -362,7 +403,7 @@ def main(args):
 
 if __name__ == '__main__':
     try:
-        result = main(parser().parse_args())
+        result = main(parse_args())
         if result is not None:
             print(json.dumps(result, indent=2 if sys.stdout.isatty() else None))
     except (ValueError, store.Refusal, store.DependencyError) as error:

@@ -38,15 +38,25 @@ def event(home, task_id, incarnation, kind, key, message):
     return observation
 
 
-def launch(home, task_id, harness='omp', selected_backend=None, unattended=False, approval_id=None,
-           profile=None, skill_mode='profile', skills=(), pr_grant=None):
+def launch(home, task_id, selected_backend=None, unattended=False, approval_id=None,
+           pr_grant=None):
     task = tasks.read(home, task_id)
     if task['phase'] != 'prepared' or task['executor'] != 'central':
         raise store.Refusal('task already launched or not prepared')
+    harness = task.get('harness', 'omp')
+    selection = task.get('worker_skill_selection', {
+        'schema': 2, 'mode': 'none', 'profile': None,
+        'skills': [], 'sources': {},
+    })
+    if (not isinstance(selection, dict) or selection.get('schema') != 2
+            or not isinstance(selection.get('skills'), list)):
+        raise store.Refusal('task worker skill selection is invalid')
     projects_data = projects.read(home, task['project'])
     if harness == 'cursor' and not projects_data['trusted']:
         raise store.Refusal('Cursor project trust requires an explicit user grant')
     work = tasks.verify_workspace(home, task)
+    if task.get('worker_skills'):
+        worker_skills.ensure(home, task)
     if unattended:
         tasks.authorization(home, task, approval_id or '', 'unattended', task_id)
     if selected_backend is None:
@@ -54,6 +64,8 @@ def launch(home, task_id, harness='omp', selected_backend=None, unattended=False
     if selected_backend not in ('tmux', 'herdr') or harness not in ('omp', 'cursor'):
         raise ValueError('unsupported backend or harness')
     if pr_grant:
+        if selection['skills'] or task.get('worker_skills'):
+            raise store.Refusal('PR grant requires a task created with no ordinary worker skills')
         grant = tasks.authorize_pr_publish(home, task, pr_grant)
         from . import pr, relay
         try:
@@ -63,19 +75,12 @@ def launch(home, task_id, harness='omp', selected_backend=None, unattended=False
             store.atomic_json(tasks.task_file(home, task_id).parent/'relay-blocked.json',
                               {'reason': str(error)[:400]})
             raise
-        if profile is not None or skill_mode != 'profile' or skills:
-            raise store.Refusal('PR grant launch controls worker skills')
-        profile, skill_mode, skills = None, 'curated', ('agd-scoped-pr-relay',)
-    preflight = dict(task, harness=harness, backend=selected_backend, pr_grant=pr_grant)
-    harnesses.launch_argv(preflight, tasks.task_file(home, task_id).parent/'brief.md', unattended)
+    preflight = dict(task, backend=selected_backend, pr_grant=pr_grant)
+    harnesses.launch_argv(
+        preflight, tasks.task_file(home, task_id).parent/'brief.md', unattended)
     module = backend(preflight)
     if selected_backend == 'tmux' and not shutil.which('tmux'):
         raise store.DependencyError('tmux is not installed')
-    selection = ({'schema': 1, 'mode': 'curated', 'profile': None,
-                  'skills': ['agd-scoped-pr-relay']} if pr_grant else
-                 worker_skills.resolve(home, profile=profile, skill_mode=skill_mode, skills=skills))
-    if selection['skills']:
-        harnesses.worker_skill_roots(harness)
     if selected_backend == 'herdr':
         module.available()
     with store.lock(home):
@@ -84,25 +89,20 @@ def launch(home, task_id, harness='omp', selected_backend=None, unattended=False
             raise store.Refusal('task launch raced another owner; no endpoint created')
         if pr_grant:
             tasks._authorize_pr_publish_locked(home, current, pr_grant)
-            selection = {'schema': 1, 'mode': 'curated', 'profile': None,
-                         'skills': ['agd-scoped-pr-relay']}
-            current['pr_grant'] = pr_grant
-        manifest = None
-        if selection['skills']:
             manifest = worker_skills.prepare(
-                home, dict(current, harness=harness), selection,
-                {'agd-scoped-pr-relay': worker_skills.scoped_pr_source()} if pr_grant else None)
+                home, current, worker_skills.scoped_pr_selection())
+            current['worker_skills'] = manifest
+            current['pr_grant'] = pr_grant
         if selected_backend == 'herdr':
             module.prepare(home)
         task = current
-        task.update(harness=harness, backend=selected_backend, worker_skill_selection=selection)
-        if manifest is not None:
-            task['worker_skills'] = manifest
+        task['backend'] = selected_backend
         incarnation = str(uuid.uuid4())
-        task.update(executor='worker', incarnation=incarnation, phase='running', worker_alive=None,
-                    unattended=unattended)
+        task.update(executor='worker', incarnation=incarnation, phase='running',
+                    worker_alive=None, unattended=unattended)
         if harness == 'omp':
-            task['observability'] = observability.worker_binding_locked(home, task_id, incarnation)
+            task['observability'] = observability.worker_binding_locked(
+                home, task_id, incarnation)
         tasks.save(home, task)
     endpoint = module.create(home, task_id, incarnation, work,
                              ['env', f'AGD_TASK_ID={task_id}', f'AGD_INCARNATION={incarnation}',

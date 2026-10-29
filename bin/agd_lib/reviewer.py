@@ -24,8 +24,11 @@ def paths(home):
     root = store.home(home); data, state = root / 'data' / 'reviewer', root / 'state' / 'reviewer'
     return {'config': data / 'config.json', 'packets': data / 'packets', 'reports': data / 'reports', 'proposals': data / 'proposals',
             'revisions': data / 'revisions', 'manifests': data / 'manifests', 'triage': data / 'triage', 'intents': state / 'intents',
-            'receipts': state / 'receipts', 'prepared': state / 'prepared', 'pending': state / 'pending', 'checkpoints': state / 'checkpoints',
-            'followups': state / 'followups', 'candidates': state / 'candidates', 'checkpoint': state / 'checkpoint.json', 'lock': state / 'run.lock'}
+            'receipts': state / 'receipts', 'prepared': state / 'prepared',
+            'pending': state / 'pending', 'checkpoints': state / 'checkpoints',
+            'followups': state / 'followups', 'candidates': state / 'candidates',
+            'runtime': state / 'runtime', 'checkpoint': state / 'checkpoint.json',
+            'lock': state / 'run.lock'}
 
 
 def _private(path):
@@ -252,7 +255,7 @@ def _catalog(home, coverage, deadline_epoch_ms=None):
         result = []
         for item in worker_skills.catalog(home):
             _check_deadline(deadline_epoch_ms)
-            raw = (store.home(home) / 'config' / 'worker-skills' / item['id'] / 'SKILL.md').read_bytes()
+            raw = (Path(item['source']) / 'SKILL.md').read_bytes()
             excerpt = raw[:256].decode('utf-8', 'replace')
             result.append({'id': item['id'], 'description': item['description'],
                            'catalog_sha256': hashlib.sha256(raw).hexdigest(), 'snapshot_excerpt': excerpt,
