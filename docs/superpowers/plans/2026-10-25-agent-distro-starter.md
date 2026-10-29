@@ -208,7 +208,7 @@ def lab():
         run(['git', 'add', 'value.txt'], cwd=seed)
         run(['git', 'commit', '-m', 'initial'], cwd=seed)
         run(['git', 'clone', '--bare', seed, origin])
-        command(home, 'init')
+        command(home, 'init', '--backend', 'tmux')
         command(home, 'project', 'add', 'sample', '--source', str(origin), '--base', 'main')
         project = home/'projects'/'sample'
         run(['git', 'config', 'user.name', 'Distro Test'], cwd=project)
@@ -393,7 +393,7 @@ def test_owned_endpoint(backend_name):
     backend = importlib.import_module('agd_lib.' + backend_name)
     with tempfile.TemporaryDirectory(prefix='agd-pane-') as tmp:
         home = Path(tmp)/'home'
-        command(home, 'init')
+        command(home, 'init', '--backend', 'tmux')
         endpoint = backend.create(
             home, 'probe', 'incarnation-one', home,
             ['/bin/sh', '-c', 'printf "agd-live-check\\n"; sleep 30'])

@@ -134,7 +134,7 @@ def test_compose_config_allows_only_browser_and_collector_ports_on_loopback(tmp_
         'collector': 'registry.example/collector@sha256:' + '0' * 64,
         'langfuse': 'registry.example/langfuse@sha256:' + '1' * 64,
     }}
-    home = tmp_path / 'home'; command(home, 'init')
+    home = tmp_path / 'home'; command(home, 'init', '--backend', 'tmux')
     rendered = observability.render_stack(home, lock)
     result = subprocess.run(['docker', 'compose', '-f', str(rendered['compose']),
                              'config', '--format', 'json'], capture_output=True, text=True, check=True)
