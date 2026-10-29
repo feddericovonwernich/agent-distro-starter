@@ -24,8 +24,8 @@ if ((${#missing[@]})); then
     [[ $answer == y || $answer == Y || $answer == yes || $answer == YES ]] || exit 1
     command -v apt >/dev/null || { echo 'APT required' >&2; exit 1; }
     sudo -v
-    apt update
-    apt install -y "${missing[@]}"
+    sudo apt update
+    sudo apt install -y "${missing[@]}"
 fi
 command -v git >/dev/null || { echo 'Git required' >&2; exit 1; }
 command -v python3 >/dev/null && python3 -c 'import sys; sys.exit(sys.version_info < (3, 12))' ||

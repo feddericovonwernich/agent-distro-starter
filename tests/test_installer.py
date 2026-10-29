@@ -23,14 +23,14 @@ def result(stdout='', stderr='', returncode=0):
 
 def fake_run(argv, check=False):
     if argv[1:] == ['--version']:
-        return result('v1.2.3\n')
+        return result('v3.1.6\n' if Path(argv[0]).name == 'treehouse' else 'v1.2.3\n')
     if argv[1:] == ['models', '--json']:
         return result('[]')
     if argv[1:] == ['login', '--help']:
         return result('usage')
     if argv[1:] == ['session', 'list', '--json']:
         return result('[]')
-    if argv[1:] == ['--session', 'agd-test', 'status', 'server']:
+    if argv[-2:] == ['status', 'server']:
         return result('status: not running\nsocket: /tmp/herdr.sock\n')
     raise AssertionError(argv)
 
@@ -298,12 +298,14 @@ def test_omp_rejects_non_https_checksum_asset(tmp_path, monkeypatch):
 def test_setup_persists_compatible_declined_dependencies_and_preserves_prior_on_refusal(tmp_path, monkeypatch):
     monkeypatch.setenv('PATH', str(tmp_path))
     omp = tmp_path/'omp'; omp.write_text('x'); omp.chmod(0o755)
+    treehouse = tmp_path/'treehouse'; treehouse.write_text('x'); treehouse.chmod(0o755)
     selected = release('omp-linux-x64')
     before = {'schema': 1, 'omp': {'source': 'existing', 'path': str(omp), 'version': 'old',
               'capabilities': ['models-json', 'login']}}
     write_dependencies(tmp_path, before)
     got = setup(tmp_path, 'tmux', lambda _: False, lambda _: selected, stream(b'executable'), fake_run)
     assert got['omp']['source'] == 'existing'
+    assert got['treehouse']['source'] == 'existing'
     assert read_dependencies(tmp_path) == got
     with pytest.raises(Refusal, match='requirement'):
         setup(tmp_path, 'herdr', lambda _: False, lambda _: selected, stream(b'executable'), fake_run)

@@ -18,11 +18,8 @@ def make_fixture(root):
     (fixture / 'bin').mkdir(parents=True)
     (fixture / 'bin' / 'agd').write_text('''#!/bin/bash
 set -eu
-printf 'agd %s\\n' "$*" >> "$AGD_LOG"
-if [ "$3" = init ]; then
-  /bin/mkdir -p "$2/data"
-  printf '{"schema":1}' > "$2/data/dependencies.json"
-fi
+printf 'agd %s\n' "$*" >> "$AGD_LOG"
+if [ "${AGD_FAIL_SETUP:-}" = 1 ] && [ "$3" = installer ]; then exit 1; fi
 ''')
     (fixture / 'bin' / 'agd').chmod(0o755)
     return fixture
@@ -36,7 +33,8 @@ def make_tools(root, fixture, python_version='3.12', include_git=True, include_t
 case "$1" in -s) echo Linux;; -m) echo x86_64;; esac
 ''',
         'sudo': '''#!/bin/bash
-printf 'sudo %s\\n' "$*" >> "$AGD_LOG"
+printf 'sudo %s\n' "$*" >> "$AGD_LOG"
+if [ "$1" != -v ]; then exec "$@"; fi
 ''',
         'apt': '''#!/bin/bash
 printf 'apt %s\n' "$*" >> "$AGD_LOG"
@@ -68,9 +66,10 @@ printf 'git %s\\n' "$*" >> "$AGD_LOG"
     return tools
 
 
-def run_install(root, tools, answers, *, path=None):
+def run_install(root, tools, answers, *, fail_setup=False, path=None):
     env = dict(os.environ, HOME=str(root / 'home'), PATH=path or str(tools), AGD_LOG=str(root / 'log'),
-               AGD_FIXTURE=str(root / 'fixture'), AGD_TOOLS=str(tools), SHELL=str(tools / 'sh'))
+               AGD_FIXTURE=str(root / 'fixture'), AGD_TOOLS=str(tools), SHELL=str(tools / 'sh'),
+               AGD_FAIL_SETUP='1' if fail_setup else '')
     master, slave = pty.openpty()
     def terminal():
         os.setsid()
@@ -112,8 +111,17 @@ def test_guided_install_initializes_before_setup_and_enters_clone_shell(backend)
         init = f'agd --home {root}/distro-{backend} init --backend {backend}'
         setup = f'agd --home {root}/distro-{backend} installer setup --backend {backend}'
         assert log.index(init) < log.index(setup)
-        assert (root / f'distro-{backend}/data/dependencies.json').exists()
         assert any(line.startswith(f'shell cwd={root}/distro-{backend} ') for line in log)
+
+
+def test_failed_owned_clone_is_removed_after_setup_refusal():
+    with tempfile.TemporaryDirectory(prefix='agd-install-') as directory:
+        root = Path(directory)
+        fixture = make_fixture(root)
+        tools = make_tools(root, fixture)
+        result = run_install(root, tools, 'distro\ntmux\n', fail_setup=True)
+        assert result.returncode != 0
+        assert not (root / 'distro').exists()
 
 
 def test_blank_sudo_declines_missing_git_without_elevation():
@@ -137,8 +145,8 @@ def test_bootstrap_installs_only_missing_selected_tmux():
         assert result.returncode == 0, (result.stdout, result.stderr)
         log = (root / 'log').read_text()
         assert 'sudo -v' in log
-        assert 'apt update' in log
-        assert 'apt install -y tmux' in log
+        assert 'sudo apt update' in log
+        assert 'sudo apt install -y tmux' in log
         assert 'git' not in '\n'.join(line for line in log.splitlines() if line.startswith('apt '))
         assert 'python3' not in '\n'.join(line for line in log.splitlines() if line.startswith('apt '))
 

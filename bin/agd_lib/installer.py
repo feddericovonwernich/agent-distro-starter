@@ -366,17 +366,30 @@ def validate_dependencies(home, run):
 def setup(home, backend, prompt, fetch_json, stream_url, run):
     if backend not in {'tmux', 'herdr'}:
         raise Refusal('selected backend is invalid')
-    tools = ['omp'] + (['herdr'] if backend == 'herdr' else [])
+    tools = ['omp'] + (['herdr'] if backend == 'herdr' else []) + ['treehouse']
     receipt = {'schema': 1}
     for tool in tools:
         path = shutil.which(tool)
-        probe = probe_omp if tool == 'omp' else lambda item, runner: probe_herdr(item, 'agd-probe', runner)
+        if tool == 'omp':
+            probe = probe_omp
+        elif tool == 'herdr':
+            probe = lambda item, runner: probe_herdr(item, 'agd-probe', runner)
+        else:
+            probe = probe_treehouse
         existing = None
         if path:
             try:
                 existing = {'source': 'existing', **probe(path, run)}
             except Refusal:
                 pass
+        if tool == 'treehouse':
+            if existing is not None:
+                receipt[tool] = existing
+            elif prompt('install pinned Treehouse v3.1.6?'):
+                receipt[tool] = install_treehouse(home, stream_url)
+            else:
+                raise Refusal('treehouse requirement is unmet')
+            continue
         release = _stable_release(fetch_json, tool)
         message = f'{tool} {release["tag_name"]} is available; install or update?'
         if not prompt(message):
