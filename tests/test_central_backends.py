@@ -280,3 +280,61 @@ def test_herdr_central_uses_named_receipted_session_and_restores_focus(tmp_path,
         returncode=0, stdout=json.dumps([{'name': session}]), stderr=''))
     with __import__('pytest').raises(store.Refusal, match='unreceipted'):
         launcher._backend_create('herdr', home, 'other', 'token', ['/opt/agd'], {'PATH': '/bin'}, ['/opt/omp'])
+
+
+def test_herdr_start_checkpoints_socket_before_workspace_failure(tmp_path, monkeypatch):
+    import json
+    import stat
+    import subprocess
+    from agd_lib import launcher, observability, store
+
+    home = tmp_path / 'home'
+    home.mkdir()
+    launcher.initialize(home, 'herdr')
+    session = json.loads((home / 'data' / 'launcher.json').read_text())['herdr_session']
+
+    class Socket:
+        st_mode, st_dev, st_ino = stat.S_IFSOCK, 9, 10
+
+    def fake_run(argv, check=True, timeout=None):
+        if argv == ['herdr', 'session', 'list', '--json']:
+            return SimpleNamespace(returncode=0, stdout='[]', stderr='')
+        if argv[-2:] == ['status', 'server']:
+            return SimpleNamespace(returncode=0, stdout='status: running\ncompatible: yes\nprotocol: 20\nsocket: /tmp/herdr.sock\n', stderr='')
+        if argv[3:] == ['workspace', 'create', '--cwd', str(home), '--label', 'agd-central', '--no-focus']:
+            raise store.Refusal('workspace failed')
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(observability, 'central_argv', lambda *_: (['/opt/omp'], {}, None))
+    monkeypatch.setattr(launcher.store, 'run', fake_run)
+    monkeypatch.setattr(launcher, '_socket_identity', lambda path: Socket())
+    monkeypatch.setattr(launcher, 'subprocess', SimpleNamespace(DEVNULL=subprocess.DEVNULL,
+                        TimeoutExpired=subprocess.TimeoutExpired, Popen=lambda *args, **kwargs: None))
+
+    with __import__('pytest').raises(store.Refusal, match='workspace failed'):
+        launcher.prepare_start(home, None, {}, launcher._backend_create, launcher._backend_inspect, launcher._backend_attach)
+    receipt = json.loads((home / 'state' / 'central-launcher.json').read_text())
+    assert receipt['phase'] == 'spawned'
+    assert receipt['endpoint'] == {'session': session, 'socket': '/tmp/herdr.sock', 'device': 9,
+                                   'inode': 10, 'protocol': '20'}
+
+
+def test_herdr_attach_refuses_replaced_socket_without_herdr_commands(tmp_path, monkeypatch):
+    import stat
+    from agd_lib import launcher, store
+
+    endpoint = {'session': 'agd-session', 'socket': '/tmp/herdr.sock', 'device': 9, 'inode': 10,
+                'protocol': '20', 'workspace': 'workspace-1', 'tab': 'tab-1', 'pane': 'pane-1',
+                'terminal': 'terminal-1', 'token': 'token', 'launch_id': 'launch-id'}
+    receipt = {'backend': 'herdr', 'endpoint': endpoint}
+    calls = []
+
+    class Replaced:
+        st_mode, st_dev, st_ino = stat.S_IFSOCK, 9, 11
+
+    monkeypatch.setattr(launcher, '_socket_identity', lambda path: Replaced())
+    monkeypatch.setattr(launcher.store, 'run', lambda argv, **kwargs: calls.append(argv))
+
+    with __import__('pytest').raises(store.Refusal, match='replaced'):
+        launcher._backend_attach(tmp_path, receipt)
+    assert calls == []

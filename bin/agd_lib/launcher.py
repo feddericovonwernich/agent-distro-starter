@@ -238,7 +238,7 @@ def _herdr_inspect(home: Path, receipt: dict) -> dict:
 
 
 def _herdr_create(home: Path, launch_id: str, endpoint_token: str, managed: list[str],
-                  env: dict[str, str], argv: list[str]) -> dict:
+                  env: dict[str, str], argv: list[str], checkpoint=None) -> dict:
     session = _herdr_session(home)
     try:
         listed = json.loads(store.run(['herdr', 'session', 'list', '--json'], timeout=10).stdout)
@@ -260,11 +260,16 @@ def _herdr_create(home: Path, launch_id: str, endpoint_token: str, managed: list
             time.sleep(.1)
     if endpoint is None:
         raise store.Refusal('Herdr server did not become available')
+    if checkpoint:
+        checkpoint(endpoint)
     workspace = _herdr_response(_herdr_call(
         endpoint, 'workspace', 'create', '--cwd', str(home), '--label', 'agd-central', '--no-focus'))['workspace']
     workspace_id = workspace.get('workspace_id')
     if not isinstance(workspace_id, str):
         raise store.Refusal('Herdr workspace identity is unverified')
+    endpoint['workspace'] = workspace_id
+    if checkpoint:
+        checkpoint(endpoint)
     checked_workspace = _herdr_response(_herdr_call(endpoint, 'workspace', 'get', workspace_id))['workspace']
     if checked_workspace.get('workspace_id') != workspace_id:
         raise store.Refusal('Herdr workspace identity changed')
@@ -273,11 +278,13 @@ def _herdr_create(home: Path, launch_id: str, endpoint_token: str, managed: list
     tab, pane = created.get('tab'), created.get('root_pane')
     if not isinstance(tab, dict) or not isinstance(pane, dict):
         raise store.Refusal('Herdr tab identity is unverified')
-    endpoint.update(workspace=workspace_id, tab=tab.get('tab_id'), pane=pane.get('pane_id'),
-                    terminal=pane.get('terminal_id'), token=endpoint_token, launch_id=launch_id)
+    endpoint.update(tab=tab.get('tab_id'), pane=pane.get('pane_id'), terminal=pane.get('terminal_id'),
+                    token=endpoint_token, launch_id=launch_id)
     if (not all(isinstance(endpoint[key], str) and endpoint[key] for key in ('workspace', 'tab', 'pane', 'terminal'))
             or pane.get('workspace_id') != endpoint['workspace'] or pane.get('tab_id') != endpoint['tab']):
         raise store.Refusal('Herdr tab identity is inconsistent')
+    if checkpoint:
+        checkpoint(endpoint)
     command_env = {key: value for key, value in {
         'AGD_HERDR_SESSION': session, 'AGD_LAUNCH_ID': launch_id, 'AGD_ENDPOINT_TOKEN': endpoint_token,
         'PATH': env.get('PATH', os.environ.get('PATH', '')),
@@ -306,9 +313,9 @@ def _backend_inspect(home: Path, receipt: dict) -> dict:
 
 
 def _backend_create(backend: str, home: Path, launch_id: str, endpoint_token: str, managed: list[str],
-                    env: dict[str, str], argv: list[str]) -> dict:
+                    env: dict[str, str], argv: list[str], checkpoint=None) -> dict:
     if backend == 'herdr':
-        return _herdr_create(home, launch_id, endpoint_token, managed, env, argv)
+        return _herdr_create(home, launch_id, endpoint_token, managed, env, argv, checkpoint)
     module = __import__(f'agd_lib.{backend}', fromlist=['create_central'])
     create = getattr(module, 'create_central', None)
     if not callable(create):
@@ -377,10 +384,25 @@ def prepare_start(home: Path, explicit_backend: str | None, inherited_env: Mappi
             raise store.Refusal('launcher receipt appeared during reservation')
         _owner(home, reserved, False)
         store.atomic_json(_receipt_path(home), reserved)
-    endpoint = create(selected, home, launch_id, endpoint_token, managed,
-                      {**central_env, 'AGD_LAUNCH_ID': launch_id, 'AGD_ENDPOINT_TOKEN': endpoint_token}, argv)
-    spawned = {**reserved, 'phase': 'spawned', 'endpoint': endpoint}
-    _advance(home, reserved, spawned)
+    if selected == 'herdr' and create is _backend_create:
+        spawned = None
+
+        def checkpoint(endpoint):
+            nonlocal spawned
+            replacement = {**(spawned or reserved), 'phase': 'spawned', 'endpoint': dict(endpoint)}
+            _advance(home, spawned or reserved, replacement)
+            spawned = replacement
+
+        endpoint = create(selected, home, launch_id, endpoint_token, managed,
+                          {**central_env, 'AGD_LAUNCH_ID': launch_id, 'AGD_ENDPOINT_TOKEN': endpoint_token}, argv,
+                          checkpoint)
+        if spawned is None or spawned['endpoint'] != endpoint:
+            raise store.Refusal('Herdr endpoint checkpoint is missing')
+    else:
+        endpoint = create(selected, home, launch_id, endpoint_token, managed,
+                          {**central_env, 'AGD_LAUNCH_ID': launch_id, 'AGD_ENDPOINT_TOKEN': endpoint_token}, argv)
+        spawned = {**reserved, 'phase': 'spawned', 'endpoint': endpoint}
+        _advance(home, reserved, spawned)
     if create is _backend_create:
         _backend_finalize(home, spawned)
     owner = _prove(home, spawned, inspect)
