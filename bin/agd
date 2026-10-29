@@ -219,7 +219,10 @@ def main(args):
             with urlopen(url) as response:
                 yield from iter(lambda: response.read(1024 * 1024), b'')
         def prompt(message):
-            return input(f'{message} [y/N] ').strip().lower() in ('y', 'yes')
+            color = sys.stderr.isatty() and os.environ.get('TERM', 'dumb') != 'dumb' and 'NO_COLOR' not in os.environ
+            label = f'\033[36m{message}\033[0m' if color else message
+            print(f'\n{label} [y/N] ', end='', file=sys.stderr, flush=True)
+            return input().strip().lower() in ('y', 'yes')
         return installer.setup(home, args.backend, prompt, fetch_json, stream_url, store.run)
     if args.command == 'doctor':
         names = ['git', 'treehouse', 'omp' if args.harness == 'omp' else 'cursor-agent',
@@ -361,7 +364,7 @@ if __name__ == '__main__':
     try:
         result = main(parser().parse_args())
         if result is not None:
-            print(json.dumps(result))
+            print(json.dumps(result, indent=2 if sys.stdout.isatty() else None))
     except (ValueError, store.Refusal, store.DependencyError) as error:
         print(str(error), file=sys.stderr)
         sys.exit(2 if isinstance(error, ValueError) else 4 if isinstance(error, store.DependencyError) else 3)
