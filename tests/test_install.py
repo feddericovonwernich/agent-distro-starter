@@ -1,57 +1,168 @@
-import json
+import fcntl
 import os
-import shlex
+import pty
+import select
 import subprocess
 import tempfile
+import termios
+import time
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = 'https://github.com/feddericovonwernich/agent-distro-starter.git'
 
 
-def test_named_install():
+def make_fixture(root):
+    fixture = root / 'fixture'
+    (fixture / 'bin').mkdir(parents=True)
+    (fixture / 'bin' / 'agd').write_text('''#!/bin/bash
+set -eu
+printf 'agd %s\\n' "$*" >> "$AGD_LOG"
+if [ "$3" = init ]; then
+  /bin/mkdir -p "$2/data"
+  printf '{"schema":1}' > "$2/data/dependencies.json"
+fi
+''')
+    (fixture / 'bin' / 'agd').chmod(0o755)
+    return fixture
+
+
+def make_tools(root, fixture, python_version='3.12', include_git=True, include_tmux=True):
+    tools = root / 'tools'
+    tools.mkdir()
+    scripts = {
+        'uname': '''#!/bin/bash
+case "$1" in -s) echo Linux;; -m) echo x86_64;; esac
+''',
+        'sudo': '''#!/bin/bash
+printf 'sudo %s\\n' "$*" >> "$AGD_LOG"
+''',
+        'apt': '''#!/bin/bash
+printf 'apt %s\n' "$*" >> "$AGD_LOG"
+if [ "$1" = install ]; then printf '#!/bin/bash\nexit 0\n' > "$AGD_TOOLS/tmux"; /bin/chmod +x "$AGD_TOOLS/tmux"; fi
+''',
+        'python3': f'''#!/bin/bash
+if [ "$1" = -c ]; then [ "{python_version}" = 3.12 ] && exit 0 || exit 1; fi
+exec /usr/bin/python3 "$@"
+''',
+        'omp': '''#!/bin/bash
+printf 'omp %s\\n' "$*" >> "$AGD_LOG"
+[ "$1" != auth ]
+''',
+        'sh': '''#!/bin/bash
+printf 'shell cwd=%s path=%s\\n' "$PWD" "$PATH" >> "$AGD_LOG"
+''',
+    }
+    if include_git:
+        scripts['git'] = '''#!/bin/bash
+printf 'git %s\\n' "$*" >> "$AGD_LOG"
+ /bin/cp -a "$AGD_FIXTURE/." "$4"
+'''
+    if include_tmux:
+        scripts['tmux'] = '#!/bin/bash\nexit 0\n'
+    for name, body in scripts.items():
+        path = tools / name
+        path.write_text(body)
+        path.chmod(0o755)
+    return tools
+
+
+def run_install(root, tools, answers, *, path=None):
+    env = dict(os.environ, HOME=str(root / 'home'), PATH=path or str(tools), AGD_LOG=str(root / 'log'),
+               AGD_FIXTURE=str(root / 'fixture'), AGD_TOOLS=str(tools), SHELL=str(tools / 'sh'))
+    master, slave = pty.openpty()
+    def terminal():
+        os.setsid()
+        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    process = subprocess.Popen(['/bin/bash', str(ROOT / 'install.sh')], cwd=root, env=env,
+                               stdin=slave, stdout=slave, stderr=slave, preexec_fn=terminal)
+    os.close(slave)
+    os.write(master, answers.encode())
+    output = bytearray()
+    deadline = time.monotonic() + 10
+    while process.poll() is None and time.monotonic() < deadline:
+        if select.select([master], [], [], .1)[0]:
+            try:
+                output.extend(os.read(master, 4096))
+            except OSError:
+                break
+    while select.select([master], [], [], 0)[0]:
+        try:
+            output.extend(os.read(master, 4096))
+        except OSError:
+            break
+    if process.poll() is None:
+        process.kill()
+    process.wait(timeout=5)
+    os.close(master)
+    text = output.decode(errors='replace')
+    return subprocess.CompletedProcess(process.args, process.returncode, text, text)
+
+
+@pytest.mark.parametrize('backend', ['tmux', 'herdr'])
+def test_guided_install_initializes_before_setup_and_enters_clone_shell(backend):
     with tempfile.TemporaryDirectory(prefix='agd-install-') as directory:
         root = Path(directory)
-        origin = root/'template.git'
-        subprocess.run(['git', 'clone', '--bare', str(ROOT), str(origin)],
-                       check=True, capture_output=True)
-        (root/'decoy/my-distro').mkdir(parents=True)
-        env = dict(os.environ, AGD_HOME=str(root/'unrelated-home'), CDPATH=str(root/'decoy'),
-                   GIT_CONFIG_COUNT='1',
-                   GIT_CONFIG_KEY_0=f'url.file://{origin}.insteadOf',
-                   GIT_CONFIG_VALUE_0=SOURCE)
-
-        def install(name):
-            return subprocess.run(
-                ['script', '-q', '-e', '-c', f'bash {shlex.quote(str(ROOT/"install.sh"))}', '/dev/null'],
-                input=name+'\n', cwd=root, env=env, capture_output=True, text=True, timeout=90)
-
-        first = install('my-distro')
-        assert first.returncode == 0, (first.stdout, first.stderr)
-        first_home = root/'my-distro'
-        first_id = json.loads((first_home/'data/home.json').read_text())['home_id']
-        assert not (root/'unrelated-home').exists()
-        assert subprocess.check_output(
-            ['git', '-C', str(first_home), 'config', '--get', 'remote.origin.url'],
-            text=True).strip() == SOURCE
-        assert subprocess.check_output(
-            ['git', '-C', str(first_home), 'status', '--porcelain=v1'], text=True) == ''
-        second = install('another-distro')
-        assert second.returncode == 0, (second.stdout, second.stderr)
-        assert json.loads((root/'another-distro/data/home.json').read_text())['home_id'] != first_id
-        sentinel = first_home/'keep'
-        sentinel.write_text('mine')
-        assert install('my-distro').returncode != 0
-        assert sentinel.read_text() == 'mine'
-        assert install('Bad Name').returncode != 0
-        assert not (root/'Bad Name').exists()
-        (root/'linked').symlink_to(first_home, target_is_directory=True)
-        assert install('linked').returncode != 0
-        assert (root/'linked').is_symlink()
-        no_tty = subprocess.run(['bash', str(ROOT/'install.sh')], cwd=root, env=env,
-                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
-        assert no_tty.returncode != 0
+        fixture = make_fixture(root)
+        tools = make_tools(root, fixture)
+        result = run_install(root, tools, f'distro-{backend}\n{backend}\n\nN\n')
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        log = (root / 'log').read_text().splitlines()
+        init = f'agd --home {root}/distro-{backend} init --backend {backend}'
+        setup = f'agd --home {root}/distro-{backend} installer setup --backend {backend}'
+        assert log.index(init) < log.index(setup)
+        assert (root / f'distro-{backend}/data/dependencies.json').exists()
+        assert any(line.startswith(f'shell cwd={root}/distro-{backend} ') for line in log)
 
 
-if __name__ == '__main__':
-    test_named_install()
+def test_blank_sudo_declines_missing_git_without_elevation():
+    with tempfile.TemporaryDirectory(prefix='agd-install-') as directory:
+        root = Path(directory)
+        fixture = make_fixture(root)
+        tools = make_tools(root, fixture, include_git=False)
+        result = run_install(root, tools, 'distro\ntmux\n\n')
+        assert result.returncode != 0
+        assert 'Missing requirements: git' in result.stderr
+        assert not (root / 'log').exists()
+        assert not (root / 'distro').exists()
+
+
+def test_bootstrap_installs_only_missing_selected_tmux():
+    with tempfile.TemporaryDirectory(prefix='agd-install-') as directory:
+        root = Path(directory)
+        fixture = make_fixture(root)
+        tools = make_tools(root, fixture, include_tmux=False)
+        result = run_install(root, tools, 'distro\ntmux\ny\n\nN\n')
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        log = (root / 'log').read_text()
+        assert 'sudo -v' in log
+        assert 'apt update' in log
+        assert 'apt install -y tmux' in log
+        assert 'git' not in '\n'.join(line for line in log.splitlines() if line.startswith('apt '))
+        assert 'python3' not in '\n'.join(line for line in log.splitlines() if line.startswith('apt '))
+
+
+def test_present_python_311_refuses_without_bootstrap():
+    with tempfile.TemporaryDirectory(prefix='agd-install-') as directory:
+        root = Path(directory)
+        fixture = make_fixture(root)
+        tools = make_tools(root, fixture, python_version='3.11')
+        result = run_install(root, tools, 'distro\ntmux\n')
+        assert result.returncode != 0
+        assert 'Python 3.12+ required' in result.stderr
+        assert not (root / 'log').exists()
+
+
+def test_optional_login_and_models_are_child_commands_without_secret_export():
+    with tempfile.TemporaryDirectory(prefix='agd-install-') as directory:
+        root = Path(directory)
+        fixture = make_fixture(root)
+        tools = make_tools(root, fixture)
+        result = run_install(root, tools, 'distro\ntmux\nopenai\ny\n')
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        log = (root / 'log').read_text()
+        assert 'omp login openai' in log
+        assert 'omp models --json' in log
+        assert 'auth export' not in log
+        assert 'auth' not in log.replace('auth export', '')

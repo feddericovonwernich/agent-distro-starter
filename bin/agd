@@ -7,8 +7,8 @@ import json
 import sys
 import uuid
 import pwd
-from pathlib import Path
-from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr, relay, observability, reviewer, reviewer_runner, reviewer_timer, launcher
+from urllib.request import urlopen
+from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr, relay, observability, reviewer, reviewer_runner, reviewer_timer, launcher, installer
 
 
 def parser():
@@ -18,6 +18,9 @@ def parser():
     init = sub.add_parser('init')
     init.add_argument('--backend', choices=('tmux', 'herdr'), default='tmux')
     doctor = sub.add_parser('doctor')
+    installer_command = sub.add_parser('installer').add_subparsers(dest='installer_operation', required=True)
+    installer_setup = installer_command.add_parser('setup')
+    installer_setup.add_argument('--backend', choices=('tmux', 'herdr'), required=True)
     doctor.add_argument('--harness', choices=('omp', 'cursor'), default='omp')
     doctor.add_argument('--backend', choices=('tmux', 'herdr'), default='tmux')
     project = sub.add_parser('project').add_subparsers(dest='operation', required=True)
@@ -149,7 +152,7 @@ def parser():
 
 def main(args):
     home = store.home(args.home)
-    mutation = (args.command == 'init' or
+    mutation = (args.command in ('init', 'installer') or
                 args.command == 'project' and args.operation not in ('list', 'inspect') or
                 args.command == 'task' and args.operation not in ('list', 'status') or
                 args.command == 'worker' and args.operation not in ('inspect', 'inbox', 'skills', 'profiles') or
@@ -192,6 +195,16 @@ def main(args):
             launcher.initialize(home, args.backend)
             worker_skills.seed_defaults(home)
         return {'home': str(home)}
+    if args.command == 'installer':
+        def fetch_json(url):
+            with urlopen(url) as response:
+                return json.load(response)
+        def stream_url(url):
+            with urlopen(url) as response:
+                yield from iter(lambda: response.read(1024 * 1024), b'')
+        def prompt(message):
+            return input(f'{message} [y/N] ').strip().lower() in ('y', 'yes')
+        return installer.setup(home, args.backend, prompt, fetch_json, stream_url, store.run)
     if args.command == 'doctor':
         names = ['git', 'treehouse', 'omp' if args.harness == 'omp' else 'cursor-agent',
                  args.backend]
