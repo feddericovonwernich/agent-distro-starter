@@ -21,14 +21,17 @@ def test_distinct_leases_and_preserved_project():
         command(home, 'project', 'add', 'sample', '--source', str(origin))
         brief = home/'brief.md'
         brief.write_text('Change the file and report the checks.\n')
-        a = command(home, 'task', 'create', 'one', '--project', 'sample', '--brief', str(brief))
-        b = command(home, 'task', 'create', 'two', '--project', 'sample', '--brief', str(brief))
+        a = command(home, 'task', 'create', 'one', '--project', 'sample',
+                    '--brief', str(brief), '--skill-mode', 'none')
+        b = command(home, 'task', 'create', 'two', '--project', 'sample',
+                    '--brief', str(brief), '--skill-mode', 'none')
         assert a['lease_id'] != b['lease_id']
         assert a['worktree'] != b['worktree']
         (Path(a['worktree'])/'value.txt').write_text('one only\n')
         assert (Path(b['worktree'])/'value.txt').read_text() == 'base\n'
         assert (home/'projects'/'sample'/'value.txt').read_text() == 'base\n'
-        command(home, 'task', 'create', 'one', '--project', 'sample', '--brief', str(brief), expected=3)
+        command(home, 'task', 'create', 'one', '--project', 'sample',
+                '--brief', str(brief), '--skill-mode', 'none', expected=3)
         assert command(home, 'task', 'status', 'one')['lease_id'] == a['lease_id']
 
         import sys

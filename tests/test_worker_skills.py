@@ -292,20 +292,18 @@ def test_config_parent_must_be_a_real_directory():
             raise AssertionError('regular config parent was treated as missing')
 
 
-def test_launch_selection_flags_resolve_before_an_endpoint_starts():
+def test_task_create_selection_refuses_before_allocating_a_lease():
     from support import lab, command
     from agd_lib import tasks
-    os.environ['PATH'] = '/tmp/agd-treehouse-v3.1.6:' + os.environ['PATH']
     with lab() as (home, project):
         brief = home/'brief.md'
         brief.write_text('Inspect value.txt.\n')
-        task = command(home, 'task', 'create', 'selection', '--project', 'sample',
-                       '--brief', str(brief), '--kind', 'scout')
-        result = command(home, 'worker', 'launch', 'selection', '--profile', 'missing',
-                         expected=3)
+        result = command(
+            home, 'task', 'create', 'selection', '--project', 'sample',
+            '--brief', str(brief), '--kind', 'scout', '--profile', 'missing',
+            expected=3)
         assert 'unknown profile' in result.stderr
-        assert tasks.read(home, 'selection')['phase'] == 'prepared'
-        assert tasks.read(home, 'selection')['lease_id'] == task['lease_id']
+        assert not tasks.task_file(home, 'selection').exists()
 
 
 def test_prepare_freezes_and_materializes_a_skill_bundle():
@@ -677,43 +675,57 @@ def test_prompt_names_assigned_skill_paths():
     assert '/tmp/.omp/skills/agd-probe/SKILL.md' in argv[-1]
 
 
-def test_cli_curated_selection_freezes_before_backend_failure():
+def test_create_materializes_curated_skills_before_prepared():
     from support import lab, command
     from agd_lib import tasks
     with lab() as (home, project):
-        os.environ['PATH'] = '/tmp/agd-treehouse-v3.1.6:' + os.environ['PATH']
         add_skill(home, 'agd-probe')
         brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
-        task = command(home, 'task', 'create', 'curated', '--project', 'sample',
+        task = command(
+            home, 'task', 'create', 'curated', '--project', 'sample',
+            '--brief', str(brief), '--kind', 'scout',
+            '--skill-mode', 'curated', '--skill', 'agd-probe')
+        stored = tasks.read(home, 'curated')
+        generated = Path(task['worktree'])/'.omp/skills/agd-probe/SKILL.md'
+        snapshot = home/'data/tasks/curated/worker-skills/agd-probe/SKILL.md'
+        assert stored['phase'] == 'prepared'
+        assert stored['harness'] == 'omp'
+        assert stored['worker_skill_selection']['schema'] == 2
+        assert generated.read_bytes() == snapshot.read_bytes()
+        assert not __import__('subprocess').run(
+            ['git', 'status', '--porcelain'], cwd=task['worktree'],
+            capture_output=True, text=True, check=True).stdout
+
+
+def test_create_materializes_native_names_without_aliases():
+    from support import lab, command
+    with lab() as (home, project):
+        default_native_skills(home)
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'native', '--project', 'sample',
                        '--brief', str(brief), '--kind', 'scout')
-        command(home, 'worker', 'launch', 'curated', '--backend', 'herdr',
-                '--skill-mode', 'curated', '--skill', 'agd-probe', expected=4)
-        assert tasks.read(home, 'curated')['phase'] == 'prepared'
-        assert not (home/'data'/'tasks'/'curated'/'worker-skills.json').exists()
-        assert not (Path(task['worktree'])/'.omp').exists()
+        root = Path(task['worktree'])/'.omp/skills'
+        assert sorted(path.name for path in root.iterdir()) == DEFAULT_WORKER_SKILLS
+        assert not any(path.name.startswith('agd-') for path in root.iterdir())
 
 
-def test_cli_default_profile_and_cursor_nonempty_refusal_preserve_task():
+def test_create_default_profile_and_cursor_nonempty_refusal():
     from support import lab, command
     from agd_lib import tasks
     with lab() as (home, project):
-        os.environ['PATH'] = '/tmp/agd-treehouse-v3.1.6:' + os.environ['PATH']
         add_skill(home, 'agd-probe')
         write_profiles(home, {'default_profile': 'implementer',
                               'profiles': {'implementer': {'skills': ['agd-probe']}}})
         brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
         task = command(home, 'task', 'create', 'profile', '--project', 'sample',
                        '--brief', str(brief), '--kind', 'scout')
-        command(home, 'worker', 'launch', 'profile', '--backend', 'herdr', expected=4)
         assert tasks.read(home, 'profile')['phase'] == 'prepared'
-        assert not (home/'data'/'tasks'/'profile'/'worker-skills.json').exists()
-        instruction = home/'trust.md'; instruction.write_text('Trust this disposable project.\n')
-        command(home, 'project', 'trust', 'sample', '--instruction', str(instruction))
-        task = command(home, 'task', 'create', 'cursor', '--project', 'sample',
-                       '--brief', str(brief), '--kind', 'scout')
-        command(home, 'worker', 'launch', 'cursor', '--harness', 'cursor',
-                '--skill-mode', 'curated', '--skill', 'agd-probe', expected=4)
-        assert tasks.read(home, 'cursor')['phase'] == 'prepared'
+        assert (Path(task['worktree'])/'.omp/skills/agd-probe/SKILL.md').is_file()
+        command(
+            home, 'task', 'create', 'cursor', '--project', 'sample',
+            '--brief', str(brief), '--kind', 'scout', '--harness', 'cursor',
+            '--skill-mode', 'curated', '--skill', 'agd-probe', expected=4)
+        assert not tasks.task_file(home, 'cursor').exists()
 
 
 def test_unchanged_generated_skill_allows_ready_but_modification_refuses():
@@ -723,12 +735,10 @@ def test_unchanged_generated_skill_allows_ready_but_modification_refuses():
         os.environ['PATH'] = '/tmp/agd-treehouse-v3.1.6:' + os.environ['PATH']
         add_skill(home, 'agd-probe')
         brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
-        task = command(home, 'task', 'create', 'guarded', '--project', 'sample',
-                       '--brief', str(brief), '--kind', 'scout')
-        task['harness'] = 'omp'
-        manifest = worker_skills.prepare(home, task, {
-            'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
-        task['worker_skills'] = manifest; tasks.save(home, task)
+        task = command(
+            home, 'task', 'create', 'guarded', '--project', 'sample',
+            '--brief', str(brief), '--kind', 'scout', '--skill-mode',
+            'curated', '--skill', 'agd-probe')
         report = home/'report.md'; report.write_text('value.txt contains base.\n')
         assert command(home, 'task', 'ready', 'guarded', '--report', str(report))['phase'] == 'ready'
         generated = Path(task['worktree'])/'.omp'/'skills'/'agd-probe'/'SKILL.md'
@@ -743,10 +753,10 @@ def test_staged_and_historic_generated_skills_refuse_ready():
     with lab() as (home, project):
         add_skill(home, 'agd-probe')
         brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
-        task = command(home, 'task', 'create', 'staged', '--project', 'sample', '--brief', str(brief), '--kind', 'scout')
-        task['harness'] = 'omp'
-        task['worker_skills'] = worker_skills.prepare(home, task, {'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
-        tasks.save(home, task)
+        task = command(
+            home, 'task', 'create', 'staged', '--project', 'sample',
+            '--brief', str(brief), '--kind', 'scout', '--skill-mode',
+            'curated', '--skill', 'agd-probe')
         work = Path(task['worktree'])
         run(['git', 'add', '-f', '.omp/skills/agd-probe/SKILL.md'], cwd=work)
         report = home/'report.md'; report.write_text('base inspected\n')
@@ -754,10 +764,11 @@ def test_staged_and_historic_generated_skills_refuse_ready():
     with lab() as (home, project):
         add_skill(home, 'agd-probe')
         brief = home/'brief.md'; brief.write_text('Change value.txt.\n')
-        task = command(home, 'task', 'create', 'history', '--project', 'sample', '--brief', str(brief))
-        task['harness'] = 'omp'
-        task['worker_skills'] = worker_skills.prepare(home, task, {'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
-        tasks.save(home, task); work = Path(task['worktree'])
+        task = command(
+            home, 'task', 'create', 'history', '--project', 'sample',
+            '--brief', str(brief), '--skill-mode', 'curated', '--skill',
+            'agd-probe')
+        work = Path(task['worktree'])
         run(['git', 'config', 'user.name', 'Distro Test'], cwd=work); run(['git', 'config', 'user.email', 'test@example.invalid'], cwd=work)
         run(['git', 'add', '-f', '.omp/skills/agd-probe/SKILL.md'], cwd=work); run(['git', 'commit', '-m', 'leak skill'], cwd=work)
         run(['git', 'rm', '-f', '.omp/skills/agd-probe/SKILL.md'], cwd=work); (work/'value.txt').write_text('changed\n')
@@ -805,12 +816,10 @@ def test_cleanup_retry_after_pre_remove_failure_releases_owned_artifacts():
     with lab() as (home, project):
         add_skill(home, 'agd-probe')
         brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
-        task = command(home, 'task', 'create', 'remove-window', '--project', 'sample',
-                       '--brief', str(brief), '--kind', 'scout')
-        task['harness'] = 'omp'
-        task['worker_skills'] = worker_skills.prepare(home, task, {
-            'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
-        tasks.save(home, task)
+        task = command(
+            home, 'task', 'create', 'remove-window', '--project', 'sample',
+            '--brief', str(brief), '--kind', 'scout', '--skill-mode',
+            'curated', '--skill', 'agd-probe')
         report = home/'report.md'; report.write_text('base inspected\n')
         command(home, 'task', 'ready', 'remove-window', '--report', str(report))
         def interrupted(root, saved):
@@ -841,12 +850,13 @@ def test_returned_lease_requires_completed_skill_removal_journal():
     with lab() as (home, project):
         add_skill(home, 'agd-probe')
         brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
-        task = command(home, 'task', 'create', 'returned-window', '--project', 'sample',
-                       '--brief', str(brief), '--kind', 'scout')
-        task['harness'] = 'omp'
-        task['worker_skills'] = worker_skills.prepare(home, task, {
-            'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
-        task.update(phase='ready', cleanup_phase='returning', cleanup_discard=False, cleanup_approval=None)
+        task = command(
+            home, 'task', 'create', 'returned-window', '--project', 'sample',
+            '--brief', str(brief), '--kind', 'scout', '--skill-mode',
+            'curated', '--skill', 'agd-probe')
+        task.update(
+            phase='ready', cleanup_phase='returning', cleanup_discard=False,
+            cleanup_approval=None)
         tasks.save(home, task)
         original = tasks.store.run
         def absent(argv, **kwargs):
@@ -873,11 +883,10 @@ def test_cleanup_retry_after_artifact_removal_before_return():
     with lab() as (home, project):
         add_skill(home, 'agd-probe')
         brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
-        task = command(home, 'task', 'create', 'cleanup-skill', '--project', 'sample',
-                       '--brief', str(brief), '--kind', 'scout')
-        task['harness'] = 'omp'
-        task['worker_skills'] = worker_skills.prepare(home, task, {'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-probe']})
-        tasks.save(home, task)
+        task = command(
+            home, 'task', 'create', 'cleanup-skill', '--project', 'sample',
+            '--brief', str(brief), '--kind', 'scout', '--skill-mode',
+            'curated', '--skill', 'agd-probe')
         report = home/'report.md'; report.write_text('base inspected\n')
         command(home, 'task', 'ready', 'cleanup-skill', '--report', str(report))
         original = tasks.store.run
@@ -893,6 +902,77 @@ def test_cleanup_retry_after_artifact_removal_before_return():
         assert tasks.read(home, 'cleanup-skill')['cleanup_phase'] == 'returning'
         assert not (Path(task['worktree'])/'.omp'/'skills'/'agd-probe').exists()
         assert tasks.cleanup(home, 'cleanup-skill')['phase'] == 'cleaned'
+
+def test_reconcile_finishes_same_lease_and_refuses_changed_source(monkeypatch):
+    from support import lab
+    from agd_lib import store, tasks, worker_skills
+    with lab() as (home, project):
+        source = add_skill(home, 'agd-probe')
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        original_prepare = worker_skills.prepare
+
+        def interrupted(*_args, **_kwargs):
+            raise RuntimeError('interrupt before snapshot')
+
+        monkeypatch.setattr(worker_skills, 'prepare', interrupted)
+        with pytest.raises(RuntimeError):
+            tasks.create(
+                home, 'recover', 'sample', brief, kind='scout',
+                skill_mode='curated', skills=('agd-probe',))
+        pending = tasks.read(home, 'recover')
+        identity = (pending['attempt'], pending['lease_holder'],
+                    pending['lease_id'], pending['worktree'])
+        assert pending['phase'] == 'preparing'
+
+        monkeypatch.setattr(worker_skills, 'prepare', original_prepare)
+        original_run = tasks.store.run
+
+        def no_second_get(argv, **kwargs):
+            assert not ('get' in argv and 'treehouse' in str(argv[0]))
+            return original_run(argv, **kwargs)
+
+        monkeypatch.setattr(tasks.store, 'run', no_second_get)
+        recovered = tasks.reconcile_allocation(home, 'recover')
+        assert recovered['phase'] == 'prepared'
+        assert (recovered['attempt'], recovered['lease_holder'],
+                recovered['lease_id'], recovered['worktree']) == identity
+
+        monkeypatch.setattr(tasks.store, 'run', original_run)
+        monkeypatch.setattr(worker_skills, 'prepare', interrupted)
+        with pytest.raises(RuntimeError):
+            tasks.create(
+                home, 'changed', 'sample', brief, kind='scout',
+                skill_mode='curated', skills=('agd-probe',))
+        monkeypatch.setattr(worker_skills, 'prepare', original_prepare)
+        (source/'SKILL.md').write_text('changed after allocation\n')
+        with pytest.raises(store.Refusal):
+            tasks.reconcile_allocation(home, 'changed')
+        assert tasks.read(home, 'changed')['phase'] == 'preparing'
+
+
+def test_task_snapshot_survives_plugin_removal():
+    import shutil
+    from support import lab, command
+    from agd_lib import tasks, worker_skills
+    with lab() as (home, project):
+        default_native_skills(home)
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'survivor', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        destination = Path(task['worktree'])/'.omp/skills/systematic-debugging'
+        snapshot = home/'data/tasks/survivor/worker-skills/systematic-debugging'
+        expected = (snapshot/'SKILL.md').read_bytes()
+        shutil.rmtree(home/'.omp/plugins')
+        shutil.rmtree(home/'data/omp/home/.omp')
+        shutil.rmtree(destination)
+
+        worker_skills.ensure(home, tasks.read(home, 'survivor'))
+
+        assert (destination/'SKILL.md').read_bytes() == expected
+        command(home, 'task', 'create', 'new-task', '--project', 'sample',
+                '--brief', str(brief), '--kind', 'scout', expected=3)
+        assert not tasks.task_file(home, 'new-task').exists()
+
 
 DEFAULT_WORKER_SKILLS = [
     'ponytail',
@@ -973,7 +1053,7 @@ if __name__ == '__main__':
     test_worker_skill_and_profile_lists_are_deterministic_json()
     test_catalog_and_config_symlinks_cannot_escape_private_home()
     test_config_parent_must_be_a_real_directory()
-    test_launch_selection_flags_resolve_before_an_endpoint_starts()
+    test_task_create_selection_refuses_before_allocating_a_lease()
     test_prepare_freezes_and_materializes_a_skill_bundle()
     test_shared_common_git_exclusion_waits_for_last_owner()
     test_ensure_recovers_missing_artifacts_and_verify_refuses_foreign_or_tracked_content()
@@ -988,8 +1068,9 @@ if __name__ == '__main__':
     test_ensure_refuses_removed_skill_set()
     test_retry_after_post_exclude_write_failure_releases_only_owned_line()
     test_prompt_names_assigned_skill_paths()
-    test_cli_curated_selection_freezes_before_backend_failure()
-    test_cli_default_profile_and_cursor_nonempty_refusal_preserve_task()
+    test_create_materializes_curated_skills_before_prepared()
+    test_create_materializes_native_names_without_aliases()
+    test_create_default_profile_and_cursor_nonempty_refusal()
     test_unchanged_generated_skill_allows_ready_but_modification_refuses()
     test_staged_and_historic_generated_skills_refuse_ready()
     test_cleanup_retry_after_artifact_removal_before_return()
@@ -997,4 +1078,5 @@ if __name__ == '__main__':
     test_cleanup_retry_after_pre_remove_failure_releases_owned_artifacts()
     test_returned_lease_requires_completed_skill_removal_journal()
     test_init_seeds_default_worker_profile_from_native_catalog()
+    test_task_snapshot_survives_plugin_removal()
     test_init_seeds_checkout_home_with_tracked_files()

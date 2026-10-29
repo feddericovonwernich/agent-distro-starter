@@ -55,6 +55,11 @@ def parser():
     create.add_argument('--brief', required=True)
     create.add_argument('--base')
     create.add_argument('--kind', choices=('ship', 'scout'), default='ship')
+    create.add_argument('--harness', choices=('omp', 'cursor'), default='omp')
+    create.add_argument('--profile')
+    create.add_argument('--skill-mode', choices=('profile', 'curated', 'none'),
+                        default='profile')
+    create.add_argument('--skill', action='append', default=[])
     status = task.add_parser('status')
     status.add_argument('id')
     task.add_parser('list')
@@ -88,12 +93,8 @@ def parser():
         op = worker.add_parser(action)
         op.add_argument('id')
         if action == 'launch':
-            op.add_argument('--harness', choices=('omp', 'cursor'), default='omp')
             op.add_argument('--backend', choices=('tmux', 'herdr'))
             op.add_argument('--unattended', action='store_true')
-            op.add_argument('--profile')
-            op.add_argument('--skill-mode', choices=('profile', 'curated'), default='profile')
-            op.add_argument('--skill', action='append', default=[])
             op.add_argument('--approval')
             op.add_argument('--pr-grant')
         if action in ('run', 'event'):
@@ -295,7 +296,10 @@ def main(args):
             return projects.approve(home, args.id, args.action, args.instruction)
     if args.command == 'task':
         if args.operation == 'create':
-            return tasks.create(home, args.id, args.project, args.brief, args.base, args.kind)
+            return tasks.create(
+                home, args.id, args.project, args.brief, args.base, args.kind,
+                harness=args.harness, profile=args.profile,
+                skill_mode=args.skill_mode, skills=tuple(args.skill))
         if args.operation == 'status':
             return dict(tasks.read(home, args.id), open_decisions=supervision.decisions(home, args.id))
         if args.operation == 'list':
@@ -321,8 +325,8 @@ def main(args):
         if args.operation == 'profiles':
             return worker_skills.profiles(home)
         if args.operation == 'launch':
-            return workers.launch(home, args.id, args.harness, args.backend, args.unattended,
-                                  args.approval, args.profile, args.skill_mode, tuple(args.skill), args.pr_grant)
+            return workers.launch(home, args.id, args.backend, args.unattended,
+                                  args.approval, args.pr_grant)
         if args.operation == 'publish-pr':
             title, body = pr.publication_texts(home, args.id, args.incarnation, args.grant,
                                                args.title, args.body)

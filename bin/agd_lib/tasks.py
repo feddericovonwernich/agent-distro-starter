@@ -28,7 +28,8 @@ def treehouse_args(task):
 
 
 
-def create(home, task_id, project_id, brief, base=None, kind='ship'):
+def create(home, task_id, project_id, brief, base=None, kind='ship', *,
+           harness='omp', profile=None, skill_mode='profile', skills=()):
     store.validate_id(task_id)
     project = projects.read(home, project_id)
     if kind not in ('ship', 'scout'):
@@ -36,6 +37,13 @@ def create(home, task_id, project_id, brief, base=None, kind='ship'):
     brief_text = Path(brief).read_text()
     if not brief_text.strip():
         raise ValueError('brief must not be empty')
+    if harness not in ('omp', 'cursor'):
+        raise ValueError('unsupported harness')
+    from . import harnesses, worker_skills
+    selection = worker_skills.resolve(
+        home, profile=profile, skill_mode=skill_mode, skills=skills)
+    if selection['skills']:
+        harnesses.worker_skill_roots(harness)
     base = base or project['base']
     clone = Path(project['path'])
     start = store.git(clone, 'rev-parse', '--verify', base)
@@ -47,7 +55,8 @@ def create(home, task_id, project_id, brief, base=None, kind='ship'):
             raise store.Refusal('task already exists; reconcile its lease instead')
         task = dict(schema=1, id=task_id, project=project_id, kind=kind, phase='preparing',
                     condition='normal', base=base, start=start, branch='agd/'+task_id,
-                    lease_holder=holder, attempt=attempt, executor='central')
+                    lease_holder=holder, attempt=attempt, executor='central',
+                    harness=harness, worker_skill_selection=selection)
         if os.environ.get('TREEHOUSE_ROOT'):
             root = Path(os.environ['TREEHOUSE_ROOT'])
             task['treehouse_root'] = str(root if root.is_absolute() else (clone/root).resolve())
@@ -70,13 +79,32 @@ def create(home, task_id, project_id, brief, base=None, kind='ship'):
         if store.git(path, 'rev-parse', 'HEAD') != start:
             raise store.Refusal('Treehouse acquired from an unexpected base commit')
         with store.lock(home):
-            task.update(phase='prepared', worktree=str(path), lease_id=allocation['lease_id'])
+            task.update(worktree=str(path), lease_id=allocation['lease_id'])
             save(home, task)
-        return task
+        return _complete_preparation(home, task)
     finally:
         empty.unlink(missing_ok=True)
 
 
+
+
+def _complete_preparation(home, task):
+    from . import worker_skills
+    manifest = None
+    selection = task['worker_skill_selection']
+    if selection['skills']:
+        manifest = worker_skills.prepare(home, task, selection)
+    with store.lock(home):
+        current = read(home, task['id'])
+        identity = ('phase', 'attempt', 'lease_holder', 'lease_id', 'worktree',
+                    'harness', 'worker_skill_selection')
+        if any(current.get(key) != task.get(key) for key in identity):
+            raise store.Refusal('task preparation identity changed')
+        if manifest is not None:
+            current['worker_skills'] = manifest
+        current['phase'] = 'prepared'
+        save(home, current)
+    return current
 def reconcile_allocation(home, task_id):
     task = read(home, task_id)
     if task['phase'] != 'preparing':
@@ -88,12 +116,17 @@ def reconcile_allocation(home, task_id):
         raise store.Refusal(f'lease allocation uncertain: {len(matches)} matching slots; inspect Treehouse')
     match = matches[0]
     path = Path(match['path']).resolve()
-    if store.git(path, 'rev-parse', '--path-format=absolute', '--git-common-dir') != project['common_dir'] or store.git(path, 'branch', '--show-current') != task['branch']:
+    if (store.git(path, 'rev-parse', '--path-format=absolute', '--git-common-dir') != project['common_dir']
+            or store.git(path, 'branch', '--show-current') != task['branch']
+            or store.git(path, 'rev-parse', 'HEAD') != task['start']):
         raise store.Refusal('recovered lease identity mismatch')
     with store.lock(home):
-        task.update(phase='prepared', worktree=str(path), lease_id=match['lease_id'])
-        save(home, task)
-    return task
+        current = read(home, task_id)
+        if current['phase'] != 'preparing' or current['attempt'] != task['attempt']:
+            raise store.Refusal('task allocation reconciliation raced another owner')
+        current.update(worktree=str(path), lease_id=match['lease_id'])
+        save(home, current)
+    return _complete_preparation(home, current)
 
 
 def verify_workspace(home, task):

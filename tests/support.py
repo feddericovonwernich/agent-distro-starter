@@ -1,4 +1,5 @@
 import json
+import shutil
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -13,11 +14,26 @@ PLUGIN_SPECS = {
                                     'superpowers', '7.0.1'),
 }
 
+DEFAULT_PLUGIN_SKILLS = {
+    'ponytail@ponytail': {
+        name: {'SKILL.md': f'---\nname: {name}\ndescription: Fixture {name}\n---\n'}
+        for name in (
+            'ponytail', 'ponytail-audit', 'ponytail-debt', 'ponytail-gain',
+            'ponytail-help', 'ponytail-review')
+    },
+    'superpowers@superpowers-dev': {
+        name: {'SKILL.md': f'---\nname: {name}\ndescription: Fixture {name}\n---\n'}
+        for name in (
+            'systematic-debugging', 'test-driven-development',
+            'verification-before-completion')
+    },
+}
+
 
 def write_native_plugins(home, plugin_skills=None):
     """Write deterministic native OMP plugin state and payloads under home."""
     home = Path(home)
-    plugin_skills = plugin_skills or {}
+    plugin_skills = DEFAULT_PLUGIN_SKILLS if plugin_skills is None else plugin_skills
     registry = {'version': 2, 'plugins': {}}
     lock = {'plugins': {}, 'settings': {}}
     marketplaces = {'version': 1, 'marketplaces': []}
@@ -26,6 +42,8 @@ def write_native_plugins(home, plugin_skills=None):
     project_plugins.mkdir(parents=True, exist_ok=True)
     for plugin_id, (market, publisher, package, version) in PLUGIN_SPECS.items():
         payload = config / 'plugins/cache/plugins' / f'{market}___fixture___{version}'
+        if payload.exists():
+            shutil.rmtree(payload)
         skill_root = payload / 'skills'
         skill_root.mkdir(parents=True)
         for skill_name, files in plugin_skills.get(plugin_id, {}).items():
@@ -47,7 +65,7 @@ def write_native_plugins(home, plugin_skills=None):
             'version': version, 'enabledFeatures': None, 'enabled': True,
         }
         catalog = config / 'plugins/cache/marketplaces' / market / 'marketplace.json'
-        catalog.parent.mkdir(parents=True)
+        catalog.parent.mkdir(parents=True, exist_ok=True)
         catalog.write_text('{}')
         marketplaces['marketplaces'].append({
             'name': market, 'sourceType': 'github', 'sourceUri': publisher,
@@ -77,6 +95,7 @@ def lab():
         run(['git', 'clone', '--bare', seed, origin])
         command(home, 'init', '--backend', 'tmux')
         command(home, 'project', 'add', 'sample', '--source', str(origin))
+        write_native_plugins(home)
         project = home/'projects'/'sample'
         run(['git', 'config', 'user.name', 'Distro Test'], cwd=project)
         run(['git', 'config', 'user.email', 'test@example.invalid'], cwd=project)

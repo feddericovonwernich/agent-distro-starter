@@ -413,6 +413,20 @@ def scoped_pr_source():
     return source
 
 
+def scoped_pr_selection():
+    source = scoped_pr_source().resolve()
+    return {
+        'schema': 2, 'mode': 'grant', 'profile': None,
+        'skills': ['agd-scoped-pr-relay'],
+        'sources': {
+            'agd-scoped-pr-relay': {
+                'source': str(source), 'origin': {'kind': 'agd'},
+                'files': _files(source),
+            },
+        },
+    }
+
+
 def _manifest(home, task):
     path = _journal(home, task)
     if not path.is_file() or path.is_symlink():
@@ -537,7 +551,8 @@ def prepare(home: Path, task: dict, selection: dict, sources=None) -> dict:
     rows = {row['id']: row for row in catalog(home)}
     available = set(rows) | set(sources)
     for skill_id in selection['skills']:
-        if skill_id not in available:
+        if (skill_id not in available
+                and not (schema == 2 and skill_id == 'agd-scoped-pr-relay')):
             _refusal(f'missing catalog skill {skill_id}')
         ancestor = Path(task['worktree']).resolve()
         while True:
@@ -550,11 +565,18 @@ def prepare(home: Path, task: dict, selection: dict, sources=None) -> dict:
         if schema == 2:
             descriptor = selection['sources'][skill_id]
             row = rows.get(skill_id)
+            agd_source = (
+                isinstance(descriptor, dict)
+                and skill_id == 'agd-scoped-pr-relay'
+                and descriptor.get('origin') == {'kind': 'agd'}
+                and descriptor.get('source') == str(scoped_pr_source().resolve()))
             if (not isinstance(descriptor, dict)
                     or set(descriptor) != {'source', 'origin', 'files'}
-                    or row is None or descriptor['source'] != row['source']
-                    or descriptor['origin'] != row['origin']
-                    or descriptor['files'] != _files(Path(row['source']))):
+                    or (row is None and not agd_source)
+                    or (row is not None and (
+                        descriptor['source'] != row['source']
+                        or descriptor['origin'] != row['origin']))
+                    or descriptor['files'] != _files(Path(descriptor['source']))):
                 _refusal(f'invalid source descriptor for {skill_id}')
             source = Path(descriptor['source'])
         else:
