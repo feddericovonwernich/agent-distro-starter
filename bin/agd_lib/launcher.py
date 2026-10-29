@@ -161,14 +161,21 @@ def _backend_inspect(home: Path, receipt: dict) -> dict:
     return inspect(home, receipt)
 
 
-def _backend_create(home: Path, launch_id: str, endpoint_token: str, managed: list[str],
+def _backend_create(backend: str, home: Path, launch_id: str, endpoint_token: str, managed: list[str],
                     env: dict[str, str], argv: list[str]) -> dict:
-    backend = resolve_backend(home, None)
     module = __import__(f'agd_lib.{backend}', fromlist=['create_central'])
     create = getattr(module, 'create_central', None)
     if not callable(create):
         raise store.Refusal('central backend is unavailable')
     return create(home, launch_id, endpoint_token, managed, env, argv)
+
+
+def _backend_finalize(home: Path, receipt: dict) -> None:
+    module = __import__(f'agd_lib.{receipt["backend"]}', fromlist=['finalize_central'])
+    finalize = getattr(module, 'finalize_central', None)
+    if not callable(finalize):
+        raise store.Refusal('central backend is unavailable')
+    finalize(home, receipt)
 
 
 def _backend_attach(home: Path, receipt: dict) -> list[str]:
@@ -215,10 +222,12 @@ def prepare_start(home: Path, explicit_backend: str | None, inherited_env: Mappi
             raise store.Refusal('launcher receipt appeared during reservation')
         _owner(home, reserved, False)
         store.atomic_json(_receipt_path(home), reserved)
-    endpoint = create(home, launch_id, endpoint_token, managed,
+    endpoint = create(selected, home, launch_id, endpoint_token, managed,
                       {**central_env, 'AGD_LAUNCH_ID': launch_id, 'AGD_ENDPOINT_TOKEN': endpoint_token}, argv)
     spawned = {**reserved, 'phase': 'spawned', 'endpoint': endpoint}
     _advance(home, reserved, spawned)
+    if create is _backend_create:
+        _backend_finalize(home, spawned)
     owner = _prove(home, spawned, inspect)
     ready = {**spawned, 'phase': 'ready',
              'owner': {'pid': owner['owner_pid'], 'start': owner['owner_start']},

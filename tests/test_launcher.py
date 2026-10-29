@@ -75,8 +75,8 @@ def test_prepare_start_correlates_only_exact_ready_endpoint(tmp_path, monkeypatc
                         lambda actual_home, args: (expected_argv, {'AGD_HOME': str(actual_home)}, None))
     seen = {}
 
-    def fake_create(actual_home, launch_id, endpoint_token, managed_command, launch_env, argv):
-        seen.update(launch_id=launch_id, endpoint_token=endpoint_token, managed_command=managed_command,
+    def fake_create(backend, actual_home, launch_id, endpoint_token, managed_command, launch_env, argv):
+        seen.update(backend=backend, launch_id=launch_id, endpoint_token=endpoint_token, managed_command=managed_command,
                     launch_env=launch_env, argv=argv)
         start = supervision.process_start(os.getpid())
         store.atomic_json(actual_home / 'state' / 'owner.json', {

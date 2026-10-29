@@ -11,6 +11,7 @@ def test_tmux_central_records_identity_and_attaches_selected_pane(tmp_path, monk
 
     home = tmp_path / 'home'
     home.mkdir()
+    monkeypatch.delenv('TMUX', raising=False)
     calls = []
 
     def fake_run(argv, check=True, timeout=None):
@@ -20,15 +21,15 @@ def test_tmux_central_records_identity_and_attaches_selected_pane(tmp_path, monk
         if argv[-2:] == ['-p', '#{pid}']:
             return SimpleNamespace(returncode=0, stdout='501\n')
         if 'new-window' in argv:
-            return SimpleNamespace(returncode=0, stdout='@9 %10\n')
+            return SimpleNamespace(returncode=0, stdout='@9 %10 /dev/pts/10\n')
         if 'show-options' in argv:
             return SimpleNamespace(returncode=0, stdout='token\n')
         if 'list-panes' in argv:
-            return SimpleNamespace(returncode=0, stdout='4321 0\n')
+            return SimpleNamespace(returncode=0, stdout='@9 %10 /dev/pts/10 4321 0\n')
         return SimpleNamespace(returncode=0, stdout='')
     monkeypatch.setattr(tmux.store, 'run', fake_run)
 
-    monkeypatch.setattr(tmux, '_foreground', lambda pid: ('start-4321', receipt['expected_process_argv']))
+    monkeypatch.setattr(tmux, '_foreground', lambda pid: ('start-4321', receipt['expected_process_argv'], '/dev/pts/10'))
     receipt = {'endpoint_token': 'token', 'launch_id': 'launch-id',
                'expected_process_argv': ['/opt/omp', '--cwd', str(home)]}
     endpoint = tmux.create_central(home, 'launch-id', 'token',
@@ -36,13 +37,13 @@ def test_tmux_central_records_identity_and_attaches_selected_pane(tmp_path, monk
                                    {'AGD_LAUNCH_ID': 'launch-id', 'AGD_ENDPOINT_TOKEN': 'token'},
                                    receipt['expected_process_argv'])
 
-    assert endpoint == {'server_pid': '501', 'window': '@9', 'pane': '%10',
+    assert endpoint == {'server_pid': '501', 'window': '@9', 'pane': '%10', 'tty': '/dev/pts/10',
                         'token': 'token', 'launch_id': 'launch-id'}
     assert tmux.inspect_central(home, {**receipt, 'endpoint': endpoint}) == {
         'endpoint': endpoint,
         'foreground': {'launch_id': 'launch-id', 'endpoint_token': 'token',
                        'pid': 4321, 'start': 'start-4321',
-                       'argv': receipt['expected_process_argv']},
+                       'argv': receipt['expected_process_argv'], 'tty': '/dev/pts/10'},
     }
     assert tmux.attach_argv(home, {**receipt, 'endpoint': endpoint}) == [*tmux.prefix(home), 'attach-session', '-t', 'agd']
     assert [*tmux.prefix(home), 'select-window', '-t', '@9'] in [argv for argv, _, _ in calls]
@@ -62,7 +63,7 @@ def test_tmux_central_refuses_changed_server_or_token(tmp_path, monkeypatch):
     home.mkdir()
     receipt = {'launch_id': 'launch-id', 'endpoint_token': 'token',
                'expected_process_argv': ['/opt/omp'],
-               'endpoint': {'server_pid': 'old', 'window': '@9', 'pane': '%10',
+               'endpoint': {'server_pid': 'old', 'window': '@9', 'pane': '%10', 'tty': '/dev/pts/10',
                             'token': 'token', 'launch_id': 'launch-id'}}
 
     def fake_run(argv, check=True, timeout=None):
@@ -85,6 +86,125 @@ def test_launcher_delegates_tmux_central_operations(tmp_path, monkeypatch):
     monkeypatch.setattr(tmux, 'create_central', lambda *args: calls.append(args) or {'pane': '%10'})
     monkeypatch.setattr(tmux, 'attach_argv', lambda actual_home, receipt: ['tmux-attach', receipt['endpoint']['pane']])
 
-    assert launcher._backend_create(home, 'launch-id', 'token', ['agd'], {'X': 'y'}, ['omp']) == {'pane': '%10'}
+    assert launcher._backend_create('tmux', home, 'launch-id', 'token', ['agd'], {'X': 'y'}, ['omp']) == {'pane': '%10'}
     assert launcher._backend_attach(home, {'backend': 'tmux', 'endpoint': {'pane': '%10'}}) == ['tmux-attach', '%10']
     assert calls == [(home, 'launch-id', 'token', ['agd'], {'X': 'y'}, ['omp'])]
+
+
+def test_tmux_attach_switches_existing_client_to_recorded_session(tmp_path, monkeypatch):
+    from agd_lib import tmux
+
+    home = tmp_path / 'home'
+    home.mkdir()
+    monkeypatch.setenv('TMUX', '/tmp/tmux-1/default,1,0')
+    receipt = {'launch_id': 'launch-id', 'endpoint_token': 'token',
+               'endpoint': {'server_pid': '501', 'window': '@9', 'pane': '%10', 'tty': '/dev/pts/10',
+                            'token': 'token', 'launch_id': 'launch-id'}}
+    calls = []
+    monkeypatch.setattr(tmux.store, 'run',
+                        lambda argv, **kwargs: calls.append(argv) or SimpleNamespace(returncode=0, stdout=''))
+
+    assert tmux.attach_argv(home, receipt) == [*tmux.prefix(home), 'switch-client', '-t', 'agd']
+    assert calls == [
+        [*tmux.prefix(home), 'select-window', '-t', '@9'],
+        [*tmux.prefix(home), 'select-pane', '-t', '%10'],
+    ]
+
+
+def test_prepare_start_passes_explicit_backend_to_creator(tmp_path, monkeypatch):
+    import os
+    from agd_lib import launcher, observability, store, supervision
+
+    home = tmp_path / 'home'
+    home.mkdir()
+    launcher.initialize(home, 'tmux')
+    expected = ['/opt/omp', '--cwd', str(home)]
+    monkeypatch.setattr(observability, 'central_argv', lambda *_: (expected, {}, None))
+    selected = []
+
+    def create(backend, actual_home, launch_id, endpoint_token, *_):
+        selected.append(backend)
+        start = supervision.process_start(os.getpid())
+        store.atomic_json(actual_home / 'state' / 'owner.json', {
+            'owner_pid': os.getpid(), 'owner_start': start, 'token': endpoint_token,
+            'watcher_pid': os.getpid(), 'watcher_start': start, 'heartbeat': __import__('time').time(),
+        })
+        return {'backend': backend}
+
+    def inspect(_, receipt):
+        start = supervision.process_start(os.getpid())
+        return {'endpoint': receipt['endpoint'], 'foreground': {
+            'launch_id': receipt['launch_id'], 'endpoint_token': receipt['endpoint_token'],
+            'pid': os.getpid(), 'start': start, 'argv': expected}}
+
+    target = launcher.prepare_start(home, 'herdr', {}, create, inspect, lambda *_: ['attach'])
+    assert selected == ['herdr']
+    assert target.attach_argv == ['attach']
+
+
+def test_tmux_create_retains_endpoint_before_token_write_failure(tmp_path, monkeypatch):
+    from agd_lib import store, tmux
+
+    home = tmp_path / 'home'
+    home.mkdir()
+
+    def fake_run(argv, check=True, timeout=None):
+        if 'has-session' in argv:
+            return SimpleNamespace(returncode=0, stdout='')
+        if argv[-2:] == ['-p', '#{pid}']:
+            return SimpleNamespace(returncode=0, stdout='501\n')
+        if 'new-window' in argv:
+            return SimpleNamespace(returncode=0, stdout='@9 %10 /dev/pts/9\n')
+        if 'set-option' in argv:
+            raise store.Refusal('token write failed')
+        return SimpleNamespace(returncode=0, stdout='')
+
+    monkeypatch.setattr(tmux.store, 'run', fake_run)
+    endpoint = tmux.create_central(home, 'launch-id', 'token', ['agd'], {}, ['omp'])
+    with __import__('pytest').raises(store.Refusal, match='token is unconfirmed'):
+        tmux.finalize_central(home, {'endpoint_token': 'token', 'launch_id': 'launch-id', 'endpoint': endpoint})
+    assert __import__('json').loads((home / 'state' / 'central-tmux-pending.json').read_text()) == {
+        'server_pid': '501', 'window': '@9', 'pane': '%10', 'tty': '/dev/pts/9',
+        'token': 'token', 'launch_id': 'launch-id'}
+
+
+def test_tmux_inspection_rejects_foreign_window_or_tty(tmp_path, monkeypatch):
+    from agd_lib import store, tmux
+
+    home = tmp_path / 'home'
+    home.mkdir()
+    receipt = {'launch_id': 'launch-id', 'endpoint_token': 'token', 'expected_process_argv': ['omp'],
+               'endpoint': {'server_pid': '501', 'window': '@9', 'pane': '%10', 'tty': '/dev/pts/9',
+                            'token': 'token', 'launch_id': 'launch-id'}}
+
+    def fake_run(argv, check=True, timeout=None):
+        if argv[-2:] == ['-p', '#{pid}']:
+            return SimpleNamespace(returncode=0, stdout='501\n')
+        if 'show-options' in argv:
+            return SimpleNamespace(returncode=0, stdout='token\n')
+        if 'list-panes' in argv:
+            return SimpleNamespace(returncode=0, stdout='@other %10 /dev/pts/other 4321 0\n')
+        return SimpleNamespace(returncode=0, stdout='')
+
+    monkeypatch.setattr(tmux.store, 'run', fake_run)
+    with __import__('pytest').raises(store.Refusal, match='membership'):
+        tmux.inspect_central(home, receipt)
+
+
+def test_tmux_endpoint_journal_survives_spawned_receipt_transition_failure(tmp_path, monkeypatch):
+    from agd_lib import launcher, observability, store, tmux
+
+    home = tmp_path / 'home'
+    home.mkdir()
+    launcher.initialize(home, 'tmux')
+    monkeypatch.setattr(observability, 'central_argv', lambda *_: (['omp'], {}, None))
+    monkeypatch.setattr(tmux.store, 'run', lambda argv, **kwargs: (
+        SimpleNamespace(returncode=0, stdout='') if 'has-session' in argv else
+        SimpleNamespace(returncode=0, stdout='501\n') if argv[-2:] == ['-p', '#{pid}'] else
+        SimpleNamespace(returncode=0, stdout='@9 %10 /dev/pts/9\n') if 'new-window' in argv else
+        SimpleNamespace(returncode=0, stdout='')))
+    monkeypatch.setattr(launcher, '_advance', lambda *_: (_ for _ in ()).throw(store.Refusal('receipt changed')))
+
+    with __import__('pytest').raises(store.Refusal, match='receipt changed'):
+        launcher.prepare_start(home, None, {}, launcher._backend_create, launcher._backend_inspect, launcher._backend_attach)
+    assert __import__('json').loads((home / 'state' / 'central-tmux-pending.json').read_text())['pane'] == '%10'
