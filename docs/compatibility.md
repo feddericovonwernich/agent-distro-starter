@@ -2,6 +2,12 @@
 
 Host: Linux x86-64. Git 2.43.0; OMP 18.3.2; tmux 3.4; Herdr 0.8.2; Cursor Agent 2026.10.22-27dcf5f. Private Treehouse v3.1.6 linux-amd64 SHA-256 `e89891caf913b3b228387c7dccf53ff908327fca47839b7957681084578cb1a1` matched the published asset. Global Treehouse v2.3.0 lacks `get --base/--branch` and was not replaced. Tests and worker smokes used `PATH=/tmp/agd-treehouse-v3.1.6:$PATH`.
 
+## Guided installation and start
+
+The guided installer supports Linux x86-64 only. It may use APT only for missing Git, Python 3.12+, and selected tmux after explicit sudo consent; no other package manager or elevation path is supported. OMP and Herdr use a consented latest stable release with an exact Linux x86-64 asset and published digest, so this document does not pin either tool version. Treehouse is fixed at v3.1.6 with archive SHA-256 `e89891caf913b3b228387c7dccf53ff908327fca47839b7957681084578cb1a1`.
+
+`bin/agd start [--backend tmux|herdr]` requires validated private dependency and launcher receipts. It attaches only to a proven ready central and otherwise refuses foreign, partial, changed, or uncorrelated state without cleanup. An ordinary-terminal Herdr central uses its recorded non-default session; Herdr workers remain pane-bound (`HERDR_ENV=1`) and use their separately named server. No end-to-end guided installer/start smoke evidence is claimed here.
+
 | Scenario | Observed outcome |
 |---|---|
 | OMP / tmux scout | Real OMP worker read disposable `value.txt`, wrote a report, called `task ready`; watcher notified an idle central without another user prompt; central inspected and acknowledged the exact event. Native turn idle, `/quit` and conditional Treehouse return were observed. A second scoped runner (`wake4`) also reached ready and stopped/cleaned after the owner gate change. |

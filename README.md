@@ -2,41 +2,31 @@
 
 An OMP central session manages registered project clones, isolated Treehouse task worktrees, and supervised OMP workers. `projects/`, `config/`, `data/`, and `state/` belong to the local operator and are ignored by Git.
 
-## Install a named local instance
+## Install and start
 
-On Linux, install Bash, curl, Git, Python 3.12+, OMP, tmux and Treehouse **v3.1.6** independently. Review the [installer](install.sh) before running downloaded code. From the parent directory where you want the instance:
+On Linux x86-64, review the [installer](install.sh) before running it. From the parent directory where you want the instance:
 
 ```sh
 bash -c 'installer=$(curl -fsSL https://raw.githubusercontent.com/feddericovonwernich/agent-distro-starter/main/install.sh) && bash -c "$installer"'
 ```
 
-Enter a name starting with a lowercase letter, followed by lowercase letters, digits or hyphens (up to 48 characters). The installer refuses existing paths, clones into `./NAME` with its template Git origin intact, and initializes ignored private state in that clone. It does not install dependencies, authenticate Cursor or configure projects.
+The interactive installer asks for a lowercase name and central backend (`tmux` or `herdr`), refuses an existing destination, clones the canonical origin into `./NAME`, and preserves that origin. It initializes the clone's ignored private home and records the selected backend plus a generated non-default Herdr session name.
+
+It can use APT only for missing Git, Python 3.12+, and selected `tmux`, after one explicit sudo prompt; blank or non-affirmative answers mean no elevation. OMP and Herdr are reused when compatible or installed/updated only after consent to the displayed latest stable release, exact Linux x86-64 asset, and published digest. Treehouse is reused when compatible or installed as **v3.1.6** after SHA-256 verification: `e89891caf913b3b228387c7dccf53ff908327fca47839b7957681084578cb1a1`. Managed downloads are atomically installed in `~/.local/bin`, and their source, version, capabilities, artifact hash, and installed hash are recorded in the private home.
+
+The installer optionally runs `omp login [provider]` in your terminal. It does not receive or store provider secrets; `omp models --json` only lists configured/selectable models and is not authentication proof. It then starts an interactive nested shell in the clone with `~/.local/bin` first on `PATH`; exiting that shell returns to the caller.
+
+If the calling shell already defines `AGD_HOME`, unset it to use this clone's private home. Then:
 
 ```sh
-cd ./NAME
-unset AGD_HOME  # use the clone's private home unless intentionally configured otherwise
-bin/agd doctor
+unset AGD_HOME
 bin/agd project add app --source /path/to/repository.git --base main
-omp
+bin/agd start
 ```
 
-`doctor` checks executable versions, not account authentication. OMP/tmux and OMP/Herdr have been exercised on Linux; Cursor workers still need authentication and live validation.
+`bin/agd start [--backend tmux|herdr]` attaches to a proven ready central or starts one after validating private dependency and launcher receipts. The explicit backend applies only to that invocation; otherwise a proven active central takes precedence over the saved backend. A conflicting override, foreign/partial/ambiguous state, or failed process/owner/watcher correlation refuses and preserves receipts, tasks, leases, and backend sessions. An omitted worker `--backend` inherits the proven active central backend; an explicit worker backend is local to that worker.
 
-## Manual setup from a source checkout
-
-Install Git, Python 3.12+, OMP, tmux and **Treehouse v3.1.6** independently. Check the selected tools with `bin/agd doctor`; older Treehouse releases are incompatible. From this checkout:
-
-```sh
-bin/agd init
-bin/agd project add app --source /path/to/repository.git --base main
-omp
-```
-
-OMP automatically loads `.omp/extensions/agd-primary.ts` from this checkout. The central process owns the home while running; unrelated shells can inspect but cannot mutate it. Use its tool environment for lifecycle commands. Workers explicitly load `lib/omp-worker.ts`, never the central extension.
-
-For a private home elsewhere, set `AGD_HOME` to its absolute path before `bin/agd init` and `omp`. Keep the pinned Treehouse binary first on `PATH` for both the central process and workers. See [operations](docs/operations.md) for approvals, recovery and commands and [compatibility](docs/compatibility.md) for tested versus deferred combinations.
-
-For the optional Herdr backend, run from a Herdr-managed pane and set `AGD_HERDR_SESSION` to a separately started, non-default named server before launching OMP; see [operations](docs/operations.md). Cursor workers still require account authentication and live transcript validation.
+Use `AGD_HOME` with an absolute private-home path, or `bin/agd --home /absolute/home ...`, to operate another initialized instance. See [operations](docs/operations.md) for the Herdr split and lifecycle constraints, and [compatibility](docs/compatibility.md) for observed compatibility evidence.
 
 ## Worker skills
 
