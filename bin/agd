@@ -17,7 +17,7 @@ def parser():
     p.add_argument('--home')
     sub = p.add_subparsers(dest='command', required=True)
     init = sub.add_parser('init')
-    init.add_argument('--backend', choices=('tmux', 'herdr'), default='tmux')
+    init.add_argument('--backend', choices=('tmux', 'herdr'), required=True)
     start = sub.add_parser('start')
     start.add_argument('--backend', choices=('tmux', 'herdr'))
     doctor = sub.add_parser('doctor')

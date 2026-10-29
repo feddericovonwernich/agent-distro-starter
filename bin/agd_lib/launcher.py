@@ -185,6 +185,26 @@ def _socket_identity(path: Path):
     return identity
 
 
+def _prove_herdr_server(endpoint: dict, process) -> dict:
+    pid = getattr(process, 'pid', None)
+    if not isinstance(pid, int) or pid < 1:
+        raise store.Refusal('Herdr server ownership is unproven')
+    start = supervision.process_start(pid)
+    try:
+        socket_inode = next(
+            fields[6] for line in Path('/proc/net/unix').read_text().splitlines()[1:]
+            if len(fields := line.split()) >= 8 and fields[-1] == endpoint['socket'])
+        argv = Path(f'/proc/{pid}/cmdline').read_bytes().rstrip(b'\0').decode().split('\0')
+        owns_socket = any(os.readlink(fd) == f'socket:[{socket_inode}]'
+                          for fd in Path(f'/proc/{pid}/fd').iterdir())
+    except (OSError, StopIteration, UnicodeDecodeError) as error:
+        raise store.Refusal('Herdr server ownership is unproven') from error
+    if (not start or argv != ['herdr', '--session', endpoint['session'], 'server']
+            or not owns_socket):
+        raise store.Refusal('Herdr server ownership is unproven')
+    return {'server_pid': pid, 'server_start': start, 'server_argv': argv}
+
+
 def _herdr_response(result) -> dict:
     try:
         value = json.loads(result.stdout)
@@ -265,8 +285,8 @@ def _herdr_create(home: Path, launch_id: str, endpoint_token: str, managed: list
         raise store.Refusal('Herdr session list is unverified')
     if any(item.get('name') == session for item in sessions):
         raise store.Refusal('unreceipted Herdr session already exists')
-    subprocess.Popen(['herdr', '--session', session, 'server'], stdin=subprocess.DEVNULL,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    process = subprocess.Popen(['herdr', '--session', session, 'server'], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     endpoint = None
     for _ in range(30):
         try:
@@ -276,6 +296,7 @@ def _herdr_create(home: Path, launch_id: str, endpoint_token: str, managed: list
             time.sleep(.1)
     if endpoint is None:
         raise store.Refusal('Herdr server did not become available')
+    endpoint.update(_prove_herdr_server(endpoint, process) or {})
     if checkpoint:
         checkpoint(endpoint)
     workspace = _herdr_response(_herdr_call(
@@ -301,12 +322,13 @@ def _herdr_create(home: Path, launch_id: str, endpoint_token: str, managed: list
         raise store.Refusal('Herdr tab identity is inconsistent')
     if checkpoint:
         checkpoint(endpoint)
-    command_env = {key: value for key, value in {
-        'AGD_HERDR_SESSION': session, 'AGD_LAUNCH_ID': launch_id, 'AGD_ENDPOINT_TOKEN': endpoint_token,
-        'PATH': env.get('PATH', os.environ.get('PATH', '')),
-    }.items()}
+    command_env = {key: value for key, value in env.items()
+                   if key != 'HERDR_ENV' and isinstance(key, str) and isinstance(value, str)
+                   and os.environ.get(key) != value}
+    command_env.update(AGD_HERDR_SESSION=session, AGD_LAUNCH_ID=launch_id,
+                       AGD_ENDPOINT_TOKEN=endpoint_token)
     _herdr_call(endpoint, 'pane', 'run', endpoint['pane'],
-                'export ' + ' '.join(f'{key}={shlex.quote(value)}' for key, value in command_env.items())
+                'unset HERDR_ENV; export ' + ' '.join(f'{key}={shlex.quote(value)}' for key, value in command_env.items())
                 + '; exec ' + shlex.join(managed))
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:

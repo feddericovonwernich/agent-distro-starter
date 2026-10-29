@@ -62,6 +62,12 @@ def test_init_refuses_nonfresh_home_without_replacement(tmp_path):
     assert marker.read_text() == 'keep'
 
 
+def test_init_requires_backend(tmp_path):
+    result = subprocess.run([str(CLI), '--home', str(tmp_path / 'h'), 'init'],
+                            capture_output=True, text=True)
+    assert result.returncode == 2
+    assert '--backend' in result.stderr
+
 def test_prepare_start_correlates_only_exact_ready_endpoint(tmp_path, monkeypatch):
     import sys
     sys.path.insert(0, str(ROOT / 'bin'))

@@ -310,3 +310,42 @@ def test_setup_persists_compatible_declined_dependencies_and_preserves_prior_on_
     with pytest.raises(Refusal, match='requirement'):
         setup(tmp_path, 'herdr', lambda _: False, lambda _: selected, stream(b'executable'), fake_run)
     assert read_dependencies(tmp_path) == got
+
+
+def test_setup_preserves_valid_managed_receipt_when_update_declined(tmp_path, monkeypatch):
+    monkeypatch.setenv('PATH', str(tmp_path))
+    omp = tmp_path / 'omp'
+    omp.write_bytes(b'bytes')
+    omp.chmod(0o755)
+    treehouse = tmp_path / 'treehouse'
+    treehouse.write_bytes(b'bytes')
+    treehouse.chmod(0o755)
+    digest = hashlib.sha256(b'bytes').hexdigest()
+    managed = {'source': 'managed', 'path': str(omp), 'version': 'old',
+               'capabilities': ['models-json', 'login'], 'asset': 'omp-linux-x64',
+               'tag': 'v1', 'artifact_sha256': '0' * 64, 'installed_sha256': digest}
+    write_dependencies(tmp_path, {'schema': 1, 'omp': managed})
+    got = setup(tmp_path, 'tmux', lambda _: False, lambda _: release('omp-linux-x64'),
+                stream(b'executable'), fake_run)
+    assert got['omp'] == {**managed, 'version': 'v1.2.3'}
+
+
+def test_setup_refuses_managed_receipt_tampering_or_path_mismatch(tmp_path, monkeypatch):
+    monkeypatch.setenv('PATH', str(tmp_path))
+    omp = tmp_path / 'omp'
+    omp.write_bytes(b'bytes')
+    omp.chmod(0o755)
+    treehouse = tmp_path / 'treehouse'
+    treehouse.write_bytes(b'bytes')
+    treehouse.chmod(0o755)
+    digest = hashlib.sha256(b'bytes').hexdigest()
+    managed = {'source': 'managed', 'path': str(omp), 'version': 'old',
+               'capabilities': ['models-json', 'login'], 'asset': 'omp-linux-x64',
+               'tag': 'v1', 'artifact_sha256': '0' * 64, 'installed_sha256': digest}
+    for change in ({'installed_sha256': '1' * 64}, {'path': str(tmp_path / 'elsewhere')}):
+        if change['path'] if 'path' in change else False:
+            other = Path(change['path']); other.write_bytes(b'bytes'); other.chmod(0o755)
+        write_dependencies(tmp_path, {'schema': 1, 'omp': {**managed, **change}})
+        with pytest.raises(Refusal, match='managed'):
+            setup(tmp_path, 'tmux', lambda _: False, lambda _: release('omp-linux-x64'),
+                  stream(b'executable'), fake_run)

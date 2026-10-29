@@ -260,9 +260,10 @@ def test_herdr_central_uses_named_receipted_session_and_restores_focus(tmp_path,
     import subprocess
     monkeypatch.setattr(launcher, 'subprocess', SimpleNamespace(DEVNULL=subprocess.DEVNULL,
                         Popen=lambda argv, **kwargs: calls.append((argv, kwargs))), raising=False)
+    monkeypatch.setattr(launcher, '_prove_herdr_server', lambda *_: None, raising=False)
 
     endpoint = launcher._backend_create('herdr', home, 'launch-id', 'token', ['/opt/agd'],
-                                        {'PATH': '/bin'}, ['/opt/omp'])
+                                        {'PATH': '/bin', 'CENTRAL_SENTINEL': 'present', 'HERDR_ENV': 'foreign'}, ['/opt/omp'])
     receipt = {'backend': 'herdr', 'launch_id': 'launch-id', 'endpoint_token': 'token',
                'expected_process_argv': ['/opt/omp'], 'endpoint': endpoint}
     assert endpoint['session'] == session
@@ -276,6 +277,9 @@ def test_herdr_central_uses_named_receipted_session_and_restores_focus(tmp_path,
     env = launcher._attach_env(home, receipt, {'HERDR_ENV': '1', 'PATH': '/bin'})
     assert env['AGD_HERDR_SESSION'] == session
     assert 'HERDR_ENV' not in env
+    pane_run = next(argv for argv in calls if isinstance(argv, list) and argv[3:6] == ['pane', 'run', 'pane-1'])
+    assert 'CENTRAL_SENTINEL=present' in pane_run[-1]
+    assert 'HERDR_ENV=' not in pane_run[-1]
     monkeypatch.setattr(launcher.store, 'run', lambda argv, **kwargs: SimpleNamespace(
         returncode=0, stdout=json.dumps([{'name': session}]), stderr=''))
     with __import__('pytest').raises(store.Refusal, match='unreceipted'):
@@ -308,6 +312,7 @@ def test_herdr_start_checkpoints_socket_before_workspace_failure(tmp_path, monke
     monkeypatch.setattr(observability, 'central_argv', lambda *_: (['/opt/omp'], {}, None))
     monkeypatch.setattr(launcher.store, 'run', fake_run)
     monkeypatch.setattr(launcher, '_socket_identity', lambda path: Socket())
+    monkeypatch.setattr(launcher, '_prove_herdr_server', lambda *_: None, raising=False)
     monkeypatch.setattr(launcher, 'subprocess', SimpleNamespace(DEVNULL=subprocess.DEVNULL,
                         TimeoutExpired=subprocess.TimeoutExpired, Popen=lambda *args, **kwargs: None))
 
@@ -338,3 +343,35 @@ def test_herdr_attach_refuses_replaced_socket_without_herdr_commands(tmp_path, m
     with __import__('pytest').raises(store.Refusal, match='replaced'):
         launcher._backend_attach(tmp_path, receipt)
     assert calls == []
+
+
+def test_herdr_refuses_foreign_post_start_socket_before_workspace(tmp_path, monkeypatch):
+    import stat
+    import subprocess
+    import pytest
+    from agd_lib import launcher, store
+
+    home = tmp_path / 'home'
+    home.mkdir()
+    launcher.initialize(home, 'herdr')
+    calls = []
+    class Socket:
+        st_mode, st_dev, st_ino = stat.S_IFSOCK, 9, 10
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv == ['herdr', 'session', 'list', '--json']:
+            return SimpleNamespace(returncode=0, stdout='[]', stderr='')
+        if argv[-2:] == ['status', 'server']:
+            return SimpleNamespace(returncode=0, stdout='status: running\ncompatible: yes\nprotocol: 20\nsocket: /tmp/foreign.sock\n', stderr='')
+        raise AssertionError(argv)
+    monkeypatch.setattr(launcher.store, 'run', fake_run)
+    monkeypatch.setattr(launcher, '_socket_identity', lambda _: Socket())
+    monkeypatch.setattr(launcher, 'subprocess', SimpleNamespace(
+        DEVNULL=subprocess.DEVNULL, TimeoutExpired=subprocess.TimeoutExpired,
+        Popen=lambda *args, **kwargs: SimpleNamespace(pid=123)))
+    monkeypatch.setattr(launcher, '_prove_herdr_server',
+                        lambda *_: (_ for _ in ()).throw(store.Refusal('Herdr server ownership is unproven')),
+                        raising=False)
+    with pytest.raises(store.Refusal, match='ownership'):
+        launcher._herdr_create(home, 'launch', 'token', ['/opt/agd'], {'PATH': '/bin'}, ['/opt/omp'])
+    assert not any(argv[3:5] == ['workspace', 'create'] for argv in calls)

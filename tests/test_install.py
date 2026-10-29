@@ -124,6 +124,22 @@ def test_failed_owned_clone_is_removed_after_setup_refusal():
         assert not (root / 'distro').exists()
 
 
+
+def test_failed_clone_that_populates_owned_destination_is_removed():
+    with tempfile.TemporaryDirectory(prefix='agd-install-') as directory:
+        root = Path(directory)
+        fixture = make_fixture(root)
+        tools = make_tools(root, fixture)
+        (tools / 'git').write_text('''#!/bin/bash
+/bin/mkdir -p "$4"
+printf partial > "$4/partial"
+exit 1
+''')
+        (tools / 'git').chmod(0o755)
+        result = run_install(root, tools, 'distro\ntmux\n')
+        assert result.returncode != 0
+        assert not (root / 'distro').exists()
+
 def test_blank_sudo_declines_missing_git_without_elevation():
     with tempfile.TemporaryDirectory(prefix='agd-install-') as directory:
         root = Path(directory)

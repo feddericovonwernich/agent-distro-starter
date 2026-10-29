@@ -778,7 +778,7 @@ def test_init_seeds_default_worker_profile_from_bundled_catalog():
     from test_projects import command
     with tempfile.TemporaryDirectory() as directory:
         home = Path(directory)
-        command(home, 'init')
+        command(home, 'init', '--backend', 'tmux')
         expected = {
             'schema': 1, 'mode': 'profile', 'profile': 'default',
             'skills': DEFAULT_WORKER_SKILLS}
@@ -801,7 +801,7 @@ def test_init_seeds_checkout_home_with_tracked_files():
         shutil.copytree(ROOT/'bundled', home/'bundled', dirs_exist_ok=True)
         env = dict(os.environ, TREEHOUSE_ROOT=str(home.parent/'pool'))
         env.pop('AGD_HOME', None)
-        run([home/'bin'/'agd', 'init'], cwd=home, env=env)
+        run([home/'bin'/'agd', 'init', '--backend', 'tmux'], cwd=home, env=env)
         assert worker_skills.resolve(home)['skills'] == DEFAULT_WORKER_SKILLS
 
 

@@ -366,6 +366,7 @@ def validate_dependencies(home, run):
 def setup(home, backend, prompt, fetch_json, stream_url, run):
     if backend not in {'tmux', 'herdr'}:
         raise Refusal('selected backend is invalid')
+    prior = read_dependencies(home)
     tools = ['omp'] + (['herdr'] if backend == 'herdr' else []) + ['treehouse']
     receipt = {'schema': 1}
     for tool in tools:
@@ -378,12 +379,21 @@ def setup(home, backend, prompt, fetch_json, stream_url, run):
             probe = lambda item, runner: probe_herdr(item, 'agd-probe', runner)
         else:
             probe = probe_treehouse
-        existing = None
-        if path:
-            try:
-                existing = {'source': 'existing', **probe(path, run)}
-            except Refusal:
-                pass
+        previous = prior.get(tool)
+        if previous and previous['source'] == 'managed':
+            recorded = Path(previous['path'])
+            if path is None or path != recorded.resolve():
+                raise Refusal('managed dependency path differs from receipt')
+            if _sha256(recorded) != previous['installed_sha256']:
+                raise Refusal('managed dependency digest differs from receipt')
+            existing = {**previous, **probe(recorded, run)}
+        else:
+            existing = None
+            if path:
+                try:
+                    existing = {'source': 'existing', **probe(path, run)}
+                except Refusal:
+                    pass
         if tool == 'treehouse':
             if existing is not None:
                 receipt[tool] = existing

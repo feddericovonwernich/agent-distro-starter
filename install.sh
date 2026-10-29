@@ -36,8 +36,9 @@ clone=$PWD/$name
 owned=false
 cleanup() { $owned && /bin/rm -rf -- "$clone"; }
 trap cleanup EXIT HUP INT TERM
-git clone -- https://github.com/feddericovonwernich/agent-distro-starter.git "$clone"
+/bin/mkdir -m 700 -- "$clone"
 owned=true
+git clone -- https://github.com/feddericovonwernich/agent-distro-starter.git "$clone"
 (
     cd -- "$clone"
     PATH="$HOME/.local/bin:$PATH" bin/agd --home "$PWD" init --backend "$backend"

@@ -34,7 +34,7 @@ def check_backend(name):
     assert name in ('tmux', 'herdr')
     backend = importlib.import_module('agd_lib.' + name)
     with tempfile.TemporaryDirectory(prefix='agd-pane-') as tmp, owned_home(name, Path(tmp)/'home with space') as home:
-        command(home, 'init')
+        command(home, 'init', '--backend', 'tmux')
         endpoint = backend.create(home, 'probe', 'incarnation-one', home,
                                   ['/bin/sh', '-c', 'printf \"agd-%s\\n\" live-check; treehouse --version; sleep 30'])
         try:
@@ -250,7 +250,6 @@ def _install_start(name):
             '#!/bin/sh\nset -eu\n'
             '[ "$1" = clone ] && [ "$2" = -- ] && [ "$3" = "$AGD_CANONICAL" ]\n'
             'printf "%s\\n" "$*" >> "$AGD_GIT_LOG"\n'
-            'mkdir "$4"\n'
             '/bin/cp -a "$AGD_SOURCE/." "$4"\n'
             '/bin/rm -rf "$4/.git"\n')
         (tools / 'git').chmod(0o755)
