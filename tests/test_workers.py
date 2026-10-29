@@ -150,13 +150,18 @@ def test_omitted_backend_refusals_preserve_worker_and_central_records(monkeypatc
                 monkeypatch.setenv(key, value)
             change(home, receipt)
             before_receipt = (home/'state'/'central-launcher.json').read_bytes()
+            before_config = (home/'data'/'launcher.json').read_bytes()
             with pytest.raises(store.Refusal, match=message):
                 workers.launch(home, task_id)
             assert tasks.read(home, task_id) == task
             assert (home/'state'/'central-launcher.json').read_bytes() == before_receipt
+            assert (home/'data'/'launcher.json').read_bytes() == before_config
 
-    refuse('mismatched', lambda _home, _receipt: monkeypatch.setenv('AGD_LAUNCH_ID', 'different'),
-           'inherited launcher environment differs')
+    def mismatched(home, _receipt):
+        (home/'data'/'launcher.json').write_text(
+            '{"schema": 1, "backend": "tmux", "herdr_session": "agd-00000000000000000000000000000000"}\n')
+        monkeypatch.setenv('AGD_LAUNCH_ID', 'different')
+    refuse('mismatched', mismatched, 'inherited launcher environment differs')
     refuse('malformed', lambda home, _receipt: (home/'state'/'central-launcher.json').write_bytes(b'{'),
            'launcher receipt is malformed')
     refuse('interrupted', lambda home, receipt: store.atomic_json(
