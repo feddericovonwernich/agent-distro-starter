@@ -215,12 +215,53 @@ def stop_central(home, backend, receipt):
     raise RuntimeError('central, watcher, or backend server remained after teardown')
 
 
+def herdr_server_pids(session):
+    expected = ['herdr', '--session', session, 'server']
+    matches = []
+    for process in Path('/proc').glob('[0-9]*'):
+        try:
+            argv = [
+                item.decode() for item in
+                process.joinpath('cmdline').read_bytes().split(b'\0') if item]
+        except (OSError, UnicodeDecodeError):
+            continue
+        if argv == expected:
+            matches.append(int(process.name))
+    return matches
+
+
+def stop_reserved_backend(home, backend, backend_name):
+    if backend_name == 'tmux':
+        server = store.run(
+            [*backend.prefix(home), 'display-message', '-p', '#{pid}'],
+            check=False)
+        if server.returncode:
+            return
+        store.run([*backend.prefix(home), 'kill-server'])
+        return
+    session = json.loads((home/'data/launcher.json').read_text())['herdr_session']
+    matches = herdr_server_pids(session)
+    if len(matches) > 1:
+        raise RuntimeError('reserved Herdr central server identity is ambiguous')
+    if not matches:
+        return
+    pid = matches[0]
+    os.killpg(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if supervision.process_start(pid) is None:
+            return
+        time.sleep(.1)
+    raise RuntimeError('reserved Herdr central server remained after teardown')
+
+
 def cleanup_central(home, backend, receipt):
     if receipt.get('phase') == 'ready':
         stop_central(home, backend, receipt)
         return
     endpoint = receipt.get('endpoint')
     if not isinstance(endpoint, dict) or not endpoint:
+        stop_reserved_backend(home, backend, receipt.get('backend'))
         return
     if receipt.get('backend') == 'tmux':
         server = store.run(
@@ -266,6 +307,7 @@ def main():
     account_before = digest_tree(account_omp)
     backend = __import__('agd_lib.' + args.backend, fromlist=['create'])
     endpoint = None
+    worker_endpoint = None
     central_receipt = None
     central_needs_cleanup = False
     evidence = {}
@@ -284,6 +326,16 @@ def main():
             'OMP_PROFILE', 'PI_PROFILE', 'PI_CONFIG_DIR', 'PI_CODING_AGENT_DIR',
             'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME')})
         agd(home, 'init', '--backend', args.backend)
+        if args.backend == 'tmux':
+            existing_server = store.run(
+                [*backend.prefix(home), 'display-message', '-p', '#{pid}'],
+                check=False)
+            if not existing_server.returncode:
+                raise RuntimeError('disposable tmux server name already exists')
+        else:
+            session = json.loads((home/'data/launcher.json').read_text())['herdr_session']
+            if herdr_server_pids(session):
+                raise RuntimeError('disposable Herdr central session already exists')
         dependencies = installer.setup(
             home, args.backend, lambda _message: False, fetch_json, stream_url,
             store.run)
@@ -378,7 +430,7 @@ def main():
             current = tasks.read(home, 'native-smoke')
             if runner_path.is_file():
                 runner = json.loads(runner_path.read_text())
-                if runner.get('phase') == 'spawned' or current.get('worker_alive') is False:
+                if runner.get('phase') == 'spawned':
                     break
             time.sleep(.1)
         else:
@@ -401,6 +453,7 @@ def main():
             time.sleep(.1)
         else:
             raise RuntimeError('actual worker did not stop with proven process absence')
+        worker_endpoint = None
 
         stop_central(home, backend, central_receipt)
         central_receipt = None
@@ -429,6 +482,27 @@ def main():
                 backend.close(endpoint)
             except Exception as error:
                 cleanup_failure = error
+        if worker_endpoint is not None:
+            try:
+                backend.close(worker_endpoint)
+                runner_path = directory/'home/state/tasks/native-smoke/runner.json'
+                runner = json.loads(runner_path.read_text()) if runner_path.is_file() else {}
+                identities = [
+                    (runner.get('pid'), runner.get('start')),
+                    (runner.get('child_pid'), runner.get('child_start')),
+                ]
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    if all(not isinstance(pid, int)
+                           or supervision.process_start(pid) != start
+                           for pid, start in identities):
+                        break
+                    time.sleep(.1)
+                else:
+                    raise RuntimeError('worker process remained after owned endpoint teardown')
+            except Exception as error:
+                if cleanup_failure is None:
+                    cleanup_failure = error
         if central_needs_cleanup:
             try:
                 receipt = central_receipt
