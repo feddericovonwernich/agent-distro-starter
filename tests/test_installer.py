@@ -379,7 +379,7 @@ def test_validate_dependencies_probes_omp_inside_local_runtime(tmp_path):
     assert calls
     for _argv, kwargs in calls:
         assert kwargs['cwd'] == tmp_path
-        assert kwargs['env']['PI_CODING_AGENT_DIR'] == str(tmp_path / 'data/omp/agent')
+        assert kwargs['env']['PI_CODING_AGENT_DIR'] == str(tmp_path / 'data/omp/home/.omp/agent')
         assert kwargs['env']['OMP_PROFILE'] == 'default'
 
 
