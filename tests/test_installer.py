@@ -113,23 +113,28 @@ def test_probes_require_documented_machine_output(tmp_path):
     assert probe_omp(omp, fake_run)['capabilities'] == ['models-json', 'login']
     assert probe_herdr(herdr, 'agd-test', fake_run)['capabilities'] == ['session-list-json', 'named-status']
 
-    def running(argv, check=False):
-        output = ('status: running\nversion: v0.9.5\nendpoint_compatible: yes\n'
-                  'private_protocol: 20\nprivate_protocol_compatible: yes\nsocket: /tmp/herdr.sock\n')
-        return result(output) if argv[1:] == ['--session', 'agd-test', 'status', 'server'] else fake_run(argv, check)
+    def status_runner(output):
+        def run(argv, check=False):
+            return result(output) if argv[1:] == ['--session', 'agd-test', 'status', 'server'] else fake_run(argv, check)
+        return run
 
-    assert probe_herdr(herdr, 'agd-test', running)['capabilities'] == ['session-list-json', 'named-status']
+    legacy = 'status: running\nversion: 0.8.2\nprotocol: 20\ncompatible: yes\nsocket: /tmp/herdr.sock\n'
+    current = ('status: running\nversion: v0.9.5\nendpoint_compatible: yes\n'
+               'private_protocol: 20\nprivate_protocol_compatible: yes\nsocket: /tmp/herdr.sock\n')
+    assert probe_herdr(herdr, 'agd-test', status_runner(legacy))['capabilities'] == ['session-list-json', 'named-status']
+    assert probe_herdr(herdr, 'agd-test', status_runner(current))['capabilities'] == ['session-list-json', 'named-status']
 
     def bad_models(argv, check=False):
         return result('not json') if argv[1:] == ['models', '--json'] else fake_run(argv, check)
 
-    def malformed_status(argv, check=False):
-        return result('not running\n') if argv[1:] == ['--session', 'agd-test', 'status', 'server'] else fake_run(argv, check)
-
+    incompatible = current.replace('private_protocol_compatible: yes', 'private_protocol_compatible: no')
+    duplicate = current + 'socket: /tmp/other.sock\n'
+    malformed = 'status: running\nprotocol: \ncompatible: yes\nsocket: relative.sock\n'
     with pytest.raises(Refusal, match='models'):
         probe_omp(omp, bad_models)
-    with pytest.raises(Refusal, match='status'):
-        probe_herdr(herdr, 'agd-test', malformed_status)
+    for output in (incompatible, duplicate, malformed):
+        with pytest.raises(Refusal, match='status'):
+            probe_herdr(herdr, 'agd-test', status_runner(output))
 
 
 def test_receipt_schema_rejects_unknown_sources_incomplete_and_extra_entries(tmp_path):

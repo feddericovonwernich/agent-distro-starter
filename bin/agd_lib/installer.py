@@ -110,6 +110,33 @@ def probe_omp(path, run):
     return {'path': str(path), 'version': version, 'capabilities': _CAPABILITIES['omp']}
 
 
+def _parse_herdr_status(text):
+    fields = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition(': ')
+        if not separator or not key or not value or key in fields:
+            raise Refusal('Herdr named status output is invalid')
+        fields[key] = value
+    status = fields.get('status')
+    if status == 'not running' and set(fields) == {'status', 'socket'}:
+        if Path(fields['socket']).is_absolute():
+            return
+    if status != 'running' or not Path(fields.get('socket', '')).is_absolute():
+        raise Refusal('Herdr named status output is invalid')
+    legacy = {'status', 'protocol', 'compatible', 'socket'}
+    current = {'status', 'version', 'endpoint_compatible', 'private_protocol',
+               'private_protocol_compatible', 'socket'}
+    if set(fields) in (legacy, legacy | {'version'}):
+        if fields.get('protocol') and fields.get('compatible') == 'yes':
+            return
+    elif set(fields) == current:
+        if (fields.get('version') and fields.get('private_protocol')
+                and fields.get('endpoint_compatible') == 'yes'
+                and fields.get('private_protocol_compatible') == 'yes'):
+            return
+    raise Refusal('Herdr named status output is invalid')
+
+
 def probe_herdr(path, session, run):
     version = _version(path, run, 'Herdr')
     sessions = _result(run, [str(path), 'session', 'list', '--json'])
@@ -120,15 +147,9 @@ def probe_herdr(path, session, run):
     if sessions.returncode or not isinstance(parsed, (list, dict)):
         raise Refusal('Herdr session list output is invalid')
     status = _result(run, [str(path), '--session', session, 'status', 'server'])
-    text = (status.stdout or status.stderr or '').strip().lower()
-    lines = text.splitlines()
-    expected = (['status: running', 'version: ', 'endpoint_compatible: ', 'private_protocol: ',
-                 'private_protocol_compatible: ', 'socket: ']
-                if lines and lines[0] == 'status: running' else ['status: not running', 'socket: '])
-    if status.returncode or len(lines) != len(expected) or any(
-            line != label if index == 0 else not line.startswith(label)
-            for index, (line, label) in enumerate(zip(lines, expected))):
+    if status.returncode:
         raise Refusal('Herdr named status output is invalid')
+    _parse_herdr_status((status.stdout or status.stderr or '').strip())
     return {'path': str(path), 'version': version, 'capabilities': _CAPABILITIES['herdr']}
 
 
