@@ -125,6 +125,19 @@ def test_treehouse_install_uses_public_pinned_archive_and_records_hashes(tmp_pat
     )['treehouse']['version'] == 'v3.1.6'
 
 
+def test_treehouse_managed_receipt_requires_fixed_pin(tmp_path):
+    executable = tmp_path/'treehouse'
+    executable.write_bytes(b'bytes')
+    executable.chmod(0o755)
+    entry = {'source': 'managed', 'path': str(executable), 'version': 'v3.1.6',
+             'capabilities': ['version'], 'asset': installer._TREEHOUSE_ASSET, 'tag': 'v3.1.6',
+             'artifact_sha256': installer._TREEHOUSE_DIGEST,
+             'installed_sha256': hashlib.sha256(b'bytes').hexdigest()}
+    for change in ({'tag': 'v3.1.5'}, {'artifact_sha256': '0' * 64}):
+        with pytest.raises(Refusal, match='receipt'):
+            write_dependencies(tmp_path, {'schema': 1, 'treehouse': {**entry, **change}})
+
+
 def test_omp_rejects_missing_api_digest(tmp_path):
     selected = {'draft': False, 'prerelease': False, 'tag_name': 'v1',
                 'assets': [{'name': 'omp-linux-x64', 'browser_download_url': 'https://example.test/omp'}]}

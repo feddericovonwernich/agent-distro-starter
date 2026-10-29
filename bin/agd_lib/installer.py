@@ -56,6 +56,8 @@ def _validate_entry(tool, entry):
         entry['asset'] != _RELEASES[tool][1] or not isinstance(entry['tag'], str) or not entry['tag']
         or any(not isinstance(entry[key], str) or not re.fullmatch(r'[0-9a-f]{64}', entry[key])
                for key in ('artifact_sha256', 'installed_sha256'))
+        or (tool == 'treehouse' and (entry['tag'] != 'v3.1.6'
+                                     or entry['artifact_sha256'] != _TREEHOUSE_DIGEST))
     ):
         raise Refusal('dependency receipt is malformed')
 
