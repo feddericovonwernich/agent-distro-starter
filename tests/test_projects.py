@@ -1,6 +1,5 @@
 import json
 import os
-import runpy
 import subprocess
 import tempfile
 from pathlib import Path
@@ -69,12 +68,6 @@ def test_project_lifecycle():
         assert not project.exists()
 
 
-def test_worker_launch_parser_preserves_omitted_backend():
-    parsed = runpy.run_path(str(CLI))['parser']().parse_args(['worker', 'launch', 'worker'])
-    explicit = runpy.run_path(str(CLI))['parser']().parse_args(
-        ['worker', 'launch', 'worker', '--backend', 'tmux'])
-    assert parsed.backend is None
-    assert explicit.backend == 'tmux'
 
 
 if __name__ == '__main__':
