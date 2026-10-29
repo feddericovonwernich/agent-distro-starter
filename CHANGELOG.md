@@ -1,12 +1,12 @@
 # Changelog
 
 ## Unreleased
-- Isolated OMP settings, authentication, sessions, caches, and plugin data inside each distro with a synthetic local OMP `HOME`; fresh setup now installs official project-scoped Ponytail and Superpowers plugins and validates their native registrations.
+- Isolate OMP settings, authentication, sessions, caches, and plugin data inside each distro while preserving the caller's real `HOME` for Git, SSH, and shell configuration; fresh setup now installs official project-scoped Ponytail and Superpowers plugins and validates their native registrations.
 - Source the default worker catalog from validated native Ponytail and Superpowers plugin payloads under canonical upstream names; preserve exact skill bytes/resources, refuse source collisions, and stop redistributing transformed upstream worker bundles.
 - Move harness/profile/curated/none selection to task creation and publish `prepared` only after an immutable schema-2 source inventory, snapshot, and ignored canonical-name worktree copy exist; launch/relaunch no longer re-resolve mutable plugin sources.
 - Keep scoped-PR workers adapter-only by requiring tasks created with no ordinary skills, validating the grant before Relay startup, and freezing the AGD adapter without replacing the task's ordinary selection.
 - Isolate the bounded reviewer from orchestrator plugins with a private per-run empty project registry while reusing the distro-local OMP auth/settings agent directory; update OMP 18.14 telemetry initialization and catalog provenance to hash native source bytes.
-- Add an opt-in native plugin lifecycle smoke covering official project installation, canonical task snapshots, backend-native skill reads, source-independent restoration, new-task refusal after source removal, lease cleanup, and unchanged account-global OMP state.
+- Add an opt-in native plugin lifecycle smoke covering official project installation, actual central and worker startup/teardown, provider-free upstream extension hooks, worker/reviewer plugin isolation, canonical task snapshots, backend-native skill reads, source-independent restoration, new-task refusal after source removal, lease cleanup, unchanged account-global OMP state, and delayed recreation detection.
 - Polish guided installation with colored stages and prompts, quieter cloning, a clear start command, and pretty terminal JSON; retain plain/compact redirected output and remove OMP login/model configuration prompts.
 - Preserve Herdr's native pane marker when starting the central agent so it can launch Herdr workers; continue filtering caller-supplied markers and sanitizing the outer attach client.
 - Export the central owner token during OMP session start and switch so agent commands can mutate their own home while foreign commands remain read-only.
