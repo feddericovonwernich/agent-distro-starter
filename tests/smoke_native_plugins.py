@@ -194,21 +194,24 @@ def stop_central(home, backend, receipt):
     if receipt['backend'] == 'tmux':
         store.run([*backend.prefix(home), 'kill-server'])
     else:
-        backend.call(endpoint, 'workspace', 'close', endpoint['workspace'])
-        if (supervision.process_start(endpoint['server_pid']) != endpoint['server_start']
-                or endpoint['server_argv'] != ['herdr', '--session', endpoint['session'], 'server']):
+        if endpoint['server_argv'] != [
+                'herdr', '--session', endpoint['session'], 'server']:
             raise RuntimeError('owned Herdr central server identity changed')
-        os.killpg(endpoint['server_pid'], signal.SIGTERM)
+        if not supervision.gone(endpoint['server_pid'], endpoint['server_start']):
+            backend.call(endpoint, 'workspace', 'close', endpoint['workspace'])
+            os.killpg(endpoint['server_pid'], signal.SIGTERM)
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        owner_gone = all(supervision.process_start(owner[key]) is None
-                         for key in ('owner_pid', 'watcher_pid'))
+        owner_gone = all(
+            supervision.gone(owner[key], owner[key.replace('_pid', '_start')])
+            for key in ('owner_pid', 'watcher_pid'))
         if receipt['backend'] == 'tmux':
             server_gone = store.run(
                 [*backend.prefix(home), 'display-message', '-p', '#{pid}'],
                 check=False).returncode != 0
         else:
-            server_gone = supervision.process_start(endpoint['server_pid']) is None
+            server_gone = supervision.gone(
+                endpoint['server_pid'], endpoint['server_start'])
         if owner_gone and server_gone:
             return
         time.sleep(.1)
@@ -246,10 +249,14 @@ def stop_reserved_backend(home, backend, backend_name):
     if not matches:
         return
     pid = matches[0]
+    try:
+        start = supervision.process_start(pid)
+    except (FileNotFoundError, ProcessLookupError):
+        return
     os.killpg(pid, signal.SIGTERM)
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        if supervision.process_start(pid) is None:
+        if supervision.gone(pid, start):
             return
         time.sleep(.1)
     raise RuntimeError('reserved Herdr central server remained after teardown')
@@ -271,17 +278,18 @@ def cleanup_central(home, backend, receipt):
             raise RuntimeError('partial tmux central server identity changed')
         store.run([*backend.prefix(home), 'kill-server'])
         return
-    if (supervision.process_start(endpoint.get('server_pid')) != endpoint.get('server_start')
-            or endpoint.get('server_argv') != [
-                'herdr', '--session', endpoint.get('session'), 'server']):
+    if endpoint.get('server_argv') != [
+            'herdr', '--session', endpoint.get('session'), 'server']:
         raise RuntimeError('partial Herdr central server identity changed')
+    if supervision.gone(endpoint['server_pid'], endpoint['server_start']):
+        return
     if endpoint.get('workspace'):
         backend.call(
             endpoint, 'workspace', 'close', endpoint['workspace'], check=False)
     os.killpg(endpoint['server_pid'], signal.SIGTERM)
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        if supervision.process_start(endpoint['server_pid']) is None:
+        if supervision.gone(endpoint['server_pid'], endpoint['server_start']):
             return
         time.sleep(.1)
     raise RuntimeError('partial Herdr central server remained after teardown')
@@ -494,7 +502,7 @@ def main():
                 deadline = time.monotonic() + 10
                 while time.monotonic() < deadline:
                     if all(not isinstance(pid, int)
-                           or supervision.process_start(pid) != start
+                           or supervision.gone(pid, start)
                            for pid, start in identities):
                         break
                     time.sleep(.1)
