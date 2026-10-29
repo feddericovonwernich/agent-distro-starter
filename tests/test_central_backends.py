@@ -264,9 +264,10 @@ def test_herdr_central_uses_named_receipted_session_and_restores_focus(tmp_path,
     monkeypatch.setattr(launcher, '_prove_herdr_server', lambda *_: None, raising=False)
     monkeypatch.setenv('CENTRAL_SAME_VALUE', 'present')
 
-    endpoint = launcher._backend_create('herdr', home, 'launch-id', 'token', ['/opt/agd'],
-                                        {'PATH': '/bin', 'CENTRAL_SENTINEL': 'present',
-                                         'CENTRAL_SAME_VALUE': 'present', 'HERDR_ENV': 'foreign'}, ['/opt/omp'])
+    endpoint = launcher._backend_create(
+        'herdr', home, 'launch-id', 'token', ['/bin/sh', '-c', 'printf "%s" "${HERDR_ENV-absent}"'],
+        {'PATH': '/bin', 'CENTRAL_SENTINEL': 'present',
+         'CENTRAL_SAME_VALUE': 'present', 'HERDR_ENV': 'foreign'}, ['/opt/omp'])
     receipt = {'backend': 'herdr', 'launch_id': 'launch-id', 'endpoint_token': 'token',
                'expected_process_argv': ['/opt/omp'], 'endpoint': endpoint}
     assert endpoint['session'] == session
@@ -284,6 +285,13 @@ def test_herdr_central_uses_named_receipted_session_and_restores_focus(tmp_path,
     assert 'export CENTRAL_SENTINEL=present' in pane_runs
     assert 'export CENTRAL_SAME_VALUE=present' in pane_runs
     assert not any('HERDR_ENV=' in command for command in pane_runs)
+    # Execute the commands against the environment of a newly created Herdr pane.
+    launched = subprocess.run(['/bin/sh', '-c', '\n'.join(pane_runs)],
+                              env={'HERDR_ENV': '1'}, capture_output=True, text=True, check=True)
+    assert launched.stdout == '1'
+    outside = subprocess.run(['/bin/sh', '-c', '\n'.join(pane_runs)],
+                             env={}, capture_output=True, text=True, check=True)
+    assert outside.stdout == 'absent'
     monkeypatch.setattr(launcher.store, 'run', lambda argv, **kwargs: SimpleNamespace(
         returncode=0, stdout=json.dumps([{'name': session}]), stderr=''))
     with __import__('pytest').raises(store.Refusal, match='unreceipted'):
