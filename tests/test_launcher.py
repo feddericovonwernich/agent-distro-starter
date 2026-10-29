@@ -70,6 +70,7 @@ def test_prepare_start_correlates_only_exact_ready_endpoint(tmp_path, monkeypatc
     home = tmp_path / 'h'
     home.mkdir()
     expected_argv = ['/opt/omp', '--cwd', str(home), '--session-dir', str(home / 'sessions')]
+    launcher.initialize(home, 'tmux')
     monkeypatch.setattr(observability, 'central_argv',
                         lambda actual_home, args: (expected_argv, {'AGD_HOME': str(actual_home)}, None))
     seen = {}
@@ -126,3 +127,45 @@ def test_prepare_start_correlates_only_exact_ready_endpoint(tmp_path, monkeypatc
     store.atomic_json(receipt_path, stale)
     with __import__('pytest').raises(store.Refusal, match='owner snapshot'):
         launcher.prepare_start(home, None, {}, fake_create, fake_inspect, fake_attach)
+
+
+def test_start_refuses_missing_dependencies_before_reservation(tmp_path):
+    home = tmp_path / 'h'
+    fake = tmp_path / 'bin'
+    fake.mkdir()
+    omp = fake / 'omp'
+    omp.write_text('#!/bin/sh\nexit 0\n')
+    omp.chmod(0o755)
+    command(home, 'init', '--backend', 'tmux')
+    result = subprocess.run([str(CLI), '--home', str(home), 'start'],
+                            env=dict(os.environ, AGD_HOME=str(home), PATH=f'{fake}:{os.environ["PATH"]}'),
+                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=90)
+    assert result.returncode == 3
+    assert not (home / 'state' / 'central-launcher.json').exists()
+
+
+def test_prepare_start_refuses_unsafe_launcher_config(tmp_path, monkeypatch):
+    import sys
+    sys.path.insert(0, str(ROOT / 'bin'))
+    from agd_lib import launcher, observability, store
+
+    home = tmp_path / 'h'
+    config = home / 'data' / 'launcher.json'
+    config.parent.mkdir(parents=True)
+    monkeypatch.setattr(observability, 'central_argv', lambda *_: (['/opt/omp'], {}, None))
+    for body in ('{', '{}', '{"schema": 2, "backend": "tmux", "herdr_session": "agd-x"}',
+                 '{"schema": 1, "backend": "tmux", "herdr_session": "agd-x", "extra": true}'):
+        (home / 'state' / 'central-launcher.json').unlink(missing_ok=True)
+        config.write_text(body)
+        with __import__('pytest').raises(store.Refusal, match='launcher config'):
+            launcher.prepare_start(home, None, {}, lambda *_: None, lambda *_: None, lambda *_: [])
+    config.unlink()
+    target = tmp_path / 'launcher.json'
+    target.write_text('{"schema": 1, "backend": "tmux", "herdr_session": "agd-00000000000000000000000000000000"}')
+    config.symlink_to(target)
+    with __import__('pytest').raises(store.Refusal, match='launcher config'):
+        launcher.prepare_start(home, None, {}, lambda *_: None, lambda *_: None, lambda *_: [])
+    config.unlink()
+    config.symlink_to(tmp_path / 'missing')
+    with __import__('pytest').raises(store.Refusal, match='launcher config'):
+        launcher.prepare_start(home, None, {}, lambda *_: None, lambda *_: None, lambda *_: [])

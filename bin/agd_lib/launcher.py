@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -25,6 +26,22 @@ def initialize(home: Path, backend: str) -> None:
         'backend': backend,
         'herdr_session': f'agd-{uuid.uuid4().hex}',
     })
+
+
+def resolve_backend(home: Path, explicit_backend: str | None) -> str:
+    path = home / 'data' / 'launcher.json'
+    if path.is_symlink() or not path.is_file():
+        raise store.Refusal('launcher config is unsafe')
+    try:
+        config = json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        raise store.Refusal('launcher config is malformed') from error
+    if (not isinstance(config, dict) or set(config) != {'schema', 'backend', 'herdr_session'}
+            or config.get('schema') != 1 or config.get('backend') not in {'tmux', 'herdr'}
+            or not isinstance(config.get('herdr_session'), str)
+            or not re.fullmatch(r'agd-[0-9a-f]{32}', config['herdr_session'])):
+        raise store.Refusal('launcher config is malformed')
+    return explicit_backend or config['backend']
 
 
 def _receipt_path(home: Path) -> Path:
@@ -154,6 +171,7 @@ def _backend_attach(home: Path, receipt: dict) -> list[str]:
 
 
 def active_backend(home: Path, inherited_env: Mapping[str, str] | None = None) -> str | None:
+    resolve_backend(home, None)
     receipt, _ = _read_receipt(home)
     if receipt is None:
         return None
@@ -166,26 +184,16 @@ def active_backend(home: Path, inherited_env: Mapping[str, str] | None = None) -
 
 def prepare_start(home: Path, explicit_backend: str | None, inherited_env: Mapping[str, str] | None,
                   create, inspect, attach) -> AttachTarget:
+    selected = resolve_backend(home, explicit_backend)
     receipt, _ = _read_receipt(home)
     if receipt is not None:
         if receipt['phase'] != 'ready':
             raise store.Refusal('central launch was interrupted')
-        if explicit_backend and explicit_backend != receipt['backend']:
+        if selected != receipt['backend']:
             raise store.Refusal('explicit backend differs from active central')
         env = _inheritance(home, receipt, inherited_env)
         _prove(home, receipt, inspect)
         return AttachTarget(attach(home, receipt), env)
-
-    config_path = home / 'data' / 'launcher.json'
-    selected = explicit_backend
-    if selected is None and config_path.exists():
-        try:
-            config = json.loads(config_path.read_text())
-            selected = config['backend'] if config.get('schema') == 1 else None
-        except (ValueError, AttributeError):
-            selected = None
-    if selected not in {'tmux', 'herdr'}:
-        selected = 'tmux'
     argv, central_env, _warning = observability.central_argv(home, ())
     launch_id, endpoint_token = str(uuid.uuid4()), uuid.uuid4().hex
     managed = [str(Path(__file__).resolve().parents[1] / 'agd'), '--home', str(home), 'observability', 'central']
