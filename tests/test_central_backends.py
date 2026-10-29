@@ -208,3 +208,75 @@ def test_tmux_endpoint_journal_survives_spawned_receipt_transition_failure(tmp_p
     with __import__('pytest').raises(store.Refusal, match='receipt changed'):
         launcher.prepare_start(home, None, {}, launcher._backend_create, launcher._backend_inspect, launcher._backend_attach)
     assert __import__('json').loads((home / 'state' / 'central-tmux-pending.json').read_text())['pane'] == '%10'
+
+
+def test_herdr_central_uses_named_receipted_session_and_restores_focus(tmp_path, monkeypatch):
+    import json
+    import stat
+    from agd_lib import launcher, store
+
+    home = tmp_path / 'home'
+    home.mkdir()
+    launcher.initialize(home, 'herdr')
+    session = json.loads((home / 'data' / 'launcher.json').read_text())['herdr_session']
+    calls, focus = [], []
+
+    def fake_run(argv, check=True, timeout=None):
+        calls.append(argv)
+        if argv == ['herdr', 'session', 'list', '--json']:
+            return SimpleNamespace(returncode=0, stdout='[]', stderr='')
+        if argv[-2:] == ['status', 'server']:
+            return SimpleNamespace(returncode=0, stdout='status: running\ncompatible: yes\nprotocol: 20\nsocket: /tmp/herdr.sock\n', stderr='')
+        command = tuple(argv[3:])
+        if command == ('workspace', 'focus', 'workspace-1'):
+            focus.append(('workspace', 'workspace-1'))
+            result = {}
+        elif command == ('tab', 'focus', 'tab-1'):
+            focus.append(('tab', 'tab-1'))
+            result = {}
+        elif command == ('workspace', 'create', '--cwd', str(home), '--label', 'agd-central', '--no-focus'):
+            result = {'workspace': {'workspace_id': 'workspace-1'}}
+        elif command == ('workspace', 'get', 'workspace-1'):
+            result = {'workspace': {'workspace_id': 'workspace-1'}}
+        elif command == ('tab', 'create', '--workspace', 'workspace-1', '--cwd', str(home), '--label', 'central', '--no-focus'):
+            result = {'tab': {'tab_id': 'tab-1'}, 'root_pane': {'pane_id': 'pane-1', 'workspace_id': 'workspace-1',
+                                                                 'tab_id': 'tab-1', 'terminal_id': 'terminal-1'}}
+        elif command == ('pane', 'get', 'pane-1'):
+            result = {'pane': {'pane_id': 'pane-1', 'workspace_id': 'workspace-1', 'tab_id': 'tab-1',
+                               'terminal_id': 'terminal-1'}}
+        elif command == ('pane', 'process-info', '--pane', 'pane-1'):
+            result = {'process_info': {'pane_id': 'pane-1', 'pid': 42, 'start': 'start-42', 'argv': ['/opt/omp']}}
+        elif command[:3] == ('pane', 'run', 'pane-1'):
+            result = {}
+        else:
+            raise AssertionError(argv)
+        return SimpleNamespace(returncode=0, stdout=json.dumps({'result': result}), stderr='')
+
+    class Socket:
+        st_mode, st_dev, st_ino = stat.S_IFSOCK, 9, 10
+
+    monkeypatch.setattr(launcher.store, 'run', fake_run)
+    monkeypatch.setattr(launcher, '_socket_identity', lambda path: Socket(), raising=False)
+    import subprocess
+    monkeypatch.setattr(launcher, 'subprocess', SimpleNamespace(DEVNULL=subprocess.DEVNULL,
+                        Popen=lambda argv, **kwargs: calls.append((argv, kwargs))), raising=False)
+
+    endpoint = launcher._backend_create('herdr', home, 'launch-id', 'token', ['/opt/agd'],
+                                        {'PATH': '/bin'}, ['/opt/omp'])
+    receipt = {'backend': 'herdr', 'launch_id': 'launch-id', 'endpoint_token': 'token',
+               'expected_process_argv': ['/opt/omp'], 'endpoint': endpoint}
+    assert endpoint['session'] == session
+    assert endpoint['socket'] == '/tmp/herdr.sock'
+    assert (['herdr', '--session', session, 'server'], {'stdin': subprocess.DEVNULL, 'stdout': subprocess.DEVNULL,
+            'stderr': subprocess.DEVNULL, 'start_new_session': True}) in calls
+    assert calls[0] == ['herdr', 'session', 'list', '--json']
+    assert launcher._backend_attach(home, receipt) == ['herdr', 'session', 'attach', session]
+    assert focus == [('workspace', 'workspace-1'), ('tab', 'tab-1')]
+
+    env = launcher._attach_env(home, receipt, {'HERDR_ENV': '1', 'PATH': '/bin'})
+    assert env['AGD_HERDR_SESSION'] == session
+    assert 'HERDR_ENV' not in env
+    monkeypatch.setattr(launcher.store, 'run', lambda argv, **kwargs: SimpleNamespace(
+        returncode=0, stdout=json.dumps([{'name': session}]), stderr=''))
+    with __import__('pytest').raises(store.Refusal, match='unreceipted'):
+        launcher._backend_create('herdr', home, 'other', 'token', ['/opt/agd'], {'PATH': '/bin'}, ['/opt/omp'])

@@ -2,6 +2,9 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import stat
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass
@@ -153,7 +156,148 @@ def _prove(home: Path, receipt: dict, inspect) -> dict:
     return owner
 
 
+
+
+def _herdr_session(home: Path) -> str:
+    resolve_backend(home, None)
+    return json.loads((home / 'data' / 'launcher.json').read_text())['herdr_session']
+
+
+def _socket_identity(path: Path):
+    try:
+        identity = path.stat()
+    except OSError as error:
+        raise store.Refusal('Herdr server socket is unavailable') from error
+    if not stat.S_ISSOCK(identity.st_mode):
+        raise store.Refusal('Herdr server socket is unverified')
+    return identity
+
+
+def _herdr_response(result) -> dict:
+    try:
+        value = json.loads(result.stdout)
+        if not isinstance(value, dict) or 'error' in value or not isinstance(value['result'], dict):
+            raise ValueError
+        return value['result']
+    except (KeyError, TypeError, ValueError) as error:
+        raise store.Refusal('Herdr response unverified') from error
+
+
+def _herdr_status(session: str) -> dict:
+    try:
+        result = store.run(['herdr', '--session', session, 'status', 'server'], check=False, timeout=10)
+    except subprocess.TimeoutExpired as error:
+        raise store.Refusal('Herdr server did not respond') from error
+    fields = dict(line.split(': ', 1) for line in result.stdout.splitlines() if ': ' in line)
+    if (result.returncode or fields.get('status') != 'running' or fields.get('compatible') != 'yes'
+            or not fields.get('protocol')):
+        raise store.Refusal('Herdr session is not running')
+    socket = Path(fields.get('socket', ''))
+    if not socket.is_absolute():
+        raise store.Refusal('Herdr server socket is unverified')
+    identity = _socket_identity(socket)
+    return {'session': session, 'socket': str(socket), 'device': identity.st_dev,
+            'inode': identity.st_ino, 'protocol': fields['protocol']}
+
+
+def _herdr_call(endpoint: dict, *args, check=True):
+    identity = _socket_identity(Path(endpoint['socket']))
+    if identity.st_dev != endpoint['device'] or identity.st_ino != endpoint['inode']:
+        raise store.Refusal('Herdr server replaced; endpoint identity unknown')
+    try:
+        result = store.run(['herdr', '--session', endpoint['session'], *args], check=False, timeout=10)
+    except subprocess.TimeoutExpired as error:
+        raise store.Refusal('Herdr command timed out; endpoint state unknown') from error
+    if result.returncode and check:
+        raise store.Refusal(f'Herdr command refused: {result.stderr.strip() or result.stdout.strip()}')
+    return result
+
+
+def _herdr_inspect(home: Path, receipt: dict) -> dict:
+    endpoint = receipt['endpoint']
+    pane = _herdr_response(_herdr_call(endpoint, 'pane', 'get', endpoint['pane']))['pane']
+    if (pane.get('pane_id') != endpoint['pane'] or pane.get('workspace_id') != endpoint['workspace']
+            or pane.get('tab_id') != endpoint['tab'] or pane.get('terminal_id') != endpoint['terminal']):
+        raise store.Refusal('Herdr pane identity differs from recorded endpoint')
+    process = _herdr_response(_herdr_call(endpoint, 'pane', 'process-info', '--pane', endpoint['pane']))['process_info']
+    if process.get('pane_id') != endpoint['pane']:
+        raise store.Refusal('Herdr process identity differs from endpoint')
+    if isinstance(process.get('pid'), int):
+        pid, start, argv = process['pid'], process.get('start'), process.get('argv')
+    else:
+        foreground = process.get('foreground_processes')
+        if not isinstance(foreground, list) or len(foreground) != 1 or not isinstance(foreground[0], dict):
+            raise store.Refusal('Herdr foreground process is unverified')
+        pid, argv = foreground[0].get('pid'), foreground[0].get('argv')
+        start = supervision.process_start(pid) if isinstance(pid, int) else None
+    if not isinstance(start, str) or not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv):
+        raise store.Refusal('Herdr foreground process is unverified')
+    return {'endpoint': endpoint, 'foreground': {'launch_id': endpoint['launch_id'],
+            'endpoint_token': endpoint['token'], 'pid': pid, 'start': start, 'argv': argv,
+            'terminal': endpoint['terminal']}}
+
+
+def _herdr_create(home: Path, launch_id: str, endpoint_token: str, managed: list[str],
+                  env: dict[str, str], argv: list[str]) -> dict:
+    session = _herdr_session(home)
+    try:
+        listed = json.loads(store.run(['herdr', 'session', 'list', '--json'], timeout=10).stdout)
+        sessions = listed['sessions'] if isinstance(listed, dict) else listed
+    except (KeyError, ValueError, TypeError) as error:
+        raise store.Refusal('Herdr session list is unverified') from error
+    if not isinstance(sessions, list) or any(not isinstance(item, dict) for item in sessions):
+        raise store.Refusal('Herdr session list is unverified')
+    if any(item.get('name') == session for item in sessions):
+        raise store.Refusal('unreceipted Herdr session already exists')
+    subprocess.Popen(['herdr', '--session', session, 'server'], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    endpoint = None
+    for _ in range(30):
+        try:
+            endpoint = _herdr_status(session)
+            break
+        except store.Refusal:
+            time.sleep(.1)
+    if endpoint is None:
+        raise store.Refusal('Herdr server did not become available')
+    workspace = _herdr_response(_herdr_call(
+        endpoint, 'workspace', 'create', '--cwd', str(home), '--label', 'agd-central', '--no-focus'))['workspace']
+    workspace_id = workspace.get('workspace_id')
+    if not isinstance(workspace_id, str):
+        raise store.Refusal('Herdr workspace identity is unverified')
+    checked_workspace = _herdr_response(_herdr_call(endpoint, 'workspace', 'get', workspace_id))['workspace']
+    if checked_workspace.get('workspace_id') != workspace_id:
+        raise store.Refusal('Herdr workspace identity changed')
+    created = _herdr_response(_herdr_call(
+        endpoint, 'tab', 'create', '--workspace', workspace_id, '--cwd', str(home), '--label', 'central', '--no-focus'))
+    tab, pane = created.get('tab'), created.get('root_pane')
+    if not isinstance(tab, dict) or not isinstance(pane, dict):
+        raise store.Refusal('Herdr tab identity is unverified')
+    endpoint.update(workspace=workspace_id, tab=tab.get('tab_id'), pane=pane.get('pane_id'),
+                    terminal=pane.get('terminal_id'), token=endpoint_token, launch_id=launch_id)
+    if (not all(isinstance(endpoint[key], str) and endpoint[key] for key in ('workspace', 'tab', 'pane', 'terminal'))
+            or pane.get('workspace_id') != endpoint['workspace'] or pane.get('tab_id') != endpoint['tab']):
+        raise store.Refusal('Herdr tab identity is inconsistent')
+    command_env = {key: value for key, value in {
+        'AGD_HERDR_SESSION': session, 'AGD_LAUNCH_ID': launch_id, 'AGD_ENDPOINT_TOKEN': endpoint_token,
+        'PATH': env.get('PATH', os.environ.get('PATH', '')),
+    }.items()}
+    _herdr_call(endpoint, 'pane', 'run', endpoint['pane'],
+                'export ' + ' '.join(f'{key}={shlex.quote(value)}' for key, value in command_env.items())
+                + '; exec ' + shlex.join(managed))
+    return endpoint
+
+
+def _attach_env(home: Path, receipt: dict, inherited_env: Mapping[str, str] | None) -> dict[str, str]:
+    env = dict(inherited_env or os.environ)
+    env.pop('HERDR_ENV', None)
+    env.update(_inheritance(home, receipt, inherited_env))
+    if receipt['backend'] == 'herdr' and isinstance(receipt['endpoint'].get('session'), str):
+        env['AGD_HERDR_SESSION'] = receipt['endpoint']['session']
+    return env
 def _backend_inspect(home: Path, receipt: dict) -> dict:
+    if receipt['backend'] == 'herdr':
+        return _herdr_inspect(home, receipt)
     module = __import__(f'agd_lib.{receipt["backend"]}', fromlist=['inspect_central'])
     inspect = getattr(module, 'inspect_central', None)
     if not callable(inspect):
@@ -163,6 +307,8 @@ def _backend_inspect(home: Path, receipt: dict) -> dict:
 
 def _backend_create(backend: str, home: Path, launch_id: str, endpoint_token: str, managed: list[str],
                     env: dict[str, str], argv: list[str]) -> dict:
+    if backend == 'herdr':
+        return _herdr_create(home, launch_id, endpoint_token, managed, env, argv)
     module = __import__(f'agd_lib.{backend}', fromlist=['create_central'])
     create = getattr(module, 'create_central', None)
     if not callable(create):
@@ -171,6 +317,8 @@ def _backend_create(backend: str, home: Path, launch_id: str, endpoint_token: st
 
 
 def _backend_finalize(home: Path, receipt: dict) -> None:
+    if receipt['backend'] == 'herdr':
+        return
     module = __import__(f'agd_lib.{receipt["backend"]}', fromlist=['finalize_central'])
     finalize = getattr(module, 'finalize_central', None)
     if not callable(finalize):
@@ -179,6 +327,13 @@ def _backend_finalize(home: Path, receipt: dict) -> None:
 
 
 def _backend_attach(home: Path, receipt: dict) -> list[str]:
+    if receipt['backend'] == 'herdr':
+        _herdr_inspect(home, receipt)
+        endpoint = receipt['endpoint']
+        _herdr_response(_herdr_call(endpoint, 'workspace', 'focus', endpoint['workspace']))
+        _herdr_response(_herdr_call(endpoint, 'tab', 'focus', endpoint['tab']))
+        _herdr_inspect(home, receipt)
+        return ['herdr', 'session', 'attach', endpoint['session']]
     module = __import__(f'agd_lib.{receipt["backend"]}', fromlist=['attach_argv'])
     attach = getattr(module, 'attach_argv', None)
     if not callable(attach):
@@ -207,7 +362,7 @@ def prepare_start(home: Path, explicit_backend: str | None, inherited_env: Mappi
             raise store.Refusal('central launch was interrupted')
         if selected != receipt['backend']:
             raise store.Refusal('explicit backend differs from active central')
-        env = _inheritance(home, receipt, inherited_env)
+        env = _attach_env(home, receipt, inherited_env)
         _prove(home, receipt, inspect)
         return AttachTarget(attach(home, receipt), env)
     argv, central_env, _warning = observability.central_argv(home, ())
@@ -233,5 +388,4 @@ def prepare_start(home: Path, explicit_backend: str | None, inherited_env: Mappi
              'owner': {'pid': owner['owner_pid'], 'start': owner['owner_start']},
              'watcher': {'pid': owner['watcher_pid'], 'start': owner['watcher_start']}}
     _advance(home, spawned, ready)
-    env = _inheritance(home, ready, inherited_env)
-    return AttachTarget(attach(home, ready), env)
+    return AttachTarget(attach(home, ready), _attach_env(home, ready, inherited_env))
