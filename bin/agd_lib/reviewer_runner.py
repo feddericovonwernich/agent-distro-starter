@@ -11,10 +11,10 @@ from urllib.parse import unquote, urlparse
 
 from pathlib import Path
 
-from . import observability, reviewer, store
+from . import observability, omp_runtime, reviewer, store
 
 
-def assert_runtime_capability(deadline_epoch_ms, *, omp_binary='omp'):
+def assert_runtime_capability(deadline_epoch_ms, *, home=None, omp_binary='omp'):
     """Discover public installed OMP modules from the selected OMP executable."""
     remaining = reviewer.deadline_remaining_seconds(deadline_epoch_ms)
     if remaining <= 0: raise store.DependencyError('reviewer deadline exceeded')
@@ -38,7 +38,8 @@ def assert_runtime_capability(deadline_epoch_ms, *, omp_binary='omp'):
 const [ai,core,sdk,registry,manager,session,telemetry,resolver]=await Promise.all(Object.values(modules).map(name=>import(name)));
 for(const [name,value] of Object.entries({Agent:core.Agent,streamSimple:ai.streamSimple,AssistantMessageEventStream:ai.AssistantMessageEventStream,Settings:sdk.Settings,discoverAuthStorage:sdk.discoverAuthStorage,ModelRegistry:registry.ModelRegistry,SessionManager:manager.SessionManager,AgentSession:session.AgentSession,initTelemetryExport:telemetry.initTelemetryExport,isTelemetryExportEnabled:telemetry.isTelemetryExportEnabled,createTelemetryExportConfig:telemetry.createTelemetryExportConfig,flushTelemetryExport:telemetry.flushTelemetryExport,getModelMatchPreferences:resolver.getModelMatchPreferences,resolveAllowedModels:resolver.resolveAllowedModels,resolveModelRoleValue:resolver.resolveModelRoleValue,resolveCliModel:resolver.resolveCliModel,formatModelString:resolver.formatModelString}))if(typeof value!=='function')throw new Error('unsupported OMP export: '+name);
 console.log(JSON.stringify({ai_url:import.meta.resolve(modules.ai),core_url:import.meta.resolve(modules.core),sdk_url:import.meta.resolve(modules.sdk),registry_url:import.meta.resolve(modules.registry),manager_url:import.meta.resolve(modules.manager),session_url:import.meta.resolve(modules.session),telemetry_url:import.meta.resolve(modules.telemetry),resolver_url:import.meta.resolve(modules.resolver),omp_version:process.argv[1]}));"""
-    env = {key: os.environ[key] for key in ('PATH', 'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME') if key in os.environ}
+    base_env = {key: os.environ[key] for key in ('PATH', 'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME') if key in os.environ}
+    env = omp_runtime.environment(home, base_env) if home is not None else base_env
     try: result = subprocess.run([binary, '-e', script, manifest['version']], capture_output=True, text=True, cwd=root, timeout=min(10, remaining), env=env)
     except subprocess.TimeoutExpired as error: raise store.DependencyError('installed OMP runtime capability timed out') from error
     if result.returncode: raise store.DependencyError(f'installed OMP runtime capability unavailable: {result.stderr.strip()}')
@@ -77,7 +78,7 @@ def run_native_reviewer(home, intent, *, agent_dir, omp_binary='omp'):
             return reviewer.close_run(home, run['review_run_id'], 'no-work', packet=packet)
         directory = Path(agent_dir)
         if directory.is_symlink() or not directory.is_dir(): return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='agent-dir', packet=packet)
-        try: capability = assert_runtime_capability(run['deadline_epoch_ms'], omp_binary=omp_binary)
+        try: capability = assert_runtime_capability(run['deadline_epoch_ms'], home=home, omp_binary=omp_binary)
         except Exception:
             return reviewer.close_run(home, run['review_run_id'], 'failed',
                                       error_code='timeout' if reviewer.deadline_remaining_seconds(run['deadline_epoch_ms']) <= 0 else 'capability',

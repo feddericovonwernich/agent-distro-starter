@@ -29,10 +29,10 @@ def validate_id(value):
     return value
 
 
-def run(argv, cwd=None, timeout=30, check=True):
+def run(argv, cwd=None, timeout=30, check=True, env=None):
     try:
         result = subprocess.run([str(x) for x in argv], cwd=cwd, stdin=subprocess.DEVNULL,
-                                capture_output=True, text=True, timeout=timeout)
+                                capture_output=True, text=True, timeout=timeout, env=env)
     except FileNotFoundError as error:
         raise DependencyError(f'missing executable: {argv[0]}') from error
     if check and result.returncode:

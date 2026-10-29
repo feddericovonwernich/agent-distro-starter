@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from agd_lib import store
+from agd_lib import omp_runtime, store
 
 
 Refusal = store.Refusal
@@ -94,6 +94,16 @@ def _result(run, argv):
         return run(argv, check=False)
     except (OSError, store.DependencyError) as error:
         raise Refusal(f'{Path(argv[0]).name} is unavailable') from error
+
+def _omp_runner(home, run):
+    environment = omp_runtime.environment(home, os.environ)
+
+    def invoke(argv, **kwargs):
+        return run(argv, cwd=Path(home), env=environment, **kwargs)
+
+    return invoke
+
+
 
 
 def _version(path, run, label):
@@ -276,7 +286,8 @@ def _install(release, tool, stream_url, run):
 
 
 def install_omp(home, fetch_json, stream_url, run):
-    return _install(_stable_release(fetch_json, 'omp'), 'omp', stream_url, run)
+    return _install(_stable_release(fetch_json, 'omp'), 'omp', stream_url,
+                    _omp_runner(home, run))
 
 
 def install_herdr(home, fetch_json, stream_url, run):
@@ -354,7 +365,7 @@ def validate_dependencies(home, run):
         if entry['source'] == 'managed' and _sha256(path) != entry['installed_sha256']:
             raise Refusal('installed digest differs from receipt')
         if tool == 'omp':
-            probe = probe_omp(path, run)
+            probe = probe_omp(path, _omp_runner(home, run))
         elif tool == 'herdr':
             probe = probe_herdr(path, 'agd-probe', run)
         else:
@@ -374,7 +385,8 @@ def setup(home, backend, prompt, fetch_json, stream_url, run):
         if path:
             path = Path(path).resolve()
         if tool == 'omp':
-            probe = probe_omp
+            omp_run = _omp_runner(home, run)
+            probe = lambda item, _runner: probe_omp(item, omp_run)
         elif tool == 'herdr':
             probe = lambda item, runner: probe_herdr(item, 'agd-probe', runner)
         else:
@@ -409,6 +421,8 @@ def setup(home, backend, prompt, fetch_json, stream_url, run):
                 raise Refusal(f'{tool} requirement is unmet')
             receipt[tool] = existing
             continue
-        receipt[tool] = _install(release, tool, stream_url, run)
+        receipt[tool] = _install(
+            release, tool, stream_url, _omp_runner(home, run) if tool == 'omp' else run)
     write_dependencies(home, receipt)
+    omp_runtime.initialize(home, receipt['omp']['path'], run=run)
     return receipt

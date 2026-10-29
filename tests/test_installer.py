@@ -21,13 +21,15 @@ def result(stdout='', stderr='', returncode=0):
     return SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
 
 
-def fake_run(argv, check=False):
+def fake_run(argv, check=False, **_kwargs):
     if argv[1:] == ['--version']:
         return result('v3.1.6\n' if Path(argv[0]).name == 'treehouse' else 'v1.2.3\n')
     if argv[1:] == ['models', '--json']:
         return result('[]')
     if argv[1:] == ['login', '--help']:
         return result('usage')
+    if argv[1:] == ['config', 'init-xdg']:
+        return result()
     if argv[1:] == ['session', 'list', '--json']:
         return result('[]')
     if argv[-2:] == ['status', 'server']:
@@ -168,12 +170,12 @@ def test_installs_probe_chmodded_temporary_file_before_replacement(tmp_path, mon
     target.write_bytes(b'old')
     calls = []
 
-    def rejecting_run(argv, check=False):
+    def rejecting_run(argv, check=False, **kwargs):
         calls.append(argv)
         if argv[1:] == ['--version']:
             assert Path(argv[0]).stat().st_mode & 0o777 == 0o755
             return result(returncode=1)
-        return fake_run(argv, check)
+        return fake_run(argv, check, **kwargs)
 
     with pytest.raises(Refusal, match='OMP version'):
         install_omp(tmp_path, lambda _: release('omp-linux-x64'), stream(b'executable'), rejecting_run)
@@ -349,3 +351,66 @@ def test_setup_refuses_managed_receipt_tampering_or_path_mismatch(tmp_path, monk
         with pytest.raises(Refusal, match='managed'):
             setup(tmp_path, 'tmux', lambda _: False, lambda _: release('omp-linux-x64'),
                   stream(b'executable'), fake_run)
+
+
+def test_validate_dependencies_probes_omp_inside_local_runtime(tmp_path):
+    executable = tmp_path / 'omp'
+    executable.write_bytes(b'executable')
+    executable.chmod(0o755)
+    write_dependencies(tmp_path, {'schema': 1, 'omp': {
+        'source': 'existing', 'path': str(executable), 'version': 'v18.14.0',
+        'capabilities': ['models-json', 'login'],
+    }})
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        if argv[1:] == ['--version']:
+            return result('omp v18.14.0\n')
+        if argv[1:] == ['models', '--json']:
+            return result('[]')
+        if argv[1:] == ['login', '--help']:
+            return result('usage')
+        raise AssertionError(argv)
+
+    validate_dependencies(tmp_path, run)
+
+    assert calls
+    for _argv, kwargs in calls:
+        assert kwargs['cwd'] == tmp_path
+        assert kwargs['env']['PI_CODING_AGENT_DIR'] == str(tmp_path / 'data/omp/agent')
+        assert kwargs['env']['OMP_PROFILE'] == 'default'
+
+
+def test_setup_initializes_native_local_omp_directories(tmp_path, monkeypatch):
+    binaries = {}
+    for name in ('omp', 'treehouse'):
+        path = tmp_path / name
+        path.write_bytes(b'executable')
+        path.chmod(0o755)
+        binaries[name] = path
+    monkeypatch.setattr(installer.shutil, 'which',
+                        lambda name: str(binaries[name]) if name in binaries else None)
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        if argv[1:] == ['--version']:
+            return result('v3.1.6\n' if Path(argv[0]).name == 'treehouse' else 'omp v18.14.0\n')
+        if argv[1:] == ['models', '--json']:
+            return result('[]')
+        if argv[1:] == ['login', '--help']:
+            return result('usage')
+        if argv[1:] == ['config', 'init-xdg']:
+            return result()
+        raise AssertionError(argv)
+
+    setup(tmp_path, 'tmux', lambda _: False, lambda _: release('omp-linux-x64'),
+          stream(b'executable'), run)
+
+    initialization = [(argv, kwargs) for argv, kwargs in calls
+                      if argv[1:] == ['config', 'init-xdg']]
+    assert len(initialization) == 1
+    assert initialization[0][1]['cwd'] == tmp_path
+    assert initialization[0][1]['env']['OMP_PROFILE'] == 'default'
+    assert all(path.is_dir() for path in installer.omp_runtime.runtime_directories(tmp_path))

@@ -20,6 +20,7 @@ def make_fixture(root):
 set -eu
 printf 'agd %s\n' "$*" >> "$AGD_LOG"
 if [ "${AGD_FAIL_SETUP:-}" = 1 ] && [ "$3" = installer ]; then exit 1; fi
+if [ "$3" = installer ] && [ "$4" = shell ]; then exec "$SHELL" -i; fi
 ''')
     (fixture / 'bin' / 'agd').chmod(0o755)
     return fixture
