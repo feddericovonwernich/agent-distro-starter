@@ -335,7 +335,7 @@ def _herdr_create(home: Path, launch_id: str, endpoint_token: str, managed: list
         _herdr_call(endpoint, 'pane', 'run', endpoint['pane'],
                     f'export {key}={shlex.quote(value)}')
     _herdr_call(endpoint, 'pane', 'run', endpoint['pane'],
-                'unset HERDR_ENV; exec ' + shlex.join(managed))
+                'exec ' + shlex.join(managed))
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         process = _herdr_response(_herdr_call(endpoint, 'pane', 'process-info', '--pane', endpoint['pane']))['process_info']

@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Preserve Herdr's native pane marker when starting the central agent so it can launch Herdr workers; continue filtering caller-supplied markers and sanitizing the outer attach client.
 - Export the central owner token during OMP session start and switch so agent commands can mutate their own home while foreign commands remain read-only.
 - Restored Herdr central startup and worker controls with Herdr 0.9.5 status fields and transient pane-process reporting during initial ownership proof.
 - Documented guided Linux x86-64 installation, verified dependency receipts, explicit OMP authentication boundary, backend-aware central start, pane-bound Herdr workers, and retention-first refusal behavior.
