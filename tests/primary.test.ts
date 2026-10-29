@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -25,6 +26,8 @@ test('launcher endpoint token becomes the central owner token', () => {
 test('session switch replaces only its owned watcher', async () => {
   const home = mkdtempSync(join(tmpdir(), 'agd-primary-'));
   const previous = process.env.AGD_HOME;
+  const previousOwner = process.env.AGD_OWNER;
+  delete process.env.AGD_OWNER;
   process.env.AGD_HOME = home;
   // Exercise a second module instance with its own home; the static import above binds the default home.
   const { default: primary } = await import('../.omp/extensions/agd-primary.ts?switch-test');
@@ -49,6 +52,19 @@ test('session switch replaces only its owned watcher', async () => {
     }
     throw new Error(`watcher generation ${generation} never became ready`);
   }
+  function checkOwnerCommands() {
+    const cli = join(import.meta.dir, '../bin/agd');
+    const args = ['-c', 'exec "$1" --home "$2" session reconcile', 'owner-check', cli, home];
+    // OMP refreshes its shell environment from process.env after lifecycle hooks.
+    const owned = spawnSync('/bin/bash', args, { encoding: 'utf8', env: { ...process.env } });
+    expect(owned.stderr).toBe('');
+    expect(owned.status).toBe(0);
+    const foreignEnv = { ...process.env };
+    delete foreignEnv.AGD_OWNER;
+    const foreign = spawnSync('/bin/bash', args, { encoding: 'utf8', env: foreignEnv });
+    expect(foreign.status).toBe(3);
+    expect(foreign.stderr).toContain('another live central owns this home');
+  }
   let idle = true;
   const context = { isIdle: () => idle, ui: {
     setStatus: (key: string, text: string | undefined) => { statuses.push({ key, text }); },
@@ -57,6 +73,7 @@ test('session switch replaces only its owned watcher', async () => {
   try {
     await hooks.session_start({}, context);
     const first = await owner('1');
+    checkOwnerCommands();
     const routine = hooks.before_agent_start({}, context) as {
       message: { customType: string; content: string; display: boolean };
     };
@@ -69,6 +86,7 @@ test('session switch replaces only its owned watcher', async () => {
     expect(second.owner_pid).toBe(first.owner_pid);
     expect(second.watcher_pid).not.toBe(first.watcher_pid);
     expect(second.token).toBe(first.token);
+    checkOwnerCommands();
     mkdirSync(join(home, 'state', 'events'), { recursive: true });
     writeFileSync(join(home, 'state', 'events', '11111111-1111-4111-8111-111111111111.json'),
       JSON.stringify({ id: '11111111-1111-4111-8111-111111111111', task: 'scout', kind: 'ready' }));
@@ -105,6 +123,8 @@ test('session switch replaces only its owned watcher', async () => {
     expect(statuses.at(-1)).toEqual({ key: 'agd', text: 'Distro · watcher unavailable' });
   } finally {
     await hooks.session_shutdown({}, context);
+    if (previousOwner === undefined) delete process.env.AGD_OWNER;
+    else process.env.AGD_OWNER = previousOwner;
     if (previous === undefined) delete process.env.AGD_HOME;
     else process.env.AGD_HOME = previous;
     rmSync(home, { recursive: true, force: true });

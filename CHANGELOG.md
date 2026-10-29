@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Export the central owner token during OMP session start and switch so agent commands can mutate their own home while foreign commands remain read-only.
 - Restored Herdr central startup and worker controls with Herdr 0.9.5 status fields and transient pane-process reporting during initial ownership proof.
 - Documented guided Linux x86-64 installation, verified dependency receipts, explicit OMP authentication boundary, backend-aware central start, pane-bound Herdr workers, and retention-first refusal behavior.
 - Verified the bounded reviewer against real OMP 18.3.2 public modules: provider-free scripted AgentSession persistence, restricted tools, disabled telemetry, and enabled loopback-only OTLP purpose/run metadata; approved disposable user-systemd lifecycle evidence is recorded.
