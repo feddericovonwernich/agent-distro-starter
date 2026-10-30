@@ -71,6 +71,7 @@ def launch(home, task_id, selected_backend=None, unattended=False, approval_id=N
     if (not isinstance(selection, dict) or selection.get('schema') != 2
             or not isinstance(selection.get('skills'), list)):
         raise store.Refusal('task worker skill selection is invalid')
+    worker_skills.require_protocol(home, task, pr_grant)
     projects_data = projects.read(home, task['project'])
     if harness == 'cursor' and not projects_data['trusted']:
         raise store.Refusal('Cursor project trust requires an explicit user grant')
@@ -84,7 +85,7 @@ def launch(home, task_id, selected_backend=None, unattended=False, approval_id=N
     if selected_backend not in ('tmux', 'herdr') or harness not in ('omp', 'cursor'):
         raise ValueError('unsupported backend or harness')
     if pr_grant:
-        if selection['skills'] or task.get('worker_skills'):
+        if selection['skills']:
             raise store.Refusal('PR grant requires a task created with no ordinary worker skills')
         grant = tasks.authorize_pr_publish(home, task, pr_grant)
         from . import pr, relay
@@ -108,10 +109,9 @@ def launch(home, task_id, selected_backend=None, unattended=False, approval_id=N
         if current['phase'] != 'prepared' or current['executor'] != 'central':
             raise store.Refusal('task launch raced another owner; no endpoint created')
         if pr_grant:
-            tasks._authorize_pr_publish_locked(home, current, pr_grant)
-            manifest = worker_skills.prepare(
-                home, current, worker_skills.scoped_pr_selection())
+            manifest = worker_skills.add_scoped_pr(home, current, pr_grant)
             current['worker_skills'] = manifest
+            current['worker_skill_selection'] = manifest['selection']
             current['pr_grant'] = pr_grant
         if selected_backend == 'herdr':
             module.prepare(home)
@@ -157,6 +157,12 @@ def run_worker(home, task_id, incarnation):
         session_dir = None
         warning = None
     child_env.pop('AGD_OWNER', None)
+    child_env.pop('AGD_PR_GRANT', None)
+    if task['harness'] == 'omp':
+        child_env['AGD_CLI'] = str(Path(__file__).resolve().parents[1]/'agd')
+        if task.get('pr_grant'):
+            child_env['AGD_PR_GRANT'] = task['pr_grant']
+    child_env.pop('AGD_WORKER_RESUME_READY', None)
     if task['harness'] == 'omp' and task['phase'] == 'ready':
         child_env['AGD_WORKER_RESUME_READY'] = '1'
     import subprocess
@@ -467,6 +473,7 @@ def stop(home, task_id):
 
 def relaunch(home, task_id):
     task = tasks.read(home, task_id)
+    worker_skills.require_protocol(home, task, task.get('pr_grant'))
     if task.get('executor') != 'worker' or task['phase'] not in ('running', 'ready'):
         raise store.Refusal('only running or ready worker tasks can relaunch')
     if task['phase'] == 'ready' and task.get('harness') != 'omp':
