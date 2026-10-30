@@ -81,6 +81,7 @@ def environment(home, inherited: Mapping[str, str]) -> dict[str, str]:
         XDG_DATA_HOME=str(runtime / 'xdg' / 'data'),
         XDG_STATE_HOME=str(runtime / 'xdg' / 'state'),
         XDG_CACHE_HOME=str(runtime / 'xdg' / 'cache'),
+        TREEHOUSE_ROOT=str(root / 'data' / 'treehouse'),
     )
     account_home = Path(inherited.get('HOME', ''))
     if account_home.is_absolute():

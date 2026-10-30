@@ -62,6 +62,37 @@ def test_lease_survives_missing_environment_override():
         assert __import__('json').loads(result.stdout)['phase'] == 'ready'
 
 
+def test_lease_survives_managed_omp_home_boundary():
+    from support import lab
+    from test_projects import CLI
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'bin'))
+    from agd_lib import omp_runtime
+    with lab() as (home, project):
+        account_home = home.parent/'account'
+        account_home.mkdir()
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        managed = omp_runtime.environment(
+            home, {**os.environ, 'HOME': str(account_home), 'AGD_HOME': str(home)})
+        created = run(
+            [CLI, '--home', home, 'task', 'create', 'managed-home',
+             '--project', 'sample', '--brief', brief, '--kind', 'scout',
+             '--skill-mode', 'none'],
+            env=managed)
+        assert __import__('json').loads(created.stdout)['phase'] == 'prepared'
+
+        report = home/'report.md'; report.write_text('Read value.txt: base. Checked read.\n')
+        account = {**os.environ, 'HOME': str(account_home), 'AGD_HOME': str(home)}
+        account.pop('TREEHOUSE_ROOT', None)
+        ready = run(
+            [CLI, '--home', home, 'task', 'ready', 'managed-home',
+             '--report', report],
+            env=account)
+        assert __import__('json').loads(ready.stdout)['phase'] == 'ready'
+        assert __import__('json').loads(created.stdout)['treehouse_root'] == str(
+            home/'data/treehouse')
+
+
 def test_cleaned_history_does_not_block_unregister():
     from support import lab
     with lab() as (home, project):
