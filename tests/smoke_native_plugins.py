@@ -17,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'bin'))
-from agd_lib import installer, launcher, omp_runtime, reviewer_runner, store, supervision, tasks, worker_skills  # noqa: E402
+from agd_lib import installer, launcher, omp_runtime, reviewer_runner, store, supervision, tasks, worker_skills, workers  # noqa: E402
 
 SKILLS = {
     'ponytail', 'ponytail-audit', 'ponytail-debt', 'ponytail-gain',
@@ -65,6 +65,58 @@ def wait_for_output(module, endpoint, needle):
             return output
         time.sleep(.1)
     raise RuntimeError(f'backend output never contained {needle!r}')
+
+
+def wait_for_worker_idle(home, task_id, timeout=180):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        task = tasks.read(home, task_id)
+        observations = [
+            json.loads(path.read_text())
+            for path in (tasks.task_file(home, task_id).parent/'observations').glob('*.json')
+        ]
+        if any(row['incarnation'] == task.get('incarnation')
+               and row['kind'] == 'idle' and row['key'] == 'turn'
+               for row in observations):
+            return task
+        if task.get('worker_alive') is False:
+            raise RuntimeError(f'{task_id} exited before becoming idle')
+        time.sleep(.2)
+    raise RuntimeError(f'{task_id} did not become idle')
+
+
+def send_and_wait_for_reply(home, task_id, root, body, timeout=180):
+    message = root/f'{task_id}-{uuid.uuid4()}.md'
+    message.write_text(body)
+    request = agd(home, 'worker', 'send', task_id, '--file', str(message))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        supervision.reconcile(home)
+        event = next(
+            (row for row in supervision.pending(home)
+             if row.get('key') == request['id']
+             and row.get('kind') in ('done', 'blocked')),
+            None,
+        )
+        if event:
+            supervision.acknowledge(home, [event['id']])
+            if event['kind'] != 'done':
+                raise RuntimeError(f'worker follow-up failed: {event["details"]}')
+            return request, event['details']
+        time.sleep(.2)
+    raise RuntimeError(f'worker follow-up {request["id"]} produced no event')
+
+
+def skill_surface(text):
+    try:
+        payload = json.loads(text[text.index('{'):text.rindex('}') + 1])
+        rows = payload['skills']
+        surface = {(row['name'], row['path']) for row in rows}
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError(f'invalid worker skill report: {text}') from error
+    if len(surface) != len(rows):
+        raise RuntimeError('worker skill report contains duplicate or invalid rows')
+    return surface
 
 
 def fetch_json(url):
@@ -379,6 +431,18 @@ def main():
         if copied != SKILLS or any((worktree/'.omp/skills'/('agd-' + name)).exists()
                                    for name in SKILLS):
             raise RuntimeError(f'unexpected task skills: {sorted(copied)}')
+        none_brief = root/'none-brief.md'
+        none_brief.write_text(
+            'Without using tools, shell commands, or filesystem scans, report every skill '
+            'available in this OMP session. Write only JSON with shape '
+            '{"skills":[{"name":"NAME","path":"/absolute/SKILL.md"}]} and include no other text.\n')
+        none_task = agd(
+            home, 'task', 'create', 'native-none', '--project', 'sample',
+            '--brief', str(none_brief), '--kind', 'scout', '--skill-mode', 'none')
+        none_worktree = Path(none_task['worktree'])
+        none_skills = none_worktree/'.omp/skills'
+        if none_skills.exists() and any(none_skills.iterdir()):
+            raise RuntimeError('none-mode task materialized worker skills')
 
         managed = omp_runtime.environment(home, hostile)
         child_env = {key: managed[key] for key in (
@@ -428,16 +492,13 @@ def main():
         launched = agd(home, 'worker', 'launch', 'native-smoke',
                        '--backend', args.backend)
         worker_endpoint = launched['endpoint']
-        runner_path = home/'state/tasks/native-smoke/runner.json'
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline:
-            current = tasks.read(home, 'native-smoke')
-            if runner_path.is_file():
-                runner = json.loads(runner_path.read_text())
-                if runner.get('phase') == 'spawned':
-                    break
-            time.sleep(.1)
-        else:
+        initial_incarnation = launched['incarnation']
+        initial_endpoint = launched['endpoint']
+        current = wait_for_worker_idle(home, 'native-smoke')
+        if current['phase'] != 'ready':
+            raise RuntimeError('selected worker did not complete its initial task')
+        runner = json.loads((home/'state/tasks/native-smoke/runner.json').read_text())
+        if runner.get('phase') != 'spawned':
             raise RuntimeError('actual worker process did not publish a spawn receipt')
         try:
             worker_output = backend.capture(worker_endpoint)
@@ -445,35 +506,66 @@ def main():
             worker_output = ''
         if 'Ponytail loaded' in worker_output:
             raise RuntimeError('worker loaded the orchestrator Ponytail extension')
-        if backend.inspect(worker_endpoint)['presence'] == 'present':
-            backend.send_text(worker_endpoint, '/quit')
-            backend.send_key(worker_endpoint, 'enter')
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline:
-            current = tasks.read(home, 'native-smoke')
-            if (current.get('worker_alive') is False
-                    and backend.inspect(worker_endpoint)['presence'] == 'missing'):
-                break
-            time.sleep(.1)
-        else:
-            raise RuntimeError('actual worker did not stop with proven process absence')
+
+        skill_prompt = (
+            'Without using tools, shell commands, or filesystem scans, reply with every skill '
+            'available in this OMP session. Return only JSON with shape '
+            '{"skills":[{"name":"NAME","path":"/absolute/SKILL.md"}]} and no other text.\n')
+        _, skill_reply = send_and_wait_for_reply(
+            home, 'native-smoke', root, skill_prompt)
+        expected_surface = {
+            (name, str(worktree/'.omp/skills'/name/'SKILL.md'))
+            for name in SKILLS
+        }
+        if skill_surface(skill_reply) != expected_surface:
+            raise RuntimeError(f'worker exposed an unexpected skill surface: {skill_reply}')
+        after_skill_reply = tasks.read(home, 'native-smoke')
+        if (after_skill_reply['incarnation'] != initial_incarnation
+                or after_skill_reply['endpoint'] != initial_endpoint):
+            raise RuntimeError('worker identity changed during the first follow-up')
+
+        marker = 'RETAINED-ROUNDTRIP-OK'
+        _, second_reply = send_and_wait_for_reply(
+            home, 'native-smoke', root,
+            f'Reply with exactly {marker} and no other text.\n')
+        if marker not in second_reply:
+            raise RuntimeError(f'second retained-worker reply was incorrect: {second_reply}')
+        after_second_reply = tasks.read(home, 'native-smoke')
+        if (after_second_reply['incarnation'] != initial_incarnation
+                or after_second_reply['endpoint'] != initial_endpoint):
+            raise RuntimeError('worker identity changed during the second follow-up')
+        workers.stop(home, 'native-smoke')
+        worker_endpoint = None
+
+        launched_none = agd(home, 'worker', 'launch', 'native-none',
+                            '--backend', args.backend)
+        worker_endpoint = launched_none['endpoint']
+        none_current = wait_for_worker_idle(home, 'native-none')
+        if none_current['phase'] != 'ready':
+            raise RuntimeError('none-mode worker did not complete its initial task')
+        none_report = (home/'data/tasks/native-none/report.md').read_text()
+        if skill_surface(none_report):
+            raise RuntimeError(f'none-mode worker exposed skills: {none_report}')
+        workers.stop(home, 'native-none')
         worker_endpoint = None
 
         stop_central(home, backend, central_receipt)
         central_receipt = None
         central_needs_cleanup = False
 
-        report = root/'report.md'; report.write_text('Native skills inspected.\n')
-        agd(home, 'task', 'ready', 'native-smoke', '--report', str(report))
         cleaned = agd(home, 'task', 'cleanup', 'native-smoke')
-        if cleaned['phase'] != 'cleaned':
-            raise RuntimeError('task cleanup did not return the lease')
+        none_cleaned = agd(home, 'task', 'cleanup', 'native-none')
+        if cleaned['phase'] != 'cleaned' or none_cleaned['phase'] != 'cleaned':
+            raise RuntimeError('task cleanup did not return both leases')
         evidence = {
             'backend': args.backend,
             'plugins': {key: value['version'] for key, value in plugins.items()},
             'plugin_lifecycles': lifecycle,
             'skills': sorted(copied),
+            'worker_skill_surface_isolated': True,
+            'none_worker_skill_surface_empty': True,
             'reviewer_plugins_isolated': True,
+            'retained_worker_replies': 2,
             'worker_spawned_and_stopped': True,
             'snapshot_restored_after_source_removal': True,
             'task_phase': cleaned['phase'],
