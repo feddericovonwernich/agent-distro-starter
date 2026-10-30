@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +19,10 @@ def test_local_environment_wins_over_inherited_storage(tmp_path):
     account_home = tmp_path / 'account'
     home.mkdir()
     account_home.mkdir()
+    (account_home / '.gitconfig').write_text('[test]\nsource = legacy\n')
+    xdg_git = account_home / '.config/git/config'
+    xdg_git.parent.mkdir(parents=True)
+    xdg_git.write_text('[test]\nsource = xdg\n')
     inherited = {
         'HOME': str(account_home),
         'PATH': '/safe/bin',
@@ -31,19 +36,67 @@ def test_local_environment_wins_over_inherited_storage(tmp_path):
         'XDG_CACHE_HOME': '/outside/cache',
     }
     before = copy.deepcopy(inherited)
+    omp_runtime.initialize(home, '/bin/true', inherited=inherited)
 
     env = omp_runtime.environment(home, inherited)
 
-    assert env['HOME'] == str(account_home)
+    assert env['HOME'] == str(home / 'data/omp/home')
     assert env['OMP_PROFILE'] == env['PI_PROFILE'] == 'default'
-    assert (Path(env['HOME']) / env['PI_CONFIG_DIR']).resolve() == home / 'data/omp/config'
-    assert env['PI_CODING_AGENT_DIR'] == str(home / 'data/omp/agent')
+    assert env['PI_CONFIG_DIR'] == '.omp'
+    assert (home / env['PI_CONFIG_DIR']).resolve() == home / '.omp'
+    assert Path(env['XDG_DATA_HOME'], 'omp/plugins').is_relative_to(home / 'data/omp')
+    assert env['PI_CODING_AGENT_DIR'] == str(home / 'data/omp/home/.omp/agent')
     assert env['XDG_DATA_HOME'] == str(home / 'data/omp/xdg/data')
     assert env['XDG_STATE_HOME'] == str(home / 'data/omp/xdg/state')
     assert env['XDG_CACHE_HOME'] == str(home / 'data/omp/xdg/cache')
     assert env['PATH'] == '/safe/bin'
     assert env['OPENAI_API_KEY'] == 'preserve-provider-value'
+    assert env['XDG_CONFIG_HOME'] == str(account_home / '.config')
+    assert subprocess.run(
+        [shutil.which('git'), 'config', '--get', 'test.source'],
+        env=env, capture_output=True, text=True, check=True,
+    ).stdout.strip() == 'legacy'
+    subprocess.run([shutil.which('git'), 'init', '-q'], cwd=home, env=env, check=True)
+    subprocess.run(
+        [shutil.which('git'), 'config', '--local', 'test.source', 'local'],
+        cwd=home, env=env, check=True,
+    )
+    assert subprocess.run(
+        [shutil.which('git'), 'config', '--get', 'test.source'],
+        cwd=home, env=env, capture_output=True, text=True, check=True,
+    ).stdout.strip() == 'local'
     assert inherited == before
+
+
+def test_environment_preserves_default_xdg_git_config(tmp_path):
+    from agd_lib import omp_runtime
+
+    home = tmp_path / 'distro'
+    account_home = tmp_path / 'account'
+    home.mkdir()
+    xdg_git = account_home / '.config/git/config'
+    xdg_git.parent.mkdir(parents=True)
+    xdg_git.write_text('[test]\nsource = xdg\n')
+
+    env = omp_runtime.environment(home, {
+        'HOME': str(account_home), 'PATH': os.environ['PATH'],
+    })
+
+    assert subprocess.run(
+        [shutil.which('git'), 'config', '--get', 'test.source'],
+        env=env, capture_output=True, text=True, check=True,
+    ).stdout.strip() == 'xdg'
+
+    explicit = account_home / 'selected.gitconfig'
+    explicit.write_text('[test]\nsource = explicit\n')
+    selected = omp_runtime.environment(home, {
+        'HOME': str(account_home), 'PATH': os.environ['PATH'],
+        'GIT_CONFIG_GLOBAL': str(explicit),
+    })
+    assert subprocess.run(
+        [shutil.which('git'), 'config', '--get', 'test.source'],
+        env=selected, capture_output=True, text=True, check=True,
+    ).stdout.strip() == 'explicit'
 
 
 def test_local_environment_keeps_user_and_project_state_inside_distro(tmp_path):
@@ -56,8 +109,10 @@ def test_local_environment_keeps_user_and_project_state_inside_distro(tmp_path):
 
     env = omp_runtime.environment(home, {'HOME': str(tmp_path / 'account')})
 
-    assert env['HOME'] == str(tmp_path / 'account')
-    assert (Path(env['HOME']) / env['PI_CONFIG_DIR']).resolve() == home / 'data/omp/config'
+    assert env['HOME'] == str(home / 'data/omp/home')
+    assert env['PI_CONFIG_DIR'] == '.omp'
+    assert (home / env['PI_CONFIG_DIR']).resolve() == home / '.omp'
+    assert Path(env['XDG_DATA_HOME'], 'omp/plugins').is_relative_to(home / 'data/omp')
 
 
 def test_environment_rejects_symlinked_runtime_root(tmp_path):
@@ -81,6 +136,9 @@ def test_initialize_creates_private_roots_and_uses_local_environment(tmp_path):
     account_home = tmp_path / 'account'
     home.mkdir()
     account_home.mkdir()
+    global_registry = account_home / '.omp/marketplaces.json'
+    global_registry.parent.mkdir()
+    global_registry.write_text('{"version":1,"marketplaces":[{"name":"global-only"}]}\n')
     capture = tmp_path / 'capture.json'
     executable = tmp_path / 'omp'
     executable.write_text(
@@ -96,11 +154,14 @@ def test_initialize_creates_private_roots_and_uses_local_environment(tmp_path):
     observed = json.loads(capture.read_text())
     assert observed['argv'] == ['config', 'init-xdg']
     assert observed['cwd'] == str(home)
-    assert observed['env']['HOME'] == str(account_home)
-    assert observed['env']['PI_CODING_AGENT_DIR'] == str(home / 'data/omp/agent')
+    assert observed['env']['HOME'] == str(home / 'data/omp/home')
+    assert observed['env']['PI_CODING_AGENT_DIR'] == str(home / 'data/omp/home/.omp/agent')
     for path in omp_runtime.runtime_directories(home):
         assert path.is_dir()
         assert path.stat().st_mode & 0o077 == 0
+    local_registry = home / 'data/omp/xdg/data/omp/marketplaces.json'
+    assert json.loads(local_registry.read_text()) == {'version': 1, 'marketplaces': []}
+    assert global_registry.read_text() == '{"version":1,"marketplaces":[{"name":"global-only"}]}\n'
 
 
 def test_agd_omp_forwards_arguments_in_local_environment(tmp_path):
@@ -134,13 +195,13 @@ def test_agd_omp_forwards_arguments_in_local_environment(tmp_path):
     observed = json.loads(capture.read_text())
     assert observed['argv'] == ['plugin', 'list', '--json']
     assert observed['cwd'] == str(home)
-    assert observed['env']['HOME'] == str(account_home)
+    assert observed['env']['HOME'] == str(home / 'data/omp/home')
     assert observed['env']['OMP_PROFILE'] == 'default'
-    assert observed['env']['PI_CODING_AGENT_DIR'] == str(home / 'data/omp/agent')
+    assert observed['env']['PI_CODING_AGENT_DIR'] == str(home / 'data/omp/home/.omp/agent')
 
 
 
-def test_installer_shell_uses_local_omp_environment(tmp_path):
+def test_installer_shell_preserves_caller_environment(tmp_path):
     home = tmp_path / 'distro'
     account_home = tmp_path / 'account'
     home.mkdir()
@@ -167,8 +228,7 @@ def test_installer_shell_uses_local_omp_environment(tmp_path):
     assert observed['argv'] == ['-i']
     assert observed['cwd'] == str(home)
     assert observed['env']['HOME'] == str(account_home)
-    assert (Path(observed['env']['HOME']) / observed['env']['PI_CONFIG_DIR']).resolve() == (
-        home / 'data/omp/config')
+    assert observed['env']['PI_CONFIG_DIR'] == '.hostile'
 
 def test_managed_omp_environments_include_fixed_local_storage(monkeypatch):
     from support import lab
@@ -185,9 +245,9 @@ def test_managed_omp_environments_include_fixed_local_storage(monkeypatch):
         central_argv, central, _ = observability.central_argv(home, [])
 
     for env in (worker, reviewer, central):
-        assert env['HOME'] == '/preserved/account'
+        assert env['HOME'] == str(home / 'data/omp/home')
         assert env['OMP_PROFILE'] == 'default'
-        assert env['PI_CODING_AGENT_DIR'] == str(home / 'data/omp/agent')
+        assert env['PI_CODING_AGENT_DIR'] == str(home / 'data/omp/home/.omp/agent')
     assert '--cwd' in central_argv
 
 
@@ -229,7 +289,7 @@ def write_native_plugins(home, *, enabled_values=None):
     for plugin_id, (package, version) in PLUGIN_SPECS.items():
         publisher = 'DietrichGebert/ponytail' if plugin_id == 'ponytail@ponytail' else 'obra/superpowers'
         market_name = plugin_id.split('@', 1)[1]
-        payload = home / 'data/omp/config/plugins/cache/plugins' / f'{market_name}-{version}'
+        payload = home / 'data/omp/xdg/data/omp/plugins/cache/plugins' / f'{market_name}-{version}'
         skills = payload / 'skills'
         skills.mkdir(parents=True)
         (skills / 'sample').mkdir()
@@ -243,7 +303,7 @@ def write_native_plugins(home, *, enabled_values=None):
             entry['enabled'] = enabled_values[plugin_id]
         registry['plugins'][plugin_id] = [entry]
         lock['plugins'][package] = {'version': version, 'enabledFeatures': None, 'enabled': True}
-        catalog = home / 'data/omp/config/plugins/cache/marketplaces' / market_name / 'marketplace.json'
+        catalog = home / 'data/omp/xdg/data/omp/plugins/cache/marketplaces' / market_name / 'marketplace.json'
         catalog.parent.mkdir(parents=True)
         catalog.write_text('{}')
         marketplaces['marketplaces'].append({
@@ -251,16 +311,16 @@ def write_native_plugins(home, *, enabled_values=None):
             'catalogPath': str(catalog), 'addedAt': '2026-01-01T00:00:00Z',
             'updatedAt': '2026-01-01T00:00:00Z',
         })
-    config = home / 'data/omp/config'
+    data_root = home / 'data/omp/xdg/data/omp'
     project_plugins = home / '.omp/plugins'
     project_plugins.mkdir(parents=True, exist_ok=True)
     registry_path = project_plugins / 'installed_plugins.json'
     registry_path.write_text(json.dumps(registry))
     (project_plugins / 'omp-plugins.lock.json').write_text(json.dumps(lock))
-    (config / 'plugins' / 'project_registries.json').write_text(json.dumps({
+    (data_root / 'plugins' / 'project_registries.json').write_text(json.dumps({
         'version': 1, 'registries': [str(registry_path)],
     }))
-    (config / 'marketplaces.json').write_text(json.dumps(marketplaces))
+    (data_root / 'marketplaces.json').write_text(json.dumps(marketplaces))
     return registry, lock, marketplaces
 
 
@@ -340,7 +400,7 @@ def test_plugin_sources_refuse_unsafe_or_ambiguous_registration(tmp_path):
 
     home, _, _, marketplaces = cases['publisher']
     marketplaces['marketplaces'][0]['sourceUri'] = 'attacker/ponytail'
-    (home / 'data/omp/config/marketplaces.json').write_text(json.dumps(marketplaces))
+    (home / 'data/omp/xdg/data/omp/marketplaces.json').write_text(json.dumps(marketplaces))
 
     for name, (home, *_unused) in cases.items():
         with pytest.raises(store.Refusal, match='plugin'):

@@ -20,7 +20,7 @@ def make_fixture(root):
 set -eu
 printf 'agd %s\n' "$*" >> "$AGD_LOG"
 if [ "${AGD_FAIL_SETUP:-}" = 1 ] && [ "$3" = installer ]; then
-  mkdir -p "$2/.omp/plugins" "$2/data/omp/config/plugins/cache/plugins/ponytail-partial"
+  mkdir -p "$2/.omp/plugins" "$2/data/omp/xdg/data/omp/plugins/cache/plugins/ponytail-partial"
   printf partial > "$2/.omp/plugins/installed_plugins.json"
   exit 1
 fi

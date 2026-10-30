@@ -37,12 +37,13 @@ def write_native_plugins(home, plugin_skills=None):
     registry = {'version': 2, 'plugins': {}}
     lock = {'plugins': {}, 'settings': {}}
     marketplaces = {'version': 1, 'marketplaces': []}
-    config = home / 'data/omp/config'
+    data_root = home / 'data/omp/xdg/data/omp'
+    plugins = data_root / 'plugins'
     project_plugins = home / '.omp/plugins'
-    (home / 'data/omp/agent').mkdir(parents=True, exist_ok=True)
+    (home / 'data/omp/home/.omp/agent').mkdir(parents=True, exist_ok=True)
     project_plugins.mkdir(parents=True, exist_ok=True)
     for plugin_id, (market, publisher, package, version) in PLUGIN_SPECS.items():
-        payload = config / 'plugins/cache/plugins' / f'{market}___fixture___{version}'
+        payload = plugins / 'cache/plugins' / f'{market}___fixture___{version}'
         if payload.exists():
             shutil.rmtree(payload)
         skill_root = payload / 'skills'
@@ -65,7 +66,7 @@ def write_native_plugins(home, plugin_skills=None):
         lock['plugins'][package] = {
             'version': version, 'enabledFeatures': None, 'enabled': True,
         }
-        catalog = config / 'plugins/cache/marketplaces' / market / 'marketplace.json'
+        catalog = plugins / 'cache/marketplaces' / market / 'marketplace.json'
         catalog.parent.mkdir(parents=True, exist_ok=True)
         catalog.write_text('{}')
         marketplaces['marketplaces'].append({
@@ -76,10 +77,10 @@ def write_native_plugins(home, plugin_skills=None):
     registry_path = project_plugins / 'installed_plugins.json'
     registry_path.write_text(json.dumps(registry))
     (project_plugins / 'omp-plugins.lock.json').write_text(json.dumps(lock))
-    (config / 'plugins/project_registries.json').write_text(json.dumps({
+    (plugins / 'project_registries.json').write_text(json.dumps({
         'version': 1, 'registries': [str(registry_path)],
     }))
-    (config / 'marketplaces.json').write_text(json.dumps(marketplaces))
+    (data_root / 'marketplaces.json').write_text(json.dumps(marketplaces))
     return registry
 
 @contextmanager

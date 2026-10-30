@@ -17,10 +17,22 @@ export async function startBridge() {
     if (row.done) throw new Error(`bridge EOF: ${await stderr}`);
     return row.value;
   };
+  const timeout = Promise.withResolvers<never>();
+  const helloTimeout = setTimeout(() => {
+    if (proc.exitCode === null) proc.kill();
+    timeout.reject(new Error('bridge hello timed out'));
+  }, 5000);
   let hello;
   try {
-    hello = JSON.parse(await Promise.race([next(), Bun.sleep(5000).then(() => { if (proc.exitCode === null) proc.kill(); throw new Error('bridge hello timed out'); })]));
-  } catch (error) { if (proc.exitCode === null) proc.kill(); await proc.exited; await lines.return?.(); throw error; }
+    hello = JSON.parse(await Promise.race([next(), timeout.promise]));
+  } catch (error) {
+    if (proc.exitCode === null) proc.kill();
+    await proc.exited;
+    await lines.return?.();
+    throw error;
+  } finally {
+    clearTimeout(helloTimeout);
+  }
   const native = { ai: await import(hello.aiUrl), core: await import(hello.coreUrl), sdk: await import(hello.sdkUrl), registry: await import(hello.registryUrl), manager: await import(hello.managerUrl), session: await import(hello.sessionUrl), telemetry: await import(hello.telemetryUrl), resolver: await import(hello.resolverUrl) };
   let queue = Promise.resolve();
   const rpc = (op: string, args: unknown) => {

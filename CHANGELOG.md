@@ -1,7 +1,7 @@
 # Changelog
 
 ## Unreleased
-- Isolate OMP settings, authentication, sessions, caches, and plugin data inside each distro while preserving the caller's real `HOME` for Git, SSH, and shell configuration; fresh setup now installs official project-scoped Ponytail and Superpowers plugins and validates their native registrations.
+- Isolate OMP settings, authentication, sessions, caches, and plugin data inside each distro with a private OMP `HOME` while preserving the caller's interactive shell environment and existing Git configuration; fresh setup now installs official project-scoped Ponytail and Superpowers plugins and validates their native registrations.
 - Source the default worker catalog from validated native Ponytail and Superpowers plugin payloads under canonical upstream names; preserve exact skill bytes/resources, refuse source collisions, and stop redistributing transformed upstream worker bundles.
 - Move harness/profile/curated/none selection to task creation and publish `prepared` only after an immutable schema-2 source inventory, snapshot, and ignored canonical-name worktree copy exist; launch/relaunch no longer re-resolve mutable plugin sources.
 - Keep scoped-PR workers adapter-only by requiring tasks created with no ordinary skills, validating the grant before Relay startup, and freezing the AGD adapter without replacing the task's ordinary selection.

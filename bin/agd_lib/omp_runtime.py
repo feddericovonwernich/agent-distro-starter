@@ -35,22 +35,25 @@ def _root(home) -> Path:
     return root / 'data' / 'omp'
 
 
-def _config(home) -> Path:
-    return _root(home) / 'config'
+def _data_root(home) -> Path:
+    return _root(home) / 'xdg' / 'data' / 'omp'
+
+
+def _plugins(home) -> Path:
+    return _data_root(home) / 'plugins'
 
 
 def agent_dir(home) -> Path:
-    return _root(home) / 'agent'
+    return _root(home) / 'home' / '.omp' / 'agent'
 
 
 def runtime_directories(home) -> tuple[Path, ...]:
     runtime = _root(home)
     return (
-        runtime / 'config',
-        runtime / 'agent',
-        runtime / 'xdg' / 'data',
-        runtime / 'xdg' / 'state',
-        runtime / 'xdg' / 'cache',
+        agent_dir(home),
+        runtime / 'xdg' / 'data' / 'omp',
+        runtime / 'xdg' / 'state' / 'omp',
+        runtime / 'xdg' / 'cache' / 'omp',
     )
 
 
@@ -68,22 +71,20 @@ def environment(home, inherited: Mapping[str, str]) -> dict[str, str]:
                 break
             if stat.S_ISLNK(identity.st_mode) or not stat.S_ISDIR(identity.st_mode):
                 raise store.Refusal('OMP runtime root is unsafe')
-    effective_home = inherited.get('HOME') or str(Path.home())
-    if not Path(effective_home).is_absolute():
-        raise store.Refusal('OMP runtime requires an absolute HOME')
-    config_dir = os.path.relpath(_config(root), effective_home)
-    if (Path(effective_home) / config_dir).resolve() != _config(root).resolve():
-        raise store.Refusal('OMP config path does not resolve inside the distro')
     result = dict(inherited)
     result.update(
-        PI_CONFIG_DIR=config_dir,
-        PI_CODING_AGENT_DIR=str(runtime / 'agent'),
+        HOME=str(runtime / 'home'),
+        PI_CONFIG_DIR='.omp',
+        PI_CODING_AGENT_DIR=str(agent_dir(root)),
         OMP_PROFILE='default',
         PI_PROFILE='default',
         XDG_DATA_HOME=str(runtime / 'xdg' / 'data'),
         XDG_STATE_HOME=str(runtime / 'xdg' / 'state'),
         XDG_CACHE_HOME=str(runtime / 'xdg' / 'cache'),
     )
+    account_home = Path(inherited.get('HOME', ''))
+    if account_home.is_absolute():
+        result.setdefault('XDG_CONFIG_HOME', str(account_home / '.config'))
     return result
 
 
@@ -101,12 +102,48 @@ def _private_directory(home: Path, destination: Path) -> None:
         os.chmod(current, 0o700)
 
 
+def _initialize_git_config(home: Path, inherited: Mapping[str, str]) -> None:
+    account_home = Path(inherited.get('HOME', ''))
+    if not account_home.is_absolute() or inherited.get('GIT_CONFIG_GLOBAL'):
+        return
+    source = account_home / '.gitconfig'
+    if not source.is_file():
+        return
+    destination = _root(home) / 'home' / '.gitconfig'
+    content = f'[include]\n\tpath = {json.dumps(str(source))}\n'
+    try:
+        identity = destination.lstat()
+    except FileNotFoundError:
+        descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
+        return
+    if (not stat.S_ISREG(identity.st_mode) or destination.read_text() != content):
+        raise store.Refusal('OMP Git configuration bridge is unsafe')
+
+
 def initialize(home, executable: str, *, inherited: Mapping[str, str] | None = None, run=store.run) -> None:
     root = store.home(home)
     for directory in runtime_directories(root):
         _private_directory(root, directory)
+    effective_inherited = os.environ if inherited is None else inherited
+    _initialize_git_config(root, effective_inherited)
+    marketplace_registry = _data_root(root) / 'marketplaces.json'
+    try:
+        identity = marketplace_registry.lstat()
+    except FileNotFoundError:
+        store.atomic_json(marketplace_registry, {'version': 1, 'marketplaces': []})
+    else:
+        if not stat.S_ISREG(identity.st_mode):
+            raise store.Refusal('OMP marketplace registry is unsafe')
     run([executable, 'config', 'init-xdg'], cwd=root,
-        env=environment(root, os.environ if inherited is None else inherited))
+        env=environment(root, effective_inherited))
 
 
 def executable(home) -> str:
@@ -175,7 +212,7 @@ def _confined_json(path: Path, root: Path, label: str, *, optional=False):
 
 def _marketplaces(home: Path, required_ids) -> dict[str, dict]:
     value = _confined_json(
-        _config(home) / 'marketplaces.json', _root(home),
+        _data_root(home) / 'marketplaces.json', _root(home),
         'marketplace registry')
     if (not isinstance(value, dict) or set(value) != {'version', 'marketplaces'}
             or value.get('version') != 1 or not isinstance(value['marketplaces'], list)):
@@ -209,7 +246,7 @@ def _registry(home: Path, *, optional=False):
     if (not isinstance(value, dict) or set(value) != {'version', 'plugins'}
             or value.get('version') != 2 or not isinstance(value['plugins'], dict)):
         raise store.Refusal('native plugin project registry is malformed')
-    index = _confined_json(_config(root) / 'plugins' / 'project_registries.json',
+    index = _confined_json(_plugins(root) / 'project_registries.json',
                            root, 'project registry index')
     if (not isinstance(index, dict) or set(index) != {'version', 'registries'}
             or index.get('version') != 1
@@ -285,7 +322,7 @@ def install_plugins(home, executable: str, *, run=store.run) -> dict[str, dict]:
     registry = _registry(root, optional=True)
     registered = set() if registry is None else set(registry['plugins'])
     marketplace_value = _confined_json(
-        _config(root) / 'marketplaces.json', _root(root),
+        _data_root(root) / 'marketplaces.json', _root(root),
         'marketplace registry', optional=True)
     existing_markets = {}
     if marketplace_value is not None:
