@@ -296,19 +296,286 @@ def test_unavailable_backend_does_not_strand_lease():
         assert tasks.read(home, 'notstarted')['lease_id'] == task['lease_id']
 
 
+def _live_worker(home, task, phase='running'):
+    task.update(
+        executor='worker',
+        incarnation='first',
+        phase=phase,
+        worker_alive=True,
+        endpoint={'identity': 'worker-endpoint', 'incarnation': 'first'},
+        backend='tmux',
+        unattended=False,
+    )
+    tasks.save(home, task)
+    return task
+
+
+def _present_worker(home, task_id):
+    return {'task': tasks.read(home, task_id), 'endpoint': {'presence': 'present'}}
+
+
+def _queue_request(home, task_id, body='Follow up.\n'):
+    message = home/f'{task_id}-message.md'
+    message.write_text(body)
+    with patch.object(workers, 'inspect', side_effect=_present_worker):
+        return workers.send(home, task_id, message)
+
+
 def test_worker_cannot_read_other_task_inbox():
     from test_projects import CLI, run
     with lab() as (home, project):
         brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
         task = command(home, 'task', 'create', 'private', '--project', 'sample',
                        '--brief', str(brief), '--kind', 'scout')
-        task.update(executor='worker', incarnation='first', phase='running')
-        tasks.save(home, task)
+        _live_worker(home, task)
         message = home/'private-message.md'; message.write_text('Do not share this.\n')
-        command(home, 'worker', 'send', 'private', '--file', str(message))
+        with patch.object(workers, 'inspect', side_effect=_present_worker):
+            workers.send(home, 'private', message)
         env = dict(os.environ, AGD_TASK_ID='different', AGD_INCARNATION='second')
         result = run([CLI, '--home', home, 'worker', 'inbox', 'private'], env=env, expected=3)
         assert 'different task' in result.stderr
+
+
+def test_send_requires_verified_live_worker_but_allows_ready():
+    import pytest
+    from agd_lib import store
+
+    with lab() as (home, project):
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'followup', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        _live_worker(home, task, phase='ready')
+        message = home/'message.md'; message.write_text('Check the conclusion.\n')
+        current = tasks.read(home, 'followup')
+        current['harness'] = 'cursor'
+        tasks.save(home, current)
+        with patch.object(workers, 'inspect', side_effect=_present_worker), \
+             pytest.raises(store.Refusal):
+            workers.send(home, 'followup', message)
+        current['harness'] = 'omp'
+        tasks.save(home, current)
+        with patch.object(workers, 'inspect', side_effect=_present_worker):
+            accepted = workers.send(home, 'followup', message)
+
+        current = tasks.read(home, 'followup')
+        current['worker_alive'] = False
+        tasks.save(home, current)
+        with patch.object(workers, 'inspect', side_effect=_present_worker), \
+             pytest.raises(store.Refusal):
+            workers.send(home, 'followup', message)
+
+        current['worker_alive'] = True
+        tasks.save(home, current)
+        for presence in ('missing', 'unknown'):
+            inspected = {'task': current, 'endpoint': {'presence': presence}}
+            with patch.object(workers, 'inspect', return_value=inspected), \
+                 pytest.raises(store.Refusal):
+                workers.send(home, 'followup', message)
+
+        assert len(list((home/'data/tasks/followup/inbox').glob('*.json'))) == 1
+        assert accepted['delivery'] == 'queued'
+
+
+def test_concurrent_sends_receive_unique_fifo_sequences():
+    from concurrent.futures import ThreadPoolExecutor
+
+    with lab() as (home, project):
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'ordered', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        _live_worker(home, task)
+        first = home/'first.md'; first.write_text('First request.\n')
+        second = home/'second.md'; second.write_text('Second request.\n')
+        with patch.object(workers, 'inspect', side_effect=_present_worker), \
+             ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(
+                lambda path: workers.send(home, 'ordered', path),
+                (first, second),
+            ))
+
+        rows = workers.inbox(home, 'ordered')
+        assert [row['sequence'] for row in rows] == [1, 2]
+        assert {row['id'] for row in rows} == {row['id'] for row in results}
+        assert {row['body'] for row in rows} == {'First request.\n', 'Second request.\n'}
+
+
+def test_pending_request_survives_worker_crash_for_relaunch():
+    with lab() as (home, project):
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'retained', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        _live_worker(home, task)
+        message = home/'message.md'; message.write_text('Retain this request.\n')
+        with patch.object(workers, 'inspect', side_effect=_present_worker):
+            accepted = workers.send(home, 'retained', message)
+        current = tasks.read(home, 'retained')
+        current['worker_alive'] = False
+        tasks.save(home, current)
+
+        assert workers.inbox(home, 'retained')[0]['id'] == accepted['id']
+
+
+def test_ready_pending_request_relaunches_without_replaying_initial_task():
+    with lab() as (home, project):
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'ready-retry', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        _live_worker(home, task)
+        report = home/'report.md'; report.write_text('Initial inspection complete.\n')
+        command(home, 'task', 'ready', 'ready-retry', '--report', str(report))
+        request = _queue_request(home, 'ready-retry', 'Answer one more question.\n')
+        crashed = tasks.read(home, 'ready-retry')
+        crashed['worker_alive'] = False
+        tasks.save(home, crashed)
+
+        class FakeBackend:
+            def create(self, _home, task_id, incarnation, _work, _argv):
+                return {'identity': task_id, 'incarnation': incarnation}
+
+        with patch.object(workers, 'inspect',
+                          return_value={'endpoint': {'presence': 'missing'}}), \
+             patch.object(workers, 'backend', return_value=FakeBackend()):
+            relaunched = workers.relaunch(home, 'ready-retry')
+
+        assert relaunched['phase'] == 'ready'
+        assert relaunched['ready_head'] == crashed['ready_head']
+        assert workers.inbox(home, 'ready-retry')[0]['id'] == request['id']
+        argv = workers.harnesses.launch_argv(
+            relaunched, tasks.task_file(home, 'ready-retry').parent/'brief.md')
+        assert argv[-2] == '-e'
+        assert argv[-1].endswith('lib/omp-worker.ts')
+
+
+def test_ready_relaunch_refuses_changed_workspace():
+    import pytest
+    from agd_lib import store
+
+    with lab() as (home, project):
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'dirty-ready', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        _live_worker(home, task)
+        report = home/'report.md'; report.write_text('Initial inspection complete.\n')
+        command(home, 'task', 'ready', 'dirty-ready', '--report', str(report))
+        current = tasks.read(home, 'dirty-ready')
+        current['worker_alive'] = False
+        tasks.save(home, current)
+        (Path(current['worktree'])/'value.txt').write_text('changed after ready\n')
+
+        with patch.object(workers, 'inspect',
+                          return_value={'endpoint': {'presence': 'missing'}}), \
+             pytest.raises(store.Refusal, match='ready workspace no longer matches'):
+            workers.relaunch(home, 'dirty-ready')
+
+
+def test_complete_is_scoped_idempotent_and_acknowledges_last():
+    import json
+    import pytest
+    from agd_lib import store
+
+    with lab() as (home, project):
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'completed', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        _live_worker(home, task)
+        request = _queue_request(home, 'completed')
+        with patch.dict(os.environ, {
+                'AGD_TASK_ID': 'foreign',
+                'AGD_INCARNATION': 'first',
+        }):
+            with pytest.raises(store.Refusal):
+                workers.complete(home, 'completed', request['id'], 'first', 'done', 'Answer.\n')
+
+        scoped = {'AGD_TASK_ID': 'completed', 'AGD_INCARNATION': 'first'}
+        with patch.dict(os.environ, scoped):
+            with pytest.raises(store.Refusal):
+                workers.complete(
+                    home, 'completed', str(uuid.uuid4()), 'first', 'done', 'Answer.\n')
+            first = workers.complete(
+                home, 'completed', request['id'], 'first', 'done', 'Answer.\n')
+            retried = workers.complete(
+                home, 'completed', request['id'], 'first', 'done', 'Answer.\n')
+            with pytest.raises(store.Refusal):
+                workers.complete(
+                    home, 'completed', request['id'], 'first', 'done', 'Different.\n')
+
+        folder = home/'data/tasks/completed'
+        assert first == retried == json.loads(
+            (folder/'replies'/f'{request["id"]}.json').read_text())
+        assert first['enqueueing_incarnation'] == 'first'
+        assert first['completed_incarnation'] == 'first'
+        assert first['status'] == 'done'
+        assert (folder/'observations'/f'{first["observation_id"]}.json').is_file()
+        assert (folder/'inbox-ack'/f'{request["id"]}.json').is_file()
+        assert workers.inbox(home, 'completed') == []
+
+
+def test_complete_repairs_reply_without_observation_or_ack():
+    with lab() as (home, project):
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'repair', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        _live_worker(home, task)
+        request = _queue_request(home, 'repair')
+        scoped = {'AGD_TASK_ID': 'repair', 'AGD_INCARNATION': 'first'}
+        with patch.dict(os.environ, scoped):
+            reply = workers.complete(
+                home, 'repair', request['id'], 'first', 'done', 'Recovered.\n')
+            folder = home/'data/tasks/repair'
+            observation = folder/'observations'/f'{reply["observation_id"]}.json'
+            acknowledgement = folder/'inbox-ack'/f'{request["id"]}.json'
+            observation.unlink()
+            acknowledgement.unlink()
+            assert workers.complete(
+                home, 'repair', request['id'], 'first', 'done', 'Recovered.\n') == reply
+
+        assert observation.is_file()
+        assert acknowledgement.is_file()
+
+
+def test_inbox_repairs_interrupted_completion_after_process_restart():
+    with lab() as (home, project):
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'restart', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        _live_worker(home, task)
+        request = _queue_request(home, 'restart')
+        scoped = {'AGD_TASK_ID': 'restart', 'AGD_INCARNATION': 'first'}
+        with patch.dict(os.environ, scoped):
+            reply = workers.complete(
+                home, 'restart', request['id'], 'first', 'done', 'Persisted.\n')
+        folder = home/'data/tasks/restart'
+        observation = folder/'observations'/f'{reply["observation_id"]}.json'
+        acknowledgement = folder/'inbox-ack'/f'{request["id"]}.json'
+        observation.unlink()
+        acknowledgement.unlink()
+
+        with patch.dict(os.environ, scoped):
+            assert workers.inbox(home, 'restart') == []
+        assert observation.is_file()
+        assert acknowledgement.is_file()
+
+
+def test_prior_incarnation_request_completes_after_relaunch():
+    with lab() as (home, project):
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'relaunched', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        _live_worker(home, task)
+        request = _queue_request(home, 'relaunched')
+        current = tasks.read(home, 'relaunched')
+        current['incarnation'] = 'second'
+        tasks.save(home, current)
+
+        with patch.dict(os.environ, {
+                'AGD_TASK_ID': 'relaunched',
+                'AGD_INCARNATION': 'second',
+        }):
+            reply = workers.complete(
+                home, 'relaunched', request['id'], 'second', 'done', 'Still here.\n')
+
+        assert reply['enqueueing_incarnation'] == 'first'
+        assert reply['completed_incarnation'] == 'second'
 
 
 def test_crashed_runner_recovered_only_after_process_and_pane_absent():
@@ -449,6 +716,8 @@ def test_granted_launch_uses_frozen_private_scoped_skill_and_prompt():
         scoped['incarnation'] = 'worker-incarnation'
         argv = __import__('agd_lib.harnesses', fromlist=['launch_argv']).launch_argv(
             scoped, tasks.task_file(home, 'granted').parent/'brief.md')
+        assert '--no-extensions' in argv
+        assert argv[argv.index('--skills') + 1] == 'agd-scoped-pr-relay'
         text = argv[-1]
         assert grant['id'] in text and '--incarnation $AGD_INCARNATION' in text
         assert f'worker verify-pr granted' in text and str(home) in text

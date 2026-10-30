@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Isolate each OMP worker from ambient plugin extensions and skills with an exact frozen native allowlist; upgrade `worker send` to FIFO retained-session request/reply with durable correlated events, idempotent crash repair, and ready-worker recovery that preserves integrity without replaying completed work.
 - Isolate OMP settings, authentication, sessions, caches, and plugin data inside each distro with a private OMP `HOME` while preserving the caller's interactive shell environment and existing Git configuration; pin managed Treehouse worktrees to `data/treehouse` so central and worker processes share one lease registry; fresh setup now installs official project-scoped Ponytail and Superpowers plugins and validates their native registrations.
 - Source the default worker catalog from validated native Ponytail and Superpowers plugin payloads under canonical upstream names; preserve exact skill bytes/resources, refuse source collisions, and stop redistributing transformed upstream worker bundles.
 - Move harness/profile/curated/none selection to task creation and publish `prepared` only after an immutable schema-2 source inventory, snapshot, and ignored canonical-name worktree copy exist; launch/relaunch no longer re-resolve mutable plugin sources.

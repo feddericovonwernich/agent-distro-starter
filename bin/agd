@@ -88,7 +88,7 @@ def parser():
     skills.add_parser('list')
     profiles = worker.add_parser('profiles').add_subparsers(dest='profile_operation', required=True)
     profiles.add_parser('list')
-    for action in ('launch', 'run', 'event', 'inspect', 'send', 'inbox', 'acknowledge', 'interrupt', 'stop', 'relaunch',
+    for action in ('launch', 'run', 'event', 'inspect', 'send', 'inbox', 'complete', 'interrupt', 'stop', 'relaunch',
                    'publish-pr', 'verify-pr', 'relay-poll', 'relay-reply'):
         op = worker.add_parser(action)
         op.add_argument('id')
@@ -105,8 +105,10 @@ def parser():
             op.add_argument('--message', required=True)
         if action == 'send':
             op.add_argument('--file', required=True)
-        if action == 'acknowledge':
+        if action == 'complete':
             op.add_argument('message_id')
+            op.add_argument('--incarnation', required=True)
+            op.add_argument('--status', choices=('done', 'failed'), required=True)
         if action == 'publish-pr':
             op.add_argument('--incarnation', required=True)
             op.add_argument('--grant', required=True)
@@ -350,8 +352,10 @@ def main(args):
             return workers.send(home, args.id, args.file)
         if args.operation == 'inbox':
             return workers.inbox(home, args.id)
-        if args.operation == 'acknowledge':
-            return workers.acknowledge(home, args.id, args.message_id)
+        if args.operation == 'complete':
+            return workers.complete(
+                home, args.id, args.message_id, args.incarnation,
+                args.status, sys.stdin.read())
         if args.operation == 'interrupt':
             return workers.interrupt(home, args.id)
         if args.operation == 'stop':
