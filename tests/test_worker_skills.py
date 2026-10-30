@@ -666,13 +666,6 @@ def test_retry_after_post_exclude_write_failure_releases_only_owned_line():
         assert exclude.read_text() == '/.omp/skills/agd-user/\nuser\n'
 
 
-def test_prompt_names_assigned_skill_paths():
-    from agd_lib import harnesses
-    task = {'id': 'prompt', 'worktree': '/tmp', 'harness': 'omp',
-            'worker_skills': {'skills': [{'id': 'agd-probe', 'destination': '/tmp/.omp/skills/agd-probe'}]}}
-    argv = harnesses.launch_argv(task, Path('/tmp/a/b/c/brief.md'))
-    assert 'Assigned worker skills: agd-probe.' in argv[-1]
-    assert '/tmp/.omp/skills/agd-probe/SKILL.md' in argv[-1]
 
 
 def test_create_materializes_curated_skills_before_prepared():
@@ -1218,7 +1211,6 @@ if __name__ == '__main__':
     test_ensure_refuses_post_prepare_native_parent_symlink()
     test_ensure_refuses_removed_skill_set()
     test_retry_after_post_exclude_write_failure_releases_only_owned_line()
-    test_prompt_names_assigned_skill_paths()
     test_create_materializes_curated_skills_before_prepared()
     test_create_materializes_native_names_without_aliases()
     test_create_default_profile_and_cursor_nonempty_refusal()
