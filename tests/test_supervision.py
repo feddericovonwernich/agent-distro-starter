@@ -140,6 +140,48 @@ def test_unfinished_clean_exit_is_actionable():
                    for row in command(home, 'events', 'list'))
 
 
+def test_failed_completion_emits_one_correlated_blocked_event():
+    from unittest.mock import patch
+    from agd_lib import store, tasks, workers
+
+    with lab() as (home, project):
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'reply', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        task.update(
+            executor='worker',
+            incarnation='first',
+            phase='running',
+            worker_alive=True,
+            endpoint={'identity': 'worker-endpoint'},
+            backend='tmux',
+        )
+        tasks.save(home, task)
+        with store.lock(home):
+            request = workers.enqueue_locked(
+                home, task, 'Question.\n')
+        diagnostic = 'steering turn ended without assistant text'
+        with patch.dict(os.environ, {
+                'AGD_TASK_ID': 'reply',
+                'AGD_INCARNATION': 'first',
+        }):
+            workers.complete(
+                home, 'reply', request.stem, 'first', 'failed', diagnostic)
+        current = tasks.read(home, 'reply')
+        current['worker_alive'] = False
+        tasks.save(home, current)
+
+        command(home, 'session', 'reconcile')
+        command(home, 'session', 'reconcile')
+        replies = [
+            event for event in command(home, 'events', 'list')
+            if event['key'] == request.stem
+        ]
+        assert len(replies) == 1
+        assert replies[0]['kind'] == 'blocked'
+        assert replies[0]['details'] == diagnostic
+
+
 def test_recovered_ready_check_rearms_next_failure():
     with lab() as (home, project):
         brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')

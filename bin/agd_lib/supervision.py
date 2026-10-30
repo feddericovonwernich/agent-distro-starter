@@ -82,8 +82,7 @@ def resolve(home, task_id, key, answer):
                                         'resolved_at': resolved_at})
         if task.get('executor') == 'worker':
             message_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f'{task_id}:{task["incarnation"]}:decision:{key}'))
-            store.atomic_json(folder/'inbox'/f'{message_id}.json',
-                              {'id': message_id, 'body': text, 'incarnation': task['incarnation']})
+            workers.enqueue_locked(home, task, text, message_id)
             decision['message_id'] = message_id
         decision.update(status='resolved', answer=str(answer_path.relative_to(folder)), resolved_at=resolved_at)
         store.atomic_json(path, decision)
@@ -126,7 +125,9 @@ def reconcile(home):
                                               'launch-absent', 'start pane vanished before publication; same lease can be launched again'))
             for observation_path in sorted((path.parent/'observations').glob('*.json')):
                 observation = json.loads(observation_path.read_text())
-                if observation['incarnation'] != task.get('incarnation', 'central'):
+                is_reply = observation.get('request_id') is not None
+                if (observation['incarnation'] != task.get('incarnation', 'central')
+                        and not is_reply):
                     continue
                 if observation['kind'] == 'decision':
                     decision_path = path.parent/'decisions'/f'{observation["key"]}.json'
@@ -136,7 +137,8 @@ def reconcile(home):
                                                              incarnation=observation['incarnation']))
                 if observation['kind'] in ('decision', 'blocked', 'failed', 'done', 'resolved'):
                     found.append(emit(home, task['id'], observation['incarnation'], observation['kind'],
-                                      observation['id'], observation['message']))
+                                      observation.get('request_id', observation['id']),
+                                      observation['message']))
                 if observation['kind'] == 'idle' and observation['key'] == 'runner-exit' and task['phase'] not in ('ready', 'landed', 'cleaned'):
                     found.append(emit(home, task['id'], observation['incarnation'], 'blocked',
                                       observation['id'], 'worker exited before readiness; inspect retained work'))

@@ -19,23 +19,43 @@ def backend(task):
     raise ValueError('unsupported backend')
 
 
+def _observation(home, task_id, incarnation, kind, key, text,
+                 observation_id=None, request_id=None):
+    if kind not in ('busy', 'idle', 'blocked', 'decision', 'resolved', 'failed', 'done'):
+        raise ValueError('unsupported event kind')
+    if not key or '/' in key or len(key) > 64:
+        raise ValueError('invalid event key')
+    if not text.strip():
+        raise store.Refusal('event message is empty')
+    observation = dict(
+        id=observation_id or str(uuid.uuid4()),
+        task=task_id,
+        incarnation=incarnation,
+        kind=kind,
+        key=key,
+        message=text,
+    )
+    if request_id is not None:
+        observation['request_id'] = request_id
+    path = tasks.task_file(home, task_id).parent/'observations'/f'{observation["id"]}.json'
+    if path.exists():
+        existing = json.loads(path.read_text())
+        if any(existing.get(name) != value for name, value in observation.items()):
+            raise store.Refusal('worker observation conflicts with durable state')
+        return existing
+    observation['observed_at'] = time.time()
+    store.atomic_json(path, observation)
+    return observation
+
+
 def event(home, task_id, incarnation, kind, key, message):
     task = tasks.read(home, task_id)
     if incarnation != task.get('incarnation') and not (incarnation == 'central' and task['executor'] == 'central'):
         raise store.Refusal('worker incarnation no longer owns task')
     if os.environ.get('AGD_TASK_ID') and (os.environ['AGD_TASK_ID'] != task_id or os.environ.get('AGD_INCARNATION') != incarnation):
         raise store.Refusal('event belongs to a different task process')
-    if kind not in ('busy', 'idle', 'blocked', 'decision', 'resolved', 'failed', 'done'):
-        raise ValueError('unsupported event kind')
-    if not key or '/' in key or len(key) > 64:
-        raise ValueError('invalid event key')
-    text = Path(message).read_text()
-    if not text.strip():
-        raise store.Refusal('event message is empty')
-    observation = dict(id=str(uuid.uuid4()), task=task_id, incarnation=incarnation,
-                       kind=kind, key=key, message=text, observed_at=time.time())
-    store.atomic_json(tasks.task_file(home, task_id).parent/'observations'/f'{observation["id"]}.json', observation)
-    return observation
+    return _observation(
+        home, task_id, incarnation, kind, key, Path(message).read_text())
 
 
 def launch(home, task_id, selected_backend=None, unattended=False, approval_id=None,
@@ -194,40 +214,205 @@ def inspect(home, task_id):
     return {'task': task, 'endpoint': state}
 
 
+def _next_inbox_sequence(folder):
+    path = folder/'inbox-sequence.json'
+    if path.exists():
+        state = json.loads(path.read_text())
+        value = state.get('value') if isinstance(state, dict) else None
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise store.Refusal('invalid worker inbox sequence')
+    else:
+        value = 0
+    value += 1
+    store.atomic_json(path, {'schema': 1, 'value': value})
+    return value
+
+
+def enqueue_locked(home, task, text, message_id=None):
+    if not text.strip():
+        raise store.Refusal('empty message')
+    message_id = str(uuid.UUID(message_id)) if message_id else str(uuid.uuid4())
+    folder = tasks.task_file(home, task['id']).parent
+    path = folder/'inbox'/f'{message_id}.json'
+    store.atomic_json(path, {
+        'schema': 1,
+        'id': message_id,
+        'body': text,
+        'incarnation': task['incarnation'],
+        'sequence': _next_inbox_sequence(folder),
+        'queued_at': time.time(),
+    })
+    return path
+
+
 def send(home, task_id, file):
-    task = tasks.read(home, task_id)
-    if task.get('executor') != 'worker':
-        raise store.Refusal('task has no worker')
     text = Path(file).read_text()
     if not text.strip():
         raise store.Refusal('empty message')
-    message_id = str(uuid.uuid4())
-    path = tasks.task_file(home, task_id).parent/'inbox'/f'{message_id}.json'
-    store.atomic_json(path, {'id': message_id, 'body': text, 'incarnation': task['incarnation']})
-    return {'id': message_id, 'delivery': 'queued', 'inbox': str(path)}
+    inspected = inspect(home, task_id)
+    inspected_task = inspected.get('task', {})
+    endpoint = inspected.get('endpoint', inspected)
+    with store.lock(home):
+        task = tasks.read(home, task_id)
+        if (task.get('phase') not in ('running', 'ready')
+                or task.get('executor') != 'worker'
+                or task.get('worker_alive') is not True
+                or endpoint.get('presence') != 'present'
+                or inspected_task.get('incarnation') != task.get('incarnation')
+                or inspected_task.get('endpoint') != task.get('endpoint')):
+            raise store.Refusal('worker is not presently available')
+        path = enqueue_locked(home, task, text)
+    return {'id': path.stem, 'delivery': 'queued', 'inbox': str(path)}
+
+
+def _inbox_record(path):
+    try:
+        record = json.loads(path.read_text())
+        uuid.UUID(record['id'])
+        valid = (
+            record.get('schema') == 1
+            and record['id'] == path.stem
+            and isinstance(record.get('body'), str)
+            and bool(record['body'].strip())
+            and isinstance(record.get('incarnation'), str)
+            and isinstance(record.get('sequence'), int)
+            and not isinstance(record['sequence'], bool)
+            and record['sequence'] > 0
+            and isinstance(record.get('queued_at'), (int, float))
+            and not isinstance(record['queued_at'], bool)
+        )
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        valid = False
+    if not valid:
+        raise store.Refusal('invalid worker inbox record')
+    return record
+
+
+def _reply_record(path):
+    try:
+        reply = json.loads(path.read_text())
+        uuid.UUID(reply['id'])
+        uuid.UUID(reply['observation_id'])
+        valid = (
+            reply.get('schema') == 1
+            and reply['id'] == path.stem
+            and isinstance(reply.get('enqueueing_incarnation'), str)
+            and isinstance(reply.get('completed_incarnation'), str)
+            and reply.get('status') in ('done', 'failed')
+            and isinstance(reply.get('body'), str)
+            and bool(reply['body'].strip())
+            and isinstance(reply.get('completed_at'), (int, float))
+            and not isinstance(reply['completed_at'], bool)
+        )
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        valid = False
+    if not valid:
+        raise store.Refusal('invalid worker reply record')
+    return reply
+
+
+def _repair_completion_locked(home, task_id, request, reply):
+    observation_id = str(uuid.uuid5(
+        uuid.NAMESPACE_URL, f'{task_id}:{request["id"]}:reply'))
+    if (reply['id'] != request['id']
+            or reply['enqueueing_incarnation'] != request['incarnation']
+            or reply['observation_id'] != observation_id):
+        raise store.Refusal('worker reply conflicts with request')
+    _observation(
+        home,
+        task_id,
+        reply['completed_incarnation'],
+        'done' if reply['status'] == 'done' else 'blocked',
+        request['id'],
+        reply['body'],
+        observation_id,
+        request['id'],
+    )
+    folder = tasks.task_file(home, task_id).parent
+    receipt = folder/'inbox-ack'/f'{request["id"]}.json'
+    expected = {
+        'schema': 1,
+        'id': request['id'],
+        'incarnation': reply['completed_incarnation'],
+        'observation_id': observation_id,
+    }
+    if receipt.exists():
+        if json.loads(receipt.read_text()) != expected:
+            raise store.Refusal('worker acknowledgement conflicts with reply')
+    else:
+        store.atomic_json(receipt, expected)
+    return reply
 
 
 def inbox(home, task_id):
-    task = tasks.read(home, task_id)
-    if os.environ.get('AGD_TASK_ID') and (os.environ['AGD_TASK_ID'] != task_id or
-                                          os.environ.get('AGD_INCARNATION') != task.get('incarnation')):
-        raise store.Refusal('worker cannot read a different task inbox')
-    folder = tasks.task_file(home, task_id).parent
-    return [json.loads(p.read_text()) for p in sorted((folder/'inbox').glob('*.json'))
-            if not (folder/'inbox-ack'/p.name).exists()]
+    with store.lock(home):
+        task = tasks.read(home, task_id)
+        scoped = os.environ.get('AGD_TASK_ID') is not None
+        if scoped and (os.environ['AGD_TASK_ID'] != task_id or
+                       os.environ.get('AGD_INCARNATION') != task.get('incarnation')):
+            raise store.Refusal('worker cannot read a different task inbox')
+        folder = tasks.task_file(home, task_id).parent
+        if scoped:
+            for reply_path in (folder/'replies').glob('*.json'):
+                reply = _reply_record(reply_path)
+                request_path = folder/'inbox'/f'{reply["id"]}.json'
+                if not request_path.is_file():
+                    raise store.Refusal('worker reply request is missing')
+                _repair_completion_locked(
+                    home, task_id, _inbox_record(request_path), reply)
+        records = [_inbox_record(path) for path in (folder/'inbox').glob('*.json')
+                   if not (folder/'inbox-ack'/path.name).exists()]
+    return sorted(records, key=lambda record: (record['sequence'], record['id']))
 
 
-def acknowledge(home, task_id, message_id):
-    task = tasks.read(home, task_id)
-    uuid.UUID(message_id)
-    if os.environ.get('AGD_INCARNATION') != task.get('incarnation') or os.environ.get('AGD_TASK_ID') != task_id:
-        raise store.Refusal('worker message acknowledgement needs current incarnation')
-    path = tasks.task_file(home, task_id).parent/'inbox'/f'{message_id}.json'
-    if not path.exists():
-        raise store.Refusal('message missing')
-    receipt = tasks.task_file(home, task_id).parent/'inbox-ack'/path.name
-    store.atomic_json(receipt, {'id': message_id, 'incarnation': task['incarnation']})
-    return {'acknowledged': message_id}
+def complete(home, task_id, request_id, incarnation, status, response):
+    try:
+        request_id = str(uuid.UUID(request_id))
+    except (TypeError, ValueError) as error:
+        raise store.Refusal('invalid worker request ID') from error
+    if status not in ('done', 'failed'):
+        raise store.Refusal('invalid worker completion status')
+    if not isinstance(response, str) or not response.strip():
+        raise store.Refusal('worker response is empty')
+    with store.lock(home):
+        task = tasks.read(home, task_id)
+        if (os.environ.get('AGD_TASK_ID') != task_id
+                or os.environ.get('AGD_INCARNATION') != incarnation
+                or task.get('incarnation') != incarnation):
+            raise store.Refusal('worker completion needs current incarnation')
+        folder = tasks.task_file(home, task_id).parent
+        request_path = folder/'inbox'/f'{request_id}.json'
+        if not request_path.is_file():
+            raise store.Refusal('worker request is missing')
+        request = _inbox_record(request_path)
+        observation_id = str(uuid.uuid5(
+            uuid.NAMESPACE_URL, f'{task_id}:{request_id}:reply'))
+        reply_path = folder/'replies'/f'{request_id}.json'
+        if reply_path.exists():
+            reply = _reply_record(reply_path)
+            expected = {
+                'id': request_id,
+                'enqueueing_incarnation': request['incarnation'],
+                'completed_incarnation': incarnation,
+                'status': status,
+                'body': response,
+                'observation_id': observation_id,
+            }
+            if any(reply.get(name) != value for name, value in expected.items()):
+                raise store.Refusal('worker completion conflicts with durable reply')
+        else:
+            reply = {
+                'schema': 1,
+                'id': request_id,
+                'enqueueing_incarnation': request['incarnation'],
+                'completed_incarnation': incarnation,
+                'status': status,
+                'body': response,
+                'completed_at': time.time(),
+                'observation_id': observation_id,
+            }
+            store.atomic_json(reply_path, reply)
+        return _repair_completion_locked(home, task_id, request, reply)
 
 
 def turn_state(home, task):
