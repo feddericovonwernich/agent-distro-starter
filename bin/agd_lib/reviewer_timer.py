@@ -1,9 +1,11 @@
 """Explicitly managed reviewer timer scheduling; it never activates itself."""
 import json
 import os
+import shutil
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -11,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from . import reviewer, store
+from . import omp_runtime, reviewer, store
 
 
 SCHEDULE_KEYS = {'mode', 'timezone', 'calendar', 'interval_hours'}
@@ -23,6 +25,29 @@ def default_config():
 
 def validate_schedule(schedule):
     return reviewer.validate_schedule(schedule)
+
+
+def runtime_environment(home):
+    from .reviewer_runner import assert_runtime_capability
+
+    directory = omp_runtime.agent_dir(home)
+    if directory.is_symlink() or not directory.is_dir():
+        raise store.DependencyError('reviewer native OMP agent directory is unavailable')
+    selected = {}
+    for name in ('omp', 'bun'):
+        executable = shutil.which(name)
+        if executable is None:
+            raise store.DependencyError(f'reviewer {name} is unavailable')
+        selected[name] = os.path.abspath(executable)
+    assert_runtime_capability(int((time.time() + 10) * 1000), home=home, omp_binary=selected['omp'])
+    directories = {str(Path(path).parent) for path in selected.values()}
+    # Preserve command precedence without forwarding the rest of the shell environment.
+    search = [os.path.abspath(path or os.curdir) for path in os.get_exec_path()
+              if os.path.abspath(path or os.curdir) in directories]
+    path = os.pathsep.join(dict.fromkeys([*search, *os.defpath.split(os.pathsep)]))
+    if any(shutil.which(name, path=path) != executable for name, executable in selected.items()):
+        raise store.DependencyError('reviewer runtime search path changed executable identity')
+    return {'python': str(Path(sys.executable).resolve()), 'path': path}
 
 
 def _native_run(argv):
@@ -143,15 +168,19 @@ def _identity(home):
 def _escape(value):
     if not isinstance(value, str) or not value or not os.path.isabs(value):
         raise store.Refusal('timer executable must be absolute')
-    return value.replace('%', '%%').replace('\\', '\\\\').replace(' ', '\\x20').replace('\t', '\\x09').replace('\n', '\\x0a')
+    if '\0' in value:
+        raise store.Refusal('timer path is unsafe')
+    return (value.replace('%', '%%').replace('\\', '\\\\').replace(' ', '\\x20')
+            .replace('\t', '\\x09').replace('\n', '\\x0a')
+            .replace('"', '\\x22').replace("'", '\\x27'))
 
 
-def render_units(home, config, *, source_cli=None):
+def render_units(home, config, *, runtime, source_cli=None):
     if not isinstance(config, dict) or not isinstance(config.get('limits'), dict):
         raise store.Refusal('timer config')
     schedule = validate_schedule(config.get('schedule'))
-    runtime = config['limits'].get('max_runtime_seconds')
-    if type(runtime) is not int or runtime <= 0:
+    runtime_limit = config['limits'].get('max_runtime_seconds')
+    if type(runtime_limit) is not int or runtime_limit <= 0:
         raise store.Refusal('timer runtime')
     home_id, uid = _identity(home)
     timer = unit_name(home)
@@ -163,7 +192,7 @@ def render_units(home, config, *, source_cli=None):
         raise store.Refusal('manual-only has no timer unit')
     return {'timer_name': timer, 'service_name': service,
             'timer': f"[Unit]\nDescription=AGD reviewer timer\n{marker}\n\n[Timer]\nOnCalendar={calendar}\nPersistent=true\nUnit={service}\n\n[Install]\nWantedBy=timers.target\n",
-            'service': f"[Unit]\nDescription=AGD reviewer run\n{marker}\n\n[Service]\nType=oneshot\nTimeoutStartSec={runtime}\nExecStart={_escape(source_cli)} --home={_escape(str(store.home(home)))} reviewer run --timer\n"}
+            'service': f"[Unit]\nDescription=AGD reviewer run\n{marker}\n\n[Service]\nType=oneshot\nTimeoutStartSec={runtime_limit}\nEnvironment=PATH={_escape(runtime['path'])}\nExecStart={_escape(runtime['python'])} {_escape(source_cli)} --home={_escape(str(store.home(home)))} reviewer run --timer\n"}
 
 
 def _safe_directory(path):
@@ -242,8 +271,14 @@ def enable(home, config, *, xdg_config_home=None, command_runner=store.run, sour
     if schedule['mode'] == 'manual-only':
         raise store.Refusal('manual-only schedule cannot enable a timer')
     agreed_next = native_calendar_agrees(schedule, now) if schedule['mode'] == 'calendar' else None
-    rendered = render_units(root, config, source_cli=source_cli)
+    runtime = runtime_environment(root)
+    rendered = render_units(root, config, runtime=runtime, source_cli=source_cli)
     marker = f'X-AGD-Reviewer-Owner={_home_id(root)}:{os.getuid()}'
+    directory = _unit_directory(xdg_config_home)
+    if any((path.exists() or path.is_symlink()) and not _owned(path, marker)
+           for path in (directory / rendered['timer_name'], directory / rendered['service_name'])):
+        raise store.Refusal('existing unit is not owned by this home')
+    command_runner(['systemctl', '--user', 'show', '--property=Version', '--value'])
     with store.lock(root):
         previous = _read_record(root)
         unchanged = previous and previous.get('schedule') == schedule and previous.get('state') == 'enabled'
@@ -252,15 +287,14 @@ def enable(home, config, *, xdg_config_home=None, command_runner=store.run, sour
         record = {'schema': 1, 'home_id': _home_id(root), 'uid': os.getuid(), 'schedule': schedule,
                   'anchor': anchor if schedule['mode'] == 'interval' else None, 'checkpoint': checkpoint, 'state': 'enabling'}
         reviewer._private(_timer_record(root).parent); store.atomic_json(_timer_record(root), record)
-    next_due = agreed_next
     try:
-        directory = _unit_directory(xdg_config_home)
         changed = _write_unit(directory / rendered['timer_name'], rendered['timer'], marker)
         changed = _write_unit(directory / rendered['service_name'], rendered['service'], marker) or changed
         if not unchanged or changed:
             command_runner(['systemctl', '--user', 'daemon-reload'])
             command_runner(['systemctl', '--user', 'enable', rendered['timer_name']])
-            command_runner(['systemctl', '--user', 'start', rendered['timer_name']])
+        command_runner(['systemctl', '--user', 'start', rendered['timer_name']])
+        command_runner(['systemctl', '--user', 'is-active', '--quiet', rendered['timer_name']])
     except Exception as error:
         with store.lock(root):
             store.atomic_json(_timer_record(root), {**record, 'state': 'failed', 'error': str(error)})
