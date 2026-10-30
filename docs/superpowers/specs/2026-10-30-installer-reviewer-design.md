@@ -1,6 +1,6 @@
 # Scheduled reviewer installer opt-in
 
-Status: approach selected; design pending approval. Base: merged main `2128811` (includes installer observability PR #18). Worktree branch: `agd/installer-reviewer`.
+Status: approved by the user on 2026-10-30; Native implementation authorized. Base: merged main `2128811` (includes installer observability PR #18). Worktree branch: `agd/installer-reviewer`.
 
 ## Intent
 
