@@ -100,13 +100,13 @@ function extensionHarness(messages: Message[], completionStatuses: number[] = []
     return { status: 0, stdout: '', stderr: '' };
   };
   const handlers: Record<string, (event: Record<string, unknown>) => unknown> = {};
-  const deliveries: { text: string; options?: { deliverAs?: string } }[] = [];
+  const deliveries: { text: string }[] = [];
   workerExtension({
     on: (name, handler) => {
       handlers[name] = event => handler(event, hookContext);
     },
-    sendUserMessage: (text: string, options?: { deliverAs?: string }) => {
-      deliveries.push({ text, options });
+    sendUserMessage: (text: string) => {
+      deliveries.push({ text });
     },
   }, spawnImpl);
   return { handlers, deliveries, completions, runtime, failures, events, aborts };
@@ -151,7 +151,6 @@ test('ready relaunch consumes its first retained request without an initial task
   expect(deliveries).toEqual([
     {
       text: 'Continue the retained conversation.',
-      options: { deliverAs: 'followUp' },
     },
   ]);
 });
@@ -168,7 +167,7 @@ test('retained worker completes one terminal follow-up before delivering the nex
   expect(deliveries).toEqual([]);
   handlers.agent_end({ willContinue: false, messages: [] });
   expect(deliveries).toEqual([
-    { text: 'First follow-up.', options: { deliverAs: 'followUp' } },
+    { text: 'First follow-up.' },
   ]);
 
   handlers.agent_start({});
@@ -192,7 +191,7 @@ test('retained worker completes one terminal follow-up before delivering the nex
   expect(completions[0].args.slice(-2)).toEqual(['--status', 'done']);
   expect(completions[0].input).toBe('Completed first.');
   expect(deliveries.at(-1)).toEqual(
-    { text: 'Second follow-up.', options: { deliverAs: 'followUp' } },
+    { text: 'Second follow-up.' },
   );
 });
 

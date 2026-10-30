@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT / 'bin'))
 from agd_lib import installer, launcher, omp_runtime, reviewer_runner, store, supervision, tasks, worker_skills, workers  # noqa: E402
 
 SKILLS = {
+    'agd-worker',
     'ponytail', 'ponytail-audit', 'ponytail-debt', 'ponytail-gain',
     'ponytail-help', 'ponytail-review', 'systematic-debugging',
     'test-driven-development', 'verification-before-completion',
@@ -105,18 +106,6 @@ def send_and_wait_for_reply(home, task_id, root, body, timeout=180):
             return request, event['details']
         time.sleep(.2)
     raise RuntimeError(f'worker follow-up {request["id"]} produced no event')
-
-
-def skill_surface(text):
-    try:
-        payload = json.loads(text[text.index('{'):text.rindex('}') + 1])
-        rows = payload['skills']
-        surface = {(row['name'], row['path']) for row in rows}
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-        raise RuntimeError(f'invalid worker skill report: {text}') from error
-    if len(surface) != len(rows):
-        raise RuntimeError('worker skill report contains duplicate or invalid rows')
-    return surface
 
 
 def fetch_json(url):
@@ -363,11 +352,15 @@ def main():
         raise SystemExit(
             '--backend herdr must run inside an owned Herdr-managed pane')
 
+    native_evidence = json.loads(run(
+        ['bun', ROOT/'tests/worker-native.test.ts'],
+        env={**os.environ, 'AGD_NATIVE_CHECK': '1'}))
     account_omp = Path.home()/'.omp'
     account_before = digest_tree(account_omp)
     backend = __import__('agd_lib.' + args.backend, fromlist=['create'])
     endpoint = None
     worker_endpoint = None
+    worker_task_id = None
     central_receipt = None
     central_needs_cleanup = False
     evidence = {}
@@ -433,16 +426,15 @@ def main():
             raise RuntimeError(f'unexpected task skills: {sorted(copied)}')
         none_brief = root/'none-brief.md'
         none_brief.write_text(
-            'Without using tools, shell commands, or filesystem scans, report every skill '
-            'available in this OMP session. Write only JSON with shape '
-            '{"skills":[{"name":"NAME","path":"/absolute/SKILL.md"}]} and include no other text.\n')
+            'Inspect value.txt and verify it contains base. Leave the workspace unchanged '
+            'and submit a concise evidence report through the AGD worker protocol.\n')
         none_task = agd(
             home, 'task', 'create', 'native-none', '--project', 'sample',
             '--brief', str(none_brief), '--kind', 'scout', '--skill-mode', 'none')
         none_worktree = Path(none_task['worktree'])
         none_skills = none_worktree/'.omp/skills'
-        if none_skills.exists() and any(none_skills.iterdir()):
-            raise RuntimeError('none-mode task materialized worker skills')
+        if {path.name for path in none_skills.iterdir()} != {'agd-worker'}:
+            raise RuntimeError('none-mode task must contain only the mandatory AGD protocol')
 
         managed = omp_runtime.environment(home, hostile)
         child_env = {key: managed[key] for key in (
@@ -492,6 +484,7 @@ def main():
         launched = agd(home, 'worker', 'launch', 'native-smoke',
                        '--backend', args.backend)
         worker_endpoint = launched['endpoint']
+        worker_task_id = 'native-smoke'
         initial_incarnation = launched['incarnation']
         initial_endpoint = launched['endpoint']
         current = wait_for_worker_idle(home, 'native-smoke')
@@ -507,18 +500,11 @@ def main():
         if 'Ponytail loaded' in worker_output:
             raise RuntimeError('worker loaded the orchestrator Ponytail extension')
 
-        skill_prompt = (
-            'Without using tools, shell commands, or filesystem scans, reply with every skill '
-            'available in this OMP session. Return only JSON with shape '
-            '{"skills":[{"name":"NAME","path":"/absolute/SKILL.md"}]} and no other text.\n')
-        _, skill_reply = send_and_wait_for_reply(
-            home, 'native-smoke', root, skill_prompt)
-        expected_surface = {
-            (name, str(worktree/'.omp/skills'/name/'SKILL.md'))
-            for name in SKILLS
-        }
-        if skill_surface(skill_reply) != expected_surface:
-            raise RuntimeError(f'worker exposed an unexpected skill surface: {skill_reply}')
+        _, first_reply = send_and_wait_for_reply(
+            home, 'native-smoke', root,
+            'Read value.txt and report its current value without modifying files.\n')
+        if 'base' not in first_reply:
+            raise RuntimeError(f'first retained-worker reply omitted the file value: {first_reply}')
         after_skill_reply = tasks.read(home, 'native-smoke')
         if (after_skill_reply['incarnation'] != initial_incarnation
                 or after_skill_reply['endpoint'] != initial_endpoint):
@@ -534,18 +520,54 @@ def main():
         if (after_second_reply['incarnation'] != initial_incarnation
                 or after_second_reply['endpoint'] != initial_endpoint):
             raise RuntimeError('worker identity changed during the second follow-up')
+        runner = json.loads((home/'state/tasks/native-smoke/runner.json').read_text())
+        if (runner.get('incarnation') != initial_incarnation
+                or runner.get('phase') != 'spawned'
+                or workers.inspect(home, 'native-smoke')['endpoint']['presence'] != 'present'):
+            raise RuntimeError('ready crash probe lost its owned worker identity')
+        child_fd = os.pidfd_open(runner['child_pid'])
+        try:
+            if supervision.gone(runner['child_pid'], runner['child_start']):
+                raise RuntimeError('ready crash probe child identity changed')
+            signal.pidfd_send_signal(child_fd, signal.SIGKILL)
+        finally:
+            os.close(child_fd)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if (supervision.gone(runner['pid'], runner['start'])
+                    and supervision.gone(runner['child_pid'], runner['child_start'])
+                    and tasks.read(home, 'native-smoke').get('worker_alive') is False
+                    and workers.inspect(home, 'native-smoke')['endpoint']['presence'] == 'missing'):
+                break
+            time.sleep(.1)
+        else:
+            raise RuntimeError('crashed ready worker absence remains unconfirmed')
+        worker_endpoint = None
+        report_before = (home/'data/tasks/native-smoke/report.md').read_bytes()
+        recovered = agd(home, 'worker', 'relaunch', 'native-smoke')
+        worker_endpoint = recovered['endpoint']
+        if recovered['incarnation'] == initial_incarnation or recovered['lease_id'] != task['lease_id']:
+            raise RuntimeError('ready-worker recovery changed the lease or reused its incarnation')
+        _, recovery_reply = send_and_wait_for_reply(
+            home, 'native-smoke', root, 'Reply exactly READY-RECOVERY-OK without changing files.\n')
+        if 'READY-RECOVERY-OK' not in recovery_reply:
+            raise RuntimeError('ready-worker recovery did not answer its queued follow-up')
+        if (tasks.read(home, 'native-smoke')['ready_head'] != current['ready_head']
+                or (home/'data/tasks/native-smoke/report.md').read_bytes() != report_before):
+            raise RuntimeError('ready-worker recovery replayed or changed the completed assignment')
         workers.stop(home, 'native-smoke')
         worker_endpoint = None
 
         launched_none = agd(home, 'worker', 'launch', 'native-none',
                             '--backend', args.backend)
         worker_endpoint = launched_none['endpoint']
+        worker_task_id = 'native-none'
         none_current = wait_for_worker_idle(home, 'native-none')
         if none_current['phase'] != 'ready':
             raise RuntimeError('none-mode worker did not complete its initial task')
         none_report = (home/'data/tasks/native-none/report.md').read_text()
-        if skill_surface(none_report):
-            raise RuntimeError(f'none-mode worker exposed skills: {none_report}')
+        if 'base' not in none_report:
+            raise RuntimeError(f'none-mode worker did not report the inspected value: {none_report}')
         workers.stop(home, 'native-none')
         worker_endpoint = None
 
@@ -562,10 +584,11 @@ def main():
             'plugins': {key: value['version'] for key, value in plugins.items()},
             'plugin_lifecycles': lifecycle,
             'skills': sorted(copied),
-            'worker_skill_surface_isolated': True,
-            'none_worker_skill_surface_empty': True,
+            'native_protocol': native_evidence,
+            'none_worker_system_skills': ['agd-worker'],
             'reviewer_plugins_isolated': True,
             'retained_worker_replies': 2,
+            'ready_worker_crash_recovery_reply': True,
             'worker_spawned_and_stopped': True,
             'snapshot_restored_after_source_removal': True,
             'task_phase': cleaned['phase'],
@@ -580,7 +603,7 @@ def main():
         if worker_endpoint is not None:
             try:
                 backend.close(worker_endpoint)
-                runner_path = directory/'home/state/tasks/native-smoke/runner.json'
+                runner_path = directory/'home/state/tasks'/worker_task_id/'runner.json'
                 runner = json.loads(runner_path.read_text()) if runner_path.is_file() else {}
                 identities = [
                     (runner.get('pid'), runner.get('start')),
@@ -619,8 +642,9 @@ def main():
                         workspace['workspace'])
                 except Exception:
                     pass
-        task_path = directory/'home/data/tasks/native-smoke/task.json'
-        if task_path.is_file():
+        if cleanup_failure is not None:
+            raise RuntimeError(f'owned runtime cleanup unconfirmed; retained {directory}') from cleanup_failure
+        for task_path in (directory/'home/data/tasks').glob('*/task.json'):
             try:
                 worktree = Path(json.loads(task_path.read_text())['worktree'])
             except (KeyError, OSError, ValueError, json.JSONDecodeError):
@@ -630,12 +654,11 @@ def main():
                     [treehouse, 'destroy', str(worktree), '--include-leased',
                      '--include-unlanded', '--include-in-use', '--yes'],
                     text=True, capture_output=True, timeout=120)
-                if destroyed.returncode and cleanup_failure is None:
-                    cleanup_failure = RuntimeError(
-                        destroyed.stderr or destroyed.stdout)
+                if destroyed.returncode:
+                    raise RuntimeError(
+                        f'lease cleanup failed; retained {directory}: '
+                        f'{destroyed.stderr or destroyed.stdout}')
         shutil.rmtree(directory, ignore_errors=True)
-        if cleanup_failure is not None and sys.exc_info()[0] is None:
-            raise cleanup_failure
     if digest_tree(account_omp) != account_before:
         raise RuntimeError('account-global OMP state changed')
     time.sleep(8)

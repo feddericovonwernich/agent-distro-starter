@@ -85,7 +85,7 @@ export function assistantReply(messages: unknown[]): string | undefined {
 
 export default function workerExtension(api: {
   on: (name: string, handler: (event: WorkerEvent, context?: HookContext) => HookResult | void) => void;
-  sendUserMessage: (text: string, options?: { deliverAs?: string }) => unknown;
+  sendUserMessage: (text: string) => unknown;
 }, run: WorkerSpawn = spawnSync as unknown as WorkerSpawn) {
   const home = process.env.AGD_HOME;
   const task = process.env.AGD_TASK_ID;
@@ -245,7 +245,8 @@ export default function workerExtension(api: {
         typeof message.body !== 'string' || !message.body.trim()) return;
     active = { id: message.id, started: false };
     try {
-      api.sendUserMessage(message.body, { deliverAs: 'followUp' });
+      // followUp only queues: a fresh ready worker has no initial turn to drain it.
+      api.sendUserMessage(message.body);
     } catch {
       active = undefined;
     }
