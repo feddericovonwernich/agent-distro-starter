@@ -681,8 +681,17 @@ def _lifecycle(home, action):
             if not (locations['compose'] / 'compose.yaml').exists():
                 _save_state(home, desired, 'disabled' if action == 'disable' else 'stopped', _allocation(home))
                 return read_status(home)
+            if 'project' in config:
+                lock, project_id = config['lock'], config['project_id']
+            else:
+                # A first enable can leave a complete render before publishing config.
+                lock = _read_json(locations['compose'] / 'release-lock.json')
+                _validate_lock(lock)
+                project_id = _read_secrets(home).get('project_id')
+                if not isinstance(project_id, str) or not project_id:
+                    raise store.Refusal('observability recovery project is unavailable')
             rendered = dict(_allocation(home), compose=locations['compose'] / 'compose.yaml',
-                            home_id=config['home_id'], lock=config['lock'], project_id=config['project_id'])
+                            home_id=config['home_id'], lock=lock, project_id=project_id)
             if action == 'disable':
                 _save_state(home, 'disabled', 'unknown', rendered)
             _compose(rendered, 'stop'); _save_state(home, desired, 'stopped', rendered)

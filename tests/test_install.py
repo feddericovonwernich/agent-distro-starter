@@ -300,6 +300,57 @@ def test_failed_telemetry_preserves_home_and_recovery_state(tmp_path, failure):
     assert 'Telemetry: disabled' not in result.stdout
 
 
+@pytest.mark.parametrize('operation', ['stop', 'disable'])
+def test_failed_telemetry_can_be_stopped_without_completed_configuration(tmp_path, monkeypatch, operation):
+    from agd_lib import observability
+    fixture = make_fixture(tmp_path)
+    tools = make_tools(tmp_path, fixture)
+    installed = run_install(tmp_path, tools, 'distro\nherdr\ny\n', telemetry='partial')
+    assert installed.returncode == 0, installed.stdout
+    home = tmp_path / 'distro'
+    assert not (home / 'data/observability/config.json').exists()
+    records = [home / path for path in (
+        'state/observability/compose/compose.yaml',
+        'state/observability/compose/release-lock.json',
+        'data/observability/secrets.json')]
+    frozen = [path.read_bytes() for path in records]
+    monkeypatch.setenv('PATH', str(tools))
+    recovered = getattr(observability, operation)(home)
+    assert recovered['runtime'] == 'stopped'
+    assert recovered['desired'] == 'disabled'
+    assert [path.read_bytes() for path in records] == frozen
+    assert observability.read_config(home)['project_id'] == json.loads(frozen[2])['project_id']
+
+
+@pytest.mark.parametrize('damage', ['missing-lock', 'changed-lock', 'foreign-secrets', 'missing-project'])
+def test_incomplete_telemetry_recovery_refuses_invalid_records(tmp_path, monkeypatch, damage):
+    from agd_lib import observability, store
+    fixture = make_fixture(tmp_path)
+    tools = make_tools(tmp_path, fixture)
+    installed = run_install(tmp_path, tools, 'distro\nherdr\ny\n', telemetry='partial')
+    assert installed.returncode == 0, installed.stdout
+    home = tmp_path / 'distro'
+    lock = home / 'state/observability/compose/release-lock.json'
+    secrets = home / 'data/observability/secrets.json'
+    if damage == 'missing-lock':
+        lock.unlink()
+    elif damage == 'changed-lock':
+        lock.write_text('{"schema":1,"images":{}}')
+    else:
+        value = json.loads(secrets.read_text())
+        if damage == 'foreign-secrets':
+            value['home_id'] = str(uuid.uuid4())
+        else:
+            del value['project_id']
+        secrets.write_text(json.dumps(value))
+    frozen = secrets.read_bytes()
+    monkeypatch.setenv('PATH', str(tools))
+    with pytest.raises(store.Refusal, match='observability'):
+        observability.disable(home)
+    assert secrets.read_bytes() == frozen
+    assert not (home / 'data/observability/config.json').exists()
+
+
 def test_interrupted_telemetry_preserves_resource_owner(tmp_path):
     fixture = make_fixture(tmp_path)
     tools = make_tools(tmp_path, fixture)

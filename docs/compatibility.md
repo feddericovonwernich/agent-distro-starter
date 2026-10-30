@@ -30,6 +30,8 @@ The fourth stage is covered by real PTY installation runs for decline/blank/EOF,
 
 A separate disposable run used actual Docker Engine 28.5.0 and Compose 2.40.0, with only mandatory bootstrap/network fixture-controlled. The existing `compose up` lifecycle timed out after 120 seconds. The terminal showed an incomplete warning, degraded/unknown-delivery status, recovery commands, and entered the preserved distro shell, where a queued marker command ran. No healthy-stack, first live-agent export, or Langfuse trace-readback claim is made from that run. All exact-owned disposable containers/volumes were removed, including late-created resources after the timeout; no matching resources or home remained after a delayed check. The live jarvis-13 installation was not changed.
 
+Final review exposed an incomplete-first-enable `stop|disable` metadata lookup failure. Six regressions demonstrated the failure before the fix and now exercise recovery plus missing/changed lock, foreign secrets, and missing project refusals. A separate disposable real-CLI/real-Docker smoke created only the retained first-enable render, then ran `observability disable` without a completed config: it reported disabled/stopped and preserved Compose/secret bytes. No services were started in that recovery smoke, so it is not proof of stopping a live stack.
+
 ### Other runtime observations
 
 | Scenario | Observed outcome |
