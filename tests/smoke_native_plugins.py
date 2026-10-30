@@ -385,10 +385,6 @@ def main():
             'HOME', 'PI_CONFIG_DIR', 'PI_CODING_AGENT_DIR', 'OMP_PROFILE',
             'PI_PROFILE', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME')}
         child_env.update(PATH=os.environ['PATH'], TERM=os.environ.get('TERM', 'xterm'))
-        worker_plugins = run([omp, 'plugin', 'list', '--json'],
-                             cwd=worktree, env=child_env)
-        if any(plugin_id in worker_plugins for plugin_id in plugins):
-            raise RuntimeError('worker project inherited orchestrator plugins')
         reviewer_runtime = reviewer_runner._runtime_boundary(home, str(uuid.uuid4()))
         reviewer_plugins = run([omp, 'plugin', 'list', '--json'],
                                cwd=reviewer_runtime, env=child_env)
@@ -477,7 +473,6 @@ def main():
             'plugins': {key: value['version'] for key, value in plugins.items()},
             'plugin_lifecycles': lifecycle,
             'skills': sorted(copied),
-            'worker_plugins_isolated': True,
             'reviewer_plugins_isolated': True,
             'worker_spawned_and_stopped': True,
             'snapshot_restored_after_source_removal': True,

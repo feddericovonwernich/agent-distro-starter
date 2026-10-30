@@ -10,6 +10,13 @@ def worker_skill_roots(harness):
     raise ValueError('unsupported harness')
 
 
+def worker_skill_args(task):
+    skills = (task.get('worker_skills') or {}).get('skills', ())
+    if not skills:
+        return ['--no-skills']
+    return ['--skills', ','.join(sorted(record['id'] for record in skills))]
+
+
 def launch_argv(task, brief_path, unattended=False, session_dir=None):
     code_root = Path(__file__).resolve().parents[2]
     if task.get('pr_grant'):
@@ -55,7 +62,8 @@ def launch_argv(task, brief_path, unattended=False, session_dir=None):
         binary = shutil.which('omp')
         if not binary:
             raise store.DependencyError('omp is not installed')
-        args = [binary, '--cwd', task['worktree']]
+        args = [binary, '--no-extensions', *worker_skill_args(task),
+                '--cwd', task['worktree']]
         if session_dir is not None:
             args.extend(['--session-dir', str(session_dir)])
         args.extend(['-e', str(code_root/'lib'/'omp-worker.ts'), prompt])

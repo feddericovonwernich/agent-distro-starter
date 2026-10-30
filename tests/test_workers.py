@@ -449,6 +449,8 @@ def test_granted_launch_uses_frozen_private_scoped_skill_and_prompt():
         scoped['incarnation'] = 'worker-incarnation'
         argv = __import__('agd_lib.harnesses', fromlist=['launch_argv']).launch_argv(
             scoped, tasks.task_file(home, 'granted').parent/'brief.md')
+        assert '--no-extensions' in argv
+        assert argv[argv.index('--skills') + 1] == 'agd-scoped-pr-relay'
         text = argv[-1]
         assert grant['id'] in text and '--incarnation $AGD_INCARNATION' in text
         assert f'worker verify-pr granted' in text and str(home) in text
