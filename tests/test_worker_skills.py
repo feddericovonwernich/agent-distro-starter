@@ -666,13 +666,6 @@ def test_retry_after_post_exclude_write_failure_releases_only_owned_line():
         assert exclude.read_text() == '/.omp/skills/agd-user/\nuser\n'
 
 
-def test_prompt_names_assigned_skill_paths():
-    from agd_lib import harnesses
-    task = {'id': 'prompt', 'worktree': '/tmp', 'harness': 'omp',
-            'worker_skills': {'skills': [{'id': 'agd-probe', 'destination': '/tmp/.omp/skills/agd-probe'}]}}
-    argv = harnesses.launch_argv(task, Path('/tmp/a/b/c/brief.md'))
-    assert 'Assigned worker skills: agd-probe.' in argv[-1]
-    assert '/tmp/.omp/skills/agd-probe/SKILL.md' in argv[-1]
 
 
 def test_create_materializes_curated_skills_before_prepared():
@@ -705,8 +698,7 @@ def test_create_materializes_native_names_without_aliases():
         task = command(home, 'task', 'create', 'native', '--project', 'sample',
                        '--brief', str(brief), '--kind', 'scout')
         root = Path(task['worktree'])/'.omp/skills'
-        assert sorted(path.name for path in root.iterdir()) == DEFAULT_WORKER_SKILLS
-        assert not any(path.name.startswith('agd-') for path in root.iterdir())
+        assert {path.name for path in root.iterdir()} == set(DEFAULT_WORKER_SKILLS) | {'agd-worker'}
 
 
 def test_create_default_profile_and_cursor_nonempty_refusal():
@@ -1043,6 +1035,158 @@ def test_init_seeds_checkout_home_with_tracked_files():
 
 
 
+def test_none_task_freezes_protocol_without_plugin_registrations():
+    import shutil
+    from unittest.mock import patch
+    from agd_lib import worker_skills
+    from support import lab, command
+
+    with lab() as (home, _):
+        shutil.rmtree(home/'.omp/plugins')
+        brief = home/'brief.md'
+        brief.write_text('Inspect the unchanged workspace.')
+        task = command(home, 'task', 'create', 'protocol', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout', '--skill-mode', 'none')
+        assert task['worker_skill_selection']['skills'] == []
+        assert task['worker_skill_selection']['system_skills'] == ['agd-worker']
+        assert {row['id'] for row in task['worker_skills']['skills']} == {'agd-worker'}
+        record = task['worker_skills']['skills'][0]
+        frozen = (Path(record['snapshot'])/'SKILL.md').read_bytes()
+        shutil.rmtree(record['destination'])
+        with patch.object(worker_skills, 'system_source', side_effect=AssertionError('live source consulted')):
+            worker_skills.ensure(home, task)
+        assert (Path(record['destination'])/'SKILL.md').read_bytes() == frozen
+        worker_skills.verify(home, task)
+        report = home/'report.md'; report.write_text('Workspace unchanged.')
+        command(home, 'task', 'ready', 'protocol', '--report', str(report))
+        command(home, 'task', 'cleanup', 'protocol')
+        assert not Path(record['destination']).exists()
+
+
+def test_protocol_and_optional_selection_remain_distinct():
+    from support import lab, command
+
+    with lab() as (home, _):
+        brief = home/'brief.md'; brief.write_text('Investigate.')
+        task = command(home, 'task', 'create', 'selected-protocol', '--project', 'sample',
+                       '--brief', str(brief), '--skill-mode', 'curated',
+                       '--skill', 'systematic-debugging')
+        assert task['worker_skill_selection']['skills'] == ['systematic-debugging']
+        assert task['worker_skill_selection']['system_skills'] == ['agd-worker']
+        assert {row['id'] for row in task['worker_skills']['skills']} == {
+            'agd-worker', 'systematic-debugging'}
+
+
+@pytest.mark.parametrize('name', ['agd-worker', 'agd-scoped-pr-relay'])
+def test_system_skill_names_cannot_be_selected_from_custom_catalog(name):
+    from agd_lib import tasks, store
+    from support import lab
+
+    with lab() as (home, _):
+        add_skill(home, name)
+        brief = home/'brief.md'; brief.write_text('Inspect.')
+        with pytest.raises(store.Refusal, match='reserved'):
+            tasks.create(home, 'reserved', 'sample', brief, skill_mode='curated', skills=(name,))
+        assert not tasks.task_file(home, 'reserved').exists()
+
+
+def test_protocol_native_collision_refuses_prepared_state(monkeypatch):
+    from agd_lib import tasks, store
+    from support import lab
+
+    with lab() as (home, _):
+        monkeypatch.setenv('TREEHOUSE_ROOT', str(home.parent/'pool'))
+        ancestor = home.parent/'.omp/skills/agd-worker'
+        ancestor.mkdir(parents=True)
+        (ancestor/'SKILL.md').write_text('---\nname: agd-worker\ndescription: Foreign.\n---\n')
+        brief = home/'brief.md'; brief.write_text('Inspect.')
+        with pytest.raises(store.Refusal, match='collid'):
+            tasks.create(home, 'collision-protocol', 'sample', brief, skill_mode='none')
+        assert tasks.read(home, 'collision-protocol')['phase'] == 'preparing'
+
+
+def test_scoped_append_preserves_base_and_recovers_only_same_grant():
+    from unittest.mock import patch
+    from agd_lib import tasks, worker_skills, store
+    from support import lab, command
+
+    with lab() as (home, _):
+        brief = home/'brief.md'; brief.write_text('Change value.txt.')
+        task = command(home, 'task', 'create', 'append-protocol', '--project', 'sample',
+                       '--brief', str(brief), '--skill-mode', 'none')
+        instruction = home/'grant.md'
+        instruction.write_text('Task append-protocol may publish origin:agd/append-protocol.')
+        grant = tasks.grant_pr_publish(home, task['id'], 'origin:agd/append-protocol', instruction)
+        base = task['worker_skills']['skills'][0]
+        original = (Path(base['snapshot'])/'SKILL.md').read_bytes()
+        copy_tree = worker_skills._copy_tree
+        def interrupt_after_snapshot(source, destination):
+            copy_tree(source, destination)
+            if Path(destination).name == 'agd-scoped-pr-relay':
+                raise OSError('interrupted after frozen copy')
+        with store.lock(home), patch.object(worker_skills, '_copy_tree', side_effect=interrupt_after_snapshot), \
+             pytest.raises(OSError, match='interrupted'):
+            worker_skills.add_scoped_pr(home, task, grant['id'])
+        with store.lock(home):
+            manifest = worker_skills.add_scoped_pr(home, task, grant['id'])
+        assert {row['id'] for row in manifest['skills']} == {'agd-worker', 'agd-scoped-pr-relay'}
+        assert next(row for row in manifest['skills'] if row['id'] == 'agd-worker') == base
+        assert (Path(base['snapshot'])/'SKILL.md').read_bytes() == original
+        with store.lock(home), pytest.raises(store.Refusal):
+            worker_skills.add_scoped_pr(home, task, 'foreign-grant')
+        (Path(base['destination'])/'SKILL.md').write_text('tampered')
+        with pytest.raises(store.Refusal, match='changed'):
+            worker_skills.verify(home, task)
+
+
+@pytest.mark.parametrize('partial', [False, True])
+def test_scoped_append_never_resnapshots_missing_or_partial_bytes(partial):
+    from unittest.mock import patch
+    from agd_lib import tasks, worker_skills, store
+    from support import lab, command
+    with lab() as (home, _):
+        brief = home/'brief.md'; brief.write_text('Change value.txt.')
+        task = command(home, 'task', 'create', 'interrupted', '--project', 'sample',
+                       '--brief', str(brief), '--skill-mode', 'none')
+        instruction = home/'grant.md'
+        instruction.write_text('Task interrupted may publish origin:agd/interrupted.')
+        grant = tasks.grant_pr_publish(home, task['id'], 'origin:agd/interrupted', instruction)
+        def interrupt_copy(_source, destination):
+            if partial:
+                destination.mkdir()
+                (destination/'SKILL.md').write_text('partial')
+            raise OSError('interrupted snapshot')
+        with store.lock(home), patch.object(worker_skills, '_copy_tree', side_effect=interrupt_copy), \
+             pytest.raises(OSError):
+            worker_skills.add_scoped_pr(home, task, grant['id'])
+        with store.lock(home), pytest.raises(store.Refusal):
+            worker_skills.add_scoped_pr(home, task, grant['id'])
+        assert tasks.read(home, task['id'])['phase'] == 'prepared'
+        assert not (Path(task['worktree'])/'.omp/skills/agd-scoped-pr-relay').exists()
+
+
+def test_grant_launch_rejects_optional_skills_and_foreign_grant_before_endpoint():
+    from agd_lib import tasks, workers, store
+    from support import lab, command
+    with lab() as (home, _):
+        brief = home/'brief.md'; brief.write_text('Change value.txt.')
+        selected = command(home, 'task', 'create', 'selected', '--project', 'sample',
+                           '--brief', str(brief), '--skill-mode', 'curated',
+                           '--skill', 'systematic-debugging')
+        empty = command(home, 'task', 'create', 'empty', '--project', 'sample',
+                        '--brief', str(brief), '--skill-mode', 'none')
+        instruction = home/'grant.md'
+        instruction.write_text('Task selected may publish origin:agd/selected.')
+        grant = tasks.grant_pr_publish(home, 'selected', 'origin:agd/selected', instruction)
+        for task, reason in ((selected, 'ordinary worker skills'), (empty, 'grant missing')):
+            with pytest.raises(store.Refusal, match=reason):
+                workers.launch(home, task['id'], pr_grant=grant['id'])
+            current = tasks.read(home, task['id'])
+            assert current['phase'] == 'prepared' and 'endpoint' not in current
+            assert current['lease_id'] == task['lease_id']
+            assert not (Path(task['worktree'])/'.omp/skills/agd-scoped-pr-relay').exists()
+
+
 if __name__ == '__main__':
     test_verified_omp_skill_root_is_project_local()
     test_unverified_cursor_has_no_skill_provisioning_root()
@@ -1067,7 +1211,6 @@ if __name__ == '__main__':
     test_ensure_refuses_post_prepare_native_parent_symlink()
     test_ensure_refuses_removed_skill_set()
     test_retry_after_post_exclude_write_failure_releases_only_owned_line()
-    test_prompt_names_assigned_skill_paths()
     test_create_materializes_curated_skills_before_prepared()
     test_create_materializes_native_names_without_aliases()
     test_create_default_profile_and_cursor_nonempty_refusal()

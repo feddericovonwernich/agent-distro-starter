@@ -42,7 +42,8 @@ def create(home, task_id, project_id, brief, base=None, kind='ship', *,
     from . import harnesses, worker_skills
     selection = worker_skills.resolve(
         home, profile=profile, skill_mode=skill_mode, skills=skills)
-    if selection['skills']:
+    selection = worker_skills.with_protocol(selection, harness)
+    if selection['skills'] or selection.get('system_skills'):
         harnesses.worker_skill_roots(harness)
     base = base or project['base']
     clone = Path(project['path'])
@@ -92,7 +93,7 @@ def _complete_preparation(home, task):
     from . import worker_skills
     manifest = None
     selection = task['worker_skill_selection']
-    if selection['skills']:
+    if selection['skills'] or selection.get('system_skills'):
         manifest = worker_skills.prepare(home, task, selection)
     with store.lock(home):
         current = read(home, task['id'])

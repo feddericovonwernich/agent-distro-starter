@@ -202,6 +202,8 @@ def catalog(home: Path) -> list[dict]:
 
     def add(path, origin):
         skill_id = _id(path.name, 'catalog entry')
+        if skill_id in ('agd-worker', 'agd-scoped-pr-relay'):
+            _refusal(f'reserved system skill name: {skill_id}')
         row = {'id': skill_id, 'description': _bundle(path, skill_id),
                'source': str(path.resolve()), 'origin': origin}
         if skill_id in result:
@@ -406,25 +408,68 @@ def seed_defaults(home: Path) -> bool:
     })
 
 
-def scoped_pr_source():
-    source = Path(__file__).resolve().parents[2]/'bundled'/'worker-skills'/'agd-scoped-pr-relay'
-    if source.is_symlink() or not source.is_dir():
-        _refusal('bundled scoped PR worker skill is unavailable')
+def system_source(skill_id):
+    if skill_id not in ('agd-worker', 'agd-scoped-pr-relay'):
+        _refusal('unknown system skill')
+    source = Path(__file__).resolve().parents[2]/'bundled'/'worker-skills'/skill_id
+    _bundle(source, skill_id)
     return source
 
 
-def scoped_pr_selection():
-    source = scoped_pr_source().resolve()
-    return {
-        'schema': 2, 'mode': 'grant', 'profile': None,
-        'skills': ['agd-scoped-pr-relay'],
-        'sources': {
-            'agd-scoped-pr-relay': {
-                'source': str(source), 'origin': {'kind': 'agd'},
-                'files': _files(source),
-            },
-        },
-    }
+def with_protocol(selection: dict, harness: str) -> dict:
+    if harness != 'omp':
+        return selection
+    if set(selection['skills']) & {'agd-worker', 'agd-scoped-pr-relay'}:
+        _refusal('reserved system skill name')
+    source = system_source('agd-worker')
+    return dict(selection, system_skills=['agd-worker'], sources={
+        **selection['sources'],
+        'agd-worker': {'source': str(source), 'origin': {'kind': 'agd'},
+                       'files': _files(source)},
+    })
+
+
+def require_protocol(home, task, grant_id=None):
+    if task['harness'] != 'omp':
+        return
+    selection = task.get('worker_skill_selection') or {}
+    if 'agd-worker' not in selection.get('system_skills', ()):
+        _refusal('task predates the mandatory worker protocol; create a new task')
+    manifest = _manifest(home, task)
+    expected = {'agd-worker'}
+    if manifest.get('grant_id'):
+        if manifest['grant_id'] != grant_id:
+            _refusal('system skill manifest belongs to another PR grant')
+        expected.add('agd-scoped-pr-relay')
+    if set(manifest['selection'].get('system_skills', ())) != expected:
+        _refusal('invalid system skill manifest')
+    effective = manifest['selection']
+    if (effective['skills'] != selection.get('skills')
+            or any(effective['sources'].get(skill_id) != descriptor
+                   for skill_id, descriptor in selection.get('sources', {}).items())):
+        _refusal('worker skill manifest differs from frozen task selection')
+    for skill_id in expected:
+        descriptor = effective['sources'][skill_id]
+        source = Path(__file__).resolve().parents[2]/'bundled'/'worker-skills'/skill_id
+        if descriptor['origin'] != {'kind': 'agd'} or descriptor['source'] != str(source):
+            _refusal('invalid system skill source')
+
+
+def _selection_ids(selection):
+    if selection.get('schema') not in (1, 2) or not isinstance(selection.get('skills'), list):
+        _refusal('invalid worker skill selection')
+    system = selection.get('system_skills', [])
+    if not isinstance(system, list) or any(
+            value not in ('agd-worker', 'agd-scoped-pr-relay') for value in system):
+        _refusal('invalid system skill selection')
+    selected = [_id(value, 'selected skill') for value in selection['skills'] + system]
+    if len(selected) != len(set(selected)):
+        _refusal('duplicate selected skill')
+    if selection['schema'] == 2 and (
+            not isinstance(selection.get('sources'), dict)
+            or set(selection['sources']) != set(selected)):
+        _refusal('invalid worker skill source descriptors')
+    return selected
 
 
 def _manifest(home, task):
@@ -441,6 +486,10 @@ def _manifest(home, task):
     selection = data.get('selection')
     if not isinstance(selection, dict) or selection.get('schema') != data['schema']:
         _refusal('invalid worker skill journal selection')
+    selected = _selection_ids(selection)
+    record_ids = [record.get('id') for record in data['skills'] if isinstance(record, dict)]
+    if len(record_ids) != len(selected) or set(record_ids) != set(selected):
+        _refusal('worker skill journal does not match selection')
     snapshot_root = _snapshot(home, task)
     root = Path(task['worktree'])/data['roots'][0]
     for parent in (root.parent, root):
@@ -521,14 +570,20 @@ def _exclude_info(task):
     return info
 
 
+def _check_collision(task, root, skill_id):
+    ancestor = Path(task['worktree']).resolve()
+    while True:
+        native = ancestor/root
+        if skill_id in _native_names(native):
+            _refusal(f'worker skill collides with native project discovery: {native}')
+        if ancestor.parent == ancestor:
+            return
+        ancestor = ancestor.parent
+
+
 def prepare(home: Path, task: dict, selection: dict, sources=None) -> dict:
     schema = selection.get('schema')
-    if schema not in (1, 2) or not isinstance(selection.get('skills'), list):
-        _refusal('invalid worker skill selection')
-    if schema == 2 and (
-            not isinstance(selection.get('sources'), dict)
-            or set(selection['sources']) != set(selection['skills'])):
-        _refusal('invalid worker skill source descriptors')
+    selected = _selection_ids(selection)
     _exclude_info(task)
     journal = _journal(home, task)
     if journal.exists():
@@ -550,26 +605,18 @@ def prepare(home: Path, task: dict, selection: dict, sources=None) -> dict:
     sources = sources or {}
     rows = {row['id']: row for row in catalog(home)}
     available = set(rows) | set(sources)
-    for skill_id in selection['skills']:
-        if (skill_id not in available
-                and not (schema == 2 and skill_id == 'agd-scoped-pr-relay')):
+    for skill_id in selected:
+        if skill_id not in available and skill_id not in selection.get('system_skills', ()):
             _refusal(f'missing catalog skill {skill_id}')
-        ancestor = Path(task['worktree']).resolve()
-        while True:
-            native = ancestor/roots[0]
-            if skill_id in _native_names(native):
-                _refusal(f'worker skill collides with native project discovery: {native}')
-            if ancestor.parent == ancestor:
-                break
-            ancestor = ancestor.parent
+        _check_collision(task, roots[0], skill_id)
         if schema == 2:
             descriptor = selection['sources'][skill_id]
             row = rows.get(skill_id)
             agd_source = (
                 isinstance(descriptor, dict)
-                and skill_id == 'agd-scoped-pr-relay'
+                and skill_id in selection.get('system_skills', ())
                 and descriptor.get('origin') == {'kind': 'agd'}
-                and descriptor.get('source') == str(scoped_pr_source().resolve()))
+                and descriptor.get('source') == str(system_source(skill_id)))
             if (not isinstance(descriptor, dict)
                     or set(descriptor) != {'source', 'origin', 'files'}
                     or (row is None and not agd_source)
@@ -608,7 +655,47 @@ def prepare(home: Path, task: dict, selection: dict, sources=None) -> dict:
     return manifest
 
 
+def add_scoped_pr(home: Path, task: dict, grant_id: str) -> dict:
+    """Append one grant-bound adapter under the caller's mutation lock."""
+    from . import tasks
+    if task['worker_skill_selection']['skills']:
+        _refusal('PR grant requires a task created with no ordinary worker skills')
+    tasks._authorize_pr_publish_locked(home, task, grant_id)
+    require_protocol(home, task, grant_id)
+    manifest = _manifest(home, task)
+    if manifest.get('grant_id'):
+        ensure(home, task)
+        verify(home, task)
+        return _manifest(home, task)
+    verify(home, task)
+    skill_id = 'agd-scoped-pr-relay'
+    _check_collision(task, manifest['roots'][0], skill_id)
+    source = system_source(skill_id)
+    descriptor = {'source': str(source), 'origin': {'kind': 'agd'}, 'files': _files(source)}
+    snapshot = _snapshot(home, task)/skill_id
+    destination = Path(task['worktree'])/manifest['roots'][0]/skill_id
+    if snapshot.exists() or snapshot.is_symlink():
+        _refusal('scoped PR snapshot already exists outside its journal')
+    record = {'id': skill_id, **descriptor, 'snapshot': str(snapshot),
+              'destination': str(destination)}
+    selection = manifest['selection']
+    manifest['selection'] = dict(selection,
+        system_skills=[*selection['system_skills'], skill_id],
+        sources={**selection['sources'], skill_id: descriptor})
+    manifest['skills'].append(record)
+    manifest['excludes'].append(str(destination.relative_to(task['worktree'])))
+    manifest.update(state='pending', grant_id=grant_id)
+    store.atomic_json(_journal(home, task), manifest)
+    _copy_tree(source, snapshot)
+    _check(record, snapshot)
+    ensure(home, task)
+    verify(home, task)
+    return _manifest(home, task)
+
+
 def _check(record, root):
+    if not root.is_dir() or root.is_symlink():
+        _refusal(f'worker skill artifact is missing or unsafe: {record["id"]}')
     if _files(root) != record['files']:
         _refusal(f'worker skill artifacts changed: {record["id"]}')
 

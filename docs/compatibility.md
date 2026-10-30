@@ -10,6 +10,14 @@ The bounded reviewer passed 126 Python checks plus both native Bun checks agains
 
 `tests/smoke_native_plugins.py` is the retained opt-in installed lifecycle check for `--backend tmux|herdr`. This workstation currently has no tmux executable, and Herdr correctly refused the smoke outside a Herdr-managed pane. Therefore no new full backend worker/central lifecycle claim is made by this cutover run; use a disposable owned tmux server or named Herdr pane and run the script before making that claim.
 
+## Native worker protocol (18.14.0)
+
+`tests/worker-native.test.ts` exercises the official importable OMP 18.14.0 SDK with a scripted provider, the real worker extension, and actual scoped AGD commands in a disposable home. It resolves the exact frozen native skill directories for none, curated, and granted tasks; reads `skill://agd-worker/references/commands.md`; observes core policy and a single fresh task binding through native compaction; and aborts before provider execution after protocol corruption. An unfinished assignment receives one continuation and one blocked diagnostic, while provider error and user abort do not trigger correction.
+
+The same native session completes two FIFO requests under a live central-owner fixture. A fresh ready incarnation then consumes a queued request without any initial prompt or assignment replay. This exposed and fixed a native API distinction: `deliverAs: followUp` only queues a message; an idle fresh session needs the normal prompt path to start a turn.
+
+These are real SDK/CLI lifecycle checks, not a paid-model obedience test or backend process-recovery acceptance. The maintained `tests/smoke_native_plugins.py` now also checks mandatory-none provisioning, real retained replies, and ready-worker relaunch. New tmux/Herdr acceptance remains unavailable on this host: tmux is absent and this shell is not an owned Herdr-managed pane. Existing backend observations below predate this protocol change.
+
 ## Guided installation and start
 
 The guided installer supports Linux x86-64 only. It may use APT only for missing Git, Python 3.12+, and selected tmux after explicit sudo consent; no other package manager or elevation path is supported. OMP and Herdr use a consented latest stable release with an exact Linux x86-64 asset and published digest, so this document does not pin either tool version. Treehouse is fixed at v3.1.6 with archive SHA-256 `e89891caf913b3b228387c7dccf53ff908327fca47839b7957681084578cb1a1`.

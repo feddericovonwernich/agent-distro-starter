@@ -88,7 +88,7 @@ def parser():
     skills.add_parser('list')
     profiles = worker.add_parser('profiles').add_subparsers(dest='profile_operation', required=True)
     profiles.add_parser('list')
-    for action in ('launch', 'run', 'event', 'inspect', 'send', 'inbox', 'complete', 'interrupt', 'stop', 'relaunch',
+    for action in ('launch', 'run', 'event', 'context', 'inspect', 'send', 'inbox', 'complete', 'interrupt', 'stop', 'relaunch',
                    'publish-pr', 'verify-pr', 'relay-poll', 'relay-reply'):
         op = worker.add_parser(action)
         op.add_argument('id')
@@ -97,7 +97,7 @@ def parser():
             op.add_argument('--unattended', action='store_true')
             op.add_argument('--approval')
             op.add_argument('--pr-grant')
-        if action in ('run', 'event'):
+        if action in ('run', 'event', 'context'):
             op.add_argument('--incarnation', required=True)
         if action == 'event':
             op.add_argument('--kind', required=True)
@@ -182,13 +182,13 @@ def main(args):
     mutation = (args.command in ('init', 'installer') or
                 args.command == 'project' and args.operation not in ('list', 'inspect') or
                 args.command == 'task' and args.operation not in ('list', 'status') or
-                args.command == 'worker' and args.operation not in ('inspect', 'inbox', 'skills', 'profiles') or
+                args.command == 'worker' and args.operation not in ('inspect', 'context', 'inbox', 'skills', 'profiles') or
                 args.command == 'decision' or
                 args.command == 'session' and args.operation == 'reconcile' or
                 args.command == 'events' and args.operation == 'acknowledge' or
                 args.command == 'observability' and args.operation != 'status')
     if mutation:
-        worker_scoped = (args.command == 'worker' and args.operation in ('run', 'event', 'acknowledge', 'publish-pr', 'verify-pr',
+        worker_scoped = (args.command == 'worker' and args.operation in ('run', 'event', 'complete', 'publish-pr', 'verify-pr',
                                                                            'relay-poll', 'relay-reply') or
                          args.command == 'task' and args.operation == 'ready')
         store.require_owner(home, worker_scoped)
@@ -326,6 +326,8 @@ def main(args):
             return worker_skills.catalog(home)
         if args.operation == 'profiles':
             return worker_skills.profiles(home)
+        if args.operation == 'context':
+            return workers.context(home, args.id, args.incarnation)
         if args.operation == 'launch':
             return workers.launch(home, args.id, args.backend, args.unattended,
                                   args.approval, args.pr_grant)

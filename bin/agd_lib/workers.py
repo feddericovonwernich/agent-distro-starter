@@ -49,13 +49,74 @@ def _observation(home, task_id, incarnation, kind, key, text,
 
 
 def event(home, task_id, incarnation, kind, key, message):
-    task = tasks.read(home, task_id)
-    if incarnation != task.get('incarnation') and not (incarnation == 'central' and task['executor'] == 'central'):
-        raise store.Refusal('worker incarnation no longer owns task')
-    if os.environ.get('AGD_TASK_ID') and (os.environ['AGD_TASK_ID'] != task_id or os.environ.get('AGD_INCARNATION') != incarnation):
-        raise store.Refusal('event belongs to a different task process')
-    return _observation(
-        home, task_id, incarnation, kind, key, Path(message).read_text())
+    with store.lock(home):
+        task = tasks.read(home, task_id)
+        if incarnation != task.get('incarnation') and not (incarnation == 'central' and task['executor'] == 'central'):
+            raise store.Refusal('worker incarnation no longer owns task')
+        if os.environ.get('AGD_TASK_ID') and (os.environ['AGD_TASK_ID'] != task_id or os.environ.get('AGD_INCARNATION') != incarnation):
+            raise store.Refusal('event belongs to a different task process')
+        return _observation(
+            home, task_id, incarnation, kind, key, Path(message).read_text())
+
+
+def context(home: Path, task_id: str, incarnation: str) -> dict:
+    with store.lock(home):
+        task = tasks.read(home, task_id)
+        if (task.get('executor') != 'worker' or task.get('harness') != 'omp'
+                or task.get('incarnation') != incarnation
+                or os.environ.get('AGD_TASK_ID') != task_id
+                or os.environ.get('AGD_INCARNATION') != incarnation):
+            raise store.Refusal('worker context requires its current OMP task environment')
+        worker_skills.require_protocol(home, task, task.get('pr_grant'))
+        manifest = worker_skills._manifest(home, task)
+        if manifest['state'] != 'complete':
+            raise store.Refusal('worker protocol snapshot is not complete')
+        protocol = next(row for row in manifest['skills'] if row['id'] == 'agd-worker')
+        for location in ('snapshot', 'destination'):
+            worker_skills._check(protocol, Path(protocol[location]))
+        core = next(row for row in protocol['files'] if row['path'] == 'SKILL.md')
+        folder = tasks.task_file(home, task_id).parent
+        latest = {}
+        for path in (folder/'observations').glob('*.json'):
+            observation = json.loads(path.read_text())
+            if (observation['incarnation'] != incarnation
+                    or observation['key'] == 'agd-contract-incomplete'
+                    or observation['kind'] not in ('blocked', 'decision', 'resolved')):
+                continue
+            key = observation['key']
+            previous = latest.get(key)
+            if previous is None or (observation['observed_at'], observation['id']) > (
+                    previous['observed_at'], previous['id']):
+                latest[key] = observation
+        active = set()
+        for key, observation in latest.items():
+            kind = observation['kind']
+            if kind == 'decision':
+                receipt = folder/'decisions'/f'{key}.json'
+                decision = json.loads(receipt.read_text()) if receipt.is_file() else {}
+                if (decision.get('incarnation') == incarnation
+                        and decision.get('status') == 'resolved'
+                        and decision.get('resolved_at', 0) >= observation['observed_at']):
+                    continue
+            active.add(kind)
+        if task['phase'] in ('landed', 'cleaned'):
+            outcome = 'closed'
+        elif task['phase'] == 'ready':
+            outcome = 'ready'
+        else:
+            outcome = 'decision' if 'decision' in active else 'blocked' if 'blocked' in active else 'unfinished'
+        return {
+            'schema': 1, 'task_id': task_id, 'incarnation': incarnation,
+            'phase': task['phase'], 'kind': task['kind'], 'worktree': task['worktree'],
+            'brief': str(folder/'brief.md'), 'report': str(folder/'report-draft.md'),
+            'agd_argv': [str(Path(__file__).resolve().parents[1]/'agd'), '--home', str(home)],
+            'pr_grant': task.get('pr_grant'),
+            'task_skills': manifest['selection']['skills'],
+            'system_skills': manifest['selection']['system_skills'],
+            'protocol': {'path': str(Path(protocol['destination'])/'SKILL.md'),
+                         'sha256': core['sha256']},
+            'outcome': outcome,
+        }
 
 
 def launch(home, task_id, selected_backend=None, unattended=False, approval_id=None,
@@ -71,6 +132,7 @@ def launch(home, task_id, selected_backend=None, unattended=False, approval_id=N
     if (not isinstance(selection, dict) or selection.get('schema') != 2
             or not isinstance(selection.get('skills'), list)):
         raise store.Refusal('task worker skill selection is invalid')
+    worker_skills.require_protocol(home, task, pr_grant)
     projects_data = projects.read(home, task['project'])
     if harness == 'cursor' and not projects_data['trusted']:
         raise store.Refusal('Cursor project trust requires an explicit user grant')
@@ -84,7 +146,7 @@ def launch(home, task_id, selected_backend=None, unattended=False, approval_id=N
     if selected_backend not in ('tmux', 'herdr') or harness not in ('omp', 'cursor'):
         raise ValueError('unsupported backend or harness')
     if pr_grant:
-        if selection['skills'] or task.get('worker_skills'):
+        if selection['skills']:
             raise store.Refusal('PR grant requires a task created with no ordinary worker skills')
         grant = tasks.authorize_pr_publish(home, task, pr_grant)
         from . import pr, relay
@@ -108,10 +170,9 @@ def launch(home, task_id, selected_backend=None, unattended=False, approval_id=N
         if current['phase'] != 'prepared' or current['executor'] != 'central':
             raise store.Refusal('task launch raced another owner; no endpoint created')
         if pr_grant:
-            tasks._authorize_pr_publish_locked(home, current, pr_grant)
-            manifest = worker_skills.prepare(
-                home, current, worker_skills.scoped_pr_selection())
+            manifest = worker_skills.add_scoped_pr(home, current, pr_grant)
             current['worker_skills'] = manifest
+            current['worker_skill_selection'] = manifest['selection']
             current['pr_grant'] = pr_grant
         if selected_backend == 'herdr':
             module.prepare(home)
@@ -157,6 +218,12 @@ def run_worker(home, task_id, incarnation):
         session_dir = None
         warning = None
     child_env.pop('AGD_OWNER', None)
+    child_env.pop('AGD_PR_GRANT', None)
+    if task['harness'] == 'omp':
+        child_env['AGD_CLI'] = str(Path(__file__).resolve().parents[1]/'agd')
+        if task.get('pr_grant'):
+            child_env['AGD_PR_GRANT'] = task['pr_grant']
+    child_env.pop('AGD_WORKER_RESUME_READY', None)
     if task['harness'] == 'omp' and task['phase'] == 'ready':
         child_env['AGD_WORKER_RESUME_READY'] = '1'
     import subprocess
@@ -467,6 +534,7 @@ def stop(home, task_id):
 
 def relaunch(home, task_id):
     task = tasks.read(home, task_id)
+    worker_skills.require_protocol(home, task, task.get('pr_grant'))
     if task.get('executor') != 'worker' or task['phase'] not in ('running', 'ready'):
         raise store.Refusal('only running or ready worker tasks can relaunch')
     if task['phase'] == 'ready' and task.get('harness') != 'omp':

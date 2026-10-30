@@ -696,6 +696,8 @@ def test_granted_launch_uses_frozen_private_scoped_skill_and_prompt():
         task = command(
             home, 'task', 'create', 'granted', '--project', 'sample',
             '--brief', str(brief), '--kind', 'ship', '--skill-mode', 'none')
+        base_record = task['worker_skills']['skills'][0]
+        base_core = (Path(base_record['snapshot'])/'SKILL.md').read_bytes()
         instruction = home/'grant.md'
         instruction.write_text('Task granted may publish origin:agd/granted for task granted.\n')
         grant = tasks.grant_pr_publish(home, 'granted', 'origin:agd/granted', instruction)
@@ -709,24 +711,18 @@ def test_granted_launch_uses_frozen_private_scoped_skill_and_prompt():
              patch.object(workers.shutil, 'which', return_value='/bin/true'):
             launched = workers.launch(home, 'granted', pr_grant=grant['id'])
         manifest = launched['worker_skills']
-        assert manifest['skills'][0]['id'] == 'agd-scoped-pr-relay'
+        records = {record['id']: record for record in manifest['skills']}
+        assert set(records) == {'agd-worker', 'agd-scoped-pr-relay'}
+        assert records['agd-worker'] == base_record
+        assert (Path(base_record['snapshot'])/'SKILL.md').read_bytes() == base_core
         assert not (home/'config'/'worker-skills'/'agd-scoped-pr-relay').exists()
-        assert (Path(manifest['skills'][0]['snapshot'])/'SKILL.md').is_file()
+        assert (Path(records['agd-scoped-pr-relay']['snapshot'])/'SKILL.md').is_file()
         scoped = dict(launched, worker_skills=manifest, pr_grant=grant['id'])
         scoped['incarnation'] = 'worker-incarnation'
         argv = __import__('agd_lib.harnesses', fromlist=['launch_argv']).launch_argv(
             scoped, tasks.task_file(home, 'granted').parent/'brief.md')
         assert '--no-extensions' in argv
-        assert argv[argv.index('--skills') + 1] == 'agd-scoped-pr-relay'
-        text = argv[-1]
-        assert grant['id'] in text and '--incarnation $AGD_INCARNATION' in text
-        assert f'worker verify-pr granted' in text and str(home) in text
-        reply_path = tasks.task_file(home, 'granted').parent/'relay-reply.json'
-        assert reply_path == home/'data'/'tasks'/'granted'/'relay-reply.json'
-        assert '--action start' in text and '--action complete' in text and '--action cancelled' in text
-        assert 'start|complete|cancelled' not in text
-        assert f'--payload {reply_path}' in text
-        assert 'feedback received; repair pending' in text
+        assert set(argv[argv.index('--skills') + 1].split(',')) == set(records)
         current = tasks.read(home, 'granted')
         current['worker_alive'] = False
         tasks.save(home, current)
@@ -778,6 +774,190 @@ def test_concurrent_skill_launch_has_one_winner_without_orphans():
                 results = list(pool.map(lambda _: attempt(), range(2)))
         assert sum(isinstance(row, dict) for row in results) == 1
         assert sum(isinstance(row, Exception) for row in results) == 1
+
+def test_runner_recipes_use_bound_cli_and_grant_in_spaced_home(monkeypatch):
+    import json
+    from agd_lib import observability, store, worker_skills
+    from uuid import uuid4
+    with lab() as (original, project):
+        home = original.parent/'home with spaces'
+        command(home, 'init', '--backend', 'tmux')
+        command(home, 'project', 'add', 'sample', '--source', str(project))
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.')
+        for task_id, granted in (('ordinary', False), ('granted', True)):
+            task = command(home, 'task', 'create', task_id, '--project', 'sample',
+                           '--brief', str(brief), '--skill-mode', 'none')
+            expected_grant = 'unset'
+            if granted:
+                instruction = home/'grant.md'
+                instruction.write_text('Task granted may publish origin:agd/granted.')
+                grant = tasks.grant_pr_publish(home, task_id, 'origin:agd/granted', instruction)
+                expected_grant = grant['id']
+                with store.lock(home):
+                    manifest = worker_skills.add_scoped_pr(home, task, grant['id'])
+                    task.update(pr_grant=grant['id'], worker_skills=manifest,
+                                worker_skill_selection=manifest['selection'])
+            task = _live_worker(home, task)
+            incarnation = str(uuid4())
+            task['incarnation'] = incarnation
+            task['endpoint']['incarnation'] = incarnation
+            with store.lock(home):
+                task['observability'] = observability.worker_binding_locked(home, task_id, incarnation)
+                tasks.save(home, task)
+            monkeypatch.setenv('AGD_TASK_ID', task_id)
+            monkeypatch.setenv('AGD_INCARNATION', incarnation)
+            monkeypatch.setenv('AGD_CLI', '/bin/false')
+            monkeypatch.setenv('AGD_PR_GRANT', 'foreign-grant')
+            monkeypatch.setenv('AGD_OWNER', 'foreign-owner')
+            recipe = (
+                'test -z "${AGD_OWNER+x}" && '
+                f'test "${{AGD_PR_GRANT-unset}}" = "{expected_grant}" && '
+                '"$AGD_CLI" --home "$AGD_HOME" task status "$AGD_TASK_ID" '
+                '> "$AGD_HOME/recipe-status.json"')
+            monkeypatch.setattr(workers.harnesses, 'launch_argv',
+                                lambda *_args, **_kwargs: ['/bin/sh', '-c', recipe])
+            assert workers.run_worker(home, task_id, incarnation) == {'exit': 0}
+            assert json.loads((home/'recipe-status.json').read_text())['id'] == task_id
+            monkeypatch.delenv('AGD_OWNER')
+            monkeypatch.delenv('AGD_TASK_ID')
+            monkeypatch.delenv('AGD_INCARNATION')
+
+
+def test_old_omp_task_remains_readable_and_cleanable_but_cannot_launch():
+    import pytest
+    from agd_lib import store
+    with lab() as (home, _):
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.')
+        task = command(home, 'task', 'create', 'legacy', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout',
+                       '--harness', 'cursor', '--skill-mode', 'none')
+        assert 'worker_skills' not in task
+        assert not (Path(task['worktree'])/'.omp').exists()
+        task['harness'] = 'omp'
+        tasks.save(home, task)
+        with pytest.raises(store.Refusal, match='create a new task'):
+            workers.launch(home, 'legacy')
+        task.update(executor='worker', phase='running', incarnation='old')
+        tasks.save(home, task)
+        with pytest.raises(store.Refusal, match='create a new task'):
+            workers.relaunch(home, 'legacy')
+        task.update(executor='central', phase='prepared')
+        tasks.save(home, task)
+        report = home/'report.md'; report.write_text('Unchanged workspace verified.')
+        command(home, 'task', 'ready', 'legacy', '--report', str(report))
+        assert command(home, 'task', 'cleanup', 'legacy')['phase'] == 'cleaned'
+
+
+def test_worker_context_binds_frozen_protocol_and_rejects_foreign_state(monkeypatch):
+    import hashlib
+    import pytest
+    from agd_lib import store
+    from test_projects import CLI
+    with lab() as (home, _):
+        task = _live_worker(home, _prepared_task(home, 'context'))
+        monkeypatch.setenv('AGD_TASK_ID', task['id'])
+        monkeypatch.setenv('AGD_INCARNATION', task['incarnation'])
+        monkeypatch.setattr(workers, 'backend', lambda _task: pytest.fail('context inspected backend'))
+        context = workers.context(home, task['id'], task['incarnation'])
+        core = Path(task['worktree'])/'.omp/skills/agd-worker/SKILL.md'
+        assert context['protocol'] == {'path': str(core), 'sha256': hashlib.sha256(core.read_bytes()).hexdigest()}
+        assert context['agd_argv'] == [str(CLI), '--home', str(home)]
+        assert context['task_skills'] == task['worker_skill_selection']['skills']
+        assert context['system_skills'] == ['agd-worker']
+        assert context['pr_grant'] is None and context['outcome'] == 'unfinished'
+        assert context['worktree'] == task['worktree'] and context['kind'] == 'scout'
+        assert context['brief'] == str(home/'data/tasks/context/brief.md')
+        assert context['report'] == str(home/'data/tasks/context/report-draft.md')
+        for name, value in (('AGD_TASK_ID', 'foreign'), ('AGD_INCARNATION', 'obsolete')):
+            with monkeypatch.context() as scoped:
+                scoped.setenv(name, value)
+                with pytest.raises(store.Refusal):
+                    workers.context(home, task['id'], task['incarnation'])
+        for field, value in (('executor', 'central'), ('harness', 'cursor'), ('incarnation', 'new')):
+            tasks.save(home, dict(task, **{field: value}))
+            with pytest.raises(store.Refusal):
+                workers.context(home, task['id'], task['incarnation'])
+        tasks.save(home, task)
+        for location in (core, Path(next(row for row in task['worker_skills']['skills']
+                                        if row['id'] == 'agd-worker')['snapshot'])/'SKILL.md'):
+            original = location.read_bytes()
+            location.write_text('corrupt protocol')
+            with pytest.raises(store.Refusal, match='changed'):
+                workers.context(home, task['id'], task['incarnation'])
+            location.write_bytes(original)
+        core.unlink()
+        with pytest.raises(store.Refusal):
+            workers.context(home, task['id'], task['incarnation'])
+
+
+def test_worker_context_folds_current_outcomes_without_watcher_timing(monkeypatch):
+    from agd_lib import supervision
+    with lab() as (home, _):
+        task = _live_worker(home, _prepared_task(home, 'outcome'))
+        monkeypatch.setenv('AGD_TASK_ID', task['id'])
+        monkeypatch.setenv('AGD_INCARNATION', task['incarnation'])
+        monkeypatch.setattr(workers, 'inspect', _present_worker)
+        def outcome():
+            return workers.context(home, task['id'], task['incarnation'])['outcome']
+        def observe(kind, key, incarnation='first'):
+            workers._observation(home, task['id'], incarnation, kind, key, 'Private observation.')
+        observe('blocked', 'old', 'old-worker')
+        observe('blocked', 'agd-contract-incomplete')
+        assert outcome() == 'unfinished'
+        observe('blocked', 'credential')
+        assert outcome() == 'blocked'
+        observe('resolved', 'credential')
+        assert outcome() == 'unfinished'
+        observe('decision', 'choice')
+        assert outcome() == 'decision'
+        supervision.reconcile(home)
+        answer = home/'answer.md'; answer.write_text('Choose the safe option.')
+        supervision.resolve(home, task['id'], 'choice', answer)
+        assert outcome() == 'unfinished'
+        observe('decision', 'choice')
+        assert outcome() == 'decision'
+        observe('blocked', 'other')
+        assert outcome() == 'decision'
+        observe('resolved', 'choice')
+        assert outcome() == 'blocked'
+        for phase, expected in (('ready', 'ready'), ('landed', 'closed'), ('cleaned', 'closed')):
+            tasks.save(home, dict(task, phase=phase))
+            assert outcome() == expected
+
+
+def test_worker_complete_with_live_owner_is_scoped(monkeypatch):
+    import json
+    import subprocess
+    from agd_lib import supervision
+    from test_projects import CLI
+    with lab() as (home, _):
+        task = _live_worker(home, _prepared_task(home, 'scoped'))
+        _live_worker(home, _prepared_task(home, 'foreign'))
+        request = _queue_request(home, task['id'], 'Give the verified answer.')
+        _proven_central(home, monkeypatch)
+        env = dict(os.environ, AGD_TASK_ID=task['id'], AGD_INCARNATION=task['incarnation'])
+        env.pop('AGD_OWNER', None)
+        def invoke(task_id, incarnation):
+            return subprocess.run(
+                [str(CLI), '--home', str(home), 'worker', 'complete', task_id,
+                 request['id'], '--incarnation', incarnation, '--status', 'done'],
+                env=env, input='Verified answer.', capture_output=True, text=True)
+        completed = invoke(task['id'], task['incarnation'])
+        assert completed.returncode == 0, completed.stderr
+        reply = json.loads((home/'data/tasks/scoped/replies'/f'{request["id"]}.json').read_text())
+        assert reply['body'] == 'Verified answer.'
+        assert invoke('foreign', task['incarnation']).returncode == 3
+        assert invoke(task['id'], 'obsolete').returncode == 3
+        queried = subprocess.run(
+            [str(CLI), '--home', str(home), 'worker', 'context', task['id'],
+             '--incarnation', task['incarnation']], env=env, capture_output=True, text=True)
+        assert queried.returncode == 0, queried.stderr
+        assert json.loads(queried.stdout)['task_id'] == task['id']
+        monkeypatch.setattr(workers, 'inspect', _present_worker)
+        supervision.reconcile(home)
+        assert [row['kind'] for row in supervision.pending(home)
+                if row['key'] == request['id']] == ['done']
+
 
 if __name__ == '__main__':
     test_old_worker_cannot_change_current_task()
