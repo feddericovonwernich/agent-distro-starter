@@ -102,6 +102,12 @@ bin/agd --home "$AGD_HOME" observability start
 bin/agd --home "$AGD_HOME" observability disable
 ```
 
+Fresh installation offers this lifecycle in stage `4 / 4  Configure observability`, defaulting to No. Consent starts the local stack before the first central launch; declining starts no Docker activity and leaves local native session recording available. The prompt warns about image downloads, resource use, and sensitive captured content. It does not configure Langfuse Cloud or install Docker/Compose.
+
+Optional enablement failure does not undo the mandatory installation. A visible incomplete warning and recovery commands accompany public status when available; generated Compose files, identity, credentials, and queues remain in the distro so partial services can be inspected and stopped. Interruption after mandatory setup also retains the home. Do not delete that directory while services remain: run the home-scoped `observability status`, retry `enable`, or use `disable` to stop its stack. Disabled desired mode after a failed attempt is not proof that no containers were created. Existing installations require explicit enablement and normal central/worker restart; the installer changes no active sessions.
+
+When the first enable fails before publishing its config, `stop` and `disable` can recover from the retained release lock and home-bound secrets. They validate those records and preserve the rendered Compose files and credentials; missing, changed, or foreign records refuse rather than guessing ownership. A successful stop does not delete volumes or history.
+
 Each home owns a distinct Docker project, named volumes, Langfuse project credentials, and loopback-only browser, media, OTLP, health, and diagnostics ports. Never reuse one home's private observability records in another home: identity validation refuses them. `enable` does not install Docker, Compose, or elevate privileges.
 
 `agd observability central [OMP_ARGS...]` starts a managed OMP central from the private home with a fresh native session under `data/observability/central/omp`. It refuses forwarded working-directory, session, resume, continue, and no-session controls. When enabled, it attempts bounded stack health first and warns rather than blocking OMP on degradation; when disabled, it starts no Docker services and removes ambient OTEL configuration. A directly started `omp` session remains unmanaged and is warned by the extension; AGD does not relocate it.

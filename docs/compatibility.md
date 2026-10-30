@@ -24,6 +24,16 @@ The guided installer supports Linux x86-64 only. It may use APT only for missing
 
 `bin/agd start [--backend tmux|herdr]` requires validated private dependency and launcher receipts. It attaches only to a proven ready central and otherwise refuses foreign, partial, changed, or uncorrelated state without cleanup. An ordinary-terminal Herdr central uses its recorded non-default session; Herdr workers remain pane-bound (`HERDR_ENV=1`) and use their separately named server. No end-to-end guided installer/start smoke evidence is claimed here.
 
+### Installer telemetry opt-in
+
+The fourth stage is covered by real PTY installation runs for decline/blank/EOF, mixed-case consent, missing Docker, daemon/partial-start failure, unavailable follow-up status, interruption, and input handoff from a spaced parent path. These checks invoke the actual observability CLI, private config/secret generation, and next-central export environment; Docker responses and external HTTP readiness are controlled. The focused installer/dependency/observability run passed 95 checks. No OMP settings or generated secrets were exposed or replaced.
+
+A separate disposable run used actual Docker Engine 28.5.0 and Compose 2.40.0, with only mandatory bootstrap/network fixture-controlled. The existing `compose up` lifecycle timed out after 120 seconds. The terminal showed an incomplete warning, degraded/unknown-delivery status, recovery commands, and entered the preserved distro shell, where a queued marker command ran. No healthy-stack, first live-agent export, or Langfuse trace-readback claim is made from that run. All exact-owned disposable containers/volumes were removed, including late-created resources after the timeout; no matching resources or home remained after a delayed check. The live jarvis-13 installation was not changed.
+
+Final review exposed an incomplete-first-enable `stop|disable` metadata lookup failure. Six regressions demonstrated the failure before the fix and now exercise recovery plus missing/changed lock, foreign secrets, and missing project refusals. A separate disposable real-CLI/real-Docker smoke created only the retained first-enable render, then ran `observability disable` without a completed config: it reported disabled/stopped and preserved Compose/secret bytes. No services were started in that recovery smoke, so it is not proof of stopping a live stack.
+
+### Other runtime observations
+
 | Scenario | Observed outcome |
 |---|---|
 | OMP / tmux scout | Real OMP worker read disposable `value.txt`, wrote a report, called `task ready`; watcher notified an idle central without another user prompt; central inspected and acknowledged the exact event. Native turn idle, `/quit` and conditional Treehouse return were observed. A second scoped runner (`wake4`) also reached ready and stopped/cleaned after the owner gate change. |
