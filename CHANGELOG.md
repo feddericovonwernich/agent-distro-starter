@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Offer an explicit, default-No local Langfuse telemetry prompt as the fourth installer stage; reuse the existing private observability lifecycle without installing Docker or configuring OMP. Preserve a usable distro and recovery records after optional failure/interruption, retain mandatory rollback, and distinguish stack health from confirmed trace delivery.
 - Give every OMP task a frozen mandatory `agd-worker` protocol, including optional-skill mode `none`; reserve AGD protocol names and append the scoped-PR adapter without replacing the base snapshot. Legacy tasks without the protocol require recreation.
 - Replace startup skill/path inventories with native on-demand discovery, verified core system guidance, fresh scoped task context, and one bounded unfinished-assignment correction. Fail closed on invalid context; preserve readiness, grant, FIFO reply, abort/error, and recovery boundaries.
 - Start retained messages through OMP's idle prompt path so a ready-restarted worker can answer without an initial assignment turn; retain real native SDK coverage for discovery, policy, compaction, correction, FIFO replies, and ready restart.

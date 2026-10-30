@@ -11,7 +11,7 @@ section() { printf '\n%s%s%s\n\n' "$accent$bold" "$1" "$reset" >&2; }
 [[ -t 0 && -r /dev/tty ]] || fail 'Interactive terminal required'
 [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || fail 'Linux x86_64 required'
 printf '\n%sAgent Distro Starter%s\n' "$bold" "$reset" >&2
-section '1 / 3  Choose your distro'
+section '1 / 4  Choose your distro'
 read -r -p "${bold}Distro name:${reset} " name </dev/tty
 [[ $name =~ ^[a-z][a-z0-9-]{0,47}$ ]] || fail 'Use 1-48 lowercase letters, digits or hyphens, starting with a letter'
 [[ ! -e $name && ! -L $name ]] || fail 'Destination exists'
@@ -43,23 +43,50 @@ command -v python3 >/dev/null && python3 -c 'import sys; sys.exit(sys.version_in
 clone=$PWD/$name
 owned=false
 cleanup() { $owned && /bin/rm -rf -- "$clone"; }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 /bin/mkdir -m 700 -- "$clone"
 owned=true
-section '2 / 3  Create your distro'
+section '2 / 4  Create your distro'
 printf 'Cloning into %s\n\n' "$clone" >&2
 git clone --quiet -- https://github.com/feddericovonwernich/agent-distro-starter.git "$clone"
 (
     cd -- "$clone"
     PATH="$HOME/.local/bin:$PATH" bin/agd --home "$PWD" init --backend "$backend"
-    section '3 / 3  Verify dependencies'
+    section '3 / 4  Verify dependencies'
     PATH="$HOME/.local/bin:$PATH" bin/agd --home "$PWD" installer setup --backend "$backend"
+)
+# Optional provisioning may create Docker resources that need this home for recovery.
+owned=false
+(
+    cd -- "$clone"
+    export PATH="$HOME/.local/bin:$PATH"
+    section '4 / 4  Configure observability'
+    printf 'Optional local Langfuse + Collector stack (Docker required; no Docker installation or sudo).\n' >&2
+    printf 'Pulls images and uses disk/memory. Captures sensitive prompts, instructions, and tool inputs/results.\n' >&2
+    printf 'Services are loopback-only, not Langfuse Cloud. Local session recording works without export.\n\n' >&2
+    answer=
+    read -r -p "${bold}Enable local Langfuse telemetry?${reset} [y/N] " answer </dev/tty || answer=
+    if [[ ${answer,,} == y || ${answer,,} == yes ]]; then
+        if bin/agd --home "$PWD" observability enable; then
+            printf 'Telemetry status shown above; stack health alone does not confirm trace delivery.\n' >&2
+        else
+            printf '%sWarning:%s Telemetry setup incomplete; distro and recovery files retained.\n' "$error" "$reset" >&2
+            bin/agd --home "$PWD" observability status ||
+                printf '%sWarning:%s Telemetry status unavailable; partial services may still exist.\n' "$error" "$reset" >&2
+        fi
+        printf '  Inspect: bin/agd observability status\n  Stop and disable: bin/agd observability disable\n' >&2
+    else
+        printf 'Telemetry: disabled (local session recording remains available).\n' >&2
+    fi
+    printf '  Enable or retry later: bin/agd observability enable\n' >&2
 )
 printf '\n%sReady%s  %s\n' "$success$bold" "$reset" "$name" >&2
 printf '  Location: %s\n  Backend:  %s\n\n' "$clone" "$backend" >&2
 printf '  Start your central: %sbin/agd start%s\n' "$bold" "$reset" >&2
 printf '  Exit this shell to return to your previous directory.\n\n' >&2
-owned=false
 trap - EXIT HUP INT TERM
 cd -- "$clone"
 export PATH="$HOME/.local/bin:$PATH"
