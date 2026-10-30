@@ -302,8 +302,9 @@ def _live_worker(home, task, phase='running'):
         incarnation='first',
         phase=phase,
         worker_alive=True,
-        endpoint={'identity': 'worker-endpoint'},
+        endpoint={'identity': 'worker-endpoint', 'incarnation': 'first'},
         backend='tmux',
+        unattended=False,
     )
     tasks.save(home, task)
     return task
@@ -345,6 +346,14 @@ def test_send_requires_verified_live_worker_but_allows_ready():
                        '--brief', str(brief), '--kind', 'scout')
         _live_worker(home, task, phase='ready')
         message = home/'message.md'; message.write_text('Check the conclusion.\n')
+        current = tasks.read(home, 'followup')
+        current['harness'] = 'cursor'
+        tasks.save(home, current)
+        with patch.object(workers, 'inspect', side_effect=_present_worker), \
+             pytest.raises(store.Refusal):
+            workers.send(home, 'followup', message)
+        current['harness'] = 'omp'
+        tasks.save(home, current)
         with patch.object(workers, 'inspect', side_effect=_present_worker):
             accepted = workers.send(home, 'followup', message)
 
@@ -404,6 +413,59 @@ def test_pending_request_survives_worker_crash_for_relaunch():
         tasks.save(home, current)
 
         assert workers.inbox(home, 'retained')[0]['id'] == accepted['id']
+
+
+def test_ready_pending_request_relaunches_without_replaying_initial_task():
+    with lab() as (home, project):
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'ready-retry', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        _live_worker(home, task)
+        report = home/'report.md'; report.write_text('Initial inspection complete.\n')
+        command(home, 'task', 'ready', 'ready-retry', '--report', str(report))
+        request = _queue_request(home, 'ready-retry', 'Answer one more question.\n')
+        crashed = tasks.read(home, 'ready-retry')
+        crashed['worker_alive'] = False
+        tasks.save(home, crashed)
+
+        class FakeBackend:
+            def create(self, _home, task_id, incarnation, _work, _argv):
+                return {'identity': task_id, 'incarnation': incarnation}
+
+        with patch.object(workers, 'inspect',
+                          return_value={'endpoint': {'presence': 'missing'}}), \
+             patch.object(workers, 'backend', return_value=FakeBackend()):
+            relaunched = workers.relaunch(home, 'ready-retry')
+
+        assert relaunched['phase'] == 'ready'
+        assert relaunched['ready_head'] == crashed['ready_head']
+        assert workers.inbox(home, 'ready-retry')[0]['id'] == request['id']
+        argv = workers.harnesses.launch_argv(
+            relaunched, tasks.task_file(home, 'ready-retry').parent/'brief.md')
+        assert argv[-2] == '-e'
+        assert argv[-1].endswith('lib/omp-worker.ts')
+
+
+def test_ready_relaunch_refuses_changed_workspace():
+    import pytest
+    from agd_lib import store
+
+    with lab() as (home, project):
+        brief = home/'brief.md'; brief.write_text('Inspect value.txt.\n')
+        task = command(home, 'task', 'create', 'dirty-ready', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        _live_worker(home, task)
+        report = home/'report.md'; report.write_text('Initial inspection complete.\n')
+        command(home, 'task', 'ready', 'dirty-ready', '--report', str(report))
+        current = tasks.read(home, 'dirty-ready')
+        current['worker_alive'] = False
+        tasks.save(home, current)
+        (Path(current['worktree'])/'value.txt').write_text('changed after ready\n')
+
+        with patch.object(workers, 'inspect',
+                          return_value={'endpoint': {'presence': 'missing'}}), \
+             pytest.raises(store.Refusal, match='ready workspace no longer matches'):
+            workers.relaunch(home, 'dirty-ready')
 
 
 def test_complete_is_scoped_idempotent_and_acknowledges_last():

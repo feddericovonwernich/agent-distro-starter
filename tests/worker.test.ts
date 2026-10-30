@@ -15,6 +15,7 @@ beforeEach(() => {
   process.env.AGD_HOME = '/tmp/agd-worker-home';
   process.env.AGD_TASK_ID = 'retained';
   process.env.AGD_INCARNATION = 'worker-one';
+  delete process.env.AGD_WORKER_RESUME_READY;
   intervalHandlers = [];
   clearedTimers = [];
   globalThis.setInterval = ((handler: () => void) => {
@@ -29,6 +30,7 @@ beforeEach(() => {
 afterEach(() => {
   globalThis.setInterval = originalSetInterval;
   globalThis.clearInterval = originalClearInterval;
+  delete process.env.AGD_WORKER_RESUME_READY;
 });
 
 type Message = {
@@ -94,6 +96,23 @@ test('assistantReply returns only the final assistant text blocks', () => {
   expect(assistantReply([
     { role: 'assistant', content: [{ type: 'thinking', thinking: 'only' }] },
   ])).toBeUndefined();
+});
+
+test('ready relaunch consumes its first retained request without an initial task turn', async () => {
+  const id = '55555555-5555-4555-8555-555555555555';
+  process.env.AGD_WORKER_RESUME_READY = '1';
+  const { handlers, deliveries } = await extensionHarness([
+    message(id, 1, 'Continue the retained conversation.'),
+  ]);
+
+  handlers.session_start({});
+
+  expect(deliveries).toEqual([
+    {
+      text: 'Continue the retained conversation.',
+      options: { deliverAs: 'followUp' },
+    },
+  ]);
 });
 
 test('retained worker completes one terminal follow-up before delivering the next', async () => {

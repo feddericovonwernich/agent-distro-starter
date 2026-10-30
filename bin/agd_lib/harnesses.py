@@ -66,7 +66,9 @@ def launch_argv(task, brief_path, unattended=False, session_dir=None):
                 '--cwd', task['worktree']]
         if session_dir is not None:
             args.extend(['--session-dir', str(session_dir)])
-        args.extend(['-e', str(code_root/'lib'/'omp-worker.ts'), prompt])
+        args.extend(['-e', str(code_root/'lib'/'omp-worker.ts')])
+        if task.get('phase') != 'ready':
+            args.append(prompt)
         if unattended:
             args.insert(1, '--auto-approve')
         return args

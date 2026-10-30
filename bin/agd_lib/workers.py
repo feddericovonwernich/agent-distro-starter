@@ -157,6 +157,8 @@ def run_worker(home, task_id, incarnation):
         session_dir = None
         warning = None
     child_env.pop('AGD_OWNER', None)
+    if task['harness'] == 'omp' and task['phase'] == 'ready':
+        child_env['AGD_WORKER_RESUME_READY'] = '1'
     import subprocess
     from .supervision import process_start
     args = harnesses.launch_argv(task, tasks.task_file(home, task_id).parent/'brief.md', task['unattended'],
@@ -256,6 +258,7 @@ def send(home, task_id, file):
         task = tasks.read(home, task_id)
         if (task.get('phase') not in ('running', 'ready')
                 or task.get('executor') != 'worker'
+                or task.get('harness') != 'omp'
                 or task.get('worker_alive') is not True
                 or endpoint.get('presence') != 'present'
                 or inspected_task.get('incarnation') != task.get('incarnation')
@@ -464,8 +467,10 @@ def stop(home, task_id):
 
 def relaunch(home, task_id):
     task = tasks.read(home, task_id)
-    if task.get('executor') != 'worker' or task['phase'] != 'running':
-        raise store.Refusal('only unfinished worker tasks can relaunch')
+    if task.get('executor') != 'worker' or task['phase'] not in ('running', 'ready'):
+        raise store.Refusal('only running or ready worker tasks can relaunch')
+    if task['phase'] == 'ready' and task.get('harness') != 'omp':
+        raise store.Refusal('ready worker relaunch requires OMP')
     if task.get('worker_alive') is not False or not task.get('endpoint'):
         raise store.Refusal('prior worker process absence unconfirmed')
     if inspect(home, task_id)['endpoint']['presence'] != 'missing':
@@ -474,6 +479,9 @@ def relaunch(home, task_id):
     if task.get('worker_skills'):
         worker_skills.ensure(home, task)
         worker_skills.verify(home, task)
+    if (task['phase'] == 'ready' and
+            (not store.clean(work) or store.git(work, 'rev-parse', 'HEAD') != task['ready_head'])):
+        raise store.Refusal('ready workspace no longer matches committed head')
     harnesses.launch_argv(task, tasks.task_file(home, task_id).parent/'brief.md', task['unattended'])
     if task['backend'] == 'herdr':
         backend(task).prepare(home)

@@ -61,7 +61,8 @@ export default function workerExtension(api: {
     if (result.status !== 0) console.error(`agd worker event failed: ${result.stderr || result.error}`);
   }
   let timer: NodeJS.Timeout | undefined;
-  let turn: 'unknown' | 'busy' | 'idle' = 'unknown';
+  let turn: 'unknown' | 'busy' | 'idle' =
+    process.env.AGD_WORKER_RESUME_READY === '1' ? 'idle' : 'unknown';
   let active: ActiveRequest | undefined;
 
   function persistCompletion() {
