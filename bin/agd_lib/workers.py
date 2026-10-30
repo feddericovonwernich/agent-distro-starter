@@ -49,13 +49,74 @@ def _observation(home, task_id, incarnation, kind, key, text,
 
 
 def event(home, task_id, incarnation, kind, key, message):
-    task = tasks.read(home, task_id)
-    if incarnation != task.get('incarnation') and not (incarnation == 'central' and task['executor'] == 'central'):
-        raise store.Refusal('worker incarnation no longer owns task')
-    if os.environ.get('AGD_TASK_ID') and (os.environ['AGD_TASK_ID'] != task_id or os.environ.get('AGD_INCARNATION') != incarnation):
-        raise store.Refusal('event belongs to a different task process')
-    return _observation(
-        home, task_id, incarnation, kind, key, Path(message).read_text())
+    with store.lock(home):
+        task = tasks.read(home, task_id)
+        if incarnation != task.get('incarnation') and not (incarnation == 'central' and task['executor'] == 'central'):
+            raise store.Refusal('worker incarnation no longer owns task')
+        if os.environ.get('AGD_TASK_ID') and (os.environ['AGD_TASK_ID'] != task_id or os.environ.get('AGD_INCARNATION') != incarnation):
+            raise store.Refusal('event belongs to a different task process')
+        return _observation(
+            home, task_id, incarnation, kind, key, Path(message).read_text())
+
+
+def context(home: Path, task_id: str, incarnation: str) -> dict:
+    with store.lock(home):
+        task = tasks.read(home, task_id)
+        if (task.get('executor') != 'worker' or task.get('harness') != 'omp'
+                or task.get('incarnation') != incarnation
+                or os.environ.get('AGD_TASK_ID') != task_id
+                or os.environ.get('AGD_INCARNATION') != incarnation):
+            raise store.Refusal('worker context requires its current OMP task environment')
+        worker_skills.require_protocol(home, task, task.get('pr_grant'))
+        manifest = worker_skills._manifest(home, task)
+        if manifest['state'] != 'complete':
+            raise store.Refusal('worker protocol snapshot is not complete')
+        protocol = next(row for row in manifest['skills'] if row['id'] == 'agd-worker')
+        for location in ('snapshot', 'destination'):
+            worker_skills._check(protocol, Path(protocol[location]))
+        core = next(row for row in protocol['files'] if row['path'] == 'SKILL.md')
+        folder = tasks.task_file(home, task_id).parent
+        latest = {}
+        for path in (folder/'observations').glob('*.json'):
+            observation = json.loads(path.read_text())
+            if (observation['incarnation'] != incarnation
+                    or observation['key'] == 'agd-contract-incomplete'
+                    or observation['kind'] not in ('blocked', 'decision', 'resolved')):
+                continue
+            key = observation['key']
+            previous = latest.get(key)
+            if previous is None or (observation['observed_at'], observation['id']) > (
+                    previous['observed_at'], previous['id']):
+                latest[key] = observation
+        active = set()
+        for key, observation in latest.items():
+            kind = observation['kind']
+            if kind == 'decision':
+                receipt = folder/'decisions'/f'{key}.json'
+                decision = json.loads(receipt.read_text()) if receipt.is_file() else {}
+                if (decision.get('incarnation') == incarnation
+                        and decision.get('status') == 'resolved'
+                        and decision.get('resolved_at', 0) >= observation['observed_at']):
+                    continue
+            active.add(kind)
+        if task['phase'] in ('landed', 'cleaned'):
+            outcome = 'closed'
+        elif task['phase'] == 'ready':
+            outcome = 'ready'
+        else:
+            outcome = 'decision' if 'decision' in active else 'blocked' if 'blocked' in active else 'unfinished'
+        return {
+            'schema': 1, 'task_id': task_id, 'incarnation': incarnation,
+            'phase': task['phase'], 'kind': task['kind'], 'worktree': task['worktree'],
+            'brief': str(folder/'brief.md'), 'report': str(folder/'report-draft.md'),
+            'agd_argv': [str(Path(__file__).resolve().parents[1]/'agd'), '--home', str(home)],
+            'pr_grant': task.get('pr_grant'),
+            'task_skills': manifest['selection']['skills'],
+            'system_skills': manifest['selection']['system_skills'],
+            'protocol': {'path': str(Path(protocol['destination'])/'SKILL.md'),
+                         'sha256': core['sha256']},
+            'outcome': outcome,
+        }
 
 
 def launch(home, task_id, selected_backend=None, unattended=False, approval_id=None,

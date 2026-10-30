@@ -848,6 +848,117 @@ def test_old_omp_task_remains_readable_and_cleanable_but_cannot_launch():
         assert command(home, 'task', 'cleanup', 'legacy')['phase'] == 'cleaned'
 
 
+def test_worker_context_binds_frozen_protocol_and_rejects_foreign_state(monkeypatch):
+    import hashlib
+    import pytest
+    from agd_lib import store
+    from test_projects import CLI
+    with lab() as (home, _):
+        task = _live_worker(home, _prepared_task(home, 'context'))
+        monkeypatch.setenv('AGD_TASK_ID', task['id'])
+        monkeypatch.setenv('AGD_INCARNATION', task['incarnation'])
+        monkeypatch.setattr(workers, 'backend', lambda _task: pytest.fail('context inspected backend'))
+        context = workers.context(home, task['id'], task['incarnation'])
+        core = Path(task['worktree'])/'.omp/skills/agd-worker/SKILL.md'
+        assert context['protocol'] == {'path': str(core), 'sha256': hashlib.sha256(core.read_bytes()).hexdigest()}
+        assert context['agd_argv'] == [str(CLI), '--home', str(home)]
+        assert context['task_skills'] == task['worker_skill_selection']['skills']
+        assert context['system_skills'] == ['agd-worker']
+        assert context['pr_grant'] is None and context['outcome'] == 'unfinished'
+        assert context['worktree'] == task['worktree'] and context['kind'] == 'scout'
+        assert context['brief'] == str(home/'data/tasks/context/brief.md')
+        assert context['report'] == str(home/'data/tasks/context/report-draft.md')
+        for name, value in (('AGD_TASK_ID', 'foreign'), ('AGD_INCARNATION', 'obsolete')):
+            with monkeypatch.context() as scoped:
+                scoped.setenv(name, value)
+                with pytest.raises(store.Refusal):
+                    workers.context(home, task['id'], task['incarnation'])
+        for field, value in (('executor', 'central'), ('harness', 'cursor'), ('incarnation', 'new')):
+            tasks.save(home, dict(task, **{field: value}))
+            with pytest.raises(store.Refusal):
+                workers.context(home, task['id'], task['incarnation'])
+        tasks.save(home, task)
+        for location in (core, Path(next(row for row in task['worker_skills']['skills']
+                                        if row['id'] == 'agd-worker')['snapshot'])/'SKILL.md'):
+            original = location.read_bytes()
+            location.write_text('corrupt protocol')
+            with pytest.raises(store.Refusal, match='changed'):
+                workers.context(home, task['id'], task['incarnation'])
+            location.write_bytes(original)
+        core.unlink()
+        with pytest.raises(store.Refusal):
+            workers.context(home, task['id'], task['incarnation'])
+
+
+def test_worker_context_folds_current_outcomes_without_watcher_timing(monkeypatch):
+    from agd_lib import supervision
+    with lab() as (home, _):
+        task = _live_worker(home, _prepared_task(home, 'outcome'))
+        monkeypatch.setenv('AGD_TASK_ID', task['id'])
+        monkeypatch.setenv('AGD_INCARNATION', task['incarnation'])
+        monkeypatch.setattr(workers, 'inspect', _present_worker)
+        def outcome():
+            return workers.context(home, task['id'], task['incarnation'])['outcome']
+        def observe(kind, key, incarnation='first'):
+            workers._observation(home, task['id'], incarnation, kind, key, 'Private observation.')
+        observe('blocked', 'old', 'old-worker')
+        observe('blocked', 'agd-contract-incomplete')
+        assert outcome() == 'unfinished'
+        observe('blocked', 'credential')
+        assert outcome() == 'blocked'
+        observe('resolved', 'credential')
+        assert outcome() == 'unfinished'
+        observe('decision', 'choice')
+        assert outcome() == 'decision'
+        supervision.reconcile(home)
+        answer = home/'answer.md'; answer.write_text('Choose the safe option.')
+        supervision.resolve(home, task['id'], 'choice', answer)
+        assert outcome() == 'unfinished'
+        observe('decision', 'choice')
+        assert outcome() == 'decision'
+        observe('blocked', 'other')
+        assert outcome() == 'decision'
+        observe('resolved', 'choice')
+        assert outcome() == 'blocked'
+        for phase, expected in (('ready', 'ready'), ('landed', 'closed'), ('cleaned', 'closed')):
+            tasks.save(home, dict(task, phase=phase))
+            assert outcome() == expected
+
+
+def test_worker_complete_with_live_owner_is_scoped(monkeypatch):
+    import json
+    import subprocess
+    from agd_lib import supervision
+    from test_projects import CLI
+    with lab() as (home, _):
+        task = _live_worker(home, _prepared_task(home, 'scoped'))
+        _live_worker(home, _prepared_task(home, 'foreign'))
+        request = _queue_request(home, task['id'], 'Give the verified answer.')
+        _proven_central(home, monkeypatch)
+        env = dict(os.environ, AGD_TASK_ID=task['id'], AGD_INCARNATION=task['incarnation'])
+        env.pop('AGD_OWNER', None)
+        def invoke(task_id, incarnation):
+            return subprocess.run(
+                [str(CLI), '--home', str(home), 'worker', 'complete', task_id,
+                 request['id'], '--incarnation', incarnation, '--status', 'done'],
+                env=env, input='Verified answer.', capture_output=True, text=True)
+        completed = invoke(task['id'], task['incarnation'])
+        assert completed.returncode == 0, completed.stderr
+        reply = json.loads((home/'data/tasks/scoped/replies'/f'{request["id"]}.json').read_text())
+        assert reply['body'] == 'Verified answer.'
+        assert invoke('foreign', task['incarnation']).returncode == 3
+        assert invoke(task['id'], 'obsolete').returncode == 3
+        queried = subprocess.run(
+            [str(CLI), '--home', str(home), 'worker', 'context', task['id'],
+             '--incarnation', task['incarnation']], env=env, capture_output=True, text=True)
+        assert queried.returncode == 0, queried.stderr
+        assert json.loads(queried.stdout)['task_id'] == task['id']
+        monkeypatch.setattr(workers, 'inspect', _present_worker)
+        supervision.reconcile(home)
+        assert [row['kind'] for row in supervision.pending(home)
+                if row['key'] == request['id']] == ['done']
+
+
 if __name__ == '__main__':
     test_old_worker_cannot_change_current_task()
     test_current_scout_worker_can_report_ready()
