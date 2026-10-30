@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- Add a fifth, default-No scheduled reviewer installer stage with daily/hourly presets, custom daily time/IANA timezone or whole-hour interval, cancellation and input correction. Preserve chosen config on missing prerequisites and keep telemetry/model settings independent.
+- Validate installed reviewer SDK/Bun/agent prerequisites and bind the actual Python plus minimal runtime search path into owned systemd services; verify native activation, retain partial-failure disable recovery, and refuse unsafe schedule reconfiguration.
 - Offer an explicit, default-No local Langfuse telemetry prompt as the fourth installer stage; reuse the existing private observability lifecycle without installing Docker or configuring OMP. Preserve a usable distro and recovery records after optional failure/interruption, retain mandatory rollback, and distinguish stack health from confirmed trace delivery.
 - Recover `observability stop|disable` after a failed first enable by validating the retained release lock and home-bound project identity, without replacing Compose files or credentials; refuse incomplete or foreign recovery records.
 - Give every OMP task a frozen mandatory `agd-worker` protocol, including optional-skill mode `none`; reserve AGD protocol names and append the scoped-PR adapter without replacing the base snapshot. Legacy tasks without the protocol require recreation.

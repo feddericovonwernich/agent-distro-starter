@@ -11,7 +11,7 @@ section() { printf '\n%s%s%s\n\n' "$accent$bold" "$1" "$reset" >&2; }
 [[ -t 0 && -r /dev/tty ]] || fail 'Interactive terminal required'
 [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || fail 'Linux x86_64 required'
 printf '\n%sAgent Distro Starter%s\n' "$bold" "$reset" >&2
-section '1 / 4  Choose your distro'
+section '1 / 5  Choose your distro'
 read -r -p "${bold}Distro name:${reset} " name </dev/tty
 [[ $name =~ ^[a-z][a-z0-9-]{0,47}$ ]] || fail 'Use 1-48 lowercase letters, digits or hyphens, starting with a letter'
 [[ ! -e $name && ! -L $name ]] || fail 'Destination exists'
@@ -49,13 +49,13 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 /bin/mkdir -m 700 -- "$clone"
 owned=true
-section '2 / 4  Create your distro'
+section '2 / 5  Create your distro'
 printf 'Cloning into %s\n\n' "$clone" >&2
 git clone --quiet -- https://github.com/feddericovonwernich/agent-distro-starter.git "$clone"
 (
     cd -- "$clone"
     PATH="$HOME/.local/bin:$PATH" bin/agd --home "$PWD" init --backend "$backend"
-    section '3 / 4  Verify dependencies'
+    section '3 / 5  Verify dependencies'
     PATH="$HOME/.local/bin:$PATH" bin/agd --home "$PWD" installer setup --backend "$backend"
 )
 # Optional provisioning may create Docker resources that need this home for recovery.
@@ -63,7 +63,7 @@ owned=false
 (
     cd -- "$clone"
     export PATH="$HOME/.local/bin:$PATH"
-    section '4 / 4  Configure observability'
+    section '4 / 5  Configure observability'
     printf 'Optional local Langfuse + Collector stack (Docker required; no Docker installation or sudo).\n' >&2
     printf 'Pulls images and uses disk/memory. Captures sensitive prompts, instructions, and tool inputs/results.\n' >&2
     printf 'Services are loopback-only, not Langfuse Cloud. Local session recording works without export.\n\n' >&2
@@ -82,6 +82,9 @@ owned=false
         printf 'Telemetry: disabled (local session recording remains available).\n' >&2
     fi
     printf '  Enable or retry later: bin/agd observability enable\n' >&2
+    section '5 / 5  Configure scheduled reviewer'
+    bin/agd --home "$PWD" installer reviewer ||
+        printf '%sWarning:%s Reviewer setup incomplete; distro and recovery records retained.\n  Retry: bin/agd installer reviewer\n  Inspect: bin/agd reviewer timer status\n  Disable: bin/agd reviewer timer disable\n' "$error" "$reset" >&2
 )
 printf '\n%sReady%s  %s\n' "$success$bold" "$reset" "$name" >&2
 printf '  Location: %s\n  Backend:  %s\n\n' "$clone" "$backend" >&2
