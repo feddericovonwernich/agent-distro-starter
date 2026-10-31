@@ -22,13 +22,15 @@ class AttachTarget:
 
 def initialize(home: Path, backend: str) -> None:
     config = home / 'data' / 'launcher.json'
-    if backend not in {'tmux', 'herdr'} or home.is_symlink() or config.exists() or config.is_symlink():
-        raise store.Refusal('fresh non-symlink launcher home required')
-    store.atomic_json(config, {
-        'schema': 1,
-        'backend': backend,
-        'herdr_session': f'agd-{uuid.uuid4().hex}',
-    })
+    from .uninstall_state import admission
+    with admission(home):
+        if backend not in {'tmux', 'herdr'} or home.is_symlink() or config.exists() or config.is_symlink():
+            raise store.Refusal('fresh non-symlink launcher home required')
+        store.atomic_json(config, {
+            'schema': 1,
+            'backend': backend,
+            'herdr_session': f'agd-{uuid.uuid4().hex}',
+        })
 
 
 def resolve_backend(home: Path, explicit_backend: str | None) -> str:
@@ -417,51 +419,53 @@ def active_backend(home: Path, inherited_env: Mapping[str, str] | None = None) -
 def prepare_start(home: Path, explicit_backend: str | None, inherited_env: Mapping[str, str] | None,
                   create, inspect, attach) -> AttachTarget:
     selected = resolve_backend(home, explicit_backend)
-    receipt, _ = _read_receipt(home)
-    if receipt is not None:
-        if receipt['phase'] != 'ready':
-            raise store.Refusal('central launch was interrupted')
-        if selected != receipt['backend']:
-            raise store.Refusal('explicit backend differs from active central')
-        env = _attach_env(home, receipt, inherited_env)
-        _prove(home, receipt, inspect)
-        return AttachTarget(attach(home, receipt), env)
-    argv, central_env, _warning = observability.central_argv(home, ())
-    launch_id, endpoint_token = str(uuid.uuid4()), uuid.uuid4().hex
-    managed = [str(Path(__file__).resolve().parents[1] / 'agd'), '--home', str(home), 'observability', 'central']
-    reserved = {'schema': 1, 'launch_id': launch_id, 'endpoint_token': endpoint_token, 'backend': selected,
-                'phase': 'reserved', 'endpoint': {}, 'managed_command': managed,
-                'expected_process_argv': argv, 'owner': None, 'watcher': None}
-    with store.lock(home):
-        existing, _ = _read_receipt(home)
-        if existing is not None:
-            raise store.Refusal('launcher receipt appeared during reservation')
-        _owner(home, reserved, False)
-        store.atomic_json(_receipt_path(home), reserved)
-    if selected == 'herdr' and create is _backend_create:
-        spawned = None
-
-        def checkpoint(endpoint):
-            nonlocal spawned
-            replacement = {**(spawned or reserved), 'phase': 'spawned', 'endpoint': dict(endpoint)}
-            _advance(home, spawned or reserved, replacement)
-            spawned = replacement
-
-        endpoint = create(selected, home, launch_id, endpoint_token, managed,
-                          {**central_env, 'AGD_LAUNCH_ID': launch_id, 'AGD_ENDPOINT_TOKEN': endpoint_token}, argv,
-                          checkpoint)
-        if spawned is None or spawned['endpoint'] != endpoint:
-            raise store.Refusal('Herdr endpoint checkpoint is missing')
-    else:
-        endpoint = create(selected, home, launch_id, endpoint_token, managed,
-                          {**central_env, 'AGD_LAUNCH_ID': launch_id, 'AGD_ENDPOINT_TOKEN': endpoint_token}, argv)
-        spawned = {**reserved, 'phase': 'spawned', 'endpoint': endpoint}
-        _advance(home, reserved, spawned)
-    if create is _backend_create:
-        _backend_finalize(home, spawned)
-    owner = _await_initial_owner(home, spawned, inspect)
-    ready = {**spawned, 'phase': 'ready',
-             'owner': {'pid': owner['owner_pid'], 'start': owner['owner_start']},
-             'watcher': {'pid': owner['watcher_pid'], 'start': owner['watcher_start']}}
-    _advance(home, spawned, ready)
-    return AttachTarget(attach(home, ready), _attach_env(home, ready, inherited_env))
+    from .uninstall_state import admission
+    with admission(home):
+        receipt, _ = _read_receipt(home)
+        if receipt is not None:
+            if receipt['phase'] != 'ready':
+                raise store.Refusal('central launch was interrupted')
+            if selected != receipt['backend']:
+                raise store.Refusal('explicit backend differs from active central')
+            env = _attach_env(home, receipt, inherited_env)
+            _prove(home, receipt, inspect)
+            return AttachTarget(attach(home, receipt), env)
+        argv, central_env, _warning = observability.central_argv(home, ())
+        launch_id, endpoint_token = str(uuid.uuid4()), uuid.uuid4().hex
+        managed = [str(Path(__file__).resolve().parents[1] / 'agd'), '--home', str(home), 'observability', 'central']
+        reserved = {'schema': 1, 'launch_id': launch_id, 'endpoint_token': endpoint_token, 'backend': selected,
+                    'phase': 'reserved', 'endpoint': {}, 'managed_command': managed,
+                    'expected_process_argv': argv, 'owner': None, 'watcher': None}
+        with store.lock(home):
+            existing, _ = _read_receipt(home)
+            if existing is not None:
+                raise store.Refusal('launcher receipt appeared during reservation')
+            _owner(home, reserved, False)
+            store.atomic_json(_receipt_path(home), reserved)
+        if selected == 'herdr' and create is _backend_create:
+            spawned = None
+    
+            def checkpoint(endpoint):
+                nonlocal spawned
+                replacement = {**(spawned or reserved), 'phase': 'spawned', 'endpoint': dict(endpoint)}
+                _advance(home, spawned or reserved, replacement)
+                spawned = replacement
+    
+            endpoint = create(selected, home, launch_id, endpoint_token, managed,
+                              {**central_env, 'AGD_LAUNCH_ID': launch_id, 'AGD_ENDPOINT_TOKEN': endpoint_token}, argv,
+                              checkpoint)
+            if spawned is None or spawned['endpoint'] != endpoint:
+                raise store.Refusal('Herdr endpoint checkpoint is missing')
+        else:
+            endpoint = create(selected, home, launch_id, endpoint_token, managed,
+                              {**central_env, 'AGD_LAUNCH_ID': launch_id, 'AGD_ENDPOINT_TOKEN': endpoint_token}, argv)
+            spawned = {**reserved, 'phase': 'spawned', 'endpoint': endpoint}
+            _advance(home, reserved, spawned)
+        if create is _backend_create:
+            _backend_finalize(home, spawned)
+        owner = _await_initial_owner(home, spawned, inspect)
+        ready = {**spawned, 'phase': 'ready',
+                 'owner': {'pid': owner['owner_pid'], 'start': owner['owner_start']},
+                 'watcher': {'pid': owner['watcher_pid'], 'start': owner['watcher_start']}}
+        _advance(home, spawned, ready)
+        return AttachTarget(attach(home, ready), _attach_env(home, ready, inherited_env))

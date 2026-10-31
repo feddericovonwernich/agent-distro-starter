@@ -194,12 +194,30 @@ def main(args):
                                                                            'relay-poll', 'relay-reply') or
                          args.command == 'task' and args.operation == 'ready')
         store.require_owner(home, worker_scoped)
+    from agd_lib.uninstall_state import admission
+    fresh = None
+    if args.command == 'init':
+        if home == Path(__file__).resolve().parents[1]:
+            fresh = not any((home / name).exists() or (home / name).is_symlink()
+                            for name in ('config', 'projects', 'data', 'state'))
+        else:
+            fresh = not home.exists() or not any(home.iterdir())
+        if not fresh:
+            raise store.Refusal('fresh non-symlink launcher home required')
+    reviewer_write = args.command == 'reviewer' and (
+        args.reviewer_op == 'run' or args.reviewer_op == 'timer' and args.timer_op != 'status'
+        or args.reviewer_op == 'proposals' and args.proposal_op == 'dispose')
+    managed_loop = (args.command == 'worker' and args.operation == 'run'
+                    or args.command == 'reviewer' and args.reviewer_op == 'run')
+    if (mutation or reviewer_write) and not managed_loop:
+        with admission(home, initializing=args.command == 'init'):
+            return _dispatch(args, home, fresh)
+    return _dispatch(args, home, fresh)
+
+
+def _dispatch(args, home, fresh):
     if args.command == 'omp':
-        omp_runtime.validate_native_args(args.omp_args)
-        executable = omp_runtime.executable(home)
-        os.chdir(home)
-        os.execvpe(executable, [executable, *args.omp_args],
-                   omp_runtime.environment(home, os.environ))
+        omp_runtime.exec_native(home, args.omp_args)
     if args.command == 'observability' and args.operation == 'central':
         argv, env, warning = observability.central_argv(home, args.omp_args)
         if warning:
@@ -207,14 +225,10 @@ def main(args):
         os.chdir(home)
         os.execvpe(argv[0], argv, env)
     if args.command == 'init':
-        if home == Path(__file__).resolve().parents[1]:
-            fresh = not any((home/name).exists() or (home/name).is_symlink()
-                            for name in ('config', 'projects', 'data', 'state'))
-        else:
-            fresh = not home.exists() or not any(home.iterdir())
+        # Freshness was captured before admission created its own lock.
         checkout_home = home == Path(__file__).resolve().parents[1]
         with store.lock(home):
-            lock_only = all(path.name == 'mutation.lock' for path in (home/'state').iterdir())
+            lock_only = all(path.name in {'mutation.lock', 'activity.lock'} for path in (home/'state').iterdir())
             if checkout_home:
                 still_fresh = fresh and lock_only and not any(
                     (home/name).exists() or (home/name).is_symlink()

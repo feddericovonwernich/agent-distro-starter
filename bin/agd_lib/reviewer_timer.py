@@ -266,72 +266,80 @@ def _read_record(home):
 
 
 def enable(home, config, *, xdg_config_home=None, command_runner=store.run, source_cli=None, now=None):
-    root = store.home(home); schedule = validate_schedule(config.get('schedule'))
-    now = time.time() if now is None else float(now)
-    if schedule['mode'] == 'manual-only':
-        raise store.Refusal('manual-only schedule cannot enable a timer')
-    agreed_next = native_calendar_agrees(schedule, now) if schedule['mode'] == 'calendar' else None
-    runtime = runtime_environment(root)
-    rendered = render_units(root, config, runtime=runtime, source_cli=source_cli)
-    marker = f'X-AGD-Reviewer-Owner={_home_id(root)}:{os.getuid()}'
-    directory = _unit_directory(xdg_config_home)
-    if any((path.exists() or path.is_symlink()) and not _owned(path, marker)
-           for path in (directory / rendered['timer_name'], directory / rendered['service_name'])):
-        raise store.Refusal('existing unit is not owned by this home')
-    command_runner(['systemctl', '--user', 'show', '--property=Version', '--value'])
-    with store.lock(root):
-        previous = _read_record(root)
-        unchanged = previous and previous.get('schedule') == schedule and previous.get('state') == 'enabled'
-        anchor = previous.get('anchor') if unchanged and schedule['mode'] == 'interval' else float(int(now // 3600) * 3600)
-        checkpoint = previous.get('checkpoint') if unchanged else ({'next_due': agreed_next} if agreed_next is not None else {'anchor': anchor, 'last_due': anchor})
-        record = {'schema': 1, 'home_id': _home_id(root), 'uid': os.getuid(), 'schedule': schedule,
-                  'anchor': anchor if schedule['mode'] == 'interval' else None, 'checkpoint': checkpoint, 'state': 'enabling'}
-        reviewer._private(_timer_record(root).parent); store.atomic_json(_timer_record(root), record)
-    try:
-        changed = _write_unit(directory / rendered['timer_name'], rendered['timer'], marker)
-        changed = _write_unit(directory / rendered['service_name'], rendered['service'], marker) or changed
-        if not unchanged or changed:
-            command_runner(['systemctl', '--user', 'daemon-reload'])
-            command_runner(['systemctl', '--user', 'enable', rendered['timer_name']])
-        command_runner(['systemctl', '--user', 'start', rendered['timer_name']])
-        command_runner(['systemctl', '--user', 'is-active', '--quiet', rendered['timer_name']])
-    except Exception as error:
+    root = store.home(home)
+    from .uninstall_state import admission
+    with admission(home):
+        schedule = validate_schedule(config.get('schedule'))
+        now = time.time() if now is None else float(now)
+        if schedule['mode'] == 'manual-only':
+            raise store.Refusal('manual-only schedule cannot enable a timer')
+        agreed_next = native_calendar_agrees(schedule, now) if schedule['mode'] == 'calendar' else None
+        runtime = runtime_environment(root)
+        rendered = render_units(root, config, runtime=runtime, source_cli=source_cli)
+        marker = f'X-AGD-Reviewer-Owner={_home_id(root)}:{os.getuid()}'
+        directory = _unit_directory(xdg_config_home)
+        if any((path.exists() or path.is_symlink()) and not _owned(path, marker)
+               for path in (directory / rendered['timer_name'], directory / rendered['service_name'])):
+            raise store.Refusal('existing unit is not owned by this home')
+        command_runner(['systemctl', '--user', 'show', '--property=Version', '--value'])
         with store.lock(root):
-            store.atomic_json(_timer_record(root), {**record, 'state': 'failed', 'error': str(error)})
-        raise
-    with store.lock(root):
-        final = {**record, 'state': 'enabled'}
-        store.atomic_json(_timer_record(root), final)
-    return final
+            previous = _read_record(root)
+            unchanged = previous and previous.get('schedule') == schedule and previous.get('state') == 'enabled'
+            anchor = previous.get('anchor') if unchanged and schedule['mode'] == 'interval' else float(int(now // 3600) * 3600)
+            checkpoint = previous.get('checkpoint') if unchanged else ({'next_due': agreed_next} if agreed_next is not None else {'anchor': anchor, 'last_due': anchor})
+            record = {'schema': 1, 'home_id': _home_id(root), 'uid': os.getuid(), 'schedule': schedule,
+                      'anchor': anchor if schedule['mode'] == 'interval' else None, 'checkpoint': checkpoint, 'state': 'enabling'}
+            reviewer._private(_timer_record(root).parent); store.atomic_json(_timer_record(root), record)
+        try:
+            changed = _write_unit(directory / rendered['timer_name'], rendered['timer'], marker)
+            changed = _write_unit(directory / rendered['service_name'], rendered['service'], marker) or changed
+            if not unchanged or changed:
+                command_runner(['systemctl', '--user', 'daemon-reload'])
+                command_runner(['systemctl', '--user', 'enable', rendered['timer_name']])
+            command_runner(['systemctl', '--user', 'start', rendered['timer_name']])
+            command_runner(['systemctl', '--user', 'is-active', '--quiet', rendered['timer_name']])
+        except Exception as error:
+            with store.lock(root):
+                store.atomic_json(_timer_record(root), {**record, 'state': 'failed', 'error': str(error)})
+            raise
+        with store.lock(root):
+            final = {**record, 'state': 'enabled'}
+            store.atomic_json(_timer_record(root), final)
+        return final
 
 
 def disable(home, *, xdg_config_home=None, command_runner=store.run):
-    root = store.home(home); name = unit_name(root); service = name[:-6] + '.service'; marker = f'X-AGD-Reviewer-Owner={_home_id(root)}:{os.getuid()}'
-    directory = _unit_directory(xdg_config_home); paths = [directory / item for item in (name, service)]
-    present = [path for path in paths if path.exists() or path.is_symlink()]
-    if any(not _owned(path, marker) for path in present): raise store.Refusal('existing unit is not owned by this home')
-    with store.lock(root):
-        record = _read_record(root) or {'schema': 1, 'home_id': _home_id(root), 'uid': os.getuid()}
-        if record.get('state') == 'disabled' and not present: return
-        store.atomic_json(_timer_record(root), {**record, 'state': 'disabling'})
-    try:
-        if present: command_runner(['systemctl', '--user', 'disable', '--now', name])
-        for path in present: path.unlink()
-        command_runner(['systemctl', '--user', 'daemon-reload'])
-    except Exception as error:
-        with store.lock(root): store.atomic_json(_timer_record(root), {**record, 'state': 'disabling', 'error': str(error)})
-        raise
-    with store.lock(root): store.atomic_json(_timer_record(root), {**record, 'state': 'disabled'})
+    root = store.home(home)
+    from .uninstall_state import admission
+    with admission(home):
+        name = unit_name(root); service = name[:-6] + '.service'; marker = f'X-AGD-Reviewer-Owner={_home_id(root)}:{os.getuid()}'
+        directory = _unit_directory(xdg_config_home); paths = [directory / item for item in (name, service)]
+        present = [path for path in paths if path.exists() or path.is_symlink()]
+        if any(not _owned(path, marker) for path in present): raise store.Refusal('existing unit is not owned by this home')
+        with store.lock(root):
+            record = _read_record(root) or {'schema': 1, 'home_id': _home_id(root), 'uid': os.getuid()}
+            if record.get('state') == 'disabled' and not present: return
+            store.atomic_json(_timer_record(root), {**record, 'state': 'disabling'})
+        try:
+            if present: command_runner(['systemctl', '--user', 'disable', '--now', name])
+            for path in present: path.unlink()
+            command_runner(['systemctl', '--user', 'daemon-reload'])
+        except Exception as error:
+            with store.lock(root): store.atomic_json(_timer_record(root), {**record, 'state': 'disabling', 'error': str(error)})
+            raise
+        with store.lock(root): store.atomic_json(_timer_record(root), {**record, 'state': 'disabled'})
 
 
 def timer_tick(home, *, now=None):
     """Durably write the immutable intent before consuming its due occurrence."""
-    root = store.home(home); now = time.time() if now is None else float(now)
-    with store.lock(root):
-        record = _read_record(root)
-        if not record or record.get('state') != 'enabled': raise store.Refusal('reviewer timer is not enabled')
-        due = calculate_due(record['schedule'], record['checkpoint'], now)
-        if due['due_at'] is None: return None
-        intent = reviewer._enqueue_intent_locked(root, kind='timer')
-        store.atomic_json(_timer_record(root), {**record, 'checkpoint': due['checkpoint']})
-        return intent
+    from .uninstall_state import admission
+    with admission(home):
+        root = store.home(home); now = time.time() if now is None else float(now)
+        with store.lock(root):
+            record = _read_record(root)
+            if not record or record.get('state') != 'enabled': raise store.Refusal('reviewer timer is not enabled')
+            due = calculate_due(record['schedule'], record['checkpoint'], now)
+            if due['due_at'] is None: return None
+            intent = reviewer._enqueue_intent_locked(root, kind='timer')
+            store.atomic_json(_timer_record(root), {**record, 'checkpoint': due['checkpoint']})
+            return intent

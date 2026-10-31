@@ -102,3 +102,35 @@ def lab():
         run(['git', 'config', 'user.name', 'Distro Test'], cwd=project)
         run(['git', 'config', 'user.email', 'test@example.invalid'], cwd=project)
         yield home, project
+
+
+@contextmanager
+def uninstall_scope(home, resources, *, discard=False):
+    """Grant only supplied fixture resources, bound to real files and home identity."""
+    import hashlib
+    import sys
+    from agd_lib import uninstall_state
+    target = uninstall_state.target_identity(home)
+    work_loss = [loss for resource in resources for loss in resource.get('work_loss', [])]
+    inventory = {'schema': 1, 'target': target, 'resources': resources,
+                 'work_loss': work_loss, 'retained': [], 'blockers': [], 'warnings': [],
+                 'outcome': 'ready',
+                 'discard_digest': uninstall_state.fingerprint(work_loss) if work_loss else None}
+    inventory['digest'] = uninstall_state.fingerprint(
+        {key: inventory[key] for key in ('target', 'resources', 'work_loss')})
+    with uninstall_state.retirement(
+            home, inventory, discard_digest=inventory['discard_digest'] if discard else None) as operation:
+        source = Path(__file__).resolve().parents[1]
+        directory = uninstall_state.operation_dir(home)
+        files = {}
+        payload = [source / 'bin/agd', *sorted((source / 'bin/agd_lib').glob('*.py')),
+                   source / 'bundled/observability/release-lock.json']
+        for original in payload:
+            relative = original.relative_to(source).as_posix()
+            path = directory / relative
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            shutil.copyfile(original, path)
+            files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        operation['executor'] = {'source_root': str(source),
+                                 'python': str(Path(sys.executable).resolve()), 'files': files}
+        yield uninstall_state.checkpoint(home, operation, phase='quiescing')

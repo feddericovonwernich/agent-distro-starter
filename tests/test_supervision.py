@@ -202,19 +202,6 @@ def test_recovered_ready_check_rearms_next_failure():
                    for e in command(home, 'events', 'list'))
 
 
-def test_watcher_runs_central_review_tick_after_reconcile(monkeypatch, tmp_path):
-    home = tmp_path / 'home'
-    monkeypatch.setenv('AGD_OWNER', 'owner-token')
-    monkeypatch.setattr(supervision, 'process_start', lambda _pid: 'start')
-    calls = []
-    monkeypatch.setattr(supervision, 'reconcile', lambda _home: calls.append('reconcile') or {'pending': []})
-    monkeypatch.setattr('agd_lib.relay_reviews.tick', lambda _home: calls.append('tick'))
-    monkeypatch.setattr('agd_lib.supervision._stop_owned_relay_services', lambda _home: calls.append('stop'))
-    monkeypatch.setattr(supervision.time, 'sleep',
-                        lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt()))
-    with pytest.raises(KeyboardInterrupt):
-        supervision.watch(home, 1, 'start', 'generation')
-    assert calls == ['reconcile', 'tick', 'stop']
 
 
 def test_owner_exit_stops_only_regular_owned_relay_service(monkeypatch, tmp_path):

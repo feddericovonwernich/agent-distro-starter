@@ -131,20 +131,22 @@ def _initialize_git_config(home: Path, inherited: Mapping[str, str]) -> None:
 
 def initialize(home, executable: str, *, inherited: Mapping[str, str] | None = None, run=store.run) -> None:
     root = store.home(home)
-    for directory in runtime_directories(root):
-        _private_directory(root, directory)
-    effective_inherited = os.environ if inherited is None else inherited
-    _initialize_git_config(root, effective_inherited)
-    marketplace_registry = _data_root(root) / 'marketplaces.json'
-    try:
-        identity = marketplace_registry.lstat()
-    except FileNotFoundError:
-        store.atomic_json(marketplace_registry, {'version': 1, 'marketplaces': []})
-    else:
-        if not stat.S_ISREG(identity.st_mode):
-            raise store.Refusal('OMP marketplace registry is unsafe')
-    run([executable, 'config', 'init-xdg'], cwd=root,
-        env=environment(root, effective_inherited))
+    from .uninstall_state import admission
+    with admission(home):
+        for directory in runtime_directories(root):
+            _private_directory(root, directory)
+        effective_inherited = os.environ if inherited is None else inherited
+        _initialize_git_config(root, effective_inherited)
+        marketplace_registry = _data_root(root) / 'marketplaces.json'
+        try:
+            identity = marketplace_registry.lstat()
+        except FileNotFoundError:
+            store.atomic_json(marketplace_registry, {'version': 1, 'marketplaces': []})
+        else:
+            if not stat.S_ISREG(identity.st_mode):
+                raise store.Refusal('OMP marketplace registry is unsafe')
+        run([executable, 'config', 'init-xdg'], cwd=root,
+            env=environment(root, effective_inherited))
 
 
 def executable(home) -> str:
@@ -153,6 +155,37 @@ def executable(home) -> str:
     if entry is None:
         raise store.DependencyError('OMP dependency receipt is unavailable')
     return entry['path']
+
+
+def exec_native(home, arguments):
+    """Publish a private PID/start receipt before handing this process to OMP."""
+    from .uninstall_state import admission
+    from .supervision import process_start
+    root = store.home(home)
+    validate_native_args(arguments)
+    with admission(root):
+        binary = executable(root)
+        env = environment(root, os.environ)
+        identity = root.lstat()
+        marker = _read_json(root / 'data/home.json', 'home identity', optional=True)
+        if marker is None:
+            marker = {}
+        if not isinstance(marker, dict):
+            raise store.Refusal('OMP home identity is malformed')
+        target = {'canonical_home': str(root), 'home_id': marker.get('home_id'),
+                  'uid': identity.st_uid, 'device': identity.st_dev, 'inode': identity.st_ino}
+        folder = root / 'state/native-omp'
+        folder.mkdir(mode=0o700, exist_ok=True)
+        mode = folder.lstat()
+        if (not stat.S_ISDIR(mode.st_mode) or mode.st_uid != os.getuid()
+                or stat.S_IMODE(mode.st_mode) != 0o700):
+            raise store.Refusal('native OMP receipt directory is unsafe')
+        pid, start = os.getpid(), process_start(os.getpid())
+        receipt = {'schema': 1, 'target': target, 'pid': pid, 'start': start,
+                   'uid': os.getuid(), 'executable': str(Path(binary).resolve())}
+        store.atomic_json(folder / f'{pid}-{start}.json', receipt)
+        os.chdir(root)
+        os.execvpe(binary, [binary, *arguments], env)
 
 
 def validate_native_args(arguments) -> None:
@@ -320,32 +353,34 @@ def installed_plugins(home, required_ids=None) -> dict[str, dict]:
 
 def install_plugins(home, executable: str, *, run=store.run) -> dict[str, dict]:
     root = store.home(home)
-    registry = _registry(root, optional=True)
-    registered = set() if registry is None else set(registry['plugins'])
-    marketplace_value = _confined_json(
-        _data_root(root) / 'marketplaces.json', _root(root),
-        'marketplace registry', optional=True)
-    existing_markets = {}
-    if marketplace_value is not None:
-        if (not isinstance(marketplace_value, dict) or marketplace_value.get('version') != 1
-                or not isinstance(marketplace_value.get('marketplaces'), list)):
-            raise store.Refusal('native plugin marketplace registry is malformed')
-        for row in marketplace_value['marketplaces']:
-            if not isinstance(row, dict) or not isinstance(row.get('name'), str):
+    from .uninstall_state import admission
+    with admission(home):
+        registry = _registry(root, optional=True)
+        registered = set() if registry is None else set(registry['plugins'])
+        marketplace_value = _confined_json(
+            _data_root(root) / 'marketplaces.json', _root(root),
+            'marketplace registry', optional=True)
+        existing_markets = {}
+        if marketplace_value is not None:
+            if (not isinstance(marketplace_value, dict) or marketplace_value.get('version') != 1
+                    or not isinstance(marketplace_value.get('marketplaces'), list)):
                 raise store.Refusal('native plugin marketplace registry is malformed')
-            existing_markets.setdefault(row['name'], []).append(row)
-    env = environment(root, os.environ)
-    for plugin_id, spec in PLUGIN_SPECS.items():
-        rows = existing_markets.get(spec['marketplace'], [])
-        if rows and (len(rows) != 1 or rows[0].get('sourceType') != 'github'
-                     or rows[0].get('sourceUri') != spec['source']):
-            raise store.Refusal(f'native plugin marketplace {spec["marketplace"]} has a conflicting publisher')
-        if not rows:
-            run([executable, 'plugin', 'marketplace', 'add', spec['source']],
+            for row in marketplace_value['marketplaces']:
+                if not isinstance(row, dict) or not isinstance(row.get('name'), str):
+                    raise store.Refusal('native plugin marketplace registry is malformed')
+                existing_markets.setdefault(row['name'], []).append(row)
+        env = environment(root, os.environ)
+        for plugin_id, spec in PLUGIN_SPECS.items():
+            rows = existing_markets.get(spec['marketplace'], [])
+            if rows and (len(rows) != 1 or rows[0].get('sourceType') != 'github'
+                         or rows[0].get('sourceUri') != spec['source']):
+                raise store.Refusal(f'native plugin marketplace {spec["marketplace"]} has a conflicting publisher')
+            if not rows:
+                run([executable, 'plugin', 'marketplace', 'add', spec['source']],
+                    cwd=root, env=env, timeout=300)
+            if plugin_id in registered:
+                installed_plugins(root, (plugin_id,))
+                continue
+            run([executable, 'plugin', 'install', '--scope', 'project', plugin_id],
                 cwd=root, env=env, timeout=300)
-        if plugin_id in registered:
-            installed_plugins(root, (plugin_id,))
-            continue
-        run([executable, 'plugin', 'install', '--scope', 'project', plugin_id],
-            cwd=root, env=env, timeout=300)
-    return installed_plugins(root)
+        return installed_plugins(root)

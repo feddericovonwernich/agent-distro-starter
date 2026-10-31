@@ -24,45 +24,51 @@ def read(home, project_id):
 
 def register(home, project_id, path, base='main', source=None):
     store.validate_id(project_id)
-    path = Path(path)
-    if path.is_symlink() or path.resolve() != home/'projects'/project_id:
-        raise store.Refusal('project must be an actual clone inside projects/')
-    with store.lock(home):
-        if record(home, project_id).exists():
-            raise store.Refusal('project already registered')
-        if store.git(path, 'rev-parse', '--is-bare-repository') != 'false':
-            raise store.Refusal('project must be a non-bare clone')
-        if store.git(path, 'rev-parse', '--show-toplevel') != str(path):
-            raise store.Refusal('project path is not the checkout root')
-        if store.git(path, 'rev-parse', '--verify', base, check=False) == '':
-            raise store.Refusal('base branch does not exist')
-        data = dict(schema=1, id=project_id, path=str(path),
-                    common_dir=store.git(path, 'rev-parse', '--path-format=absolute', '--git-common-dir'),
-                    source=source or store.git(path, 'remote', 'get-url', 'origin', check=False),
-                    base=base, trusted=False)
-        store.atomic_json(record(home, project_id), data)
-        return data
+    from .uninstall_state import admission
+    with admission(home):
+        path = Path(path)
+        if path.is_symlink() or path.resolve() != home/'projects'/project_id:
+            raise store.Refusal('project must be an actual clone inside projects/')
+        with store.lock(home):
+            if record(home, project_id).exists():
+                raise store.Refusal('project already registered')
+            if store.git(path, 'rev-parse', '--is-bare-repository') != 'false':
+                raise store.Refusal('project must be a non-bare clone')
+            if store.git(path, 'rev-parse', '--show-toplevel') != str(path):
+                raise store.Refusal('project path is not the checkout root')
+            if store.git(path, 'rev-parse', '--verify', base, check=False) == '':
+                raise store.Refusal('base branch does not exist')
+            data = dict(schema=1, id=project_id, path=str(path),
+                        common_dir=store.git(path, 'rev-parse', '--path-format=absolute', '--git-common-dir'),
+                        source=source or store.git(path, 'remote', 'get-url', 'origin', check=False),
+                        base=base, trusted=False)
+            store.atomic_json(record(home, project_id), data)
+            return data
 
 
 def add(home, project_id, source, base='main'):
     store.validate_id(project_id)
-    target = home/'projects'/project_id
-    if target.exists() or target.is_symlink() or record(home, project_id).exists():
-        raise store.Refusal('clone or record already exists')
-    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    store.run(['git', 'clone', '--', source, str(target)], timeout=120)
-    return register(home, project_id, target, base=base, source=source)
+    from .uninstall_state import admission
+    with admission(home):
+        target = home/'projects'/project_id
+        if target.exists() or target.is_symlink() or record(home, project_id).exists():
+            raise store.Refusal('clone or record already exists')
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        store.run(['git', 'clone', '--', source, str(target)], timeout=120)
+        return register(home, project_id, target, base=base, source=source)
 
 
 def refresh(home, project_id):
     data = read(home, project_id)
-    clone = Path(data['path'])
-    with store.lock(home):
-        if not store.clean(clone) or store.git(clone, 'branch', '--show-current') != data['base']:
-            raise store.Refusal('clone must be clean on its base branch')
-        store.git(clone, 'fetch', 'origin', data['base'])
-        store.git(clone, 'merge', '--ff-only', f'origin/{data["base"]}')
-    return read(home, project_id)
+    from .uninstall_state import admission
+    with admission(home):
+        clone = Path(data['path'])
+        with store.lock(home):
+            if not store.clean(clone) or store.git(clone, 'branch', '--show-current') != data['base']:
+                raise store.Refusal('clone must be clean on its base branch')
+            store.git(clone, 'fetch', 'origin', data['base'])
+            store.git(clone, 'merge', '--ff-only', f'origin/{data["base"]}')
+        return read(home, project_id)
 
 def approve(home, project_id, action, instruction):
     if action != 'delete-clone':

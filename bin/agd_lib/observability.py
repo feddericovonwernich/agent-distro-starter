@@ -151,40 +151,46 @@ def worker_binding_locked(home, task_id, incarnation):
 
 def worker_binding(home, task_id, incarnation):
     home = _home(home)
-    with store.lock(home):
-        return worker_binding_locked(home, task_id, incarnation)
+    from .uninstall_state import admission
+    with admission(home):
+        with store.lock(home):
+            return worker_binding_locked(home, task_id, incarnation)
 
 
 def reviewer_session_dir(home, review_run_id):
     """Provision only the reviewer native directory; binding awaits the real ID."""
-    home = _home(home)
-    try: review_run_id = str(uuid.UUID(review_run_id))
-    except (ValueError, TypeError, AttributeError) as error: raise ValueError('invalid reviewer run ID') from error
-    with store.lock(home):
-        return str(_private_directory(_private_directory(home, 'data', 'observability', 'reviewer', review_run_id), 'omp'))
+    from .uninstall_state import admission
+    with admission(home):
+        home = _home(home)
+        try: review_run_id = str(uuid.UUID(review_run_id))
+        except (ValueError, TypeError, AttributeError) as error: raise ValueError('invalid reviewer run ID') from error
+        with store.lock(home):
+            return str(_private_directory(_private_directory(home, 'data', 'observability', 'reviewer', review_run_id), 'omp'))
 
 def reviewer_binding(home, review_run_id, native_session_id):
     """Create the reviewer-owned native session receipt after native allocation."""
-    home = _home(home)
-    try:
-        review_run_id = str(uuid.UUID(review_run_id))
-    except (ValueError, TypeError, AttributeError) as error:
-        raise ValueError('invalid reviewer run ID') from error
-    if not isinstance(native_session_id, str) or not native_session_id or '/' in native_session_id:
-        raise ValueError('invalid native reviewer session ID')
-    with store.lock(home):
-        directory = _private_directory(home, 'data', 'observability', 'reviewer', review_run_id)
-        session_dir = _private_directory(directory, 'omp')
-        receipt = directory / 'binding.json'
-        expected = {'schema': 1, 'purpose': 'background-skill-review', 'review_run_id': review_run_id,
-                    'native_session_id': native_session_id, 'session_dir': str(session_dir)}
-        value = _read_json(receipt)
-        if value is None:
-            store.atomic_json(receipt, expected)
-            return expected
-        if value != expected:
-            raise store.Refusal('reviewer binding is immutable')
-        return value
+    from .uninstall_state import admission
+    with admission(home):
+        home = _home(home)
+        try:
+            review_run_id = str(uuid.UUID(review_run_id))
+        except (ValueError, TypeError, AttributeError) as error:
+            raise ValueError('invalid reviewer run ID') from error
+        if not isinstance(native_session_id, str) or not native_session_id or '/' in native_session_id:
+            raise ValueError('invalid native reviewer session ID')
+        with store.lock(home):
+            directory = _private_directory(home, 'data', 'observability', 'reviewer', review_run_id)
+            session_dir = _private_directory(directory, 'omp')
+            receipt = directory / 'binding.json'
+            expected = {'schema': 1, 'purpose': 'background-skill-review', 'review_run_id': review_run_id,
+                        'native_session_id': native_session_id, 'session_dir': str(session_dir)}
+            value = _read_json(receipt)
+            if value is None:
+                store.atomic_json(receipt, expected)
+                return expected
+            if value != expected:
+                raise store.Refusal('reviewer binding is immutable')
+            return value
 
 
 def managed_environment(home, role, task, incarnation):
@@ -270,36 +276,38 @@ def reviewer_environment(home, review_run_id):
 
 def central_argv(home, omp_args):
     home = _home(home)
-    omp_runtime.validate_native_args(omp_args)
-    forbidden = {'--cwd', '--session-dir', '--continue', '-c', '--resume', '-r', '--session',
-                 '--no-session', '--fork', '--from-claude', '--from-codex'}
-    for argument in omp_args:
-        if argument == '--':
-            break
-        if argument in forbidden or any(argument.startswith(flag + '=') for flag in forbidden):
-            raise store.Refusal('managed central refuses forwarded cwd or native session controls')
-    config = read_config(home)
-    warning = None
-    if config['mode'] == 'enabled':
-        try:
-            start(home)
-        except store.Refusal as error:
-            warning = f'observability degraded: {error}'
-    env, generation, environment_warning = managed_environment(home, 'central', None, None)
-    warning = warning or environment_warning
-    _private_directory(home, 'data', 'observability', 'central', 'omp')
-    binary = shutil.which('omp')
-    if not binary:
-        raise store.DependencyError('omp is not installed')
-    binary = str(Path(binary).resolve())
-    argv = [binary, '--cwd', str(home), '--session-dir', str(paths(home)['central_sessions']), *omp_args]
-    if Path(binary).read_text(errors='ignore').split('\n', 1)[0] == '#!/usr/bin/env bun':
-        bun = shutil.which('bun')
-        if not bun:
-            raise store.DependencyError('bun is unavailable')
-        argv[:0] = [str(Path(bun).resolve())]
-    record_process_generation(home, 'central', generation)
-    return argv, env, warning
+    from .uninstall_state import admission
+    with admission(home):
+        omp_runtime.validate_native_args(omp_args)
+        forbidden = {'--cwd', '--session-dir', '--continue', '-c', '--resume', '-r', '--session',
+                     '--no-session', '--fork', '--from-claude', '--from-codex'}
+        for argument in omp_args:
+            if argument == '--':
+                break
+            if argument in forbidden or any(argument.startswith(flag + '=') for flag in forbidden):
+                raise store.Refusal('managed central refuses forwarded cwd or native session controls')
+        config = read_config(home)
+        warning = None
+        if config['mode'] == 'enabled':
+            try:
+                start(home)
+            except store.Refusal as error:
+                warning = f'observability degraded: {error}'
+        env, generation, environment_warning = managed_environment(home, 'central', None, None)
+        warning = warning or environment_warning
+        _private_directory(home, 'data', 'observability', 'central', 'omp')
+        binary = shutil.which('omp')
+        if not binary:
+            raise store.DependencyError('omp is not installed')
+        binary = str(Path(binary).resolve())
+        argv = [binary, '--cwd', str(home), '--session-dir', str(paths(home)['central_sessions']), *omp_args]
+        if Path(binary).read_text(errors='ignore').split('\n', 1)[0] == '#!/usr/bin/env bun':
+            bun = shutil.which('bun')
+            if not bun:
+                raise store.DependencyError('bun is unavailable')
+            argv[:0] = [str(Path(bun).resolve())]
+        record_process_generation(home, 'central', generation)
+        return argv, env, warning
 
 
 def _home(value):
@@ -447,7 +455,7 @@ def record_process_generation(home, role, generation, task_id=None, incarnation=
     identity = '-'.join((role, task_id or 'central', incarnation or 'session', str(pid), start))
     name = uuid.uuid5(uuid.NAMESPACE_URL, identity).hex + '.json'
     receipt = {'schema': 1, 'role': role, 'generation': generation, 'pid': pid, 'start': start,
-               'recorded_at': time.time()}
+               'uid': os.getuid(), 'recorded_at': time.time()}
     if role == 'worker':
         receipt.update(task_id=task_id, incarnation=incarnation)
     with store.lock(home):
@@ -653,55 +661,57 @@ def _parse_collector_metrics(text):
 
 def _lifecycle(home, action):
     home = _home(home)
-    locations = paths(home)
-    _runtime_directories(home)
-    fd = os.open(locations['compose'] / 'lifecycle.lock', os.O_CREAT | os.O_RDWR, 0o600)
-    acquired = False
-    try:
+    from .uninstall_state import admission
+    with admission(home):
+        locations = paths(home)
+        _runtime_directories(home)
+        fd = os.open(locations['compose'] / 'lifecycle.lock', os.O_CREAT | os.O_RDWR, 0o600)
+        acquired = False
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            acquired = True
-        except BlockingIOError as error:
-            raise store.Refusal('observability lifecycle is busy') from error
-        _save_stage(home, action)
-        if action == 'enable':
-            rendered = render_stack(home); _compose(rendered, 'up', '-d')
-            _wait_ready(rendered, _secrets(home, rendered)); _save_state(home, 'enabled', 'healthy', rendered)
-            return status(home)
-        config = read_config(home)
-        if action == 'start':
-            if config['mode'] != 'enabled' or not (locations['compose'] / 'compose.yaml').exists():
-                raise store.Refusal('observability is not enabled')
-            rendered = dict(_allocation(home), compose=locations['compose'] / 'compose.yaml',
-                            home_id=config['home_id'], lock=config['lock'], project_id=config['project_id'])
-            _compose(rendered, 'up', '-d'); _wait_ready(rendered, _read_secrets(home))
-            _save_state(home, 'enabled', 'healthy', rendered); return status(home)
-        if action in ('stop', 'disable'):
-            desired = 'disabled' if action == 'disable' else config['mode']
-            if not (locations['compose'] / 'compose.yaml').exists():
-                _save_state(home, desired, 'disabled' if action == 'disable' else 'stopped', _allocation(home))
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except BlockingIOError as error:
+                raise store.Refusal('observability lifecycle is busy') from error
+            _save_stage(home, action)
+            if action == 'enable':
+                rendered = render_stack(home); _compose(rendered, 'up', '-d')
+                _wait_ready(rendered, _secrets(home, rendered)); _save_state(home, 'enabled', 'healthy', rendered)
+                return status(home)
+            config = read_config(home)
+            if action == 'start':
+                if config['mode'] != 'enabled' or not (locations['compose'] / 'compose.yaml').exists():
+                    raise store.Refusal('observability is not enabled')
+                rendered = dict(_allocation(home), compose=locations['compose'] / 'compose.yaml',
+                                home_id=config['home_id'], lock=config['lock'], project_id=config['project_id'])
+                _compose(rendered, 'up', '-d'); _wait_ready(rendered, _read_secrets(home))
+                _save_state(home, 'enabled', 'healthy', rendered); return status(home)
+            if action in ('stop', 'disable'):
+                desired = 'disabled' if action == 'disable' else config['mode']
+                if not (locations['compose'] / 'compose.yaml').exists():
+                    _save_state(home, desired, 'disabled' if action == 'disable' else 'stopped', _allocation(home))
+                    return read_status(home)
+                if 'project' in config:
+                    lock, project_id = config['lock'], config['project_id']
+                else:
+                    # A first enable can leave a complete render before publishing config.
+                    lock = _read_json(locations['compose'] / 'release-lock.json')
+                    _validate_lock(lock)
+                    project_id = _read_secrets(home).get('project_id')
+                    if not isinstance(project_id, str) or not project_id:
+                        raise store.Refusal('observability recovery project is unavailable')
+                rendered = dict(_allocation(home), compose=locations['compose'] / 'compose.yaml',
+                                home_id=config['home_id'], lock=lock, project_id=project_id)
+                if action == 'disable':
+                    _save_state(home, 'disabled', 'unknown', rendered)
+                _compose(rendered, 'stop'); _save_state(home, desired, 'stopped', rendered)
                 return read_status(home)
-            if 'project' in config:
-                lock, project_id = config['lock'], config['project_id']
-            else:
-                # A first enable can leave a complete render before publishing config.
-                lock = _read_json(locations['compose'] / 'release-lock.json')
-                _validate_lock(lock)
-                project_id = _read_secrets(home).get('project_id')
-                if not isinstance(project_id, str) or not project_id:
-                    raise store.Refusal('observability recovery project is unavailable')
-            rendered = dict(_allocation(home), compose=locations['compose'] / 'compose.yaml',
-                            home_id=config['home_id'], lock=lock, project_id=project_id)
-            if action == 'disable':
-                _save_state(home, 'disabled', 'unknown', rendered)
-            _compose(rendered, 'stop'); _save_state(home, desired, 'stopped', rendered)
-            return read_status(home)
-    except store.Refusal:
-        if acquired:
-            _save_failure(home, action)
-        raise
-    finally:
-        os.close(fd)
+        except store.Refusal:
+            if acquired:
+                _save_failure(home, action)
+            raise
+        finally:
+            os.close(fd)
 
 
 def _compose(rendered, *command):

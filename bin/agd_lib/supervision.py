@@ -205,33 +205,37 @@ def process_start(pid):
 
 
 def watch(home, owner_pid, owner_start, generation):
-    lock_path = home/'state'/'session.lock'
-    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    from contextlib import ExitStack
+    from .uninstall_state import admission
     owned = False
     try:
-        with lock_path.open('a+') as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise store.Refusal('another central watcher owns this home') from error
-            if process_start(owner_pid) != owner_start:
-                raise store.Refusal('central owner identity is no longer alive')
-            token = os.environ.get('AGD_OWNER')
-            if not token:
-                raise store.Refusal('central owner token required')
-            previous_path = home/'state'/'owner.json'
-            if previous_path.exists():
-                previous = json.loads(previous_path.read_text())
+        with ExitStack() as lifetime:
+            with admission(home):
+                lock_path = home/'state'/'session.lock'
+                lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                lock = lifetime.enter_context(lock_path.open('a+'))
                 try:
-                    still_alive = process_start(previous['owner_pid']) == previous['owner_start']
-                except (FileNotFoundError, ProcessLookupError):
-                    still_alive = False
-                if still_alive and (previous['owner_pid'] != owner_pid or previous.get('token') != token):
-                    raise store.Refusal('prior central remains alive; foreign watcher cannot take over')
-            owned = True
-            owner = dict(owner_pid=owner_pid, owner_start=owner_start, generation=generation,
-                         token=token, watcher_pid=os.getpid(), watcher_start=process_start(os.getpid()), heartbeat=time.time())
-            store.atomic_json(home/'state'/'owner.json', owner)
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as error:
+                    raise store.Refusal('another central watcher owns this home') from error
+                if process_start(owner_pid) != owner_start:
+                    raise store.Refusal('central owner identity is no longer alive')
+                token = os.environ.get('AGD_OWNER')
+                if not token:
+                    raise store.Refusal('central owner token required')
+                previous_path = home/'state'/'owner.json'
+                if previous_path.exists():
+                    previous = json.loads(previous_path.read_text())
+                    try:
+                        still_alive = process_start(previous['owner_pid']) == previous['owner_start']
+                    except (FileNotFoundError, ProcessLookupError):
+                        still_alive = False
+                    if still_alive and (previous['owner_pid'] != owner_pid or previous.get('token') != token):
+                        raise store.Refusal('prior central remains alive; foreign watcher cannot take over')
+                owned = True
+                owner = dict(owner_pid=owner_pid, owner_start=owner_start, generation=generation, uid=os.getuid(),
+                             token=token, watcher_pid=os.getpid(), watcher_start=process_start(os.getpid()), heartbeat=time.time())
+                store.atomic_json(home/'state'/'owner.json', owner)
             print(json.dumps({'type': 'ready', 'generation': generation}), flush=True)
             seen, next_review = set(), 0.0
             from . import relay_reviews

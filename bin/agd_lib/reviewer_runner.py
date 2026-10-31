@@ -16,6 +16,8 @@ from . import observability, omp_runtime, reviewer, store
 
 def assert_runtime_capability(deadline_epoch_ms, *, home=None, omp_binary='omp'):
     """Discover public installed OMP modules from the selected OMP executable."""
+    from contextlib import nullcontext
+    from .uninstall_state import admission
     remaining = reviewer.deadline_remaining_seconds(deadline_epoch_ms)
     if remaining <= 0: raise store.DependencyError('reviewer deadline exceeded')
     omp = shutil.which(omp_binary)
@@ -40,8 +42,9 @@ for(const [name,value] of Object.entries({Agent:core.Agent,streamSimple:ai.strea
 console.log(JSON.stringify({ai_url:import.meta.resolve(modules.ai),core_url:import.meta.resolve(modules.core),sdk_url:import.meta.resolve(modules.sdk),registry_url:import.meta.resolve(modules.registry),manager_url:import.meta.resolve(modules.manager),session_url:import.meta.resolve(modules.session),telemetry_url:import.meta.resolve(modules.telemetry),resolver_url:import.meta.resolve(modules.resolver),omp_version:process.argv[1]}));"""
     base_env = {key: os.environ[key] for key in ('PATH', 'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME') if key in os.environ}
     env = omp_runtime.environment(home, base_env) if home is not None else base_env
-    try: result = subprocess.run([binary, '--no-install', '--no-env-file', '-e', script, manifest['version']], capture_output=True, text=True, cwd=root, timeout=min(10, remaining), env=env)
-    except subprocess.TimeoutExpired as error: raise store.DependencyError('installed OMP runtime capability timed out') from error
+    with admission(home) if home is not None else nullcontext():
+        try: result = subprocess.run([binary, '--no-install', '--no-env-file', '-e', script, manifest['version']], capture_output=True, text=True, cwd=root, timeout=min(10, remaining), env=env)
+        except subprocess.TimeoutExpired as error: raise store.DependencyError('installed OMP runtime capability timed out') from error
     if result.returncode: raise store.DependencyError(f'installed OMP runtime capability unavailable: {result.stderr.strip()}')
     try: capability = json.loads(result.stdout)
     except json.JSONDecodeError as error: raise store.DependencyError('installed OMP runtime capability malformed') from error
@@ -71,10 +74,19 @@ def _runtime_boundary(home, review_run_id):
 
 def run_native_reviewer(home, intent, *, omp_binary='omp'):
     """Run one selector-only native child while retaining the private lease."""
-    with reviewer.run_lease(home):
-        config, started = reviewer.read_config(home), time.time()
-        run = reviewer.reserve_run(home, intent, config_snapshot=config, instruction_snapshot=Path(reviewer.INSTRUCTION_FILE).read_bytes(),
-                                   started_at=started, deadline_epoch_ms=int((started + config['limits']['max_runtime_seconds']) * 1000))
+    from contextlib import ExitStack
+    from .uninstall_state import admission
+    from .supervision import process_start
+    with ExitStack() as lifetime:
+        with admission(home):
+            lifetime.enter_context(reviewer.run_lease(home))
+            config, started = reviewer.read_config(home), time.time()
+            run = reviewer.reserve_run(home, intent, config_snapshot=config, instruction_snapshot=Path(reviewer.INSTRUCTION_FILE).read_bytes(),
+                                       started_at=started, deadline_epoch_ms=int((started + config['limits']['max_runtime_seconds']) * 1000))
+            with store.lock(store.home(home)):
+                receipt = reviewer._receipt(home, run['review_run_id'])
+                receipt['coordinator'] = {'pid': os.getpid(), 'start': process_start(os.getpid()), 'uid': os.getuid()}
+                store.atomic_json(reviewer.paths(home)['receipts'] / f"{run['review_run_id']}.json", receipt)
         try:
             packet = reviewer.select_packet(home, cutoff=started, config_snapshot=config,
                                             retrospective_review_run_ids=tuple(intent.get('retrospective_review_run_ids', ())),
@@ -113,7 +125,17 @@ def run_native_reviewer(home, intent, *, omp_binary='omp'):
         if not bun: return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='bun', packet=packet)
         stderr = bytearray()
         try:
-            process = subprocess.Popen([bun, '--no-install', '--no-env-file', str(Path(__file__).resolve().parents[2] / 'lib' / 'agd-reviewer-host.ts')], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=runtime, start_new_session=True)
+            with admission(home):
+                process = subprocess.Popen([bun, '--no-install', '--no-env-file', str(Path(__file__).resolve().parents[2] / 'lib' / 'agd-reviewer-host.ts')], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=runtime, start_new_session=True)
+                try:
+                    with store.lock(store.home(home)):
+                        receipt = reviewer._receipt(home, run['review_run_id'])
+                        receipt['child'] = {'pid': process.pid, 'start': process_start(process.pid), 'uid': os.getuid()}
+                        store.atomic_json(reviewer.paths(home)['receipts'] / f"{run['review_run_id']}.json", receipt)
+                except BaseException:
+                    process.kill()
+                    process.wait()
+                    raise
         except OSError: return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='spawn', packet=packet)
         def drain():
             for chunk in iter(lambda: process.stderr.read(256), ''):

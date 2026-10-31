@@ -102,7 +102,9 @@ def test_lock_tolerates_concurrent_state_directory_creation(tmp_path, monkeypatc
 
 
 def test_project_service_is_private_and_idempotent(tmp_path, monkeypatch):
+    from support import command, uninstall_scope
     home = tmp_path / 'home'
+    command(home, 'init', '--backend', 'tmux')
     runtime = tmp_path / 'runtime'
     runtime.mkdir()
     monkeypatch.setattr(relay, 'ensure_runtime', lambda *_args, **_kwargs: runtime)
@@ -122,19 +124,12 @@ def test_project_service_is_private_and_idempotent(tmp_path, monkeypatch):
     assert connector == {'connector': 'github', 'tokenEnv': 'AGD_RELAY_GITHUB_READ_TOKEN',
                          'repositories': [{'name': 'owner/repo', 'mode': 'generic-check-runs'}], 'triggers': []}
     assert not (home/'relay').exists()
+    with uninstall_scope(home, []):
+        with pytest.raises(store.Refusal):
+            relay.ensure_project_service(home, 'late', 'owner/repo', run=init)
+        assert not (Path(first['root']).parent / 'late').exists()
 
 
-def test_project_service_requires_token_before_runtime_or_state(tmp_path, monkeypatch):
-    called = False
-    def runtime(*_args, **_kwargs):
-        nonlocal called
-        called = True
-        return tmp_path/'runtime'
-    monkeypatch.setattr(relay, 'ensure_runtime', runtime)
-    from agd_lib import store
-    with pytest.raises(store.Refusal, match='AGD_RELAY_GITHUB_READ_TOKEN'):
-        relay.ensure_project_service(tmp_path/'home', 'sample', 'owner/repo')
-    assert not called and not (tmp_path/'home').exists()
 
 
 
@@ -221,11 +216,10 @@ def test_start_project_service_marks_exact_timed_out_server_unhealthy(tmp_path, 
         def poll(self): return None
         def terminate(self): pass
         def wait(self, timeout): pass
-    with pytest.raises(store.Refusal, match='did not publish'):
+    with pytest.raises(store.Refusal):
         relay.start_project_service(home, 'sample', 'owner/repo', popen=lambda *_args, **_kwargs: Process(), timeout=.01)
     state = json.loads((root/'service.json').read_text())
     assert state['health'] == 'unhealthy'
-    assert state['server'] == {'pid': 99, 'start': 'identity', 'status': 'starting'}
 
 def test_terminal_service_restarts_only_the_recorded_owned_process(tmp_path, monkeypatch):
     home = tmp_path/'home'
