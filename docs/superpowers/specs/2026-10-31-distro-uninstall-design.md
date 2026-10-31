@@ -16,12 +16,14 @@ No new dependency, service manager, global resource registry, generic workflow e
 
 ## Command and confirmation contract
 
-Proposed interface (builder choice, not a previously existing API):
+Proposed interface, including the user's requested in-directory invocation (not a previously existing API):
 
 ```sh
-/path/to/distro/bin/agd --home /absolute/path/to/distro uninstall --dry-run
-/path/to/distro/bin/agd --home /absolute/path/to/distro uninstall
+./bin/agd --home . uninstall --dry-run
+./bin/agd --home . uninstall
 ```
+
+For this command, resolve a relative `--home` against the invocation cwd before validation, staging, or chdir; pass only the resulting absolute, identity-checked target to existing lifecycle helpers. Do not relax `store.home()` or other commands' path contracts. `./bin/agd` is the distro-local script; `/bin/agd` would mean an unrelated system-wide installation, which this project does not create.
 
 - Dry-run is read-only and works without a terminal. It returns a pretty-printed JSON inventory with resource identities, planned removals, retained shared resources, data-loss warnings, and blockers. It must not call helpers that create directories, generate secrets, or publish lifecycle records merely to inspect an unconfigured feature.
 - Print the inventory even when blocked. Dry-run exits 0 when executable after the stated confirmations, 3 for ownership/state refusal, and 4 when an essential inspection dependency is unavailable; malformed arguments retain exit 2. Work-loss warnings awaiting discard approval are not unknown-ownership blockers. Cancellation is a distinct `cancelled` result with exit 0, never an `uninstalled` claim.
@@ -34,7 +36,7 @@ Proposed interface (builder choice, not a previously existing API):
 
 ## Invocation and home identity
 
-Execute from a terminal whose working directory is outside the target home and its owned worktrees. Refuse when the coordinator is a descendant/member of a central, worker, or backend process group that teardown would stop. This avoids killing the uninstaller or leaving the caller in a deleted working directory; a child cannot change its parent shell's cwd. Print an external-terminal invocation on refusal. Detached self-uninstall is not part of this design.
+Allow invocation from a normal terminal inside the target home. After validation/consent, move only the coordinator's cwd outside every deletion root before foreground handoff. Still refuse when the coordinator is a descendant/member of a central, worker, or backend process group that teardown would stop; being inside the directory is allowed, being part of a process tree being terminated is not. A child cannot change the caller shell's cwd: display the parent-directory `cd` command and recommend `./bin/agd --home . uninstall && cd ..` for an in-home shell. The acknowledged caller shell's cwd alone is not kill authority or an unresolved-runtime blocker; unrelated references retain their normal safety checks. Detached self-uninstall and automatic parent-shell manipulation are not part of this design.
 
 Require a real initialized home with a regular, current-UID `data/home.json`, valid schema/home ID, and safe directory identity. Bind the operation to canonical path, home ID, UID, and filesystem identity. Reject dangerous targets such as `/`, the account home, malformed/copied conflicting identities, and symlink redirection. Within each deletion root, do not follow symlinks or descend into nested mounts (including bind mounts); a root that is itself a mount point, an unexpected nested mount, or foreign ownership blocks removal. Do not unmount anything. A separately inventoried, receipt-proven external worktree may live on another filesystem: treat it as an independent exact deletion root with its own identity, never as permission to traverse or delete its parent pool. Symlink entries inside approved local data can be unlinked without following their destinations.
 
@@ -124,7 +126,9 @@ Behavioral regressions must cover target/identity refusal, no-write dry-run and 
 
 Also cover source-checkout linked-worktree registration removal, lost/corrupt journal refusal, cancellation before versus after irreversible removal, safe independent external filesystem roots versus nested mounts, and crashes during home deletion or after deletion but before delayed verification. Those recovery cases must work from the external executor without the original CLI, home marker, or modules.
 
-Use disposable native smoke resources to prove actual central/backend shutdown, active reviewer service/timer cleanup including persistent state, owned Docker container/network/volume removal, native Treehouse release/destruction and Git registration cleanup, and delayed non-recreation. Exercise the actual interactive command from outside its target; verify a second home and shared tools/sentinel resources remain untouched. No paid model call or real user-distro deletion is required. Name unavailable prerequisites and distinguish exercised proof from inference; mocks do not replace native lifecycle acceptance.
+Invocation acceptance includes relative-home normalization before any cwd change, a normal in-home terminal, coordinator cwd relocation, and refusal from a managed process tree being stopped. Do not claim to have changed the parent shell's cwd.
+
+Use disposable native smoke resources to prove actual central/backend shutdown, active reviewer service/timer cleanup including persistent state, owned Docker container/network/volume removal, native Treehouse release/destruction and Git registration cleanup, and delayed non-recreation. Exercise the actual interactive command from normal terminals both inside and outside its target; verify a second home and shared tools/sentinel resources remain untouched. No paid model call or real user-distro deletion is required. Name unavailable prerequisites and distinguish exercised proof from inference; mocks do not replace native lifecycle acceptance.
 
 ## Technical calls left to the builder
 
