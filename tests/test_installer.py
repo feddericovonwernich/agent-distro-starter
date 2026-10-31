@@ -1,9 +1,14 @@
 import hashlib
+from functools import partial
 import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tarfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -431,3 +436,198 @@ def test_probe_omp_requires_native_plugin_capability_floor():
 
     with pytest.raises(Refusal, match='18.14.0'):
         probe_omp('/opt/omp', run)
+
+
+@pytest.fixture
+def reviewer_onboarding(tmp_path, monkeypatch):
+    from agd_lib import omp_runtime, reviewer_timer
+    home = tmp_path / 'home'
+    (home / 'data').mkdir(parents=True)
+    (home / 'data/home.json').write_text('{"schema":1,"home_id":"123e4567-e89b-12d3-a456-426614174000"}')
+    omp_runtime.agent_dir(home).mkdir(parents=True)
+    xdg = tmp_path / 'xdg'
+    control = {'failure': None}
+    def systemctl(argv):
+        if control['failure'] in argv:
+            raise installer.store.DependencyError('native timer unavailable')
+    monkeypatch.setattr(reviewer_timer, 'enable',
+                        partial(reviewer_timer.enable, xdg_config_home=xdg, command_runner=systemctl))
+    return home, xdg, control
+
+
+@pytest.mark.parametrize('answers,state', [
+    ([''], 'skipped'), (['n'], 'skipped'), ([None], 'skipped'),
+    (['yes', '0'], 'cancelled'), (['yes', None], 'cancelled'),
+    (['yes', '4', '03:45', None], 'cancelled'), (['yes', '5', None], 'cancelled'),
+])
+def test_reviewer_onboarding_decline_and_cancel_have_no_state(reviewer_onboarding, answers, state):
+    from agd_lib import reviewer
+    home, xdg, _ = reviewer_onboarding
+    values = iter(answers)
+    got = installer.setup_reviewer(home, lambda _: next(values, None), lambda _: None)
+    assert got['state'] == state
+    assert not reviewer.paths(home)['config'].exists()
+    assert not list(xdg.glob('systemd/user/*.timer'))
+
+
+@pytest.mark.parametrize('answers,schedule', [
+    (['y', ''], {'mode': 'calendar', 'calendar': '02:00', 'timezone': 'UTC', 'interval_hours': None}),
+    (['YES', '2'], {'mode': 'interval', 'calendar': None, 'timezone': None, 'interval_hours': 6}),
+    (['y', '3'], {'mode': 'interval', 'calendar': None, 'timezone': None, 'interval_hours': 1}),
+    (['y', '4', '03:45', 'Europe/Berlin'], {'mode': 'calendar', 'calendar': '03:45', 'timezone': 'Europe/Berlin', 'interval_hours': None}),
+    (['y', '5', '9'], {'mode': 'interval', 'calendar': None, 'timezone': None, 'interval_hours': 9}),
+])
+def test_reviewer_onboarding_presets_and_customization(reviewer_onboarding, answers, schedule):
+    from agd_lib import reviewer, reviewer_timer
+    home, xdg, _ = reviewer_onboarding
+    before = reviewer.read_config(home)
+    before['limits']['max_model_calls'] = 7
+    before['review_model'] = 'operator-selected-model'
+    reviewer._private(reviewer.paths(home)['config'].parent)
+    installer.store.atomic_json(reviewer.paths(home)['config'], before)
+    values = iter(answers)
+    got = installer.setup_reviewer(home, lambda _: next(values, None), lambda _: None)
+    assert got['state'] == 'enabled'
+    config = reviewer.read_config(home)
+    assert config['schedule'] == schedule
+    assert config['review_model'] == 'operator-selected-model'
+    assert config['limits']['max_model_calls'] == 7
+    assert reviewer_timer._read_record(home)['schedule'] == schedule
+    assert list(xdg.glob('systemd/user/*.timer'))
+    assert not list(reviewer.paths(home)['receipts'].glob('*.json'))
+
+
+@pytest.mark.parametrize('invalid', [
+    ['4', '25:61', 'UTC'], ['4', '03:45', '../invalid'], ['5', '1.5'], ['5', '-2'], ['not-a-choice'],
+])
+def test_reviewer_onboarding_corrects_invalid_input_without_partial_config(reviewer_onboarding, invalid):
+    from agd_lib import reviewer
+    home, _, _ = reviewer_onboarding
+    values = iter(['y', *invalid, '5', '9'])
+    errors = []
+    def ask(_):
+        assert not reviewer.paths(home)['config'].exists()
+        return next(values, None)
+    got = installer.setup_reviewer(home, ask, errors.append)
+    assert got['state'] == 'enabled'
+    assert reviewer.read_config(home)['schedule']['interval_hours'] == 9
+    assert any('invalid' in message.lower() for message in errors)
+
+
+@pytest.mark.parametrize('failure', ['runtime', 'show', 'is-active'])
+def test_reviewer_onboarding_retains_schedule_when_activation_unavailable(reviewer_onboarding, monkeypatch, failure):
+    from agd_lib import reviewer, reviewer_runner, reviewer_timer
+    home, xdg, control = reviewer_onboarding
+    if failure == 'runtime':
+        def unavailable(*args, **kwargs):
+            raise installer.store.DependencyError('installed OMP package root is unavailable')
+        monkeypatch.setattr(reviewer_runner, 'assert_runtime_capability', unavailable)
+    else:
+        control['failure'] = failure
+    values = iter(['y', '2'])
+    messages = []
+    got = installer.setup_reviewer(home, lambda _: next(values, None), messages.append)
+    assert got['state'] == 'configured'
+    assert reviewer.read_config(home)['schedule']['interval_hours'] == 6
+    assert any('not enabled' in message.lower() for message in messages)
+    record = reviewer_timer._read_record(home)
+    assert record is None or record['state'] == 'failed'
+    if failure != 'is-active':
+        assert not list(xdg.glob('systemd/user/*.timer'))
+    else:
+        reviewer_timer.disable(home, xdg_config_home=xdg, command_runner=lambda _: None)
+        assert reviewer_timer._read_record(home)['state'] == 'disabled'
+
+
+@pytest.mark.parametrize('state', ['enabled', 'failed', 'enabling', 'disabling'])
+def test_reviewer_onboarding_refuses_unsafe_reconfiguration(reviewer_onboarding, state):
+    from agd_lib import reviewer, reviewer_timer
+    home, _, _ = reviewer_onboarding
+    reviewer._private(reviewer_timer._timer_record(home).parent)
+    installer.store.atomic_json(reviewer_timer._timer_record(home), {'state': state})
+    before = reviewer.read_config(home)
+    reviewer._private(reviewer.paths(home)['config'].parent)
+    installer.store.atomic_json(reviewer.paths(home)['config'], before)
+    frozen = reviewer.paths(home)['config'].read_bytes()
+    values = iter(['y', '3'])
+    with pytest.raises(installer.store.Refusal, match='disable'):
+        installer.setup_reviewer(home, lambda _: next(values, None), lambda _: None)
+    assert reviewer.paths(home)['config'].read_bytes() == frozen
+
+
+def test_reviewer_onboarding_respects_active_run_lease(reviewer_onboarding):
+    from agd_lib import reviewer
+    home, _, _ = reviewer_onboarding
+    values = iter(['y', '3'])
+    with reviewer.run_lease(home), pytest.raises(installer.store.Refusal, match='reviewer run'):
+        installer.setup_reviewer(home, lambda _: next(values, None), lambda _: None)
+    assert not reviewer.paths(home)['config'].exists()
+
+
+def test_reviewer_onboarding_cli_preserves_live_central_owner(reviewer_onboarding):
+    from agd_lib import reviewer
+    home, xdg, _ = reviewer_onboarding
+    pid = os.getpid()
+    start = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19]
+    owner = home / 'state/owner.json'
+    installer.store.atomic_json(owner, {'owner_pid': pid, 'owner_start': start, 'token': 'central-only'})
+    frozen = owner.read_bytes()
+    env = {key: value for key, value in os.environ.items() if key != 'AGD_OWNER'}
+    env.update(PATH='', XDG_CONFIG_HOME=str(xdg))
+    command = [sys.executable, str(Path(__file__).resolve().parents[1] / 'bin/agd'), '--home', str(home)]
+    observed = subprocess.run([*command, 'installer', 'reviewer'], input='y\n2\n',
+                              capture_output=True, text=True, env=env, timeout=20)
+    assert observed.returncode == 0, observed.stderr
+    assert reviewer.read_config(home)['schedule']['interval_hours'] == 6
+    assert owner.read_bytes() == frozen
+    guarded = subprocess.run([*command, 'installer', 'setup', '--backend', 'herdr'],
+                             capture_output=True, text=True, env=env, timeout=20)
+    assert guarded.returncode == 3
+    assert 'live central' in guarded.stderr
+    assert owner.read_bytes() == frozen
+
+
+def test_partial_reviewer_sdk_does_not_contact_registry_or_install(reviewer_onboarding, tmp_path, monkeypatch):
+    from agd_lib import reviewer
+    if shutil.which('bun') is None:
+        pytest.skip('native Bun runtime unavailable')
+    home, xdg, _ = reviewer_onboarding
+    requests = []
+    class Registry(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            self.send_response(404)
+            self.end_headers()
+        def log_message(self, *_args):
+            pass
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Registry)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    sdk = tmp_path / 'partial-sdk'
+    (sdk / 'bin').mkdir(parents=True)
+    (sdk / 'package.json').write_text(json.dumps({
+        'name': '@oh-my-pi/pi-coding-agent', 'version': '18.14.0', 'type': 'module',
+        'bin': {'omp': 'bin/omp'}, 'exports': {'.': './stub.js', './*': './stub.js'},
+        'dependencies': {'@oh-my-pi/pi-ai': '9999.0.0', '@oh-my-pi/pi-agent-core': '9999.0.0'}}))
+    (sdk / 'stub.js').write_text('export const placeholder = true;\n')
+    (sdk / 'bin/omp').write_text('#!/usr/bin/env bun\n')
+    (sdk / 'bin/omp').chmod(0o755)
+    cache = tmp_path / 'bun-cache'
+    (sdk / 'bunfig.toml').write_text(
+        f'[install]\nregistry = "http://127.0.0.1:{server.server_port}"\n'
+        f'[install.cache]\ndir = "{cache}"\n')
+    frozen = {str(path.relative_to(sdk)): path.read_bytes() for path in sdk.rglob('*') if path.is_file()}
+    monkeypatch.setenv('PATH', f'{sdk / "bin"}:{os.environ["PATH"]}')
+    values = iter(['y', '2'])
+    try:
+        got = installer.setup_reviewer(home, lambda _: next(values, None), lambda _: None)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert got['state'] == 'configured'
+    assert reviewer.read_config(home)['schedule']['interval_hours'] == 6
+    assert requests == []
+    assert {str(path.relative_to(sdk)): path.read_bytes() for path in sdk.rglob('*') if path.is_file()} == frozen
+    assert not any(path.is_file() for path in cache.rglob('*'))
+    assert not list(xdg.glob('systemd/user/*.timer'))

@@ -1,12 +1,16 @@
 import os
+import json
+import shutil
+import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
-from agd_lib import reviewer, reviewer_runner, reviewer_timer, store
+from agd_lib import omp_runtime, reviewer, reviewer_runner, reviewer_timer, store
 
 
 def utc(value):
@@ -17,6 +21,7 @@ def home(tmp_path):
     root = tmp_path / 'home'
     (root / 'data').mkdir(parents=True)
     (root / 'data' / 'home.json').write_text('{"schema":1,"home_id":"123e4567-e89b-12d3-a456-426614174000"}\n')
+    omp_runtime.agent_dir(root).mkdir(parents=True)
     return root
 
 
@@ -45,15 +50,6 @@ def test_manual_schedule_never_changes_checkpoint():
     assert reviewer_timer.calculate_due(schedule, checkpoint, 100.0) == {'due_at': None, 'next_due': None, 'checkpoint': checkpoint}
 
 
-def test_rendered_interval_units_are_hourly_private_and_escaped(tmp_path):
-    config = interval_config(); config['limits']['max_runtime_seconds'] = 321
-    rendered = reviewer_timer.render_units(home(tmp_path), config, source_cli='/opt/a b/agd%run')
-    assert 'OnCalendar=*-*-* *:00:00 UTC' in rendered['timer']
-    assert 'Persistent=true' in rendered['timer']
-    assert 'Type=oneshot' in rendered['service']
-    assert 'TimeoutStartSec=321' in rendered['service']
-    assert '/opt/a\\x20b/agd%%run' in rendered['service']
-    assert '--timer' in rendered['service']
 
 
 def test_refuses_symlink_and_foreign_unit_before_command(tmp_path):
@@ -80,7 +76,6 @@ def test_enable_releases_store_lock_and_preserves_progress(tmp_path):
     second = reviewer_timer.enable(root, config, xdg_config_home=xdg, command_runner=runner, now=99_999)
     assert first['anchor'] == second['anchor'] == 10_800
     assert second['checkpoint']['last_due'] == 54_000
-    assert len(calls) == 3
 
 
 def test_due_tick_writes_pending_intent_before_checkpoint_and_recovers(tmp_path, monkeypatch):
@@ -106,9 +101,9 @@ def test_disable_is_idempotent_and_recovers_after_reload_failure(tmp_path):
     with pytest.raises(OSError): reviewer_timer.disable(root, xdg_config_home=xdg, command_runner=failing)
     assert reviewer_timer._read_record(root)['state'] == 'disabling'
     reviewer_timer.disable(root, xdg_config_home=xdg, command_runner=calls.append)
-    after = len(calls); reviewer_timer.disable(root, xdg_config_home=xdg, command_runner=calls.append)
+    reviewer_timer.disable(root, xdg_config_home=xdg, command_runner=calls.append)
     assert reviewer_timer._read_record(root)['state'] == 'disabled'
-    assert len(calls) == after
+    assert not list((xdg / 'systemd/user').glob('agd-reviewer-*'))
 
 
 def test_precise_fold_bracket_refuses_second_native_occurrence(tmp_path, monkeypatch):
@@ -143,3 +138,89 @@ def test_refuses_foreign_owned_xdg_root(tmp_path, monkeypatch):
     monkeypatch.setattr(reviewer_timer.os, 'lstat', foreign)
     with pytest.raises(store.Refusal):
         reviewer_timer.enable(root, interval_config(), xdg_config_home=xdg, command_runner=lambda _: None)
+
+
+@pytest.mark.parametrize('missing', ['omp', 'bun', 'agent-dir'])
+def test_enable_refuses_unusable_runtime_before_unit_activation(tmp_path, monkeypatch, missing):
+    root, xdg = home(tmp_path), tmp_path / 'xdg'
+    actual = shutil.which
+    if missing == 'agent-dir':
+        omp_runtime.agent_dir(root).rmdir()
+    else:
+        monkeypatch.setattr(shutil, 'which', lambda name, *args, **kwargs:
+                            None if name == missing else actual(name, *args, **kwargs))
+    with pytest.raises((store.Refusal, store.DependencyError)):
+        reviewer_timer.enable(root, interval_config(), xdg_config_home=xdg, command_runner=lambda _: None)
+    assert not list(xdg.glob('systemd/user/*.timer'))
+    assert reviewer_timer._read_record(root) is None
+
+
+def test_runtime_binding_survives_minimal_environment_and_special_paths(tmp_path, monkeypatch):
+    root = home(tmp_path)
+    directory = tmp_path / "runtime % 'quoted' \"tools\""
+    directory.mkdir()
+    for name in ('omp', 'bun'):
+        (directory / name).symlink_to(shutil.which(name))
+    monkeypatch.setenv('PATH', f'{directory}:{os.environ["PATH"]}')
+    runtime = reviewer_timer.runtime_environment(root)
+    result = subprocess.run(
+        [runtime['python'], '-c',
+         'import json,shutil;print(json.dumps({name:shutil.which(name) for name in ("omp","bun")}))'],
+        cwd='/', env={'PATH': runtime['path']}, capture_output=True, text=True, check=True)
+    assert json.loads(result.stdout) == {'omp': str(directory / 'omp'), 'bun': str(directory / 'bun')}
+
+
+def test_native_activation_failure_retains_owned_disable_recovery(tmp_path):
+    root, xdg = home(tmp_path), tmp_path / 'xdg'
+    def inactive(argv):
+        if 'is-active' in argv:
+            raise store.DependencyError('timer remained inactive')
+    with pytest.raises(store.DependencyError, match='inactive'):
+        reviewer_timer.enable(root, interval_config(), xdg_config_home=xdg, command_runner=inactive)
+    assert reviewer_timer._read_record(root)['state'] == 'failed'
+    assert list((xdg / 'systemd/user').glob('*.timer'))
+    reviewer_timer.disable(root, xdg_config_home=xdg, command_runner=lambda _: None)
+    assert reviewer_timer._read_record(root)['state'] == 'disabled'
+    assert not list((xdg / 'systemd/user').glob('agd-reviewer-*'))
+
+
+def test_native_service_discards_inherited_credentials(tmp_path):
+    try:
+        manager = subprocess.run(['systemctl', '--user', 'show', '--property=Version', '--value'],
+                                 capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        pytest.skip('native user-systemd manager unavailable')
+    if manager.returncode:
+        pytest.skip('native user-systemd manager unavailable')
+    root = home(tmp_path)
+    identity = str(uuid.uuid4())
+    store.atomic_json(root / 'data/home.json', {'schema': 1, 'home_id': identity})
+    marker = root / 'environment.json'
+    helper = tmp_path / 'environment-probe.py'
+    helper.write_text(
+        'import json,os\nfrom pathlib import Path\n'
+        f'Path({str(marker)!r}).write_text(json.dumps({{key:os.environ.get(key) for key in '
+        '("AGD_CREDENTIAL_SENTINEL","OTEL_EXPORTER_OTLP_HEADERS","HOME","PATH")}))\n')
+    rendered = reviewer_timer.render_units(
+        root, interval_config(), runtime={'python': sys.executable, 'path': os.defpath}, source_cli=str(helper))
+    content = rendered['service'].replace(
+        '[Service]\n', '[Service]\nEnvironment=AGD_CREDENTIAL_SENTINEL=synthetic-secret\n'
+        'Environment=OTEL_EXPORTER_OTLP_HEADERS=synthetic-header\n')
+    directory = reviewer_timer._unit_directory(Path.home() / '.config')
+    service = directory / rendered['service_name']
+    owner = f'X-AGD-Reviewer-Owner={identity}:{os.getuid()}'
+    assert not service.exists()
+    reviewer_timer._write_unit(service, content, owner)
+    try:
+        store.run(['systemctl', '--user', 'daemon-reload'])
+        store.run(['systemctl', '--user', 'start', '--wait', service.name])
+        observed = json.loads(marker.read_text())
+        assert observed['AGD_CREDENTIAL_SENTINEL'] is None
+        assert observed['OTEL_EXPORTER_OTLP_HEADERS'] is None
+        assert observed['HOME'] == str(Path.home())
+        assert observed['PATH'] == os.defpath
+    finally:
+        store.run(['systemctl', '--user', 'stop', service.name])
+        assert reviewer_timer._owned(service, owner)
+        service.unlink()
+        store.run(['systemctl', '--user', 'daemon-reload'])

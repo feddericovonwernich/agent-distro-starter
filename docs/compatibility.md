@@ -74,6 +74,16 @@ The following is the acceptance matrix for the bounded reviewer. “Executable c
 
 Observed scheduling and reviewer evidence is recorded above. The compatibility matrix has real native acceptance for rows 1 and 4 and approved disposable user-systemd activation for row 5. No provider call was made by the scripted reviewer acceptance.
 
+### Scheduled reviewer installer onboarding
+
+The fifth installer stage has real PTY coverage for independent telemetry/reviewer choices, presets, custom time correction, cancellation/EOF, missing prerequisites, and shell handoff from a spaced parent path. Python checks exercise the actual validated config, preserved limits/model, run lease, timer ownership/checkpoints, missing SDK/user manager, partial native activation, and disable recovery. Systemctl effects are controlled in those regressions; enabled assertions are not paid-model readiness claims.
+
+On Linux/systemd 255, a separately owned disposable home configured a custom near-future UTC schedule through the actual onboarding function. Its real user timer fired a service using official OMP SDK 18.14.0 and Bun from paths containing spaces, percent signs, and both quote characters. The service independently imported the SDK under its minimal environment and ran the actual reviewer CLI, producing a terminal `no-work` receipt without a provider call. The home argument survived native systemd parsing; re-enable preserved the due checkpoint and unit-file timestamps. Explicit stop, timer-state cleanup, disable, and reload removed only that home's units/stamp; the home remained absent after a delayed check. No existing distro or unrelated timer was changed.
+
+A real Bun capability probe against an incomplete SDK and disposable loopback registry made no registry requests or installation/cache writes. A separately owned native user service proved that synthetic inherited credential and OTEL-header values were absent from its Python child, while HOME and the selected PATH remained available.
+
+This proves native scheduling, runtime binding, and empty-evidence execution—not model authentication, nonempty paid review success, automatic skill changes, or Langfuse delivery. Standalone OMP alone still lacks the importable SDK prerequisite; onboarding retains a selected schedule and warns rather than installing a runtime or arming an unusable timer.
+
 ## Guided installation and start acceptance
 
 On Linux x86-64 with Treehouse v3.1.6 at `/tmp/agd-treehouse-v3.1.6`, `tests/test_backends.py install-start-tmux` and `install-start-herdr` each ran tracked local `install.sh` through a fake Git/network boundary that asserted the canonical repository URL, copied the current test revision, declined compatible OMP/Herdr updates, and used real installed runtime tools. Each isolated temporary HOME/project/session then proved a ready central owner and watcher, PTY attach/detach/reattach, unchanged retained receipt, explicit conflicting-backend refusal, and owned tmux/Herdr cleanup.

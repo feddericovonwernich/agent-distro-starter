@@ -266,7 +266,7 @@ def _install_start(name):
         updates = b'n\n' if name == 'tmux' else b'n\nn\n'
         installed = root / f'distro-{name}'
         result = _pty(['/bin/bash', str(ROOT / 'install.sh')], root, base,
-                      f'distro-{name}\n{name}\n'.encode() + updates + b'n\nexit\n', detach=False)
+                      f'distro-{name}\n{name}\n'.encode() + updates + b'n\nn\nexit\n', detach=False)
         assert result.returncode == 0, result.stdout
         receipt = json.loads((installed / 'data' / 'dependencies.json').read_text())
         assert receipt['omp']['source'] == receipt['treehouse']['source'] == 'existing'
