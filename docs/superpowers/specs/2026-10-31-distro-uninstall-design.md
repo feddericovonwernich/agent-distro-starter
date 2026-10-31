@@ -1,6 +1,6 @@
 # Distro uninstall — design
 
-Status: proposed; requires user approval before implementation.
+Status: approved by the user on 2026-10-31, including in-directory `./bin/agd --home . uninstall` invocation. Implementation requires the accompanying plan and execution handoff.
 
 ## Intent and agreed scope
 
