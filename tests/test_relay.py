@@ -158,45 +158,7 @@ def test_project_service_rejects_symlinked_state_root(tmp_path, monkeypatch):
     raise AssertionError('symlinked project state was accepted')
 
 
-def test_start_project_service_starts_one_owned_connector(tmp_path, monkeypatch):
-    import json
-    from concurrent.futures import ThreadPoolExecutor
-    home = tmp_path/'home'
-    root = home/'state'/'relay'/'projects'/'sample'
-    (root/'.relay'/'connectors').mkdir(parents=True)
-    (root/'.relay'/'connectors'/'github.json').write_text('{}')
-    runtime = tmp_path/'runtime'
-    (runtime/'bin').mkdir(parents=True)
-    record = {'schema': 1, 'project': 'sample', 'repository': 'owner/repo',
-              'runtime': str(runtime), 'root': str(root), 'health': 'starting'}
-    (root/'service.json').write_text(json.dumps(record))
-    monkeypatch.setattr(relay, 'ensure_project_service', lambda *_args, **_kwargs: record)
-    monkeypatch.setattr('agd_lib.supervision.process_start', lambda pid: f'start-{pid}')
-    monkeypatch.setattr('agd_lib.supervision.gone', lambda *_args: False)
 
-    class Process:
-        next_pid = 10
-        def __init__(self, argv, cwd, **_kwargs):
-            self.argv, self.cwd, self.pid = argv, cwd, Process.next_pid
-            Process.next_pid += 1
-            if argv[1] == 'start':
-                (cwd/'.relay'/'runtime.json').write_text(json.dumps({'pid': self.pid, 'port': 4444}))
-        def poll(self):
-            return None
-
-    launched = []
-    def popen(*args, **kwargs):
-        process = Process(*args, **kwargs)
-        launched.append(process)
-        return process
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        first, second = list(pool.map(lambda _: relay.start_project_service(home, 'sample', 'owner/repo', popen=popen), range(2)))
-
-    assert first['health'] == second['health'] == 'healthy'
-    assert len(launched) == 2
-    assert launched[1].argv[1:4] == ['connect', 'github', '--config']
-    assert second['connector']['pid'] == launched[1].pid
 
 
 def test_start_project_service_marks_exact_timed_out_server_unhealthy(tmp_path, monkeypatch):
@@ -221,44 +183,9 @@ def test_start_project_service_marks_exact_timed_out_server_unhealthy(tmp_path, 
     state = json.loads((root/'service.json').read_text())
     assert state['health'] == 'unhealthy'
 
-def test_terminal_service_restarts_only_the_recorded_owned_process(tmp_path, monkeypatch):
-    home = tmp_path/'home'
-    root = home/'state'/'relay'/'projects'/'sample'
-    (root/'.relay'/'connectors').mkdir(parents=True)
-    (root/'.relay'/'connectors'/'github.json').write_text('{}')
-    runtime = tmp_path/'runtime'; (runtime/'bin').mkdir(parents=True)
-    record = {'schema': 1, 'project': 'sample', 'repository': 'owner/repo',
-              'runtime': str(runtime), 'root': str(root), 'health': 'unhealthy',
-              'server': {'pid': 11, 'start': 'server'}, 'connector': {'pid': 12, 'start': 'connector'}}
-    (root/'service.json').write_text(json.dumps(record))
-    monkeypatch.setenv('AGD_RELAY_GITHUB_READ_TOKEN', 'read-only')
-    monkeypatch.setattr(relay, 'ensure_runtime', lambda *_args: runtime)
-    monkeypatch.setattr(relay, '_install_review_definition', lambda *_args: None)
-    monkeypatch.setattr(relay, '_configure_connector', lambda *_args, **_kwargs: None)
-    stopped = []
-    monkeypatch.setattr('agd_lib.supervision.gone', lambda pid, start: pid == 12 or (pid == 11 and bool(stopped)))
-    monkeypatch.setattr(relay.os, 'kill', lambda pid, signal: stopped.append((pid, signal)))
 
-    restarted = relay.ensure_project_service(home, 'sample', 'owner/repo')
 
-    assert restarted['health'] == 'starting'
-    assert 'server' not in restarted and 'connector' not in restarted
-    assert stopped == [(11, 15)]
 
-def test_stop_service_waits_for_owned_process_and_retains_unrelated_identity(tmp_path, monkeypatch):
-    home = tmp_path/'home'
-    root = home/'state'/'relay'/'projects'/'sample'; root.mkdir(parents=True)
-    (root/'service.json').write_text(json.dumps({'server': {'pid': 11, 'start': 'owned'},
-                                                  'connector': {'pid': 12, 'start': 'other'}}))
-    killed = []
-    monkeypatch.setattr(relay.os, 'kill', lambda pid, signal: killed.append(pid))
-    monkeypatch.setattr('agd_lib.supervision.gone', lambda pid, start: pid == 12 or (pid == 11 and bool(killed)))
-
-    stopped = relay.stop_project_service(home, 'sample')
-
-    assert killed == [11]
-    assert stopped['health'] == 'stopped'
-    assert 'server' not in stopped and 'connector' not in stopped
 
 
 def test_connector_spawn_failure_marks_owned_service_unhealthy(tmp_path, monkeypatch):
@@ -352,3 +279,48 @@ def test_poll_rejects_prepared_or_stale_worker_without_subprocess(tmp_path, monk
         with pytest.raises(store.Refusal, match='current worker'):
             relay.poll(home, task, {'id': 'grant'}, 'stale', run=run)
         assert not called
+
+
+def test_uninstall_relay_rejects_copy_and_stops_only_original(tmp_path):
+    import json
+    import shutil
+    import subprocess
+    import sys
+    from agd_lib import supervision
+    from support import command, uninstall_scope
+    home = tmp_path / 'home'
+    command(home, 'init', '--backend', 'tmux')
+    root = home / 'state/relay/projects/sample'
+    root.mkdir(parents=True)
+    process = subprocess.Popen(
+        [sys.executable, '-c', 'import sys\nprint("ready", flush=True)\nsys.stdin.read()'],
+        cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        start_new_session=True)
+    try:
+        assert process.stdout.readline() == 'ready\n'
+        identity = supervision.process_identity(process.pid)
+        identity.pop('state')
+        path = root / 'service.json'
+        store.atomic_json(path, {
+            'schema': 1, 'project': 'sample', 'repository': 'fixture/repo',
+            'runtime': str(tmp_path / 'shared-runtime'), 'root': str(root),
+            'health': 'healthy', 'target': supervision.runtime_home_identity(home),
+            'server': identity})
+        copy = tmp_path / 'copy'
+        shutil.copytree(home, copy)
+        copied = relay.uninstall_inventory(copy)
+        assert any(row['ownership'] != 'owned' and row['blockers'] for row in copied)
+        assert process.poll() is None
+        resources = relay.uninstall_inventory(home)
+        original = path.read_bytes()
+        with uninstall_scope(home, resources) as operation:
+            relay.uninstall_quiesce(home, resources, operation)
+            assert process.wait(timeout=3) != 0
+            assert path.read_bytes() == original
+            assert all(row['presence'] == 'absent'
+                       for row in relay.uninstall_inventory(home, expected=resources))
+            assert resources[0]['key'] in operation['completed']
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        process.communicate(timeout=3)

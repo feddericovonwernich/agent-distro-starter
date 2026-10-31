@@ -13,6 +13,8 @@ from pathlib import Path
 
 from . import observability, omp_runtime, reviewer, store
 
+UNINSTALL_TIMEOUT = 15.0
+
 
 def assert_runtime_capability(deadline_epoch_ms, *, home=None, omp_binary='omp'):
     """Discover public installed OMP modules from the selected OMP executable."""
@@ -76,7 +78,7 @@ def run_native_reviewer(home, intent, *, omp_binary='omp'):
     """Run one selector-only native child while retaining the private lease."""
     from contextlib import ExitStack
     from .uninstall_state import admission
-    from .supervision import process_start
+    from .supervision import process_identity, runtime_home_identity
     with ExitStack() as lifetime:
         with admission(home):
             lifetime.enter_context(reviewer.run_lease(home))
@@ -85,7 +87,10 @@ def run_native_reviewer(home, intent, *, omp_binary='omp'):
                                        started_at=started, deadline_epoch_ms=int((started + config['limits']['max_runtime_seconds']) * 1000))
             with store.lock(store.home(home)):
                 receipt = reviewer._receipt(home, run['review_run_id'])
-                receipt['coordinator'] = {'pid': os.getpid(), 'start': process_start(os.getpid()), 'uid': os.getuid()}
+                receipt['target'] = runtime_home_identity(home)
+                receipt['coordinator'] = process_identity(os.getpid())
+                receipt['coordinator'].pop('state')
+                receipt['child_state'] = 'not-started'
                 store.atomic_json(reviewer.paths(home)['receipts'] / f"{run['review_run_id']}.json", receipt)
         try:
             packet = reviewer.select_packet(home, cutoff=started, config_snapshot=config,
@@ -126,11 +131,17 @@ def run_native_reviewer(home, intent, *, omp_binary='omp'):
         stderr = bytearray()
         try:
             with admission(home):
+                with store.lock(store.home(home)):
+                    receipt = reviewer._receipt(home, run['review_run_id'])
+                    receipt['child_state'] = 'spawning'
+                    store.atomic_json(reviewer.paths(home)['receipts'] / f"{run['review_run_id']}.json", receipt)
                 process = subprocess.Popen([bun, '--no-install', '--no-env-file', str(Path(__file__).resolve().parents[2] / 'lib' / 'agd-reviewer-host.ts')], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=runtime, start_new_session=True)
                 try:
                     with store.lock(store.home(home)):
                         receipt = reviewer._receipt(home, run['review_run_id'])
-                        receipt['child'] = {'pid': process.pid, 'start': process_start(process.pid), 'uid': os.getuid()}
+                        receipt['child'] = process_identity(process.pid)
+                        receipt['child'].pop('state')
+                        receipt['child_state'] = 'spawned'
                         store.atomic_json(reviewer.paths(home)['receipts'] / f"{run['review_run_id']}.json", receipt)
                 except BaseException:
                     process.kill()
@@ -318,3 +329,123 @@ def serve_broker(home, review_run_id, stdin, stdout):
             response['error'] = str(error)
         stdout.write(json.dumps(response, sort_keys=True) + '\n'); stdout.flush()
     return completion
+
+
+def _uninstall_lease(home):
+    """Inspect Linux flock ownership without creating or taking the run lock."""
+    import stat
+    path = reviewer.paths(home)['lock']
+    if not os.path.lexists(path):
+        return None
+    mode = path.lstat()
+    if not stat.S_ISREG(mode.st_mode) or mode.st_uid != os.getuid():
+        raise store.Refusal('reviewer run lock identity is unsafe')
+    identity = {'path': str(path), 'device': mode.st_dev, 'inode': mode.st_ino,
+                'uid': mode.st_uid}
+    holders = []
+    for line in Path('/proc/locks').read_text().splitlines():
+        fields = line.split()
+        if len(fields) < 6 or fields[1] != 'FLOCK':
+            continue
+        major, minor, inode = fields[5].split(':')
+        if (int(major, 16), int(minor, 16), int(inode)) == (
+                os.major(mode.st_dev), os.minor(mode.st_dev), mode.st_ino):
+            holders.append(int(fields[4]))
+    return {'identity': identity, 'holders': holders}
+
+
+def uninstall_inventory(home, *, expected=None, service=None):
+    from . import supervision
+    expected = {row['key']: row for row in expected or [] if row['kind'].startswith('reviewer-')}
+    lease = _uninstall_lease(home)
+    holders = lease['holders'] if lease else []
+    rows, accounted = {}, set()
+    receipts = reviewer.paths(home)['receipts']
+    for path in sorted(receipts.glob('*.json')):
+        record = reviewer._read_json(path)
+        if (not isinstance(record, dict) or record.get('schema') != 1
+                or not isinstance(record.get('review_run_id'), str)):
+            raise store.Refusal('reviewer run receipt is malformed')
+        run_id = record['review_run_id']
+        if path.stem != run_id or str(uuid.UUID(run_id)) != run_id:
+            raise store.Refusal('reviewer receipt path differs from its run identity')
+        key = f'reviewer-run:{run_id}'
+        coordinator, child = record.get('coordinator'), record.get('child')
+        processes = [item for item in (coordinator, child) if item is not None]
+        for item in processes:
+            if (not isinstance(item, dict) or type(item.get('pid')) is not int
+                    or not isinstance(item.get('start'), str)
+                    or type(item.get('uid')) is not int):
+                raise store.Refusal('reviewer process receipt is malformed')
+        identity = {'target': record.get('target'), 'review_run_id': run_id,
+                    'coordinator': coordinator, 'child': child}
+        blockers = []
+        busy = bool(coordinator and coordinator['pid'] in holders
+                    and supervision.process_presence(coordinator))
+        child_live = bool(child and supervision.process_presence(child))
+        active = record.get('dispatch_state') != 'final' or busy or child_live
+        if not active:
+            presence, ownership = 'absent', 'owned'
+        elif (identity['target'] != supervision.runtime_home_identity(home)
+              or not coordinator or any(not all(name in item for name in
+                  ('pid', 'start', 'uid', 'ppid', 'pgid', 'sid', 'argv_sha256')) for item in processes)):
+            presence, ownership = 'unknown', 'unknown'
+            blockers.append({'code': 'reviewer-identity', 'reason': 'active reviewer lacks bound launch identity'})
+        else:
+            live = [item for item in processes if supervision.process_presence(item)]
+            if (not live and record.get('dispatch_state') != 'final' and child is None
+                    and record.get('child_state') not in {'not-started', 'absent'}):
+                presence, ownership = 'unknown', 'unknown'
+                blockers.append({'code': 'reviewer-child-gap', 'reason': 'interrupted reviewer has no proved child outcome'})
+            else:
+                presence, ownership = ('present' if live or busy else 'absent'), 'owned'
+                if busy:
+                    accounted.add(coordinator['pid'])
+        rows[key] = {'key': key, 'kind': 'reviewer-run', 'identity': identity,
+                     'presence': presence, 'ownership': ownership, 'blockers': blockers}
+    for key, saved in expected.items():
+        if key in rows or saved['kind'] != 'reviewer-run':
+            continue
+        identity = saved['identity']
+        processes = [item for item in (identity['coordinator'], identity['child']) if item]
+        live = any(supervision.process_presence(item) for item in processes)
+        rows[key] = {**saved, 'presence': 'present' if live else 'absent', 'blockers': []}
+    unresolved = set(holders) - accounted
+    if unresolved:
+        proof = service.get('identity', {}) if service and service.get('ownership') == 'owned' else {}
+        owned = {item['pid']: item for item in proof.get('processes', [])}
+        proved = (proof.get('run_lock') == lease['identity'] and unresolved <= owned.keys())
+        identity = {'lease': lease['identity'], 'processes': [owned[pid] for pid in sorted(unresolved)]
+                    if proved else [], 'service_key': service['key'] if proved else None}
+        rows['reviewer-lease:legacy'] = {
+            'key': 'reviewer-lease:legacy', 'kind': 'reviewer-lease', 'identity': identity,
+            'presence': 'present' if proved else 'unknown',
+            'ownership': 'owned' if proved else 'unknown',
+            'blockers': [] if proved else [{'code': 'reviewer-lease-owner',
+                'reason': 'busy reviewer lease lacks coordinator or owned-service proof'}]}
+    elif 'reviewer-lease:legacy' in expected:
+        saved = expected['reviewer-lease:legacy']
+        live = any(supervision.process_presence(item) for item in saved['identity']['processes'])
+        rows[saved['key']] = {**saved, 'presence': 'present' if live else 'absent', 'blockers': []}
+    return list(rows.values())
+
+
+def uninstall_quiesce(home, resources, operation):
+    from . import supervision, uninstall_state
+    for resource in resources:
+        approved = uninstall_state.require_scope(home, operation, resource['key'])
+        current = next((row for row in uninstall_inventory(home, expected=[approved])
+                        if row['key'] == approved['key']), None)
+        if (current is None or current['identity'] != approved['identity']
+                or current['ownership'] != 'owned' or current['presence'] == 'unknown'):
+            raise store.Refusal('reviewer uninstall identity changed or remains unknown')
+        if current['presence'] == 'present':
+            identity = approved['identity']
+            processes = identity['processes'] if approved['kind'] == 'reviewer-lease' else [
+                item for item in (identity['coordinator'], identity['child']) if item]
+            supervision.stop_owned_processes(processes, timeout=UNINSTALL_TIMEOUT)
+        remaining = next(row for row in uninstall_inventory(home, expected=[approved])
+                         if row['key'] == approved['key'])
+        if remaining['presence'] != 'absent':
+            raise store.Refusal('reviewer remains active; run lock and receipts retained')
+        uninstall_state.checkpoint(home, operation, phase='quiescing', completed=approved['key'])

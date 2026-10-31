@@ -16,15 +16,13 @@ def call(endpoint, *args, check=True):
 
 
 def create(home: Path, task_id: str, incarnation: str, cwd: Path, argv: list[str]) -> dict:
-    cmd = prefix(home)
-    session = 'agd'
-    if store.run([*cmd, 'has-session', '-t', session], check=False).returncode:
-        store.run([*cmd, 'new-session', '-d', '-s', session, '-n', 'anchor', '-c', str(home)], timeout=10)
-    server_pid = store.run([*cmd, 'display-message', '-p', '#{pid}']).stdout.strip()
+    cmd, session, server = prefix(home), 'agd', _ensure_server(home)
+    server_pid = str(server['process']['pid'])
     token = str(uuid.uuid4())
     receipt = home/'state'/'tasks'/task_id/'endpoint.json'
     reservation = dict(prefix=cmd, session=session, server_pid=server_pid,
-                       token=token, task=task_id, incarnation=incarnation)
+                       token=token, task=task_id, incarnation=incarnation, server=server,
+                       target=supervision.runtime_home_identity(home))
     store.atomic_json(receipt, reservation)
     pane = store.run([*cmd, 'new-window', '-d', '-P', '-F', '#{pane_id}', '-t', session,
                       '-n', task_id, '-c', str(cwd), shlex.join(argv)]).stdout.strip()
@@ -104,9 +102,10 @@ def _foreground(pid):
 def _central_endpoint(receipt):
     endpoint = receipt.get('endpoint')
     if (not isinstance(endpoint, dict)
-            or set(endpoint) != {'server_pid', 'window', 'pane', 'tty', 'token', 'launch_id'}
+            or not {'server_pid', 'window', 'pane', 'tty', 'token', 'launch_id'} <= endpoint.keys()
+            or not set(endpoint) <= {'server_pid', 'window', 'pane', 'tty', 'token', 'launch_id', 'server'}
             or not all(isinstance(endpoint.get(key), str) and endpoint[key]
-                       for key in endpoint)):
+                       for key in ('server_pid', 'window', 'pane', 'tty', 'token', 'launch_id'))):
         raise store.Refusal('tmux central endpoint is malformed')
     if endpoint['token'] != receipt.get('endpoint_token') or endpoint['launch_id'] != receipt.get('launch_id'):
         raise store.Refusal('tmux central endpoint identity differs')
@@ -119,15 +118,13 @@ def create_central(home: Path, launch_id: str, endpoint_token: str, managed_argv
             or not all(isinstance(arg, str) for arg in expected_omp_argv)
             or not all(isinstance(key, str) and isinstance(value, str) for key, value in launch_env.items())):
         raise store.Refusal('tmux central command is malformed')
-    cmd, session = prefix(home), 'agd'
-    if store.run([*cmd, 'has-session', '-t', session], check=False).returncode:
-        store.run([*cmd, 'new-session', '-d', '-s', session, '-n', 'anchor', '-c', str(home)], timeout=10)
-    server_pid = store.run([*cmd, 'display-message', '-p', '#{pid}']).stdout.strip()
+    cmd, session, server = prefix(home), 'agd', _ensure_server(home)
+    server_pid = str(server['process']['pid'])
     command = shlex.join(['exec', 'env', *[f'{key}={value}' for key, value in sorted(launch_env.items())], *managed_argv])
     window, pane, tty = store.run([*cmd, 'new-window', '-d', '-P', '-F', '#{window_id} #{pane_id} #{pane_tty}', '-t', session,
                                    '-n', 'central', '-c', str(home), command]).stdout.strip().split()
     endpoint = {'server_pid': server_pid, 'window': window, 'pane': pane, 'tty': tty,
-                'token': endpoint_token, 'launch_id': launch_id}
+                'token': endpoint_token, 'launch_id': launch_id, 'server': server}
     store.atomic_json(home / 'state' / 'central-tmux-pending.json', endpoint)
     return endpoint
 
@@ -179,3 +176,122 @@ def attach_argv(home: Path, receipt: dict) -> list[str]:
     store.run([*cmd, 'select-window', '-t', endpoint['window']], timeout=10)
     store.run([*cmd, 'select-pane', '-t', endpoint['pane']], timeout=10)
     return [*cmd, 'switch-client' if os.environ.get('TMUX') else 'attach-session', '-t', 'agd']
+
+
+def _server_evidence(home):
+    import stat
+    cmd = prefix(home)
+    pid = int(store.run([*cmd, 'display-message', '-p', '#{pid}']).stdout.strip())
+    path = Path(store.run([*cmd, 'display-message', '-p', '#{socket_path}']).stdout.strip())
+    if not path.is_absolute():
+        raise store.Refusal('tmux socket path is unproven')
+    mode = path.lstat()
+    if not stat.S_ISSOCK(mode.st_mode) or mode.st_uid != os.getuid():
+        raise store.Refusal('tmux socket ownership is unproven')
+    identity = supervision.process_identity(pid)
+    identity.pop('state')
+    if identity['uid'] != os.getuid():
+        raise store.Refusal('tmux server user differs')
+    return {'target': supervision.runtime_home_identity(home), 'process': identity,
+            'socket': {'path': str(path), 'device': mode.st_dev, 'inode': mode.st_ino,
+                       'uid': mode.st_uid}}
+
+
+def _ensure_server(home):
+    from . import uninstall_state
+    path = home / 'state/tmux-server.json'
+    previous = uninstall_state.read_evidence(path, private=True) if os.path.lexists(path) else None
+    if previous and not _uninstall_server(home, previous):
+        raise store.Refusal('previous tmux server is absent; evidence retained')
+    cmd, anchor = prefix(home), None
+    if store.run([*cmd, 'has-session', '-t', 'agd'], check=False).returncode:
+        pane = store.run([*cmd, 'new-session', '-d', '-P', '-F', '#{pane_id}', '-s', 'agd',
+                          '-n', 'anchor', '-c', str(home)], timeout=10).stdout.strip()
+        if not pane.startswith('%') or not pane[1:].isdigit():
+            raise store.Refusal('tmux anchor pane identity is unproven')
+        token = uuid.uuid4().hex
+        store.run([*cmd, 'set-option', '-p', '-t', pane, '@agd_anchor_owner', token])
+        anchor = {'pane': pane, 'token_sha256': hashlib.sha256(token.encode()).hexdigest()}
+    current = _server_evidence(home)
+    if previous:
+        if (previous['target'] != current['target'] or previous['socket'] != current['socket']
+                or any(previous['process'][name] != current['process'][name] for name in ('pid', 'start', 'uid'))):
+            raise store.Refusal('tmux server changed; previous evidence retained')
+        current['anchor'] = anchor or previous.get('anchor')
+    else:
+        current['anchor'] = anchor
+    store.atomic_json(path, current)
+    return current
+
+
+def _uninstall_server(home, server):
+    import stat
+    target = server['target']
+    if (target.get('canonical_home') != str(home) or target.get('uid') != os.getuid()
+            or os.path.lexists(home) and target != supervision.runtime_home_identity(home)):
+        raise store.Refusal('tmux server home binding differs')
+    path = Path(server['socket']['path'])
+    if not supervision.process_presence(server['process']):
+        if not os.path.lexists(path):
+            return False
+        raise store.Refusal('tmux socket remains after recorded server exit')
+    mode = path.lstat()
+    if (not stat.S_ISSOCK(mode.st_mode) or mode.st_uid != os.getuid()
+            or (mode.st_dev, mode.st_ino) != (server['socket']['device'], server['socket']['inode'])):
+        raise store.Refusal('tmux socket was replaced')
+    pid = store.run([*prefix(home), 'display-message', '-p', '#{pid}']).stdout.strip()
+    if pid != str(server['process']['pid']):
+        raise store.Refusal('tmux server PID differs')
+    return True
+
+
+def _uninstall_probe(home, identity):
+    endpoint = identity['endpoint']
+    try:
+        server = endpoint['server']
+        if not _uninstall_server(home, server):
+            return {'presence': 'absent', 'ownership': 'owned', 'blockers': []}
+        if endpoint.get('prefix', prefix(home)) != prefix(home):
+            raise store.Refusal('tmux endpoint namespace differs')
+        cmd = prefix(home)
+        panes = store.run([*cmd, 'list-panes', '-a', '-F', '#{pane_id}']).stdout.splitlines()
+        if endpoint['pane'] not in panes:
+            return {'presence': 'absent', 'ownership': 'owned', 'blockers': []}
+        name = '@agd_owner' if identity.get('task_id') else '@agd_central_token'
+        token = store.run([*cmd, 'show-options', '-p', '-v', '-t', endpoint['pane'], name]).stdout.strip()
+        if hashlib.sha256(token.encode()).hexdigest() != endpoint['token_sha256']:
+            raise store.Refusal('tmux pane owner token differs')
+        if 'window' in endpoint:
+            actual = store.run([*cmd, 'display-message', '-p', '-t', endpoint['pane'],
+                                '#{window_id} #{pane_tty}']).stdout.strip().split()
+            if actual != [endpoint['window'], endpoint['tty']]:
+                raise store.Refusal('tmux central pane membership differs')
+        return {'presence': 'present', 'ownership': 'owned', 'blockers': []}
+    except (OSError, ValueError, KeyError, TypeError, store.Refusal):
+        return {'presence': 'unknown', 'ownership': 'unknown', 'blockers': [
+            {'code': 'tmux-endpoint', 'reason': 'tmux process/socket/token continuity is unproven'}]}
+
+
+def _uninstall_grace(home, identity):
+    probe = _uninstall_probe(home, identity)
+    if probe['ownership'] != 'owned' or probe['presence'] == 'unknown':
+        raise store.Refusal('tmux quit endpoint is unproven')
+    if probe['presence'] == 'present':
+        pane = identity['endpoint']['pane']
+        cmd = prefix(home)
+        store.run([*cmd, 'send-keys', '-t', pane, 'Escape'])
+        store.run([*cmd, 'send-keys', '-l', '-t', pane, '/quit'])
+        store.run([*cmd, 'send-keys', '-t', pane, 'Enter'])
+
+
+def uninstall_close(home, resource, operation):
+    from . import uninstall_state
+    approved = uninstall_state.require_scope(home, operation, resource['key'])
+    probe = _uninstall_probe(home, approved['identity'])
+    if probe['ownership'] != 'owned' or probe['presence'] == 'unknown':
+        raise store.Refusal('tmux endpoint cannot be safely closed')
+    if probe['presence'] == 'present':
+        store.run([*prefix(home), 'kill-pane', '-t', approved['identity']['endpoint']['pane']])
+    if _uninstall_probe(home, approved['identity'])['presence'] != 'absent':
+        raise store.Refusal('tmux pane absence remains unproven')
+    uninstall_state.checkpoint(home, operation, phase='quiescing', completed=approved['key'])

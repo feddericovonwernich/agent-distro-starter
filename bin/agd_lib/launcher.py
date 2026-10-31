@@ -195,7 +195,7 @@ def _prove_herdr_server(endpoint: dict, process) -> dict:
     try:
         socket_inode = next(
             fields[6] for line in Path('/proc/net/unix').read_text().splitlines()[1:]
-            if len(fields := line.split()) >= 8 and fields[-1] == endpoint['socket'])
+            if len(fields := line.split(maxsplit=7)) == 8 and fields[7] == endpoint['socket'])
         argv = Path(f'/proc/{pid}/cmdline').read_bytes().rstrip(b'\0').decode().split('\0')
         owns_socket = any(os.readlink(fd) == f'socket:[{socket_inode}]'
                           for fd in Path(f'/proc/{pid}/fd').iterdir())
@@ -244,7 +244,8 @@ def _herdr_call(endpoint: dict, *args, check=True):
     if identity.st_dev != endpoint['device'] or identity.st_ino != endpoint['inode']:
         raise store.Refusal('Herdr server replaced; endpoint identity unknown')
     try:
-        result = store.run(['herdr', '--session', endpoint['session'], *args], check=False, timeout=10)
+        env = dict(os.environ, HERDR_CONFIG_PATH=endpoint['config_path']) if endpoint.get('config_path') else None
+        result = store.run(['herdr', '--session', endpoint['session'], *args], check=False, timeout=10, env=env)
     except subprocess.TimeoutExpired as error:
         raise store.Refusal('Herdr command timed out; endpoint state unknown') from error
     if result.returncode and check:
@@ -293,7 +294,8 @@ def _herdr_create(home: Path, launch_id: str, endpoint_token: str, managed: list
     if any(item.get('name') == session for item in sessions):
         raise store.Refusal('unreceipted Herdr session already exists')
     process = subprocess.Popen(['herdr', '--session', session, 'server'], stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                               cwd=home)
     endpoint = None
     for _ in range(30):
         try:
@@ -304,10 +306,19 @@ def _herdr_create(home: Path, launch_id: str, endpoint_token: str, managed: list
     if endpoint is None:
         raise store.Refusal('Herdr server did not become available')
     endpoint.update(_prove_herdr_server(endpoint, process) or {})
+    from . import herdr
+    endpoint['server'] = herdr.server_identity(endpoint)
+    endpoint['server']['target'] = supervision.runtime_home_identity(home)
+    endpoint['target'] = supervision.runtime_home_identity(home)
+    endpoint['config_path'] = herdr.config_path()
     if checkpoint:
         checkpoint(endpoint)
-    workspace = _herdr_response(_herdr_call(
-        endpoint, 'workspace', 'create', '--cwd', str(home), '--label', 'agd-central', '--no-focus'))['workspace']
+    created_workspace = _herdr_response(_herdr_call(
+        endpoint, 'workspace', 'create', '--cwd', str(home), '--label', 'agd-central', '--no-focus'))
+    workspace = created_workspace['workspace']
+    if isinstance(created_workspace.get('root_pane'), dict):
+        endpoint['anchor'] = {name: created_workspace['root_pane'][name] for name in
+                              ('pane_id', 'workspace_id', 'tab_id', 'terminal_id')}
     workspace_id = workspace.get('workspace_id')
     if not isinstance(workspace_id, str):
         raise store.Refusal('Herdr workspace identity is unverified')
@@ -435,7 +446,8 @@ def prepare_start(home: Path, explicit_backend: str | None, inherited_env: Mappi
         managed = [str(Path(__file__).resolve().parents[1] / 'agd'), '--home', str(home), 'observability', 'central']
         reserved = {'schema': 1, 'launch_id': launch_id, 'endpoint_token': endpoint_token, 'backend': selected,
                     'phase': 'reserved', 'endpoint': {}, 'managed_command': managed,
-                    'expected_process_argv': argv, 'owner': None, 'watcher': None}
+                    'expected_process_argv': argv, 'owner': None, 'watcher': None,
+                    'target': supervision.runtime_home_identity(home)}
         with store.lock(home):
             existing, _ = _read_receipt(home)
             if existing is not None:
@@ -466,6 +478,324 @@ def prepare_start(home: Path, explicit_backend: str | None, inherited_env: Mappi
         owner = _await_initial_owner(home, spawned, inspect)
         ready = {**spawned, 'phase': 'ready',
                  'owner': {'pid': owner['owner_pid'], 'start': owner['owner_start']},
-                 'watcher': {'pid': owner['watcher_pid'], 'start': owner['watcher_start']}}
+                 'watcher': {'pid': owner['watcher_pid'], 'start': owner['watcher_start']},
+                 'processes': [owner.get('owner_identity'), owner.get('watcher_identity')]}
         _advance(home, spawned, ready)
         return AttachTarget(attach(home, ready), _attach_env(home, ready, inherited_env))
+
+
+def _uninstall_endpoint(endpoint, target):
+    safe = {name: value for name, value in endpoint.items() if name not in {'token', 'server_argv'}}
+    safe['token_sha256'] = hashlib.sha256(endpoint.get('token', '').encode()).hexdigest()
+    safe['target'] = target
+    return safe
+
+
+def _uninstall_process(pid, start, recorded=None):
+    if recorded and recorded.get('pid') == pid and recorded.get('start') == start:
+        return recorded
+    try:
+        current = supervision.process_identity(pid)
+        current.pop('state')
+        if current['start'] == start and current['uid'] == os.getuid():
+            return current
+    except (FileNotFoundError, ProcessLookupError):
+        pass
+    return {'pid': pid, 'start': start, 'uid': os.getuid(),
+            'ppid': None, 'pgid': None, 'sid': None, 'argv_sha256': None}
+
+
+def _uninstall_server_probe(home, identity, *, late=False):
+    from . import herdr, tmux
+    server, backend = identity['server'], identity['backend']
+    process = server['process']
+    try:
+        if os.path.lexists(home) and server['target'] != supervision.runtime_home_identity(home):
+            raise store.Refusal('backend server home inode differs')
+        alive = supervision.process_presence(process)
+        socket_path = Path(server['socket']['path'])
+        if alive:
+            if backend == 'tmux':
+                tmux._uninstall_server(home, server)
+                panes = store.run([*tmux.prefix(home), 'list-panes', '-a', '-F', '#{pane_id}']).stdout.splitlines()
+            else:
+                peer = herdr.server_identity(identity['endpoint'])
+                if any(peer['process'][name] != process[name] for name in ('pid', 'start', 'uid')):
+                    raise store.Refusal('backend peer differs')
+                panes = [row['pane_id'] for row in _herdr_response(
+                    _herdr_call(identity['endpoint'], 'pane', 'list'))['panes']]
+            allowed = identity['anchors'] if late else identity['panes']
+            if set(panes) - set(allowed):
+                raise store.Refusal('backend contains an unrelated or unretired pane')
+            if backend == 'tmux' and server.get('anchor'):
+                anchor = server['anchor']
+                if anchor['pane'] in panes:
+                    token = store.run([*tmux.prefix(home), 'show-options', '-p', '-v', '-t',
+                                       anchor['pane'], '@agd_anchor_owner']).stdout.strip()
+                    if hashlib.sha256(token.encode()).hexdigest() != anchor['token_sha256']:
+                        raise store.Refusal('tmux anchor token differs')
+        elif os.path.lexists(socket_path):
+            mode = socket_path.lstat()
+            if (mode.st_uid != os.getuid() or not stat.S_ISSOCK(mode.st_mode)
+                    or (mode.st_dev, mode.st_ino) != (server['socket']['device'], server['socket']['inode'])):
+                raise store.Refusal('backend socket was replaced after server exit')
+        return {'presence': 'present' if alive or os.path.lexists(socket_path) else 'absent',
+                'ownership': 'owned', 'blockers': []}
+    except (OSError, ValueError, KeyError, TypeError, store.Refusal):
+        return {'presence': 'unknown', 'ownership': 'unknown', 'blockers': [
+            {'code': 'backend-continuity', 'reason': 'backend ownership, transport or pane continuity is unproven'}]}
+
+
+def uninstall_inventory(home, *, expected=None):
+    from . import herdr, tmux, uninstall_state
+    expected = {row['key']: row for row in expected or []}
+    rows, servers = {}, {}
+    receipt_path = _receipt_path(home)
+    target = supervision.runtime_home_identity(home) if os.path.lexists(home) else None
+    if os.path.lexists(receipt_path):
+        uninstall_state.read_evidence(receipt_path, private=True)
+        receipt, _ = _read_receipt(home)
+        key = f"central:{receipt['launch_id']}"
+        endpoint = dict(receipt['endpoint'])
+        binding = receipt.get('target')
+        owner_path = home / 'state/owner.json'
+        owner = uninstall_state.read_evidence(owner_path, private=True) if os.path.lexists(owner_path) else None
+        processes, blockers = [], []
+        if owner:
+            if owner.get('token') != receipt['endpoint_token']:
+                blockers.append({'code': 'central-token', 'reason': 'central owner token differs'})
+            for name in ('owner', 'watcher'):
+                processes.append(_uninstall_process(
+                    owner[f'{name}_pid'], owner[f'{name}_start'], owner.get(f'{name}_identity')))
+        else:
+            processes = [item for item in receipt.get('processes', []) if item]
+            if not processes:
+                processes = [_uninstall_process(item['pid'], item['start'])
+                             for item in (receipt.get('owner'), receipt.get('watcher')) if item]
+        if binding is None and processes:
+            try:
+                home_index = receipt['managed_command'].index('--home') + 1
+                if receipt['managed_command'][home_index] != str(home):
+                    raise store.Refusal('copied central home path differs')
+                live = [item for item in processes if supervision.process_presence(item)]
+                if live:
+                    _backend_inspect(home, receipt)
+                    mode = Path(f"/proc/{processes[0]['pid']}/cwd").stat()
+                    if (mode.st_dev, mode.st_ino) != (target['device'], target['inode']):
+                        raise store.Refusal('legacy central cwd inode differs')
+                binding = target
+            except (OSError, ValueError, KeyError, store.Refusal):
+                blockers.append({'code': 'central-legacy', 'reason': 'legacy central home binding is unproven'})
+        if binding != target:
+            blockers.append({'code': 'central-home', 'reason': 'central belongs to a different home identity'})
+        if endpoint and receipt['backend'] == 'herdr' and not endpoint.get('server'):
+            pid, start = endpoint.get('server_pid'), endpoint.get('server_start')
+            if pid and start and binding == target:
+                server_process = _uninstall_process(pid, start)
+                endpoint['server'] = {'target': binding, 'process': server_process,
+                    'socket': {'path': endpoint['socket'], 'device': endpoint['device'],
+                               'inode': endpoint['inode'], 'uid': os.getuid()}}
+        safe = _uninstall_endpoint(endpoint, binding)
+        identity = {'target': binding, 'backend': receipt['backend'], 'launch_id': receipt['launch_id'],
+                    'endpoint': safe, 'processes': processes,
+                    'argv_sha256': uninstall_state.fingerprint(receipt['expected_process_argv'])}
+        if not endpoint.get('pane'):
+            probe = {'presence': 'unknown', 'ownership': 'unknown', 'blockers': [
+                {'code': 'central-publication', 'reason': 'interrupted central has no complete endpoint'}]}
+        else:
+            module = tmux if receipt['backend'] == 'tmux' else herdr
+            probe = module._uninstall_probe(home, identity)
+        if blockers:
+            probe = {'presence': 'unknown', 'ownership': 'unknown', 'blockers': blockers}
+        elif any(supervision.process_presence(item) for item in processes) and probe['ownership'] == 'owned':
+            probe['presence'] = 'present'
+        rows[key] = {'key': key, 'kind': 'central', 'identity': identity, **probe}
+        if endpoint.get('server') and endpoint['server'].get('target') == binding:
+            server = endpoint['server']
+            server_key = f"backend-server:{receipt['backend']}:{server['process']['pid']}:{server['process']['start']}"
+            anchors = [endpoint['anchor']['pane_id']] if endpoint.get('anchor') else []
+            if receipt['backend'] == 'tmux' and server.get('anchor'):
+                anchors.append(server['anchor']['pane'])
+            servers[server_key] = {'backend': receipt['backend'], 'server': server, 'endpoint': safe,
+                                  'panes': [endpoint['pane']] if endpoint.get('pane') else [],
+                                  'anchors': anchors, 'workspaces': [endpoint['workspace']] if endpoint.get('workspace') else []}
+    tmux_path = home / 'state/tmux-server.json'
+    if os.path.lexists(tmux_path):
+        server = uninstall_state.read_evidence(tmux_path, private=True)
+        key = f"backend-server:tmux:{server['process']['pid']}:{server['process']['start']}"
+        if key not in servers:
+            anchors = [server['anchor']['pane']] if server.get('anchor') else []
+            servers[key] = {'backend': 'tmux', 'server': server, 'endpoint': {},
+                            'panes': [], 'anchors': anchors, 'workspaces': []}
+    workspace_path = home / 'state/herdr-workspace.json'
+    if os.path.lexists(workspace_path):
+        workspace = uninstall_state.read_evidence(workspace_path, private=True)
+        key = f"backend-workspace:herdr:{workspace['workspace']}"
+        identity = {name: workspace.get(name) for name in (
+            'target', 'session', 'socket', 'device', 'inode', 'protocol', 'workspace', 'anchor', 'server', 'config_path')}
+        rows[key] = {'key': key, 'kind': 'backend-workspace', 'identity': identity,
+                     **_uninstall_workspace_probe(home, identity)}
+        for server in servers.values():
+            if server['backend'] == 'herdr' and server['endpoint']['socket'] == workspace['socket']:
+                server['workspaces'].append(workspace['workspace'])
+                if workspace.get('anchor'):
+                    server['anchors'].append(workspace['anchor']['pane_id'])
+    for path in sorted((home / 'data/tasks').glob('*/task.json')):
+        task = uninstall_state.read_evidence(path, private=True)
+        for name in ('endpoint', 'prior_endpoint'):
+            endpoint = task.get(name)
+            if not endpoint:
+                continue
+            for server in servers.values():
+                if (server['backend'] == task.get('backend') and endpoint.get('pane')
+                        and endpoint.get('server', {}).get('process', {}).get('pid') == server['server']['process']['pid']):
+                    server['panes'].append(endpoint['pane'])
+    for key, identity in servers.items():
+        identity['panes'] = sorted(set(identity['panes'] + identity['anchors']))
+        identity['anchors'] = sorted(set(identity['anchors']))
+        identity['workspaces'] = sorted(set(identity['workspaces']))
+        rows[key] = {'key': key, 'kind': 'backend-server', 'identity': identity,
+                     **_uninstall_server_probe(home, identity)}
+    fields = ('pid', 'start', 'uid', 'ppid', 'pgid', 'sid', 'argv_sha256')
+    for path in sorted((home / 'state/native-omp').glob('*.json')):
+        record = uninstall_state.read_evidence(path, private=True)
+        process = {name: record.get(name) for name in fields}
+        key = f"native-omp:{process['pid']}:{process['start']}"
+        if key in expected and expected[key]['identity']['process']['pid'] == process['pid']:
+            process = expected[key]['identity']['process']
+        live = supervision.process_presence(process)
+        blockers = []
+        if live and record['target'] != target:
+            blockers.append({'code': 'native-home', 'reason': 'native OMP belongs to another home inode'})
+        if live and any(process[name] is None for name in fields):
+            process = _uninstall_process(process['pid'], process['start'])
+        rows[key] = {'key': key, 'kind': 'native-omp',
+                     'identity': {'target': record['target'], 'process': process, 'executable': record['executable']},
+                     'presence': 'unknown' if blockers else 'present' if live else 'absent',
+                     'ownership': 'unknown' if blockers else 'owned', 'blockers': blockers}
+    for key, saved in expected.items():
+        if key in rows:
+            continue
+        identity = saved['identity']
+        if saved['kind'] in {'central', 'native-omp'}:
+            processes = identity['processes'] if saved['kind'] == 'central' else [identity['process']]
+            live = any(supervision.process_presence(item) for item in processes)
+            rows[key] = {**saved, 'presence': 'present' if live else 'absent', 'blockers': []}
+        elif saved['kind'] == 'backend-server':
+            rows[key] = {**saved, **_uninstall_server_probe(home, identity)}
+        elif saved['kind'] == 'backend-workspace':
+            rows[key] = {**saved, **_uninstall_workspace_probe(home, identity)}
+    return list(rows.values())
+
+
+def _uninstall_workspace_probe(home, identity):
+    try:
+        if (not identity.get('target') or os.path.lexists(home)
+                and identity['target'] != supervision.runtime_home_identity(home)):
+            raise store.Refusal('workspace home binding differs')
+        if identity.get('server') and not supervision.process_presence(identity['server']['process']):
+            return {'presence': 'absent', 'ownership': 'owned', 'blockers': []}
+        result = _herdr_call(identity, 'workspace', 'get', identity['workspace'], check=False)
+        if result.returncode:
+            if json.loads(result.stderr or result.stdout).get('error', {}).get('code') == 'workspace_not_found':
+                return {'presence': 'absent', 'ownership': 'owned', 'blockers': []}
+            raise store.Refusal('workspace absence is unproven')
+        if _herdr_response(result)['workspace']['workspace_id'] != identity['workspace']:
+            raise store.Refusal('workspace identity differs')
+        return {'presence': 'present', 'ownership': 'owned', 'blockers': []}
+    except (OSError, ValueError, KeyError, TypeError, store.Refusal):
+        return {'presence': 'unknown', 'ownership': 'unknown', 'blockers': [
+            {'code': 'herdr-workspace', 'reason': 'workspace binding or transport is unproven'}]}
+
+
+def uninstall_quiesce(home, resources, operation):
+    from . import herdr, tmux, uninstall_state
+    for resource in resources:
+        if resource['kind'] not in {'central', 'native-omp'}:
+            continue
+        approved = uninstall_state.require_scope(home, operation, resource['key'])
+        current = next(row for row in uninstall_inventory(home, expected=[approved]) if row['key'] == approved['key'])
+        if current['identity'] != approved['identity'] or current['ownership'] != 'owned' or current['presence'] == 'unknown':
+            raise store.Refusal('central/native uninstall identity changed')
+        identity = approved['identity']
+        processes = identity['processes'] if approved['kind'] == 'central' else [identity['process']]
+        if current['presence'] == 'present' and approved['kind'] == 'central':
+            module = tmux if identity['backend'] == 'tmux' else herdr
+            module._uninstall_grace(home, identity)
+            deadline = time.monotonic() + 3
+            while any(supervision.process_presence(item) for item in processes) and time.monotonic() < deadline:
+                time.sleep(.05)
+        live = [item for item in processes if supervision.process_presence(item)]
+        if live:
+            supervision.stop_owned_processes(live)
+        if approved['kind'] == 'central':
+            module = tmux if identity['backend'] == 'tmux' else herdr
+            module.uninstall_close(home, approved, operation)
+        if any(supervision.process_presence(item) for item in processes):
+            raise store.Refusal('central/native process absence is unproven')
+        uninstall_state.checkpoint(home, operation, phase='quiescing', completed=approved['key'])
+
+
+def uninstall_remove(home, resources, operation):
+    from . import tmux, uninstall_state
+    for resource in sorted(resources, key=lambda row: row['kind'] == 'backend-server'):
+        if resource['kind'] not in {'backend-workspace', 'backend-server'}:
+            continue
+        approved = uninstall_state.require_scope(home, operation, resource['key'])
+        identity = approved['identity']
+        if approved['kind'] == 'backend-workspace':
+            probe = _uninstall_workspace_probe(home, identity)
+            if probe['ownership'] != 'owned' or probe['presence'] == 'unknown':
+                raise store.Refusal('workspace cannot be retired')
+            if probe['presence'] == 'present':
+                panes = _herdr_response(_herdr_call(identity, 'pane', 'list', '--workspace', identity['workspace']))['panes']
+                anchor = identity.get('anchor')
+                if any(not anchor or pane['pane_id'] != anchor['pane_id'] for pane in panes):
+                    raise store.Refusal('workspace contains an unrelated or unretired pane')
+                _herdr_call(identity, 'workspace', 'close', identity['workspace'])
+            if _uninstall_workspace_probe(home, identity)['presence'] != 'absent':
+                raise store.Refusal('workspace remains after close')
+        else:
+            probe = _uninstall_server_probe(home, identity, late=True)
+            if probe['ownership'] != 'owned' or probe['presence'] == 'unknown':
+                raise store.Refusal('backend server cannot be retired')
+            server = identity['server']
+            if supervision.process_presence(server['process']):
+                if identity['backend'] == 'tmux':
+                    store.run([*tmux.prefix(home), 'kill-server'])
+                else:
+                    for workspace in identity['workspaces']:
+                        result = _herdr_call(identity['endpoint'], 'workspace', 'get', workspace, check=False)
+                        if not result.returncode:
+                            _herdr_call(identity['endpoint'], 'workspace', 'close', workspace)
+                    supervision.stop_owned_processes([server['process']])
+            if supervision.process_presence(server['process']):
+                raise store.Refusal('backend server remains alive')
+            path = Path(server['socket']['path'])
+            if os.path.lexists(path):
+                mode = path.lstat()
+                if (not stat.S_ISSOCK(mode.st_mode) or mode.st_uid != os.getuid()
+                        or (mode.st_dev, mode.st_ino) != (server['socket']['device'], server['socket']['inode'])):
+                    raise store.Refusal('backend socket changed before removal')
+                uninstall_state.checkpoint(home, operation, phase='removing', irreversible=True)
+                path.unlink()
+            if identity['backend'] == 'herdr':
+                endpoint = identity['endpoint']
+                env = dict(os.environ, HERDR_CONFIG_PATH=endpoint['config_path']) if endpoint.get('config_path') else None
+                listed = json.loads(store.run(['herdr', 'session', 'list', '--json'], env=env).stdout)
+                sessions = listed['sessions'] if isinstance(listed, dict) else listed
+                selected = [item for item in sessions if item['name'] == endpoint['session']]
+                if selected:
+                    if (len(selected) != 1 or selected[0].get('running')
+                            or Path(selected[0]['session_dir']) != Path(endpoint['socket']).parent):
+                        raise store.Refusal('stopped Herdr session directory differs')
+                    uninstall_state.checkpoint(home, operation, phase='removing', irreversible=True)
+                    deleted = json.loads(store.run(
+                        ['herdr', 'session', 'delete', endpoint['session'], '--json'], env=env).stdout)
+                    if deleted.get('deleted') is not True:
+                        raise store.Refusal('Herdr session deletion is unconfirmed')
+                    remaining = json.loads(store.run(['herdr', 'session', 'list', '--json'], env=env).stdout)
+                    remaining = remaining['sessions'] if isinstance(remaining, dict) else remaining
+                    if any(item['name'] == endpoint['session'] for item in remaining):
+                        raise store.Refusal('Herdr named session remains after deletion')
+        uninstall_state.checkpoint(home, operation, phase='removing', completed=approved['key'])

@@ -233,12 +233,13 @@ def run_worker(home, task_id, incarnation):
         if task['harness'] == 'omp' and task['phase'] == 'ready':
             child_env['AGD_WORKER_RESUME_READY'] = '1'
         import subprocess
-        from .supervision import process_start
+        from .supervision import process_identity, runtime_home_identity
         args = harnesses.launch_argv(task, tasks.task_file(home, task_id).parent/'brief.md', task['unattended'],
                                     session_dir=session_dir)
         receipt = home/'state'/'tasks'/task_id/'runner.json'
-        runner = dict(incarnation=incarnation, pid=os.getpid(), start=process_start(os.getpid()),
-                      uid=os.getuid(), phase='spawning')
+        runner = process_identity(os.getpid())
+        runner.pop('state')
+        runner.update(incarnation=incarnation, phase='preparing', target=runtime_home_identity(home))
         if warning:
             runner['observability_warning'] = warning
         if task['harness'] == 'omp':
@@ -252,8 +253,13 @@ def run_worker(home, task_id, incarnation):
             tasks.save(home, current)
         child = None
         try:
+            runner['phase'] = 'spawning'
+            store.atomic_json(receipt, runner)
             child = subprocess.Popen(args, cwd=task['worktree'], env=child_env, stdin=None)
-            runner.update(phase='spawned', child_pid=child.pid, child_start=process_start(child.pid))
+            identity = process_identity(child.pid)
+            identity.pop('state')
+            runner.update(phase='spawned', child_pid=child.pid, child_start=identity['start'],
+                          child=identity)
             if task['harness'] == 'omp':
                 observability.record_process_generation(home, 'worker', generation, task_id, incarnation,
                                                         child.pid, runner['child_start'])
@@ -276,6 +282,10 @@ def run_worker(home, task_id, incarnation):
                     tasks.save(home, current)
             note.write_text(reason)
             event(home, task_id, incarnation, 'failed' if status else 'idle', 'runner-exit', note)
+        with store.lock(home):
+            if tasks.read(home, task_id).get('incarnation') == incarnation:
+                runner['phase'] = 'exited'
+                store.atomic_json(receipt, runner)
         return {'exit': status}
 
 
@@ -582,3 +592,109 @@ def relaunch(home, task_id):
             task['endpoint'] = endpoint
             tasks.save(home, task)
         return task
+
+
+def uninstall_inventory(home, *, expected=None):
+    import hashlib
+    from . import supervision, uninstall_state
+    expected = {row['key']: row for row in expected or [] if row['kind'].startswith('worker')}
+    rows = {}
+    fields = ('pid', 'start', 'uid', 'ppid', 'pgid', 'sid', 'argv_sha256')
+    for path in sorted((home / 'data/tasks').glob('*/task.json')):
+        task = uninstall_state.read_evidence(path, private=True)
+        task_id = store.validate_id(task['id'])
+        if path.parent.name != task_id:
+            raise store.Refusal('task receipt path differs from its identity')
+        incarnation = task.get('incarnation')
+        receipt = home / 'state/tasks' / task_id / 'runner.json'
+        if os.path.lexists(receipt):
+            runner = uninstall_state.read_evidence(receipt, private=True)
+            if runner.get('incarnation') != incarnation:
+                raise store.Refusal('worker runner incarnation differs from its task')
+            key = f'worker:{task_id}:{incarnation}'
+            coordinator = {name: runner.get(name) for name in fields}
+            child = runner.get('child')
+            if child is None and runner.get('child_pid'):
+                child = {'pid': runner['child_pid'], 'start': runner['child_start'],
+                         'uid': runner.get('uid')}
+            processes = [coordinator, *([child] if child else [])]
+            identity = {'target': runner.get('target'), 'task_id': task_id,
+                        'incarnation': incarnation, 'runner': coordinator, 'child': child}
+            blockers = []
+            active = processes[1:] if runner.get('phase') == 'exited' else processes
+            try:
+                live = [item for item in active if supervision.process_presence(item)]
+                if not live and runner.get('phase') == 'spawning' and child is None:
+                    presence, ownership = 'unknown', 'unknown'
+                    blockers.append({'code': 'worker-spawn-gap', 'reason': 'worker child outcome is unproven'})
+                elif live and (identity['target'] != supervision.runtime_home_identity(home)
+                               or any(any(name not in item or item[name] is None for name in fields)
+                                      for item in live)):
+                    presence, ownership = 'unknown', 'unknown'
+                    blockers.append({'code': 'worker-identity', 'reason': 'live worker launch identity is incomplete or foreign'})
+                else:
+                    presence, ownership = ('present' if live else 'absent'), 'owned'
+            except (store.Refusal, KeyError, TypeError) as error:
+                presence, ownership = 'unknown', 'unknown'
+                blockers.append({'code': 'worker-process', 'reason': type(error).__name__})
+            rows[key] = {'key': key, 'kind': 'worker', 'identity': identity,
+                         'presence': presence, 'ownership': ownership, 'blockers': blockers}
+        for field in ('endpoint', 'prior_endpoint'):
+            endpoint = task.get(field)
+            if not endpoint:
+                continue
+            endpoint_incarnation = endpoint.get('incarnation', incarnation)
+            key = f'worker-endpoint:{task_id}:{endpoint_incarnation}'
+            safe = {name: value for name, value in endpoint.items() if name not in {'token', 'command'}}
+            safe['token_sha256'] = hashlib.sha256(endpoint.get('token', '').encode()).hexdigest()
+            identity = {'backend': task['backend'], 'task_id': task_id,
+                        'incarnation': endpoint_incarnation, 'endpoint': safe,
+                        'endpoint_digest': uninstall_state.fingerprint(endpoint)}
+            module = tmux if task['backend'] == 'tmux' else herdr
+            probe = module._uninstall_probe(home, identity)
+            rows[key] = {'key': key, 'kind': 'worker-endpoint', 'identity': identity, **probe}
+    for key, saved in expected.items():
+        if key in rows:
+            continue
+        identity = saved['identity']
+        if saved['kind'] == 'worker':
+            processes = [item for item in (identity['runner'], identity['child']) if item]
+            presence = 'present' if any(supervision.process_presence(item) for item in processes) else 'absent'
+            rows[key] = {**saved, 'presence': presence, 'blockers': []}
+        else:
+            module = tmux if identity['backend'] == 'tmux' else herdr
+            rows[key] = {**saved, **module._uninstall_probe(home, identity)}
+    return list(rows.values())
+
+
+def uninstall_quiesce(home, resources, operation):
+    from . import supervision, uninstall_state
+    for resource in sorted(resources, key=lambda row: row['kind'] != 'worker'):
+        approved = uninstall_state.require_scope(home, operation, resource['key'])
+        if approved['kind'] == 'worker-endpoint':
+            module = tmux if approved['identity']['backend'] == 'tmux' else herdr
+            module.uninstall_close(home, approved, operation)
+            continue
+        current = next((row for row in uninstall_inventory(home, expected=[approved])
+                        if row['key'] == approved['key']), None)
+        if (current is None or current['identity'] != approved['identity']
+                or current['ownership'] != 'owned' or current['presence'] == 'unknown'):
+            raise store.Refusal('worker uninstall identity changed or is unknown')
+        if current['presence'] == 'present':
+            identity = approved['identity']
+            processes = [item for item in (identity['runner'], identity['child']) if item]
+            endpoint_key = f"worker-endpoint:{identity['task_id']}:{identity['incarnation']}"
+            endpoint = next((row for row in resources if row['key'] == endpoint_key), None)
+            if endpoint:
+                endpoint = uninstall_state.require_scope(home, operation, endpoint_key)
+                module = tmux if endpoint['identity']['backend'] == 'tmux' else herdr
+                module._uninstall_grace(home, endpoint['identity'])
+                deadline = time.monotonic() + 2
+                while any(supervision.process_presence(item) for item in processes) and time.monotonic() < deadline:
+                    time.sleep(.05)
+            supervision.stop_owned_processes(processes)
+        remaining = next(row for row in uninstall_inventory(home, expected=[approved])
+                         if row['key'] == approved['key'])
+        if remaining['presence'] != 'absent':
+            raise store.Refusal('worker process absence unproven; lease and receipts retained')
+        uninstall_state.checkpoint(home, operation, phase='quiescing', completed=approved['key'])

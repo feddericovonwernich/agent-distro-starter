@@ -273,3 +273,62 @@ def test_prepare_start_refuses_unsafe_launcher_config(tmp_path, monkeypatch):
     config.symlink_to(tmp_path / 'missing')
     with __import__('pytest').raises(store.Refusal, match='launcher config'):
         launcher.prepare_start(home, None, {}, lambda *_: None, lambda *_: None, lambda *_: [])
+
+
+def test_native_omp_exit_does_not_claim_worker_or_relay_absence():
+    import sys
+    import uuid
+    from agd_lib import launcher, relay, store, supervision, tasks, workers
+    from support import command as json_command, lab, uninstall_scope
+    with lab() as (home, _):
+        brief = home / 'brief.md'
+        brief.write_text('Read the fixture.')
+        task = json_command(home, 'task', 'create', 'still-working', '--project', 'sample',
+                            '--brief', str(brief), '--skill-mode', 'none')
+        incarnation = str(uuid.uuid4())
+        task.update(executor='worker', incarnation=incarnation, phase='running',
+                    worker_alive=True, harness='omp', backend='tmux')
+        tasks.save(home, task)
+        program = 'import sys\nprint("ready", flush=True)\nsys.stdin.read()'
+        def spawn(cwd):
+            process = subprocess.Popen([sys.executable, '-c', program], cwd=cwd,
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            assert process.stdout.readline() == 'ready\n'
+            return process
+        worker = spawn(task['worktree'])
+        relay_root = home / 'state/relay/projects/sample'
+        relay_root.mkdir(parents=True)
+        connector = spawn(relay_root)
+        native = None
+        try:
+            target = supervision.runtime_home_identity(home)
+            worker_id = supervision.process_identity(worker.pid); worker_id.pop('state')
+            relay_id = supervision.process_identity(connector.pid); relay_id.pop('state')
+            store.atomic_json(home / 'state/tasks/still-working/runner.json', {
+                **worker_id, 'target': target, 'phase': 'preparing', 'incarnation': incarnation})
+            store.atomic_json(relay_root / 'service.json', {
+                'schema': 1, 'project': 'sample', 'root': str(relay_root),
+                'runtime': '/shared/relay', 'target': target, 'health': 'healthy', 'connector': relay_id})
+            binary = home.parent / 'omp'
+            binary.write_text('#!/usr/bin/env python3\n' + program)
+            binary.chmod(0o755)
+            store.atomic_json(home / 'data/dependencies.json', {'schema': 1, 'omp': {
+                'source': 'existing', 'path': str(binary), 'version': 'omp/18.14.0',
+                'capabilities': ['models-json', 'login']}})
+            native = subprocess.Popen([CLI, '--home', home, 'omp'], stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            assert native.stdout.readline() == 'ready\n'
+            central_rows = launcher.uninstall_inventory(home)
+            worker_rows, relay_rows = workers.uninstall_inventory(home), relay.uninstall_inventory(home)
+            with uninstall_scope(home, central_rows + worker_rows + relay_rows) as operation:
+                launcher.uninstall_quiesce(home, central_rows, operation)
+                assert native.wait(timeout=3) != 0
+                assert worker.poll() is None and connector.poll() is None
+                assert set(operation['completed']) == {row['key'] for row in central_rows}
+                assert tasks.read(home, task['id'])['lease_id'] == task['lease_id']
+        finally:
+            for process in (native, worker, connector):
+                if process is not None:
+                    if process.poll() is None:
+                        process.terminate()
+                    process.communicate(timeout=5)

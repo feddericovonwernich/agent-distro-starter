@@ -160,29 +160,23 @@ def executable(home) -> str:
 def exec_native(home, arguments):
     """Publish a private PID/start receipt before handing this process to OMP."""
     from .uninstall_state import admission
-    from .supervision import process_start
+    from .supervision import process_identity, runtime_home_identity
     root = store.home(home)
     validate_native_args(arguments)
     with admission(root):
         binary = executable(root)
         env = environment(root, os.environ)
-        identity = root.lstat()
-        marker = _read_json(root / 'data/home.json', 'home identity', optional=True)
-        if marker is None:
-            marker = {}
-        if not isinstance(marker, dict):
-            raise store.Refusal('OMP home identity is malformed')
-        target = {'canonical_home': str(root), 'home_id': marker.get('home_id'),
-                  'uid': identity.st_uid, 'device': identity.st_dev, 'inode': identity.st_ino}
+        target = runtime_home_identity(root)
         folder = root / 'state/native-omp'
         folder.mkdir(mode=0o700, exist_ok=True)
         mode = folder.lstat()
         if (not stat.S_ISDIR(mode.st_mode) or mode.st_uid != os.getuid()
                 or stat.S_IMODE(mode.st_mode) != 0o700):
             raise store.Refusal('native OMP receipt directory is unsafe')
-        pid, start = os.getpid(), process_start(os.getpid())
-        receipt = {'schema': 1, 'target': target, 'pid': pid, 'start': start,
-                   'uid': os.getuid(), 'executable': str(Path(binary).resolve())}
+        receipt = process_identity(os.getpid())
+        receipt.pop('state')
+        receipt.update(schema=1, target=target, executable=str(Path(binary).resolve()))
+        pid, start = receipt['pid'], receipt['start']
         store.atomic_json(folder / f'{pid}-{start}.json', receipt)
         os.chdir(root)
         os.execvpe(binary, [binary, *arguments], env)

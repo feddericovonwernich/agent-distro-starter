@@ -49,7 +49,7 @@ def _directory(path, *, private=False):
     return value
 
 
-def _json(path, *, private=False):
+def read_evidence(path, *, private=False):
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         with os.fdopen(fd, encoding='utf-8') as stream:
@@ -70,7 +70,7 @@ def target_identity(home):
     if os.path.ismount(root):
         _refuse('uninstall target is a mount point')
     _directory(root / 'data')
-    marker = _json(root / 'data/home.json')
+    marker = read_evidence(root / 'data/home.json')
     try:
         valid = (isinstance(marker, dict) and marker.get('schema') == 1
                  and str(uuid.UUID(marker['home_id'])) == marker['home_id'])
@@ -167,7 +167,7 @@ def read_operation(home):
     if not os.path.lexists(directory):
         return None
     _directory(directory, private=True)
-    value = _json(directory / 'operation.json', private=True)
+    value = read_evidence(directory / 'operation.json', private=True)
     try:
         if (not isinstance(value, dict) or value.get('schema') != 1 or value.get('phase') not in _PHASES
                 or not isinstance(value.get('irreversible_started'), bool)
@@ -196,7 +196,7 @@ def read_operation(home):
                 _directory(state)
             pointer = state / 'uninstall.json'
             if os.path.lexists(pointer):
-                hint = _json(pointer, private=True)
+                hint = read_evidence(pointer, private=True)
                 if (not isinstance(hint, dict) or hint.get('schema') != 1
                         or hint.get('target') != target
                         or hint.get('operation') != str(directory)
