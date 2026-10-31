@@ -40,7 +40,7 @@ for(const [name,value] of Object.entries({Agent:core.Agent,streamSimple:ai.strea
 console.log(JSON.stringify({ai_url:import.meta.resolve(modules.ai),core_url:import.meta.resolve(modules.core),sdk_url:import.meta.resolve(modules.sdk),registry_url:import.meta.resolve(modules.registry),manager_url:import.meta.resolve(modules.manager),session_url:import.meta.resolve(modules.session),telemetry_url:import.meta.resolve(modules.telemetry),resolver_url:import.meta.resolve(modules.resolver),omp_version:process.argv[1]}));"""
     base_env = {key: os.environ[key] for key in ('PATH', 'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME') if key in os.environ}
     env = omp_runtime.environment(home, base_env) if home is not None else base_env
-    try: result = subprocess.run([binary, '--no-env-file', '-e', script, manifest['version']], capture_output=True, text=True, cwd=root, timeout=min(10, remaining), env=env)
+    try: result = subprocess.run([binary, '--no-install', '--no-env-file', '-e', script, manifest['version']], capture_output=True, text=True, cwd=root, timeout=min(10, remaining), env=env)
     except subprocess.TimeoutExpired as error: raise store.DependencyError('installed OMP runtime capability timed out') from error
     if result.returncode: raise store.DependencyError(f'installed OMP runtime capability unavailable: {result.stderr.strip()}')
     try: capability = json.loads(result.stdout)
@@ -113,7 +113,7 @@ def run_native_reviewer(home, intent, *, omp_binary='omp'):
         if not bun: return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='bun', packet=packet)
         stderr = bytearray()
         try:
-            process = subprocess.Popen([bun, '--no-env-file', str(Path(__file__).resolve().parents[2] / 'lib' / 'agd-reviewer-host.ts')], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=runtime, start_new_session=True)
+            process = subprocess.Popen([bun, '--no-install', '--no-env-file', str(Path(__file__).resolve().parents[2] / 'lib' / 'agd-reviewer-host.ts')], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=runtime, start_new_session=True)
         except OSError: return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='spawn', packet=packet)
         def drain():
             for chunk in iter(lambda: process.stderr.read(256), ''):

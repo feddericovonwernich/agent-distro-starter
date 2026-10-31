@@ -3,6 +3,7 @@ import json
 import shutil
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -181,3 +182,45 @@ def test_native_activation_failure_retains_owned_disable_recovery(tmp_path):
     reviewer_timer.disable(root, xdg_config_home=xdg, command_runner=lambda _: None)
     assert reviewer_timer._read_record(root)['state'] == 'disabled'
     assert not list((xdg / 'systemd/user').glob('agd-reviewer-*'))
+
+
+def test_native_service_discards_inherited_credentials(tmp_path):
+    try:
+        manager = subprocess.run(['systemctl', '--user', 'show', '--property=Version', '--value'],
+                                 capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        pytest.skip('native user-systemd manager unavailable')
+    if manager.returncode:
+        pytest.skip('native user-systemd manager unavailable')
+    root = home(tmp_path)
+    identity = str(uuid.uuid4())
+    store.atomic_json(root / 'data/home.json', {'schema': 1, 'home_id': identity})
+    marker = root / 'environment.json'
+    helper = tmp_path / 'environment-probe.py'
+    helper.write_text(
+        'import json,os\nfrom pathlib import Path\n'
+        f'Path({str(marker)!r}).write_text(json.dumps({{key:os.environ.get(key) for key in '
+        '("AGD_CREDENTIAL_SENTINEL","OTEL_EXPORTER_OTLP_HEADERS","HOME","PATH")}))\n')
+    rendered = reviewer_timer.render_units(
+        root, interval_config(), runtime={'python': sys.executable, 'path': os.defpath}, source_cli=str(helper))
+    content = rendered['service'].replace(
+        '[Service]\n', '[Service]\nEnvironment=AGD_CREDENTIAL_SENTINEL=synthetic-secret\n'
+        'Environment=OTEL_EXPORTER_OTLP_HEADERS=synthetic-header\n')
+    directory = reviewer_timer._unit_directory(Path.home() / '.config')
+    service = directory / rendered['service_name']
+    owner = f'X-AGD-Reviewer-Owner={identity}:{os.getuid()}'
+    assert not service.exists()
+    reviewer_timer._write_unit(service, content, owner)
+    try:
+        store.run(['systemctl', '--user', 'daemon-reload'])
+        store.run(['systemctl', '--user', 'start', '--wait', service.name])
+        observed = json.loads(marker.read_text())
+        assert observed['AGD_CREDENTIAL_SENTINEL'] is None
+        assert observed['OTEL_EXPORTER_OTLP_HEADERS'] is None
+        assert observed['HOME'] == str(Path.home())
+        assert observed['PATH'] == os.defpath
+    finally:
+        store.run(['systemctl', '--user', 'stop', service.name])
+        assert reviewer_timer._owned(service, owner)
+        service.unlink()
+        store.run(['systemctl', '--user', 'daemon-reload'])

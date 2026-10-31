@@ -3,9 +3,12 @@ from functools import partial
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -582,3 +585,49 @@ def test_reviewer_onboarding_cli_preserves_live_central_owner(reviewer_onboardin
     assert guarded.returncode == 3
     assert 'live central' in guarded.stderr
     assert owner.read_bytes() == frozen
+
+
+def test_partial_reviewer_sdk_does_not_contact_registry_or_install(reviewer_onboarding, tmp_path, monkeypatch):
+    from agd_lib import reviewer
+    if shutil.which('bun') is None:
+        pytest.skip('native Bun runtime unavailable')
+    home, xdg, _ = reviewer_onboarding
+    requests = []
+    class Registry(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            self.send_response(404)
+            self.end_headers()
+        def log_message(self, *_args):
+            pass
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Registry)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    sdk = tmp_path / 'partial-sdk'
+    (sdk / 'bin').mkdir(parents=True)
+    (sdk / 'package.json').write_text(json.dumps({
+        'name': '@oh-my-pi/pi-coding-agent', 'version': '18.14.0', 'type': 'module',
+        'bin': {'omp': 'bin/omp'}, 'exports': {'.': './stub.js', './*': './stub.js'},
+        'dependencies': {'@oh-my-pi/pi-ai': '9999.0.0', '@oh-my-pi/pi-agent-core': '9999.0.0'}}))
+    (sdk / 'stub.js').write_text('export const placeholder = true;\n')
+    (sdk / 'bin/omp').write_text('#!/usr/bin/env bun\n')
+    (sdk / 'bin/omp').chmod(0o755)
+    cache = tmp_path / 'bun-cache'
+    (sdk / 'bunfig.toml').write_text(
+        f'[install]\nregistry = "http://127.0.0.1:{server.server_port}"\n'
+        f'[install.cache]\ndir = "{cache}"\n')
+    frozen = {str(path.relative_to(sdk)): path.read_bytes() for path in sdk.rglob('*') if path.is_file()}
+    monkeypatch.setenv('PATH', f'{sdk / "bin"}:{os.environ["PATH"]}')
+    values = iter(['y', '2'])
+    try:
+        got = installer.setup_reviewer(home, lambda _: next(values, None), lambda _: None)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert got['state'] == 'configured'
+    assert reviewer.read_config(home)['schedule']['interval_hours'] == 6
+    assert requests == []
+    assert {str(path.relative_to(sdk)): path.read_bytes() for path in sdk.rglob('*') if path.is_file()} == frozen
+    assert not any(path.is_file() for path in cache.rglob('*'))
+    assert not list(xdg.glob('systemd/user/*.timer'))

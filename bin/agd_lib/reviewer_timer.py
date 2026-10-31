@@ -192,7 +192,7 @@ def render_units(home, config, *, runtime, source_cli=None):
         raise store.Refusal('manual-only has no timer unit')
     return {'timer_name': timer, 'service_name': service,
             'timer': f"[Unit]\nDescription=AGD reviewer timer\n{marker}\n\n[Timer]\nOnCalendar={calendar}\nPersistent=true\nUnit={service}\n\n[Install]\nWantedBy=timers.target\n",
-            'service': f"[Unit]\nDescription=AGD reviewer run\n{marker}\n\n[Service]\nType=oneshot\nTimeoutStartSec={runtime_limit}\nEnvironment=PATH={_escape(runtime['path'])}\nExecStart={_escape(runtime['python'])} {_escape(source_cli)} --home={_escape(str(store.home(home)))} reviewer run --timer\n"}
+            'service': f"[Unit]\nDescription=AGD reviewer run\n{marker}\n\n[Service]\nType=oneshot\nTimeoutStartSec={runtime_limit}\nExecStart=/usr/bin/env -i HOME={_escape(str(Path.home()))} PATH={_escape(runtime['path'])} LANG=C.UTF-8 {_escape(runtime['python'])} {_escape(source_cli)} --home={_escape(str(store.home(home)))} reviewer run --timer\n"}
 
 
 def _safe_directory(path):

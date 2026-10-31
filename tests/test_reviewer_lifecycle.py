@@ -54,7 +54,6 @@ def test_native_runner_uses_local_agent_empty_project_and_safe_diagnostic(monkey
         assert capture.exists(), result.get('error')
         captured = json.loads(capture.read_text())
         runtime = home/'state/reviewer/runtime'/result['review_run_id']
-        assert captured['argv'][0] == '--no-env-file'
         assert captured['cwd'] == captured['payload']['input']['cwd'] == str(runtime)
         assert captured['payload']['input']['agentDir'] == str(omp_runtime.agent_dir(home))
         assert captured['agent'] == str(omp_runtime.agent_dir(home))

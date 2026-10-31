@@ -80,6 +80,8 @@ The fifth installer stage has real PTY coverage for independent telemetry/review
 
 On Linux/systemd 255, a separately owned disposable home configured a custom near-future UTC schedule through the actual onboarding function. Its real user timer fired a service using official OMP SDK 18.14.0 and Bun from paths containing spaces, percent signs, and both quote characters. The service independently imported the SDK under its minimal environment and ran the actual reviewer CLI, producing a terminal `no-work` receipt without a provider call. The home argument survived native systemd parsing; re-enable preserved the due checkpoint and unit-file timestamps. Explicit stop, timer-state cleanup, disable, and reload removed only that home's units/stamp; the home remained absent after a delayed check. No existing distro or unrelated timer was changed.
 
+A real Bun capability probe against an incomplete SDK and disposable loopback registry made no registry requests or installation/cache writes. A separately owned native user service proved that synthetic inherited credential and OTEL-header values were absent from its Python child, while HOME and the selected PATH remained available.
+
 This proves native scheduling, runtime binding, and empty-evidence execution—not model authentication, nonempty paid review success, automatic skill changes, or Langfuse delivery. Standalone OMP alone still lacks the importable SDK prerequisite; onboarding retains a selected schedule and warns rather than installing a runtime or arming an unusable timer.
 
 ## Guided installation and start acceptance
