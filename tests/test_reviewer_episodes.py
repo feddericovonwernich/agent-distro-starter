@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import sys
+import threading
 import time
 import tracemalloc
 import uuid
@@ -503,3 +504,67 @@ def test_completion_records_apply_cutoff_and_pending_native_read(tmp_path, monke
     assert len(records) == 1 and records[0]['source'] == source
     ready = reviewer_episodes.read_native(session, now + 1, 4096, completion=records[0])
     assert ready['status'] == 'ready' and ready['boundary']['entry_id'] == 'final-id'
+
+
+def test_worker_registration_waits_for_receipt_publication_barrier(tmp_path, monkeypatch):
+    home, worktree, task_id, incarnation, session = _worker_case(tmp_path)
+    process_receipts = home / 'state' / 'observability' / 'processes'
+    for path in process_receipts.glob('*.json'):
+        path.unlink()
+    _fake_identity(monkeypatch, 2222, '3333')
+    monkeypatch.setenv('AGD_TASK_ID', task_id)
+    monkeypatch.setenv('AGD_INCARNATION', incarnation)
+    real_once = reviewer_episodes._managed_process_receipt_once
+    published = False
+    writer = None
+    writer_errors = []
+
+    def write_receipt():
+        try:
+            observability.record_process_generation(
+                home, 'worker', '0', task_id=task_id, incarnation=incarnation,
+                pid=2222, start='3333')
+        except Exception as error:
+            writer_errors.append(error)
+
+    def publish_after_first_missing(*args, **kwargs):
+        nonlocal published, writer
+        try:
+            return real_once(*args, **kwargs)
+        except reviewer_episodes._ManagedReceiptMissing:
+            if not published:
+                published = True
+                writer = threading.Thread(target=write_receipt)
+                writer.start()
+            raise
+
+    monkeypatch.setattr(reviewer_episodes, '_managed_process_receipt_once', publish_after_first_missing)
+    source = reviewer_episodes.register_source(
+        home, {'role': 'worker', 'session_id': 'worker-session', 'session_file': str(session)})
+    writer.join(timeout=1)
+    assert published and not writer.is_alive() and not writer_errors and source['task_id'] == task_id
+
+
+def test_idempotent_reuse_refuses_tampered_source_and_completion(tmp_path, monkeypatch):
+    home, _, session = _central_case(tmp_path)
+    _fake_identity(monkeypatch, 1234, '4567')
+    _central_env(monkeypatch)
+    source = reviewer_episodes.register_source(
+        home, {'role': 'central', 'session_id': 'central-session', 'session_file': str(session)})
+    source_path = home / 'state' / 'reviewer' / 'episodes' / 'sources' / f"{source['source_id']}.json"
+    tampered_source = json.loads(source_path.read_text())
+    tampered_source['message'] = 'raw body'
+    source_path.write_text(json.dumps(tampered_source))
+    with pytest.raises(store.Refusal):
+        reviewer_episodes.register_source(
+            home, {'role': 'central', 'session_id': 'central-session', 'session_file': str(session)})
+
+    source_path.write_text(json.dumps(source))
+    completion = reviewer_episodes.record_completion(home, _complete_request(source['source_id']))
+    completion_path = (home / 'state' / 'reviewer' / 'episodes' / 'completions'
+                       / source['source_id'] / f"{completion['interaction_id']}.json")
+    tampered_completion = json.loads(completion_path.read_text())
+    tampered_completion['content'] = 'raw body'
+    completion_path.write_text(json.dumps(tampered_completion))
+    with pytest.raises(store.Refusal):
+        reviewer_episodes.record_completion(home, _complete_request(source['source_id']))

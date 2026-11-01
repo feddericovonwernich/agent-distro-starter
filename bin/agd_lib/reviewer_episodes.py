@@ -99,7 +99,9 @@ def _validate_source(receipt, session_path, session_id, native_cwd=None):
         raise store.Refusal('source process identity is invalid')
     if not isinstance(receipt.get('start'), str) or not re.fullmatch(r'\d+', receipt['start']):
         raise store.Refusal('source timestamp is invalid')
-    if not isinstance(receipt.get('recorded_at'), (int, float)) or isinstance(receipt['recorded_at'], bool) or not math.isfinite(receipt['recorded_at']):
+    if (not isinstance(receipt.get('recorded_at'), (int, float))
+            or isinstance(receipt['recorded_at'], bool) or not math.isfinite(receipt['recorded_at'])
+            or receipt['recorded_at'] < 0):
         raise store.Refusal('source timestamp is invalid')
     if role == 'worker' and (not isinstance(receipt.get('task_id'), str) or not isinstance(receipt.get('incarnation'), str)):
         raise store.Refusal('worker source identity is invalid')
@@ -632,29 +634,60 @@ def _check_caller(identity):
     return current
 
 
-def _managed_process_receipt(home, role, caller, task_id=None, incarnation=None):
+class _ManagedReceiptMissing(Exception):
+    pass
+
+
+def _managed_process_receipt_once(home, role, caller, task_id=None, incarnation=None):
     directory = home / 'state' / 'observability' / 'processes'
     if not directory.is_dir() or directory.is_symlink():
-        raise store.Refusal('managed native process receipt is missing')
+        raise _ManagedReceiptMissing
     matches = []
     for path in directory.glob('*.json'):
-        try:
-            value = _read_private_json(path)
-        except store.Refusal:
-            continue
+        value = _read_private_json(path)
         expected = {'schema', 'role', 'generation', 'pid', 'start', 'uid', 'recorded_at'}
         if role == 'worker':
             expected |= {'task_id', 'incarnation'}
-        if set(value) != expected or value.get('schema') != 1 or value.get('role') != role:
+        if (set(value) != expected or value.get('schema') != 1
+                or value.get('role') not in ('central', 'worker')
+                or not isinstance(value.get('generation'), str)
+                or not value['generation'].isdigit()
+                or type(value.get('pid')) is not int or value['pid'] <= 0
+                or not isinstance(value.get('start'), str) or not value['start'].isdigit()
+                or type(value.get('uid')) is not int or value['uid'] < 0
+                or not isinstance(value.get('recorded_at'), (int, float))
+                or isinstance(value['recorded_at'], bool) or not math.isfinite(value['recorded_at'])):
+            raise store.Refusal('managed native process receipt is malformed')
+        if value.get('role') != role:
             continue
         if role == 'worker' and (value.get('task_id') != task_id or value.get('incarnation') != incarnation):
             continue
-        if (value.get('pid') == caller.get('pid') and value.get('start') == caller.get('start')
-                and value.get('uid') == caller.get('uid')):
+        same_identity = (value['pid'] == caller['pid']
+                         and value['start'] == caller['start']
+                         and value['uid'] == caller['uid'])
+        if same_identity:
             matches.append(value)
-    if len(matches) != 1:
-        raise store.Refusal('managed native process receipt is missing or ambiguous')
-    return matches[0]
+        elif role == 'worker':
+            raise store.Refusal('managed worker process identity differs')
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise store.Refusal('managed native process receipt is ambiguous')
+    raise _ManagedReceiptMissing
+
+
+def _managed_process_receipt(home, role, caller, task_id=None, incarnation=None, *, wait=True, lock_held=False):
+    deadline = time.monotonic() + 4.8 if wait else time.monotonic()
+    while True:
+        try:
+            if lock_held:
+                return _managed_process_receipt_once(home, role, caller, task_id, incarnation)
+            with store.lock(home):
+                return _managed_process_receipt_once(home, role, caller, task_id, incarnation)
+        except _ManagedReceiptMissing:
+            if not wait or time.monotonic() >= deadline:
+                raise store.Refusal('managed native process receipt is missing')
+            time.sleep(0.05)
 
 
 def _expected_cwd(home, role, task_id=None):
@@ -674,7 +707,7 @@ def _expected_cwd(home, role, task_id=None):
     return str(cwd)
 
 
-def _authorize_worker(home, caller):
+def _authorize_worker(home, caller, *, wait=True, lock_held=False):
     from . import observability, tasks
     task_id = os.environ.get('AGD_TASK_ID')
     incarnation = os.environ.get('AGD_INCARNATION')
@@ -696,11 +729,11 @@ def _authorize_worker(home, caller):
             or binding.get('session_dir') != str(expected_session_dir)
             or binding.get('state') != 'directory allocated'):
         raise store.Refusal('worker observability binding is invalid')
-    _managed_process_receipt(home, 'worker', caller, task_id, incarnation)
+    _managed_process_receipt(home, 'worker', caller, task_id, incarnation, wait=wait, lock_held=lock_held)
     return task_id, incarnation, expected_session_dir, task
 
 
-def _authorize_central(home, caller):
+def _authorize_central(home, caller, *, lock_held=False):
     if os.environ.get('AGD_MANAGED_CENTRAL') != '1':
         raise store.Refusal('central capture requires managed native environment')
     owner = _read_private_json(home / 'state' / 'owner.json')
@@ -715,7 +748,7 @@ def _authorize_central(home, caller):
                 if os.environ.get(key)]
     if not supplied or any(token != owner['token'] for token in supplied):
         raise store.Refusal('central owner token differs')
-    _managed_process_receipt(home, 'central', caller)
+    _managed_process_receipt(home, 'central', caller, lock_held=lock_held)
     return None, None, home / 'data' / 'observability' / 'central' / 'omp', None
 
 
@@ -734,14 +767,15 @@ def _source_request(request):
     return role, session_id, Path(session_file)
 
 
-def _source_authorize(home, request, *, require_live=True):
+def _source_authorize(home, request, *, require_live=True, wait=True, lock_held=False):
     role, session_id, session_file = _source_request(request)
     caller = _caller_identity()
     if role == 'worker':
-        task_id, incarnation, session_dir, task = _authorize_worker(home, caller)
+        task_id, incarnation, session_dir, task = _authorize_worker(
+            home, caller, wait=wait, lock_held=lock_held)
     else:
         task_id = incarnation = task = None
-        _, _, session_dir, _ = _authorize_central(home, caller)
+        _, _, session_dir, _ = _authorize_central(home, caller, lock_held=lock_held)
     session_file = _regular_session(session_file)
     try:
         canonical_home = home.resolve(strict=True)
@@ -765,12 +799,30 @@ def _source_authorize(home, request, *, require_live=True):
     return caller, role, session_id, canonical_file, rel, header, task_id, incarnation
 
 
+def _validate_persisted_source(home, source):
+    if not isinstance(source, dict) or not isinstance(source.get('path'), str):
+        raise store.Refusal('source receipt is malformed')
+    try:
+        native = home / source['path']
+    except TypeError as error:
+        raise store.Refusal('source receipt path is malformed') from error
+    _validate_source(source, native, source.get('session_id'), source.get('cwd'))
+    if source.get('home') != str(home):
+        raise store.Refusal('source receipt home differs')
+    header = _native_header(native)
+    if header.get('id') != source.get('session_id') or header.get('cwd') != source.get('cwd'):
+        raise store.Refusal('source native header changed')
+    return source
+
+
 def register_source(home: Path, request: dict) -> dict:
     from .uninstall_state import admission
     home = store.home(home)
     with admission(home):
+        _source_authorize(home, request, wait=True)
         with store.lock(home):
-            caller, role, session_id, session_file, rel, header, task_id, incarnation = _source_authorize(home, request)
+            caller, role, session_id, session_file, rel, header, task_id, incarnation = _source_authorize(
+                home, request, wait=False, lock_held=True)
             value = {
                 'schema': 1, 'source_id': '', 'home': str(home), 'role': role,
                 'session_id': session_id, 'path': str(rel), 'cwd': header['cwd'],
@@ -783,7 +835,8 @@ def register_source(home: Path, request: dict) -> dict:
             path = _episode_paths(home)['sources'] / f"{value['source_id']}.json"
             existing = _read_private_json(path) if path.exists() or path.is_symlink() else None
             if existing is not None:
-                if existing != value and {key: existing.get(key) for key in value if key != 'recorded_at'} != {key: value.get(key) for key in value if key != 'recorded_at'}:
+                _validate_persisted_source(home, existing)
+                if {key: existing.get(key) for key in value if key != 'recorded_at'} != {key: value.get(key) for key in value if key != 'recorded_at'}:
                     raise store.Refusal('source publication conflicts with existing record')
                 return existing
             return _publish_immutable(path, value)
@@ -844,15 +897,13 @@ def record_completion(home: Path, request: dict) -> dict:
             source = _read_private_json(source_path)
             if source.get('source_id') != source_id:
                 raise store.Refusal('source receipt ID differs')
-            if not isinstance(source.get('path'), str):
-                raise store.Refusal('source receipt path is invalid')
+            _validate_persisted_source(home, source)
             native = home / source['path']
-            _validate_source(source, native, source.get('session_id'), source.get('cwd'))
             source_request = {
                 'role': source.get('role'), 'session_id': source.get('session_id'),
                 'session_file': str(native),
             }
-            caller, *_ = _source_authorize(home, source_request)
+            caller, *_ = _source_authorize(home, source_request, wait=False, lock_held=True)
             if any(caller.get(key) != source.get(key) for key in ('pid', 'start', 'uid')):
                 raise store.Refusal('completion caller differs from source')
             value = {
@@ -868,6 +919,7 @@ def record_completion(home: Path, request: dict) -> dict:
             path = paths['completions'] / source_id / f'{interaction_id}.json'
             if path.exists() or path.is_symlink():
                 existing = _read_private_json(path)
+                _valid_record(source, existing, source_id, interaction_id)
                 if {key: existing.get(key) for key in value if key != 'recorded_at'} != {key: value.get(key) for key in value if key != 'recorded_at'}:
                     raise store.Refusal('completion publication conflicts with existing record')
                 return existing
@@ -889,7 +941,8 @@ def _valid_record(source, value, source_id, interaction_id):
     timestamp = final.get('timestamp')
     digest = final.get('text_sha256')
     if (final.get('stop_reason') != 'stop'
-            or isinstance(recorded, bool) or not isinstance(recorded, (int, float)) or not math.isfinite(recorded)
+            or isinstance(recorded, bool) or not isinstance(recorded, (int, float))
+            or not math.isfinite(recorded) or recorded < 0
             or not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool)
             or not math.isfinite(timestamp) or timestamp < 0
             or not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest)):
