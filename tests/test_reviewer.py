@@ -11,7 +11,7 @@ import pytest
 from support import command, lab
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
-from agd_lib import observability, reviewer, reviewer_runner, store, supervision, tasks, worker_skills, workers
+from agd_lib import observability, reviewer, reviewer_episodes, reviewer_runner, store, supervision, tasks, worker_skills, workers
 
 
 def ended_worker(home, task_id, incarnation, rows, status=1):
@@ -41,16 +41,16 @@ def packet(home, cutoff=None, limit=262144, retrospective=()):
 
 
 def test_messages_tracks_physical_prefix_across_malformed_rows(tmp_path):
-    header = b'{"type":"session","version":3,"id":"native"}\n'
+    header = b'{\"type\":\"session\",\"version\":3,\"id\":\"native\"}\n'
     bad = b'{bad}\n'; array = b'[]\n'
     late = json.dumps(message('late', 300)).encode() + b'\n'
     valid = json.dumps(message('kept', 100)).encode() + b'\n'
     path = tmp_path / 'native.jsonl'; path.write_bytes(header + bad + array + late + valid)
-    _, watermark, digest, rows, late_seen, _, withheld = reviewer._messages(path, 200, 4096)
+    result = reviewer_episodes.read_native(path, 200, 4096)
     body = path.read_bytes()
-    assert watermark == len(body) and digest == __import__('hashlib').sha256(body).hexdigest()
-    assert rows[0]['text'] == 'kept' and body[rows[0]['byte_start']:rows[0]['byte_end']] == valid
-    assert late_seen and [item['reason'] for item in withheld].count('native-row-malformed') == 2
+    assert result['byte_watermark'] == len(body) and result['content_sha256'] == __import__('hashlib').sha256(body).hexdigest()
+    assert result['rows'][0]['text'] == 'kept' and body[result['rows'][0]['byte_start']:result['rows'][0]['byte_end']] == valid
+    assert result['late'] and [item['reason'] for item in result['withheld']].count('native-row-malformed') == 2
 
 def test_packet_collects_closed_failure_and_success_with_stable_cited_spans():
     with lab() as (home, _):

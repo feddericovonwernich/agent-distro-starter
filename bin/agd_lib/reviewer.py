@@ -8,11 +8,10 @@ import stat
 import tempfile
 import time
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from . import observability, store, worker_skills
+from . import observability, reviewer_episodes, store, worker_skills
 INSTRUCTION_FILE = Path(__file__).resolve().parents[2] / 'lib' / 'agd-reviewer-instructions.md'
 DEFAULT_LIMITS = {'max_candidates': 20, 'max_input_bytes': 262144, 'max_model_calls': 20,
                   'max_output_bytes': 65536, 'max_runtime_seconds': 1800}
@@ -172,70 +171,6 @@ def _observation_candidates(home, cutoff, coverage, deadline_epoch_ms=None):
     return sorted(result, key=lambda row: (row[0], row[1].get('id', ''), row[2].get('id', '')))
 
 
-def _epoch(value):
-    if isinstance(value, (int, float)): return float(value)
-    if isinstance(value, str):
-        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
-        if parsed.tzinfo is None: raise ValueError('naive timestamp')
-        return parsed.astimezone(timezone.utc).timestamp()
-    raise ValueError('timestamp')
-
-
-def _render_content(content):
-    if isinstance(content, str): return content, False
-    if not isinstance(content, list): return None, True
-    texts, unsupported = [], False
-    for block in content:
-        if isinstance(block, dict) and block.get('type') == 'text' and isinstance(block.get('text'), str): texts.append(block['text'])
-        else: unsupported = True
-    return ''.join(texts), unsupported
-
-
-def _messages(session_path, cutoff, budget, deadline_epoch_ms=None):
-    _check_deadline(deadline_epoch_ms)
-    if session_path.is_symlink() or not session_path.is_file(): raise store.Refusal('unsafe native JSONL')
-    with session_path.open('rb') as stream:
-        header_line = stream.readline(budget + 1)
-        # Local reads are checked between bounded reads; an active syscall cannot be cancelled.
-        _check_deadline(deadline_epoch_ms)
-        if not header_line or len(header_line) > budget: raise store.Refusal('invalid native JSONL header')
-        try: header = json.loads(header_line)
-        except (json.JSONDecodeError, UnicodeDecodeError) as error: raise store.Refusal('native JSONL header is invalid') from error
-        hasher = hashlib.sha256(header_line); watermark = len(header_line)
-        if not isinstance(header, dict) or header.get('type') != 'session' or header.get('version') != 3 or not isinstance(header.get('id'), str): raise store.Refusal('native JSONL header is invalid')
-        rows, late, limited, withheld, number, retained = [], False, False, [], 1, 0
-        while True:
-            _check_deadline(deadline_epoch_ms)
-            line = stream.readline(budget + 1)
-            _check_deadline(deadline_epoch_ms)
-            if not line: break
-            number += 1; start = watermark
-            while line and not line.endswith(b'\n'):
-                _check_deadline(deadline_epoch_ms)
-                hasher.update(line); watermark += len(line); line = stream.readline(budget + 1)
-                _check_deadline(deadline_epoch_ms)
-                limited = True
-            if not line: break
-            hasher.update(line); watermark += len(line)
-            if len(line) > budget:
-                limited = True; withheld.append({'reason': 'native-row-too-large', 'line_start': number}); continue
-            try: row = json.loads(line)
-            except (json.JSONDecodeError, UnicodeDecodeError): withheld.append({'reason': 'native-row-malformed', 'line_start': number}); continue
-            if not isinstance(row, dict): withheld.append({'reason': 'native-row-malformed', 'line_start': number}); continue
-            try: at = _epoch(row.get('timestamp'))
-            except (TypeError, ValueError): withheld.append({'reason': 'native-row-missing-timestamp', 'line_start': number}); continue
-            if at > cutoff:
-                late = True; continue
-            message = row.get('message')
-            text, unsupported = _render_content(message.get('content')) if isinstance(message, dict) else (None, False)
-            if text and retained + len(text.encode()) > budget:
-                limited = True; continue
-            if not isinstance(message, dict) or not isinstance(row.get('id'), str): continue
-            if unsupported: withheld.append({'reason': 'unsupported-content-block', 'line_start': number, 'message_id': row['id']})
-            if text:
-                retained += len(text.encode())
-                rows.append({'message_id': row['id'], 'text': text, 'line_start': number, 'line_end': number, 'byte_start': start, 'byte_end': watermark})
-    return header['id'], watermark, hasher.hexdigest(), rows, late, limited, withheld
 
 
 def _fixed_session(root, task_id, incarnation, binding):
@@ -329,7 +264,9 @@ def _candidate_material(root, task, event, task_dir, jsonls, cutoff, limit, cove
     for jsonl in jsonls:
         _check_deadline(deadline_epoch_ms)
         try:
-            sid, watermark, digest, rows, late, limited, withheld = _messages(jsonl, cutoff, limit, deadline_epoch_ms)
+            read = reviewer_episodes.read_native(jsonl, cutoff, limit, deadline_epoch_ms)
+            sid, watermark, digest = read['session_id'], read['byte_watermark'], read['content_sha256']
+            rows, late, limited, withheld = read['rows'], read['late'], read['limited'], read['withheld']
             source = {'kind': 'native-jsonl', 'task_id': key[0], 'incarnation': key[1], 'session_id': sid, 'path': str(jsonl.relative_to(root)), 'byte_watermark': watermark, 'content_sha256': digest}; source['source_id'] = _digest(source); sources.append(source)
             for row in rows:
                 excerpt = {'source_id': source['source_id'], **row}; excerpt['excerpt_id'] = _digest(excerpt); excerpts.append(excerpt)
@@ -416,7 +353,9 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
             for jsonl in jsonls:
                 _check_deadline(deadline_epoch_ms)
                 try:
-                    sid, watermark, digest, rows, late, limited, withheld = _messages(jsonl, cutoff, config['limits']['max_input_bytes'], deadline_epoch_ms)
+                    read = reviewer_episodes.read_native(jsonl, cutoff, config['limits']['max_input_bytes'], deadline_epoch_ms)
+                    sid, watermark, digest = read['session_id'], read['byte_watermark'], read['content_sha256']
+                    rows, late, limited, withheld = read['rows'], read['late'], read['limited'], read['withheld']
                     source = {'kind': 'reviewer-native-jsonl', 'review_run_id': rid, 'session_id': sid, 'path': str(jsonl.relative_to(root)), 'byte_watermark': watermark, 'content_sha256': digest}
                     source['source_id'] = _digest(source); sources.append(source)
                     for row in rows:
