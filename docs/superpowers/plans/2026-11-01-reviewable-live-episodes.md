@@ -137,3 +137,39 @@ AGD_NATIVE_EPISODES_CHECK=1 bun --no-env-file tests/episodes-native.test.ts
 The new native file must expose that standalone mode, following the existing native probe pattern, and print concrete lifecycle/evidence assertions. Its disposable homes contain no account-global credentials, enabled timers or telemetry stack. Existing missing-tmux cases are already known host limitations; do not rerun them merely to reconfirm absence. Native SDK persistence is not backend recovery acceptance and makes no paid-model quality claim. After task completion, obtain the normal independent whole-branch review and use native task lifecycle/publication authority; do not invent approval or lease cleanup.
 
 **Execution recommendation:** Native in this session, then one fresh whole-branch reviewer. These four tasks share reader/receipt/material interfaces and are sequential; per-task fresh implementation contexts would add handoff cost without independent parallel work. Wait for the user's plan review and execution-method choice before product edits.
+
+## Execution record
+
+The user approved subagent-driven execution. Frozen interfaces allowed disjoint work in parallel; the controller retained shared-file integration, commits, and verification. The recipe above is retained as written: pre-implementation RED checks were not consistently run, and no full TDD-order claim is made.
+
+Exercised evidence:
+
+- Real `reviewer episode bind|complete` CLI with `--home .`: taskless central registration, idempotence, conflicting completion and wrong-owner refusal, metadata-only persistence.
+- Reader/recording regressions: 37 passed. Incremental reviewer/report finalization regressions: 60 passed.
+- Official SDK/scripted-provider native smoke: both worker and taskless central remained alive; completed boundaries were admitted, active tails excluded, retained material finalized, later material disjoint, and a fresh third scan empty.
+- Full Bun suite: 24 passed, 0 failed, 160 assertions. Broad Python run: 291 passed, 3 failed because `tmux` is unavailable, with one existing deprecation warning. Those three backend cases were not rerun to reconfirm absence.
+- Native proof includes actual `session_stop` continuation and controlled SDK revive/cutoff recovery. It does not claim parked-subagent lifecycle, background delegation, paid-model quality, backend recovery, or telemetry delivery. No live distro was updated or stopped.
+
+### Rulings I made
+
+Ordered decisions retained from the execution ledger, including their risk if wrong:
+
+1. Implement reader and TypeScript capture as disjoint slices against a frozen contract; keep recording's shared-file dependency gated. Wrong interfaces would require integration rework; unverified behavior would not ship.
+2. Implementers write checks but the controller runs them and owns commits, overriding the skill's worker-run commands. Missed RED ordering must remain explicit; otherwise the evidence would overstate regression protection.
+3. Use configured agent profiles after the runtime rejected unsupported model overrides. No selected model-tier claim is made; the risk is review depth, not an invented capability.
+4. Record actual publication bases separately from dispatch bases. A wrong base could hide unrelated changes or mis-scope a review.
+5. Use visible native records and recorded timestamps for cutoff, not an unavailable persistence fence. A delayed write remains pending instead of being consumed.
+6. Fix mechanical sub-30-line fixture errors inline. A mistaken correction could weaken a regression, so existing behavioral assertions remain the gate.
+7. Keep semantic material identity separate from title/UI bytes and physical citation metadata. A wrong identity would replay unchanged evidence or suppress changed material.
+8. Use a fixed-cache temporary stdlib SQLite metadata index rather than retaining session graphs/bodies. The cost is bounded scratch disk I/O; incorrect cleanup could leave temporary files.
+9. Emit a distinct hidden gap carrier when ordinary prompt binding fails; never reuse an older authorized binding. Successful publication retires pending state. A wrong association could attribute another turn's reply to a closed interaction.
+10. Require the binding to precede its own final without crossing a newer interaction; classify native companion/control provenance rather than prose. Unprovable provenance costs eligibility, not agent progress.
+11. Scope fix packages to actual publication bases while retaining the semantic previous-reviewed head. A wrong range could leave a fix or regression unreviewed.
+12. Hash only admitted rows after cutoff, branch/boundary, and retention selection. Hashing an unadmitted tail would create false new work; omitting admitted material would lose coverage.
+13. A binding or gap physically between the claimed binding and final closes that window even off-branch; later active-tail markers do not invalidate an earlier final. A wrong interval could reject legitimate evidence or borrow a stale binding.
+14. Revive preserves only an unambiguous, registered, still-open interaction; it does not mint a new identity or reopen published work. A wrong reuse could conflate replies across turns.
+15. Negative native checks compare recursive completion records and actual continuation/revive events, not directory counts or prompt wording. A weak check could miss an unwanted terminal publication.
+16. Authorize against retained managed process receipts plus exact owner/token identity, not a launcher-ready phase written after watcher readiness. A wrong readiness dependency could lose the first response or accept an unmanaged caller.
+17. Label controlled SDK revive recovery separately from parked-subagent acceptance. The remaining ceiling is unexercised parked/background orchestration, not a claimed substitute.
+18. Once recording interfaces were exercised, overlap selector-only work while preserving single ownership of reader/native fixture edits. A mistaken ownership boundary could create stale edits; publication and real integrated checks remain mandatory.
+
