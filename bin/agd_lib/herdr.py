@@ -187,7 +187,8 @@ def server_identity(endpoint):
             or (mode.st_dev, mode.st_ino) != (endpoint['device'], endpoint['inode'])):
         raise store.Refusal('Herdr server socket identity differs')
     sockets = [fields[6] for line in Path('/proc/net/unix').read_text().splitlines()[1:]
-               if len(fields := line.split(maxsplit=7)) == 8 and fields[7] == str(path)]
+               if len(fields := line.split(maxsplit=7)) == 8 and fields[7] == str(path)
+               and int(fields[3], 16) & 0x10000]  # SO_ACCEPTCON: connected peers can share the path.
     if len(sockets) != 1:
         raise store.Refusal('Herdr listening socket identity is ambiguous')
     owners = []

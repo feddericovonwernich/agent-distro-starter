@@ -372,3 +372,23 @@ def test_native_herdr_control_keeps_launch_namespace_after_caller_env_change(mon
             deleted = subprocess.run([binary, 'session', 'delete', session, '--json'], env=environment,
                                      capture_output=True, text=True, check=True)
             assert json.loads(deleted.stdout)['deleted'] is True
+
+
+def test_herdr_listener_identity_survives_an_open_client(tmp_path):
+    import os
+    import socket
+    from agd_lib import herdr
+    path = tmp_path / 'control.sock'
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener, \
+            socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        listener.bind(str(path))
+        listener.listen()
+        mode = path.stat()
+        client.connect(str(path))
+        accepted, _ = listener.accept()
+        with accepted:
+            identity = herdr.server_identity(
+                {'socket': str(path), 'device': mode.st_dev, 'inode': mode.st_ino})
+            assert identity['process']['pid'] == os.getpid()
+            assert identity['process']['uid'] == os.getuid()
+            assert identity['socket']['inode'] == mode.st_ino

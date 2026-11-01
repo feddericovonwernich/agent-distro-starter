@@ -278,11 +278,12 @@ def _refresh(home, operation, ask, report):
     if fresh['blockers']:
         raise store.Refusal('post-quiesce inventory has unresolved resource evidence')
     old = operation['inventory']
-    new_keys = {row['key'] for row in fresh['resources']} - {row['key'] for row in old['resources']}
+    old_scope = {row['key']: (row['kind'], row['identity']) for row in old['resources']}
+    new_scope = any(old_scope.get(row['key']) != (row['kind'], row['identity']) for row in fresh['resources'])
     new_work = any(item not in old['work_loss'] for item in fresh['work_loss'])
-    if new_keys or new_work:
+    if new_scope or new_work:
         _announce(fresh, report)
-        if new_keys and ask('Resources changed. Confirm home: ') != str(home):
+        if new_scope and ask('Resources changed. Confirm home: ') != str(home):
             return False
         grant = _ask_discard(fresh, ask)
         if grant is False:
@@ -356,9 +357,10 @@ def _run(home, operation, ask, report):
         else:
             state.checkpoint(home, operation, phase='verifying', irreversible=True)
     elif home.exists():
-        # A partial removal is still bound to the original inode by read_operation.
-        from . import projects
-        projects._removal_identity(home)
+        # Its marker may be gone, but the partial directory must still be the original inode.
+        physical = projects._removal_identity(home)
+        if any(physical[key] != operation['target'][key] for key in ('device', 'inode', 'uid')):
+            raise store.Refusal('home identity changed before recovery removal')
         shutil.rmtree(home)
     state.checkpoint(home, operation, phase='verifying', completed='home:' + operation['target']['home_id'])
     report('3 / 3  Verify absence for at least eight seconds')

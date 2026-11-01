@@ -53,7 +53,7 @@ def terminal(argv, *, cwd, home, answers='approve', env=None, on_output=None, ti
     os.close(slave)
     output, sent, deadline = bytearray(), 0, time.monotonic() + timeout
     standard = bytearray()
-    discards = 0
+    discards, confirms = 0, 0
     try:
         while process.poll() is None:
             assert time.monotonic() < deadline, output.decode(errors='replace')
@@ -68,12 +68,13 @@ def terminal(argv, *, cwd, home, answers='approve', env=None, on_output=None, ti
             text = output.decode(errors='replace')
             pending = text[sent:]
             if 'Confirm home:' in pending:
-                answer = str(home) if answers != 'decline' else 'no'
+                answer = 'no' if answers == 'decline' or answers == 'approve-first-scope' and confirms else str(home)
+                confirms += 1
                 os.write(master, b'\x04' if answers == 'eof' else (answer + '\n').encode())
                 sent = len(text)
             elif re.search(r'Type (DISCARD [0-9a-f]{16}): ', pending):
                 match = re.search(r'Type (DISCARD [0-9a-f]{16}): ', pending)
-                answer = match[1] if answers == 'approve' or answers == 'approve-first' and discards == 0 else 'no'
+                answer = match[1] if answers in ('approve', 'approve-first-scope') or answers == 'approve-first' and discards == 0 else 'no'
                 discards += 1
                 os.write(master, (answer + '\n').encode())
                 sent = len(text)
@@ -421,3 +422,57 @@ def test_recreated_home_during_delay_is_not_deleted_again(tmp_path):
                             capture_output=True, text=True)
     assert result.returncode == 3
     assert snapshot(home) == replacement[0]
+
+
+def test_replaced_clean_checkout_requires_fresh_scope_confirmation(tmp_path):
+    from smoke_uninstall import checkouts
+    from agd_lib import projects
+    _backing, (home, sentinel) = checkouts(tmp_path)
+    origin = tmp_path / 'source-origin.git'
+    subprocess.run([sys.executable, home / 'bin/agd', '--home', home, 'project', 'add',
+                    'sample', '--source', origin], check=True, capture_output=True)
+    checkout = home / 'projects/sample'
+    original = projects.checkout_inventory(checkout)
+    replacement = []
+    def replace(_process, text):
+        if not replacement and 'Confirm home:' in text:
+            checkout.rename(tmp_path / 'original-project')
+            subprocess.run(['git', 'clone', origin, checkout], check=True, capture_output=True)
+            fresh = projects.checkout_inventory(checkout)
+            assert not original['work_loss'] and not fresh['work_loss']
+            assert fresh['key'] == original['key']
+            assert fresh['identity']['inode'] != original['identity']['inode']
+            replacement.append(snapshot(checkout))
+    code, stdout, stderr = terminal(
+        [sys.executable, home / 'bin/agd', '--home', '.', 'uninstall'], cwd=home, home=home,
+        answers='approve-first-scope', on_output=replace, timeout=60)
+    assert code == 0, (stdout, stderr)
+    assert json.loads(stdout)['outcome'] == 'cancelled'
+    assert replacement and snapshot(checkout) == replacement[0]
+    assert (tmp_path / 'original-project').is_dir()
+    assert (sentinel / 'bin/agd').is_file()
+
+
+def test_partial_recovery_revalidates_home_inode_at_deletion(tmp_path, monkeypatch):
+    from agd_lib import projects, store, uninstall, uninstall_state
+    from support import uninstall_scope
+    home = fixture_home(tmp_path)
+    preview = uninstall.inventory(home)
+    moved = tmp_path / 'original-home'
+    replacement = []
+    removal_identity = projects._removal_identity
+    def replace_before_removal(path):
+        assert path == home
+        home.rename(moved)
+        home.mkdir()
+        (home / 'replacement-work').write_text('not approved for removal')
+        replacement.append(snapshot(home))
+        return removal_identity(path)
+    with uninstall_scope(home, preview['resources'], discard=True) as operation:
+        uninstall_state.checkpoint(home, operation, phase='verifying', irreversible=True)
+        monkeypatch.setattr(projects, '_removal_identity', replace_before_removal)
+        with pytest.raises(store.Refusal, match='home identity changed'):
+            uninstall._run(home, operation, lambda _message: pytest.fail('unexpected consent'),
+                           lambda _message: None)
+        assert replacement and snapshot(home) == replacement[0]
+        assert (moved / 'data/home.json').is_file()

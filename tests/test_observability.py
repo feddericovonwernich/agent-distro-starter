@@ -410,6 +410,10 @@ def test_ownership_preflight_sanitizes_missing_docker_and_timeout(monkeypatch, e
 def _uninstall_engine(monkeypatch, root):
     from types import SimpleNamespace
     from agd_lib import supervision, uninstall_state
+    # Teardown starts from a persisted stack; no fixture service binds these ports.
+    observability._runtime_directories(root)
+    store.atomic_json(observability.paths(root)['compose'] / 'release-lock.json',
+                      observability._load_lock())
     rendered = observability.render_stack(root)
     project, home_id = rendered['project'], rendered['home_id']
     labels = {'agd.home_id': home_id, 'com.docker.compose.project': project,
