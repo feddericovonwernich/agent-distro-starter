@@ -189,6 +189,8 @@ async function nativeProbe(role: 'worker' | 'central') {
   let holdOldEnd = true;
   let injectGap = false;
   let injectAmbiguous = false;
+  let invalidSnapshotKind: 'truncated' | 'error' | 'errorDetails' | undefined;
+  let invalidInjected = false;
   let gapInjected = false;
   let ambiguousInjected = false;
   const terminalWaiters: Array<{ stage: string; resolve: (messages: unknown[]) => void }> = [];
@@ -247,6 +249,19 @@ async function nativeProbe(role: 'worker' | 'central') {
         }
         injectGap = false;
         injectAmbiguous = false;
+      }
+      if (invalidSnapshotKind && event.messages) {
+        const final = [...event.messages].reverse().find(message =>
+          typeof message === 'object' && message !== null &&
+          (message as Record<string, unknown>).role === 'assistant' &&
+          (message as Record<string, unknown>).stopReason === 'stop') as Record<string, unknown> | undefined;
+        if (final) {
+          if (invalidSnapshotKind === 'truncated') final.truncated = true;
+          if (invalidSnapshotKind === 'error') final.error = 'Injected native error.';
+          if (invalidSnapshotKind === 'errorDetails') final.errorDetails = { code: 'injected-native-error' };
+          invalidInjected = true;
+        }
+        invalidSnapshotKind = undefined;
       }
       if (!holdOldEnd) return;
       holdOldEnd = false;
@@ -538,6 +553,44 @@ async function nativeProbe(role: 'worker' | 'central') {
     const resumedMatches = resumedFinalRecord.timestamp === resumedMessage.timestamp &&
       resumedFinalRecord.text_sha256 === textFingerprint(resumedMessage.content);
     assert(resumedMatches);
+    const invalidKinds = ['truncated', 'error', 'errorDetails'] as const;
+    for (const kind of invalidKinds) {
+      invalidInjected = false;
+      invalidSnapshotKind = kind;
+      const completionsBeforeInvalid = completionSnapshot(completionDir);
+      const invalidTerminal = awaitTerminal(`invalid-${kind}`);
+      await session.prompt(`Exercise native terminal ${kind} rejection.`);
+      const invalidMessages = await invalidTerminal;
+      const invalidFinal = [...invalidMessages].reverse().find(message => {
+        if (typeof message !== 'object' || message === null) return false;
+        const value = message as Record<string, unknown>;
+        return value.role === 'assistant' && value.stopReason === 'stop';
+      }) as Record<string, unknown> | undefined;
+      assert(invalidInjected);
+      assert(invalidFinal);
+      assert.equal(invalidFinal.stopReason, 'stop');
+      assert(textFingerprint(invalidFinal.content).match(/^[0-9a-f]{64}$/));
+      if (kind === 'truncated') assert.equal(invalidFinal.truncated, true);
+      if (kind === 'error') assert.equal(invalidFinal.error, 'Injected native error.');
+      if (kind === 'errorDetails') assert.deepEqual(invalidFinal.errorDetails, { code: 'injected-native-error' });
+      await manager.flush();
+      assert.equal(completionSnapshot(completionDir), completionsBeforeInvalid);
+    }
+    const completionsBeforeNormal = completionSnapshot(completionDir);
+    const normalTerminal = awaitTerminal('normal-after-invalid');
+    await session.prompt('Produce a normal final after invalid terminal snapshots.');
+    const normalMessages = await normalTerminal;
+    const normalFinal = [...normalMessages].reverse().find(message => {
+      if (typeof message !== 'object' || message === null) return false;
+      const value = message as Record<string, unknown>;
+      return value.role === 'assistant' && value.stopReason === 'stop';
+    }) as Record<string, unknown> | undefined;
+    assert(normalFinal);
+    assert.equal(normalFinal.stopReason, 'stop');
+    assert(textFingerprint(normalFinal.content).match(/^[0-9a-f]{64}$/));
+    await manager.flush();
+    assert.notEqual(completionSnapshot(completionDir), completionsBeforeNormal);
+
     const heldRowsPath = join(data.home, currentReceipt.path as string);
     const heldCompletionCount = completionRecords(completionDir).length;
     mode = 'hold';

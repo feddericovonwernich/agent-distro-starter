@@ -145,9 +145,10 @@ The user approved subagent-driven execution. Frozen interfaces allowed disjoint 
 Exercised evidence:
 
 - Real `reviewer episode bind|complete` CLI with `--home .`: taskless central registration, idempotence, conflicting completion and wrong-owner refusal, metadata-only persistence.
-- Reader/recording regressions: 37 passed. Incremental reviewer/report finalization regressions: 60 passed.
-- Official SDK/scripted-provider native smoke: both worker and taskless central remained alive; completed boundaries were admitted, active tails excluded, retained material finalized, later material disjoint, and a fresh third scan empty.
+- Combined reader/recording/reviewer/report-finalization regressions: 99 passed, including legacy-prefix migration and explicit pending-proof arrival.
+- Official SDK/scripted-provider native smoke: both worker and taskless central remained alive; completed boundaries were admitted, active tails excluded, retained material finalized, later material disjoint, and a fresh third scan empty. Terminal truncation and alternate error flags are rejected before payload reduction.
 - Full Bun suite: 24 passed, 0 failed, 160 assertions. Broad Python run: 291 passed, 3 failed because `tmux` is unavailable, with one existing deprecation warning. Those three backend cases were not rerun to reconfirm absence.
+- The native episode smoke was rerun after the final compatibility correction: 1 passed, 0 failed. The full Bun run also covers normal-final recovery after rejected terminal snapshots.
 - Native proof includes actual `session_stop` continuation and controlled SDK revive/cutoff recovery. It does not claim parked-subagent lifecycle, background delegation, paid-model quality, backend recovery, or telemetry delivery. No live distro was updated or stopped.
 
 ### Rulings I made

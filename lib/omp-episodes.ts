@@ -83,7 +83,9 @@ function finalProjection(messages: unknown[]): RecordValue | undefined {
       break;
     }
   }
-  if (!candidate || candidate.stopReason !== 'stop' || candidate.isError === true || 'errorMessage' in candidate) return;
+  if (!candidate || candidate.stopReason !== 'stop' || Boolean(candidate.isError) ||
+      'errorMessage' in candidate || Boolean(candidate.error) ||
+      Boolean(candidate.errorDetails) || Boolean(candidate.truncated)) return;
   if (typeof candidate.timestamp !== 'number' || !Number.isFinite(candidate.timestamp)) return;
   const content = candidate.content;
   if (typeof content === 'string') {

@@ -329,6 +329,27 @@ def test_pending_completion_waits_for_fresh_cutoff_without_mutating_old_packet()
         assert {row['text'] for row in later['excerpts']} >= {'future answer'}
         assert packet(home, cutoff=200)['packet_id'] == frozen['packet_id']
 
+def test_pending_native_proof_marks_incomplete_and_later_finalizes_without_mutating_packet():
+    with lab() as (home, _):
+        source, native, _ = completed_session(home, texts=('pending answer',))
+        lines = native.read_text().splitlines()
+        native.write_text('\n'.join(lines[:2]) + '\n')
+        pending = packet(home, cutoff=200)
+        assert pending['episodes'] == [] and pending['excerpts'] == []
+        assert pending['coverage']['complete'] is False
+        assert {'source_id': source['source_id'],
+                'interaction_id': str(uuid.uuid5(uuid.NAMESPACE_URL,
+                                                 f'{source["session_id"]}-binding-0')),
+                'reason': 'native-proof-pending'} in pending['coverage']['unavailable']
+        native_packet_id = pending['packet_id']
+        with native.open('a') as stream:
+            stream.write('\n'.join(lines[2:]) + '\n')
+        later = packet(home, cutoff=250)
+        assert {row['text'] for row in later['excerpts']} >= {'pending answer'}
+        complete_review(home, later)
+        assert packet(home, cutoff=300)['excerpts'] == []
+        assert packet(home, cutoff=200) == pending
+
 def test_legacy_reviewed_packet_migrates_only_matching_source_scope():
     with lab() as (home, _):
         source, native, task = completed_session(home, role='worker', task_id='legacy',
@@ -357,7 +378,43 @@ def test_legacy_reviewed_packet_migrates_only_matching_source_scope():
             {'scope': {}, 'packet_id': packet_id, 'material_basis': 'e' * 64})
         scope = {'home': str(home.resolve()), 'role': 'worker', 'session_id': source['session_id'],
                  'task_id': task['id'], 'incarnation': task['incarnation']}
-        assert f"legacy-message:{hashlib.sha256(b'legacy answer').hexdigest()}" in reviewer._reviewed_material(home, scope)
+        assert reviewer._material_id(scope, row) in reviewer._reviewed_material(home, scope)
+        assert reviewer._legacy_material_id(row) not in reviewer._reviewed_material(home, scope)
+
+def test_legacy_reviewed_prefix_skips_before_budget_for_new_same_session_completion():
+    with lab() as (home, _):
+        old_texts = tuple(f'old answer {index} ' + ('o' * 5000) for index in range(4))
+        source, native, task = completed_session(
+            home, role='worker', task_id='legacy-prefix', texts=old_texts)
+        original = packet(home, cutoff=200, limit=100000)
+        old_ids = {row['message_id'] for row in original['excerpts']}
+        followup_id = 'a' * 64
+        legacy = json.loads(json.dumps(original))
+        legacy.pop('packet_id', None)
+        legacy['coverage']['followup_id'] = followup_id
+        legacy_ids = []
+        for row in legacy['excerpts']:
+            row.pop('material_id', None)
+            legacy_ids.append(reviewer._legacy_material_id(row))
+        packet_id = reviewer._digest(legacy)
+        reviewer.publish_immutable(reviewer.paths(home)['packets'] / f'{packet_id}.json', legacy)
+        scope = reviewer._source_scope(home, source)
+        reviewer.store.atomic_json(
+            reviewer.paths(home)['followups'] / f'{followup_id}.json',
+            {'schema': 1, 'material_basis': followup_id, 'state': 'reviewed',
+            'candidates': [{'candidate_id': reviewer._candidate_id(task['id'], task['incarnation']),
+                             'excerpt_ids': legacy_ids}]})
+        reviewer.store.atomic_json(
+            reviewer.paths(home)['checkpoints'] / 'legacy-prefix.json',
+            {'scope': {}, 'packet_id': packet_id, 'material_basis': followup_id})
+        append_episode(source, native, 'new answer', len(old_texts))
+        selected = packet(home, cutoff=250, limit=16000)
+        selected_ids = {row['message_id'] for row in selected['excerpts']}
+        assert not old_ids.intersection(selected_ids)
+        assert 'new answer' in {row['text'] for row in selected['excerpts']}
+        complete_review(home, selected)
+        assert packet(home, cutoff=300, limit=16000)['excerpts'] == []
+
 
 def test_exited_worker_multiple_native_sessions_each_stay_reviewed():
     with lab() as (home, _):

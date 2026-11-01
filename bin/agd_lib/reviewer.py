@@ -333,8 +333,11 @@ def _reviewed_material(home, scope):
         for row in packet.get('excerpts', ()):
             if row.get('source_id') not in source_ids:
                 continue
-            reviewed.add(row.get('material_id', _legacy_material_id(row)))
-            reviewed.add(_legacy_material_id(row))
+            if isinstance(row.get('material_id'), str):
+                reviewed.add(row['material_id'])
+            else:
+                # Reconstruct legacy rows only after their packet source matched this scope.
+                reviewed.add(_material_id(scope, row))
     return reviewed
 
 
@@ -363,6 +366,11 @@ def _candidate_material(root, task, event, task_dir, jsonls, cutoff, limit, cove
                 kwargs['completion'] = completion
             read = reviewer_episodes.read_native(jsonl, cutoff, limit, deadline_epoch_ms, **kwargs)
             if read.get('status') != 'ready':
+                if completion is not None:
+                    _coverage(coverage, 'unavailable', {
+                        'source_id': completion.get('source_id'),
+                        'interaction_id': completion.get('interaction_id'),
+                        'reason': 'native-proof-pending'})
                 continue
             sid, watermark, digest = read['session_id'], read['byte_watermark'], read['content_sha256']
             rows, late, limited, withheld = read['rows'], read['late'], read['limited'], read['withheld']
