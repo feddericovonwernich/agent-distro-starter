@@ -153,7 +153,6 @@ def _scan(session_path, budget, deadline_epoch_ms, visit):
     if path.is_symlink() or not path.is_file():
         raise store.Refusal('unsafe native JSONL')
     hasher = hashlib.sha256()
-    material = hashlib.sha256()
     watermark = 0
     with path.open('rb') as stream:
         number = 0
@@ -165,14 +164,18 @@ def _scan(session_path, budget, deadline_epoch_ms, visit):
                 break
             number += 1
             watermark = record['byte_end']
-            value = record.get('value')
-            if record['complete'] and not record['malformed'] and isinstance(value, dict) and value.get('type') != 'title':
-                material.update(_json_bytes(value))
-                material.update(b'\n')
             visit(record)
             if not record['complete']:
                 break
-    return hasher.hexdigest(), watermark, material.hexdigest()
+    return hasher.hexdigest(), watermark
+
+
+def _material_digest(session_id, rows):
+    hasher = hashlib.sha256()
+    hasher.update(_json_bytes({'session_id': session_id}) + b'\n')
+    for row in rows:
+        hasher.update(_json_bytes({'message_id': row['message_id'], 'text': row['text']}) + b'\n')
+    return hasher.hexdigest()
 
 
 def _prefix_digest(session_path, end, budget, deadline_epoch_ms):
@@ -291,13 +294,14 @@ class _MetadataIndex:
             current = row.get('parentId')
         return found
 
-    def latest_window_marker(self):
+    def window_marker(self, binding_id, final_id):
         row = self._connection.execute(
-            '''SELECT id FROM entries
-               WHERE id IN (SELECT id FROM selected_chain)
-                 AND type='custom_message'
-                 AND custom_type IN ('agd:episode-binding', 'agd:episode-gap')
-               ORDER BY seq DESC LIMIT 1''').fetchone()
+            '''SELECT marker.id FROM entries AS marker
+               WHERE marker.type='custom_message'
+                 AND marker.custom_type IN ('agd:episode-binding', 'agd:episode-gap')
+                 AND marker.seq > (SELECT seq FROM entries WHERE id=?)
+                 AND marker.seq <= (SELECT seq FROM entries WHERE id=?)
+               ORDER BY marker.seq LIMIT 1''', (binding_id, final_id)).fetchone()
         return row[0] if row else None
 
     def in_chain(self, ident):
@@ -400,7 +404,7 @@ def _read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_
         if at > cutoff:
             state['late'] = True
 
-    digest, watermark, material_digest = _scan(session_path, budget, deadline_epoch_ms, visit)
+    digest, watermark = _scan(session_path, budget, deadline_epoch_ms, visit)
     header = state['header']
     header_record = state['header_record']
     if header is None or header_record is None or not isinstance(header, dict):
@@ -408,12 +412,12 @@ def _read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_
     if header.get('type') != 'session' or header.get('version') != 3 or not isinstance(header.get('id'), str):
         raise store.Refusal('invalid native JSONL header')
     result = _base_result(header['id'], watermark, digest)
-    result['material_sha256'] = material_digest
     result['late'] = state['late']
     result['limited'] = state['limited']
     result['withheld'] = state['withheld']
     if completion is None:
         result['rows'] = state['rows']
+        result['material_sha256'] = _material_digest(header['id'], result['rows'])
         return result
     if not isinstance(completion, dict):
         raise store.Refusal('completion provenance is invalid')
@@ -464,7 +468,7 @@ def _read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_
         return {**result, 'status': 'pending', 'rows': [], 'boundary': None}
     if not chain_result:
         raise store.Refusal('native final is on the wrong branch')
-    if index.latest_window_marker() != bindings[0]['id']:
+    if index.window_marker(bindings[0]['id'], final_entry['id']) is not None:
         raise store.Refusal('native interaction window crossed')
     boundary_record = final_entry['_reader_record']
     result['byte_watermark'] = boundary_record['byte_end']
@@ -481,6 +485,7 @@ def _read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_
              if index.in_chain(entry.get('id')) and entry['_reader_record']['byte_end'] <= boundary_record['byte_end']),
             key=lambda item: item[0]['_reader_record']['byte_start'])
     ]
+    result['material_sha256'] = _material_digest(header['id'], result['rows'])
     result['late'] = False
     result['withheld'] = [item for item in result['withheld']
                           if item['line_start'] <= boundary_record['line_start']]

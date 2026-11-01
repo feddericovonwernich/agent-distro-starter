@@ -80,6 +80,33 @@ def test_read_native_material_digest_ignores_title_and_coordinate_shift(tmp_path
     assert plain['content_sha256'] != titled['content_sha256']
     assert [row['text'] for row in plain['rows']] == [row['text'] for row in titled['rows']]
 
+def test_read_native_material_digest_excludes_late_and_clipped_rows(tmp_path):
+    path = tmp_path / 'native.jsonl'
+    user, _, _, _ = episode_entries()
+    write_native(path, 'session', [user], title=None)
+    first = reviewer_episodes.read_native(path, 200, 4096)
+    late = message('late', None, 'late', 300.0)
+    clipped = message('clipped', None, 'z' * 10000, 150.0)
+    with path.open('ab') as stream:
+        stream.write(json.dumps(late, separators=(',', ':')).encode() + b'\n')
+        stream.write(json.dumps(clipped, separators=(',', ':')).encode() + b'\n')
+    second = reviewer_episodes.read_native(path, 200, 4096)
+    assert first['material_sha256'] == second['material_sha256']
+
+
+def test_read_native_proved_material_digest_excludes_active_tail(tmp_path):
+    path = tmp_path / 'native.jsonl'
+    user, binding, final, _ = episode_entries()
+    value = completion(path, 'session')
+    binding['details']['source_id'] = value['source_id']
+    write_native(path, 'session', [user, binding, final], title=None)
+    first = reviewer_episodes.read_native(path, 300, 4096, completion=value)
+    with path.open('ab') as stream:
+        stream.write(json.dumps(message('active', 'bbbbbbbb', 'active', 201.0), separators=(',', ':')).encode() + b'\n')
+    second = reviewer_episodes.read_native(path, 300, 4096, completion=value)
+    assert first['status'] == second['status'] == 'ready'
+    assert first['material_sha256'] == second['material_sha256']
+
 
 def test_read_native_pending_then_arriving_final(tmp_path):
     path = tmp_path / 'native.jsonl'
@@ -124,6 +151,21 @@ def test_read_native_gap_carrier_closes_prior_binding_window(tmp_path):
     with pytest.raises(store.Refusal, match='interaction window'):
         reviewer_episodes.read_native(path, 300, 4096, completion=value)
     assert all(row['message_id'] != gap['id'] for row in legacy['rows'])
+
+def test_read_native_off_branch_window_markers_use_physical_interval(tmp_path):
+    path = tmp_path / 'native.jsonl'
+    user, binding, final, _ = episode_entries()
+    value = completion(path, 'session')
+    binding['details']['source_id'] = value['source_id']
+    gap = {'type': 'custom_message', 'id': 'offbranch', 'parentId': 'other', 'timestamp': 150.0,
+           'customType': 'agd:episode-gap', 'display': False,
+           'details': {'schema': 1, 'interaction_id': 'cccccccc-cccc-cccc-cccc-cccccccccccc'}}
+    write_native(path, 'session', [user, binding, gap, final])
+    with pytest.raises(store.Refusal, match='interaction window'):
+        reviewer_episodes.read_native(path, 300, 4096, completion=value)
+    write_native(path, 'session', [user, binding, final, gap])
+    result = reviewer_episodes.read_native(path, 300, 4096, completion=value)
+    assert result['status'] == 'ready' and result['boundary']['entry_id'] == final['id']
 
 def test_read_native_completion_index_cleans_up_all_paths(tmp_path, monkeypatch):
     created = []
