@@ -4,6 +4,8 @@ import json
 import math
 import os
 import re
+import sqlite3
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -151,6 +153,7 @@ def _scan(session_path, budget, deadline_epoch_ms, visit):
     if path.is_symlink() or not path.is_file():
         raise store.Refusal('unsafe native JSONL')
     hasher = hashlib.sha256()
+    material = hashlib.sha256()
     watermark = 0
     with path.open('rb') as stream:
         number = 0
@@ -162,10 +165,14 @@ def _scan(session_path, budget, deadline_epoch_ms, visit):
                 break
             number += 1
             watermark = record['byte_end']
+            value = record.get('value')
+            if record['complete'] and not record['malformed'] and isinstance(value, dict) and value.get('type') != 'title':
+                material.update(_json_bytes(value))
+                material.update(b'\n')
             visit(record)
             if not record['complete']:
                 break
-    return hasher.hexdigest(), watermark
+    return hasher.hexdigest(), watermark, material.hexdigest()
 
 
 def _prefix_digest(session_path, end, budget, deadline_epoch_ms):
@@ -193,49 +200,127 @@ def _base_result(session_id, watermark, digest):
 
 
 
+class _MetadataIndex:
+    def __init__(self):
+        self._directory = tempfile.TemporaryDirectory(prefix='agd-reviewer-')
+        self._connection = sqlite3.connect(Path(self._directory.name) / 'metadata.sqlite')
+        self._connection.execute('PRAGMA journal_mode=OFF')
+        self._connection.execute('PRAGMA synchronous=OFF')
+        self._connection.execute('PRAGMA temp_store=FILE')
+        self._connection.execute('PRAGMA cache_size=-1024')
+        self._connection.execute('''CREATE TABLE entries (
+            seq INTEGER PRIMARY KEY, id TEXT, parent_id TEXT, type TEXT, at REAL,
+            message_at REAL, role TEXT, stop_reason TEXT, is_error INTEGER,
+            error_message TEXT, unsupported INTEGER, thinking_only INTEGER,
+            text_sha256 TEXT, text_size INTEGER, line_start INTEGER,
+            byte_start INTEGER, byte_end INTEGER, custom_type TEXT, display INTEGER,
+            details_schema INTEGER, details_source_id TEXT, details_interaction_id TEXT)''')
+        self._connection.execute('CREATE UNIQUE INDEX entry_ids ON entries(id)')
+        self._connection.execute('CREATE TEMP TABLE selected_chain (id TEXT PRIMARY KEY)')
+        self.ambiguous = False
 
+    def close(self):
+        connection, self._connection = self._connection, None
+        if connection is None:
+            return
+        try:
+            connection.close()
+        finally:
+            self._directory.cleanup()
 
+    def add(self, entry):
+        if not isinstance(entry.get('id'), str):
+            return
+        record = entry['_reader_record']
+        details = entry.get('details') if isinstance(entry.get('details'), dict) else {}
+        try:
+            self._connection.execute(
+                'INSERT INTO entries VALUES (NULL,' + ','.join('?' for _ in range(21)) + ')',
+                (entry['id'], entry.get('parentId'), entry.get('type'), entry.get('_reader_epoch'),
+                 entry.get('_message_epoch'), entry.get('_role'), entry.get('_stop_reason'),
+                 int(bool(entry.get('_is_error'))), entry.get('_error_message'),
+                 int(bool(entry.get('_unsupported'))), int(bool(entry.get('_thinking_only'))),
+                 entry.get('_text_sha256'), entry.get('_text_size'), record['line_start'],
+                 record['byte_start'], record['byte_end'], entry.get('customType'),
+                 int(bool(entry.get('display'))) if entry.get('display') is not None else None,
+                 details.get('schema'), details.get('source_id'), details.get('interaction_id')))
+        except sqlite3.IntegrityError:
+            self.ambiguous = True
 
-def _is_binding(entry, source_id, interaction_id):
-    details = entry.get('details') if isinstance(entry, dict) else None
-    return (isinstance(entry, dict) and entry.get('type') == 'custom_message'
-            and entry.get('customType') == 'agd:episode-binding' and entry.get('display') is False
-            and isinstance(details, dict) and details.get('schema') == 1
-            and details.get('source_id') == source_id and details.get('interaction_id') == interaction_id)
-
-
-def _final_valid(entry):
-    return (isinstance(entry, dict) and entry.get('type') == 'message'
-            and entry.get('_role') == 'assistant' and entry.get('_stop_reason') == 'stop'
-            and not entry.get('_is_error') and not entry.get('_error_message')
-            and (not entry.get('_unsupported') or entry.get('_thinking_only'))
-            and entry.get('_text_size', 0) > 0 and entry.get('_message_epoch') is not None)
-
-
-def _parent_chain(entries, leaf):
-    by_id = {entry.get('id'): entry for entry in entries if isinstance(entry, dict) and isinstance(entry.get('id'), str)}
-    chain, seen = [], set()
-    current = leaf
-    while current is not None:
-        ident = current.get('id')
-        if not isinstance(ident, str) or ident in seen:
-            raise store.Refusal('native parent chain is invalid')
-        seen.add(ident); chain.append(current)
-        parent = current.get('parentId')
-        if parent is None:
-            break
-        current = by_id.get(parent)
-        if current is None:
+    def _row(self, ident):
+        row = self._connection.execute(
+            'SELECT id,parent_id,type,at,message_at,role,stop_reason,is_error,error_message,unsupported,thinking_only,text_sha256,text_size,line_start,byte_start,byte_end,custom_type,display,details_schema,details_source_id,details_interaction_id FROM entries WHERE id=?',
+            (ident,)).fetchone()
+        if row is None:
             return None
-    chain.reverse()
-    return chain
+        keys = ('id', 'parentId', 'type', '_reader_epoch', '_message_epoch', '_role', '_stop_reason',
+                '_is_error', '_error_message', '_unsupported', '_thinking_only', '_text_sha256',
+                '_text_size', '_line_start', '_byte_start', '_byte_end', 'customType', 'display',
+                '_details_schema', '_details_source_id', '_details_interaction_id')
+        value = dict(zip(keys, row))
+        value['_reader_record'] = {'line_start': value.pop('_line_start'), 'byte_start': value.pop('_byte_start'),
+                                   'byte_end': value.pop('_byte_end')}
+        value['details'] = {'schema': value.pop('_details_schema'), 'source_id': value.pop('_details_source_id'),
+                            'interaction_id': value.pop('_details_interaction_id')}
+        return value
+
+    def bindings(self, source_id, interaction_id, cutoff):
+        return [self._row(row[0]) for row in self._connection.execute(
+            '''SELECT id FROM entries WHERE type='custom_message' AND custom_type='agd:episode-binding'
+               AND display=0 AND details_schema=1 AND details_source_id=? AND details_interaction_id=? AND at<=?
+               LIMIT 2''', (source_id, interaction_id, cutoff))]
+
+    def finals(self, text_sha256, final_at, cutoff):
+        return [self._row(row[0]) for row in self._connection.execute(
+            '''SELECT id FROM entries WHERE type='message' AND at<=? AND role='assistant'
+               AND stop_reason='stop' AND NOT is_error AND (NOT unsupported OR thinking_only)
+               AND text_size>0 AND text_sha256=? AND message_at=? LIMIT 2''',
+            (cutoff, text_sha256, final_at))]
+
+    def prove_chain(self, final_id, binding_id):
+        current, found = final_id, False
+        while current is not None:
+            row = self._row(current)
+            if row is None:
+                return None
+            try:
+                self._connection.execute('INSERT INTO selected_chain VALUES (?)', (current,))
+            except sqlite3.IntegrityError:
+                raise store.Refusal('native parent chain is invalid')
+            found = found or current == binding_id
+            current = row.get('parentId')
+        return found
+
+    def latest_window_marker(self):
+        row = self._connection.execute(
+            '''SELECT id FROM entries
+               WHERE id IN (SELECT id FROM selected_chain)
+                 AND type='custom_message'
+                 AND custom_type IN ('agd:episode-binding', 'agd:episode-gap')
+               ORDER BY seq DESC LIMIT 1''').fetchone()
+        return row[0] if row else None
+
+    def in_chain(self, ident):
+        return self._connection.execute('SELECT 1 FROM selected_chain WHERE id=?', (ident,)).fetchone() is not None
 
 
 def read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_ms: int | None = None, *, completion: dict | None = None) -> dict:
+    index = None
+    try:
+        index = _MetadataIndex() if completion is not None else None
+        return _read_native(session_path, cutoff, budget, deadline_epoch_ms, completion=completion, _index=index)
+    finally:
+        if index is not None:
+            index.close()
+
+
+def _read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_ms: int | None = None, *, completion: dict | None = None, _index=None) -> dict:
     if not isinstance(cutoff, (int, float)) or isinstance(cutoff, bool) or not math.isfinite(cutoff):
         raise store.Refusal('native cutoff is invalid')
-    state = {'header': None, 'header_record': None, 'header_index': None, 'entries': [],
-             'rows': [], 'candidates': [], 'retained': 0, 'late': False, 'limited': False, 'withheld': []}
+    state = {'header': None, 'header_record': None, 'header_index': None,
+             'index': _index if completion is not None else None,
+             'rows': [], 'candidates': [], 'retained': 0, 'late': False,
+             'limited': False, 'withheld': []}
 
     def withhold(reason, record, message_id=None):
         state['withheld'].append({'reason': reason, 'line_start': record['line_start'],
@@ -311,11 +396,11 @@ def read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_m
                     else:
                         state['limited'] = True
         if completion is not None:
-            state['entries'].append(entry)
+            state['index'].add(entry)
         if at > cutoff:
             state['late'] = True
 
-    digest, watermark = _scan(session_path, budget, deadline_epoch_ms, visit)
+    digest, watermark, material_digest = _scan(session_path, budget, deadline_epoch_ms, visit)
     header = state['header']
     header_record = state['header_record']
     if header is None or header_record is None or not isinstance(header, dict):
@@ -323,6 +408,7 @@ def read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_m
     if header.get('type') != 'session' or header.get('version') != 3 or not isinstance(header.get('id'), str):
         raise store.Refusal('invalid native JSONL header')
     result = _base_result(header['id'], watermark, digest)
+    result['material_sha256'] = material_digest
     result['late'] = state['late']
     result['limited'] = state['limited']
     result['withheld'] = state['withheld']
@@ -359,48 +445,41 @@ def read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_m
         raise store.Refusal('completion timestamp is invalid')
     if published > cutoff or final_at > cutoff:
         return {**result, 'status': 'pending', 'rows': [], 'boundary': None}
-    ids = [entry['id'] for entry in state['entries'] if isinstance(entry.get('id'), str)]
-    if len(ids) != len(set(ids)):
+    index = state['index']
+    if index.ambiguous:
         raise store.Refusal('ambiguous native entry identity')
-    bindings = [entry for entry in state['entries']
-                if _is_binding(entry, source['source_id'], interaction_id) and entry['_reader_epoch'] <= cutoff]
+    bindings = index.bindings(source['source_id'], interaction_id, cutoff)
     if len(bindings) > 1:
         raise store.Refusal('ambiguous native binding')
     if not bindings:
         return {**result, 'status': 'pending', 'rows': [], 'boundary': None}
-    matching = []
-    for entry in state['entries']:
-        if entry['_reader_epoch'] > cutoff or not _final_valid(entry):
-            continue
-        if (entry.get('_text_sha256') != final['text_sha256']
-                or abs(entry.get('_message_epoch') - final_at) > 1e-9):
-            continue
-        matching.append(entry)
+    matching = index.finals(final['text_sha256'], final_at, cutoff)
     if not matching:
         return {**result, 'status': 'pending', 'rows': [], 'boundary': None}
     if len(matching) != 1:
         raise store.Refusal('ambiguous native final')
     final_entry = matching[0]
-    chain = _parent_chain(state['entries'], final_entry)
-    if chain is None:
+    chain_result = index.prove_chain(final_entry['id'], bindings[0]['id'])
+    if chain_result is None:
         return {**result, 'status': 'pending', 'rows': [], 'boundary': None}
-    binding_pos = next((index for index, entry in enumerate(chain)
-                        if entry.get('id') == bindings[0].get('id')), None)
-    if binding_pos is None:
+    if not chain_result:
         raise store.Refusal('native final is on the wrong branch')
+    if index.latest_window_marker() != bindings[0]['id']:
+        raise store.Refusal('native interaction window crossed')
     boundary_record = final_entry['_reader_record']
     result['byte_watermark'] = boundary_record['byte_end']
     result['content_sha256'] = _prefix_digest(session_path, boundary_record['byte_end'], budget, deadline_epoch_ms)
     result['boundary'] = {'interaction_id': interaction_id, 'entry_id': final_entry['id'],
                           'parent_id': final_entry.get('parentId'),
                           'closed_at': max(published, final_entry['_reader_epoch'])}
-    chain_ids = {entry.get('id') for entry in chain}
     result['rows'] = [
         {'message_id': entry['id'], 'text': text,
          'line_start': entry['_reader_record']['line_start'], 'line_end': entry['_reader_record']['line_start'],
          'byte_start': entry['_reader_record']['byte_start'], 'byte_end': entry['_reader_record']['byte_end']}
-        for entry, text in state['candidates']
-        if entry.get('id') in chain_ids and entry['_reader_record']['byte_end'] <= boundary_record['byte_end']
+        for entry, text in sorted(
+            ((entry, text) for entry, text in state['candidates']
+             if index.in_chain(entry.get('id')) and entry['_reader_record']['byte_end'] <= boundary_record['byte_end']),
+            key=lambda item: item[0]['_reader_record']['byte_start'])
     ]
     result['late'] = False
     result['withheld'] = [item for item in result['withheld']

@@ -52,6 +52,18 @@ def test_messages_tracks_physical_prefix_across_malformed_rows(tmp_path):
     assert result['rows'][0]['text'] == 'kept' and body[result['rows'][0]['byte_start']:result['rows'][0]['byte_end']] == valid
     assert result['late'] and [item['reason'] for item in result['withheld']].count('native-row-malformed') == 2
 
+
+def test_native_followup_identity_excludes_physical_proof():
+    first = {'kind': 'native-jsonl', 'task_id': 'task', 'incarnation': 'inc', 'session_id': 'session',
+             'path': 'session.jsonl', 'byte_watermark': 100, 'content_sha256': 'a' * 64,
+             'material_sha256': 'b' * 64}
+    second = {**first, 'byte_watermark': 356, 'content_sha256': 'c' * 64}
+    row1 = {'message_id': 'message', 'text': 'evidence', 'line_start': 2, 'line_end': 2,
+            'byte_start': 20, 'byte_end': 100}
+    row2 = {**row1, 'line_start': 3, 'line_end': 3, 'byte_start': 276, 'byte_end': 356}
+    assert reviewer._digest(reviewer._native_material_identity(first)) == reviewer._digest(reviewer._native_material_identity(second))
+    assert reviewer._native_excerpt_id('source', row1) == reviewer._native_excerpt_id('source', row2)
+
 def test_packet_collects_closed_failure_and_success_with_stable_cited_spans():
     with lab() as (home, _):
         failed, _, _ = ended_worker(home, 'failed', str(uuid.uuid4()), [message('failure')])
@@ -301,19 +313,37 @@ def test_shared_cap_does_not_consume_clipped_candidate_material():
         reviewer.mark_material_reviewed(home, second['coverage']['followup_id'])
         assert reviewer.select_packet(home, cutoff=cutoff + 2, config_snapshot=config)['episodes'] == []
 
-def test_shared_cap_revisits_only_clipped_candidate_excerpt_without_starving_next():
+def test_shared_cap_revisits_clipped_material_without_starving_next():
     with lab() as (home, _):
-        ended_worker(home, 'a', str(uuid.uuid4()), [message('a' * 2500, 100)])
-        ended_worker(home, 'b', str(uuid.uuid4()), [message('b1' * 1200, 100), message('b2' * 1200, 101)])
-        ended_worker(home, 'c', str(uuid.uuid4()), [message('c' * 2500, 100)])
-        config = reviewer.read_config(home); config['limits'].update(max_candidates=3, max_input_bytes=17000)
-        first = reviewer.select_packet(home, cutoff=time.time() + 100, config_snapshot=config)
-        b_first = [row['text'] for row in first['excerpts'] if any(source['source_id'] == row['source_id'] and source.get('task_id') == 'b' for source in first['sources'])]
-        assert b_first == ['b1' * 1200]
-        reviewer.mark_material_reviewed(home, first['coverage']['followup_id'])
-        second = reviewer.select_packet(home, cutoff=time.time() + 101, config_snapshot=config)
-        b_second = [row['text'] for row in second['excerpts'] if any(source['source_id'] == row['source_id'] and source.get('task_id') == 'b' for source in second['sources'])]
-        assert b_second == ['b2' * 1200]
+        fixtures = {
+            'a': [message('a' * 2500, 100)],
+            'b': [message('b1' * 1200, 100), message('b2' * 1200, 101)],
+            'c': [message('c' * 2500, 100)],
+        }
+        expected = set()
+        for task_id, rows in fixtures.items():
+            task, _, _ = ended_worker(home, task_id, str(uuid.uuid4()), rows)
+            expected.update((task['id'], row['id']) for row in rows)
+        config = reviewer.read_config(home)
+        cap = 17000
+        config['limits'].update(max_candidates=3, max_input_bytes=cap)
+        consumed = set()
+        packets = 0
+        while True:
+            selected = reviewer.select_packet(home, cutoff=time.time() + packets + 100, config_snapshot=config)
+            assert len(reviewer._json_bytes({key: value for key, value in selected.items() if key != 'packet_id'})) <= cap
+            sources = {source['source_id']: source for source in selected['sources']}
+            retained = {(sources[excerpt['source_id']]['task_id'], excerpt['message_id'])
+                        for excerpt in selected['excerpts']}
+            if not retained:
+                assert selected['episodes'] == []
+                break
+            assert not consumed.intersection(retained)
+            consumed.update(retained)
+            reviewer.mark_material_reviewed(home, selected['coverage']['followup_id'])
+            packets += 1
+            assert packets <= len(expected)
+        assert consumed == expected
 
 
 def test_reviewed_oversized_candidate_does_not_repeat_its_admitted_prefix():

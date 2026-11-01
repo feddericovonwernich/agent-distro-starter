@@ -51,6 +51,15 @@ def _json_bytes(value): return json.dumps(value, sort_keys=True, separators=(','
 def _digest(value): return hashlib.sha256(_json_bytes(value)).hexdigest()
 
 
+def _native_material_identity(value):
+    return {key: item for key, item in value.items() if key not in ('byte_watermark', 'content_sha256')}
+
+
+def _native_excerpt_id(source_id, row):
+    return _digest({'source_id': source_id, 'message_id': row['message_id'],
+                    'text_sha256': hashlib.sha256(row['text'].encode()).hexdigest()})
+
+
 def publish_immutable(path, value):
     path, body = Path(path), _json_bytes(value); _private(path.parent)
     fd, temporary = tempfile.mkstemp(prefix='.write-', dir=path.parent)
@@ -267,9 +276,13 @@ def _candidate_material(root, task, event, task_dir, jsonls, cutoff, limit, cove
             read = reviewer_episodes.read_native(jsonl, cutoff, limit, deadline_epoch_ms)
             sid, watermark, digest = read['session_id'], read['byte_watermark'], read['content_sha256']
             rows, late, limited, withheld = read['rows'], read['late'], read['limited'], read['withheld']
-            source = {'kind': 'native-jsonl', 'task_id': key[0], 'incarnation': key[1], 'session_id': sid, 'path': str(jsonl.relative_to(root)), 'byte_watermark': watermark, 'content_sha256': digest}; source['source_id'] = _digest(source); sources.append(source)
+            source = {'kind': 'native-jsonl', 'task_id': key[0], 'incarnation': key[1], 'session_id': sid,
+                      'path': str(jsonl.relative_to(root)), 'byte_watermark': watermark,
+                      'content_sha256': digest, 'material_sha256': read['material_sha256']}
+            source['source_id'] = _digest(_native_material_identity(source)); sources.append(source)
             for row in rows:
-                excerpt = {'source_id': source['source_id'], **row}; excerpt['excerpt_id'] = _digest(excerpt); excerpts.append(excerpt)
+                excerpt = {'source_id': source['source_id'], **row}
+                excerpt['excerpt_id'] = _native_excerpt_id(source['source_id'], row); excerpts.append(excerpt)
             for row in withheld: _coverage(coverage, 'withheld', row)
             if limited: _coverage(coverage, 'late_basis', {'task_id': key[0], 'session_id': sid, 'reason': 'input-limit'})
             if late: _coverage(coverage, 'late_basis', {'task_id': key[0], 'session_id': sid, 'reason': 'post-cutoff-native-row'})
@@ -356,10 +369,13 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
                     read = reviewer_episodes.read_native(jsonl, cutoff, config['limits']['max_input_bytes'], deadline_epoch_ms)
                     sid, watermark, digest = read['session_id'], read['byte_watermark'], read['content_sha256']
                     rows, late, limited, withheld = read['rows'], read['late'], read['limited'], read['withheld']
-                    source = {'kind': 'reviewer-native-jsonl', 'review_run_id': rid, 'session_id': sid, 'path': str(jsonl.relative_to(root)), 'byte_watermark': watermark, 'content_sha256': digest}
-                    source['source_id'] = _digest(source); sources.append(source)
+                    source = {'kind': 'reviewer-native-jsonl', 'review_run_id': rid, 'session_id': sid,
+                              'path': str(jsonl.relative_to(root)), 'byte_watermark': watermark,
+                              'content_sha256': digest, 'material_sha256': read['material_sha256']}
+                    source['source_id'] = _digest(_native_material_identity(source)); sources.append(source)
                     for row in rows:
-                        excerpt = {'source_id': source['source_id'], **row}; excerpt['excerpt_id'] = _digest(excerpt); excerpts.append(excerpt)
+                        excerpt = {'source_id': source['source_id'], **row}
+                        excerpt['excerpt_id'] = _native_excerpt_id(source['source_id'], row); excerpts.append(excerpt)
                     if limited: _coverage(coverage, 'late_basis', {'review_run_id': rid, 'reason': 'input-limit'})
                     if late: _coverage(coverage, 'late_basis', {'review_run_id': rid, 'reason': 'post-cutoff-native-row'})
                     for row in withheld: _coverage(coverage, 'withheld', row)
@@ -393,7 +409,8 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
                                'material_basis': _digest(retained), 'excerpt_ids': retained})
     packet['episodes'] = [episode for episode in packet['episodes'] if any(
         candidate['candidate_id'] == _candidate_id(episode['task_id'], episode['incarnation']) for candidate in candidates)]
-    material_basis = _digest({'sources': [(source['source_id'], source.get('content_sha256'), source.get('answer_sha256')) for source in packet['sources']],
+    material_basis = _digest({'sources': [(source['source_id'], source.get('material_sha256', source.get('content_sha256')),
+                                            source.get('answer_sha256')) for source in packet['sources']],
                               'excerpts': [excerpt['excerpt_id'] for excerpt in packet['excerpts']]})
     packet['coverage']['followup_id'] = material_basis
     with store.lock(root):

@@ -69,6 +69,18 @@ def test_read_native_title_and_proved_boundary_preserve_utf8_coordinates(tmp_pat
     assert b'marker title' not in admitted_native_line and b'marker never excerpt' not in admitted_native_line
 
 
+def test_read_native_material_digest_ignores_title_and_coordinate_shift(tmp_path):
+    path = tmp_path / 'native.jsonl'
+    user, binding, final, later = episode_entries()
+    write_native(path, 'session', [user, binding, final, later], title=None)
+    plain = reviewer_episodes.read_native(path, 300, 4096)
+    write_native(path, 'session', [user, binding, final, later], title='renamed title')
+    titled = reviewer_episodes.read_native(path, 300, 4096)
+    assert plain['material_sha256'] == titled['material_sha256']
+    assert plain['content_sha256'] != titled['content_sha256']
+    assert [row['text'] for row in plain['rows']] == [row['text'] for row in titled['rows']]
+
+
 def test_read_native_pending_then_arriving_final(tmp_path):
     path = tmp_path / 'native.jsonl'
     user, binding, final, _ = episode_entries()
@@ -98,6 +110,52 @@ def test_read_native_rejects_wrong_branch_and_ambiguous_final(tmp_path):
     with pytest.raises(store.Refusal):
         reviewer_episodes.read_native(path, 300, 4096, completion=value)
 
+def test_read_native_gap_carrier_closes_prior_binding_window(tmp_path):
+    path = tmp_path / 'native.jsonl'
+    user, binding, final, _ = episode_entries()
+    value = completion(path, 'session')
+    binding['details']['source_id'] = value['source_id']
+    gap = {'type': 'custom_message', 'id': 'gapgapgg', 'parentId': 'bbbbbbbb', 'timestamp': 102.0,
+           'customType': 'agd:episode-gap', 'display': False,
+           'details': {'schema': 1, 'interaction_id': 'cccccccc-cccc-cccc-cccc-cccccccccccc'}}
+    final['parentId'] = gap['id']
+    write_native(path, 'session', [user, binding, gap, final])
+    legacy = reviewer_episodes.read_native(path, 300, 4096)
+    with pytest.raises(store.Refusal, match='interaction window'):
+        reviewer_episodes.read_native(path, 300, 4096, completion=value)
+    assert all(row['message_id'] != gap['id'] for row in legacy['rows'])
+
+def test_read_native_completion_index_cleans_up_all_paths(tmp_path, monkeypatch):
+    created = []
+    real_temporary_directory = reviewer_episodes.tempfile.TemporaryDirectory
+
+    class TrackingTemporaryDirectory:
+        def __init__(self, *args, **kwargs):
+            self._inner = real_temporary_directory(*args, **kwargs)
+            self.name = self._inner.name
+            created.append(self.name)
+
+        def cleanup(self):
+            self._inner.cleanup()
+
+    monkeypatch.setattr(reviewer_episodes.tempfile, 'TemporaryDirectory', TrackingTemporaryDirectory)
+    path = tmp_path / 'native.jsonl'
+    user, binding, final, _ = episode_entries()
+    value = completion(path, 'session')
+    binding['details']['source_id'] = value['source_id']
+    write_native(path, 'session', [user, binding, final])
+    reviewer_episodes.read_native(path, 300, 4096, completion=value)
+    write_native(path, 'session', [user])
+    reviewer_episodes.read_native(path, 300, 4096, completion=value)
+    wrong = dict(final, parentId='other')
+    other = message('other', None, 'other', 99.0)
+    write_native(path, 'session', [user, binding, other, wrong])
+    with pytest.raises(store.Refusal):
+        reviewer_episodes.read_native(path, 300, 4096, completion=value)
+    with pytest.raises(store.Refusal):
+        reviewer_episodes.read_native(path, 300, 4096, 1, completion=value)
+    assert created and all(not Path(directory).exists() for directory in created)
+
 
 def test_read_native_thinking_is_withheld_but_final_is_proved(tmp_path):
     path = tmp_path / 'native.jsonl'
@@ -121,8 +179,14 @@ def test_read_native_streams_large_history_and_drains_oversized_row(tmp_path):
     write_native(path, 'session', entries)
     tracemalloc.start()
     result = reviewer_episodes.read_native(path, 20000, 4096)
-    _, peak = tracemalloc.get_traced_memory()
+    _, legacy_peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
-    assert peak < 40 * 1024 * 1024
+    value = completion(path, 'session')
+    tracemalloc.start()
+    pending = reviewer_episodes.read_native(path, 20000, 4096, completion=value)
+    _, completion_peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert max(legacy_peak, completion_peak) < 40 * 1024 * 1024
+    assert pending['status'] == 'pending' and pending['rows'] == []
     assert result['limited'] is True
     assert any(item['reason'] == 'native-row-too-large' for item in result['withheld'])
