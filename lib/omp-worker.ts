@@ -1,3 +1,5 @@
+import { registerEpisodeCapture, type EpisodeAPI } from './omp-episodes';
+
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -156,6 +158,9 @@ export default function workerExtension(api: {
       console.error(`agd worker diagnostic persistence failed: ${error}`);
     }
   }
+  registerEpisodeCapture(api as unknown as EpisodeAPI, {
+    home, cli, role: 'worker', diagnostic: message => console.error(message),
+  });
 
   function unavailable(error: unknown, context?: HookContext, abort = true) {
     healthy = false;
