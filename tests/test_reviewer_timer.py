@@ -224,3 +224,119 @@ def test_native_service_discards_inherited_credentials(tmp_path):
         assert reviewer_timer._owned(service, owner)
         service.unlink()
         store.run(['systemctl', '--user', 'daemon-reload'])
+
+
+def test_uninstall_inventory_unconfigured_features_is_read_only(monkeypatch):
+    from agd_lib import observability
+    from support import lab
+    with lab() as (root, _):
+        before = {str(p.relative_to(root)): (p.lstat().st_ino, p.lstat().st_mtime_ns, p.lstat().st_mode)
+                  for p in root.rglob('*')}
+        monkeypatch.setattr(store, 'run', lambda *_a, **_k: pytest.fail('unconfigured inventory invoked a runtime'))
+        monkeypatch.setattr(observability, '_ownership_command',
+                            lambda *_a: pytest.fail('unconfigured inventory invoked Docker'))
+        assert reviewer_timer.uninstall_inventory(root) == []
+        assert observability.uninstall_inventory(root) == []
+        assert before == {str(p.relative_to(root)): (p.lstat().st_ino, p.lstat().st_mtime_ns, p.lstat().st_mode)
+                          for p in root.rglob('*')}
+
+
+@pytest.mark.parametrize('foreign', ['marker', 'home', 'symlink'])
+def test_uninstall_refuses_foreign_fragment_or_service_home(tmp_path, monkeypatch, foreign):
+    root = home(tmp_path)
+    directory = tmp_path / 'xdg/systemd/user'
+    directory.mkdir(parents=True)
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'xdg'))
+    rendered = reviewer_timer.render_units(root, interval_config(),
+                                          runtime={'python': sys.executable, 'path': os.environ['PATH']})
+    path = directory / rendered['service_name']
+    content = rendered['service']
+    if foreign == 'marker':
+        content = content.replace('X-AGD-Reviewer-Owner=', 'X-Other-Owner=')
+    elif foreign == 'home':
+        content = content.replace(reviewer_timer._escape(str(root)), reviewer_timer._escape(str(tmp_path / 'other')))
+    if foreign == 'symlink':
+        target = tmp_path / 'outside.service'
+        target.write_text(content)
+        path.symlink_to(target)
+    else:
+        path.write_text(content)
+    before = path.read_bytes()
+    monkeypatch.setattr(store, 'run', lambda *_a, **_k: pytest.fail('foreign fragment invoked native control'))
+    resources = reviewer_timer.uninstall_inventory(root)
+    assert resources and any(row['blockers'] and row['ownership'] in {'unknown', 'foreign'} for row in resources)
+    assert path.read_bytes() == before
+    assert path.is_symlink() == (foreign == 'symlink')
+
+
+def test_active_reviewer_service_is_stopped_not_only_timer_disabled(tmp_path):
+    import time
+    from support import lab, uninstall_scope
+    manager = subprocess.run(['systemctl', '--user', 'is-system-running'], capture_output=True, text=True)
+    if manager.stdout.strip() not in {'running', 'degraded'}:
+        pytest.skip(f'user manager unavailable: {manager.stdout.strip()}')
+    directory = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'systemd/user'
+    directory.mkdir(parents=True, exist_ok=True)
+    fixture = tmp_path / 'reviewer-fixture.py'
+    fixture.write_text('''import fcntl, os, signal, sys
+from pathlib import Path
+home = Path(next(arg.split("=", 1)[1] for arg in sys.argv if arg.startswith("--home=")))
+lock = home / "state/reviewer/run.lock"
+lock.parent.mkdir(parents=True, exist_ok=True)
+with lock.open("a+") as stream:
+    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    (home / "service-ready").write_text(str(os.getpid()))
+    signal.pause()
+''')
+    units = []
+    with lab() as (root, _), lab() as (other, _):
+        try:
+            for target in (root, other):
+                rendered = reviewer_timer.render_units(
+                    target, interval_config(), runtime={'python': sys.executable, 'path': os.environ['PATH']},
+                    source_cli=fixture)
+                for kind in ('timer', 'service'):
+                    path = directory / rendered[f'{kind}_name']
+                    assert not os.path.lexists(path)
+                    content = rendered[kind]
+                    if kind == 'timer':
+                        content = content.replace('OnCalendar=*-*-* *:00:00 UTC',
+                                                  'OnCalendar=2099-01-01 00:00:00 UTC')
+                    path.write_text(content); path.chmod(0o600)
+                    units.append(path)
+            subprocess.run(['systemctl', '--user', 'daemon-reload'], check=True)
+            for target in (root, other):
+                timer = reviewer_timer.unit_name(target)
+                subprocess.run(['systemctl', '--user', 'enable', '--now', timer], check=True, capture_output=True)
+                subprocess.run(['systemctl', '--user', 'start', '--no-block', timer[:-6] + '.service'], check=True)
+            deadline = time.monotonic() + 10
+            while not all((target / 'service-ready').exists() for target in (root, other)):
+                assert time.monotonic() < deadline, 'native services did not acquire their leases'
+                time.sleep(.02)
+            other_pid = int((other / 'service-ready').read_text())
+            resources = reviewer_timer.uninstall_inventory(root)
+            assert resources and all(row['ownership'] == 'owned' and not row['blockers'] for row in resources)
+            service = resources[0]['identity']
+            lease = reviewer_runner._uninstall_lease(root)
+            assert service['run_lock'] == lease['identity']
+            assert any(item['pid'] in lease['holders'] for item in service['processes'])
+            with uninstall_scope(root, resources) as operation:
+                reviewer_timer.uninstall_quiesce(root, resources, operation)
+                assert reviewer_runner._uninstall_lease(root)['holders'] == []
+                reviewer_timer.uninstall_remove(root, resources, operation)
+                assert reviewer_timer.uninstall_inventory(root, expected=resources)[0]['presence'] == 'absent'
+            assert all(not os.path.lexists(path) for path in units[:2])
+            assert all(path.is_file() for path in units[2:])
+            os.kill(other_pid, 0)
+            assert reviewer_runner._uninstall_lease(other)['holders'] == [other_pid]
+            assert not os.path.lexists(directory / 'timers.target.wants' / reviewer_timer.unit_name(root))
+        finally:
+            for target in (root, other):
+                timer = reviewer_timer.unit_name(target)
+                subprocess.run(['systemctl', '--user', 'disable', '--now', timer], capture_output=True)
+                subprocess.run(['systemctl', '--user', 'stop', timer[:-6] + '.service'], capture_output=True)
+                subprocess.run(['systemctl', '--user', 'clean', '--what=state', timer], capture_output=True)
+            for path in units:
+                if path.exists():
+                    path.unlink()
+            subprocess.run(['systemctl', '--user', 'daemon-reload'], capture_output=True)

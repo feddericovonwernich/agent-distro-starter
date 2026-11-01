@@ -72,6 +72,7 @@ def render_collector(home, lock, secrets_value=None):
 
 def render_stack(home, lock=None):
     home = _home(home)
+    from . import supervision, uninstall_state
     lock = _load_lock() if lock is None else lock
     _validate_lock(lock)
     locations = paths(home)
@@ -82,6 +83,7 @@ def render_stack(home, lock=None):
     mapping = dict(lock['images'])
     mapping.update({
         'PROJECT': allocation['project'], 'HOME_ID': _home_id(home), 'WEB_PORT': allocation['web_port'],
+        'HOME_IDENTITY': uninstall_state.fingerprint(supervision.runtime_home_identity(home)),
         'MINIO_PORT': allocation['minio_port'], 'OTLP_HTTP_PORT': allocation['otlp_http_port'],
         'OTLP_GRPC_PORT': allocation['otlp_grpc_port'], 'COLLECTOR_HEALTH_PORT': allocation['collector_health_port'],
         'COLLECTOR_METRICS_PORT': allocation['collector_metrics_port'], 'COLLECTOR_CONFIG': collector,
@@ -102,7 +104,7 @@ def render_stack(home, lock=None):
     _private_write(compose, _render(_template('compose.yaml.tmpl'), mapping))
     _private_write(locations['compose'] / 'release-lock.json', json.dumps(lock, sort_keys=True) + '\n')
     return dict(allocation, compose=compose, collector=collector, lock=lock, project_id=values['project_id'],
-                home_id=_home_id(home))
+                home_id=_home_id(home), home_identity=mapping['HOME_IDENTITY'])
 
 
 def read_config(home):
@@ -920,3 +922,178 @@ def _private_write(path, text):
     temporary.write_text(text)
     os.chmod(temporary, 0o600)
     os.replace(temporary, path)
+
+
+def _uninstall_engine():
+    def query(argv):
+        result = _ownership_command(['docker', *argv])
+        if result.returncode:
+            raise store.Refusal('Docker engine inspection failed')
+        return result.stdout.strip()
+    context = query(['context', 'show'])
+    endpoint = json.loads(query(['context', 'inspect', context, '--format', '{{json .Endpoints.docker.Host}}']))
+    engine = json.loads(query(['info', '--format', '{{json .ID}}']))
+    if not isinstance(engine, str) or not engine or not isinstance(endpoint, str) or not endpoint:
+        raise store.Refusal('Docker engine identity is unavailable')
+    import hashlib
+    return {'context': context, 'engine_id': engine,
+            'endpoint_sha256': hashlib.sha256(endpoint.encode()).hexdigest(),
+            'host_sha256': hashlib.sha256(os.environ.get('DOCKER_HOST', '').encode()).hexdigest(),
+            'config': str(Path(os.environ.get('DOCKER_CONFIG', Path.home() / '.docker')).absolute())}
+
+
+def _uninstall_docker_object(kind, name, target, project):
+    from . import uninstall_state
+    result = _ownership_command(['docker', kind, 'inspect', name])
+    if result.returncode:
+        error = result.stderr.strip().lower()
+        missing = (error.startswith(f'error: no such {kind}:')
+                   or error.startswith('error response from daemon: ') and
+                   (kind == 'volume' and ': no such volume' in error
+                    or kind == 'network' and error.endswith(' not found')
+                    or kind == 'container' and 'no such container:' in error))
+        if missing and result.returncode == 1:
+            return None, False
+        raise store.Refusal('Docker resource inspection failed; absence is unconfirmed')
+    values = json.loads(result.stdout)
+    if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], dict):
+        raise store.Refusal('Docker resource inspection is malformed')
+    value = values[0]
+    labels = value.get('Config', {}).get('Labels') if kind == 'container' else value.get('Labels')
+    if (not isinstance(labels, dict) or labels.get('agd.home_id') != target['home_id']
+            or labels.get('com.docker.compose.project', project if kind != 'container' else None) != project):
+        raise store.Refusal('Docker resource ownership differs')
+    if labels.get('agd.home_identity') != uninstall_state.fingerprint(target):
+        raise store.Refusal('Docker physical-home binding is unavailable or differs; legacy labels are not adopted')
+    native_name = value.get('Name', '').lstrip('/')
+    if not native_name or kind != 'container' and not native_name.startswith(project + '_'):
+        raise store.Refusal('Docker resource project binding differs')
+    identity = {'kind': kind, 'name': native_name,
+                'labels': {key: labels[key] for key in ('agd.home_id', 'agd.home_identity', 'com.docker.compose.project') if key in labels}}
+    if kind == 'volume':
+        if not all(isinstance(value.get(key), str) and value[key] for key in ('Driver', 'CreatedAt', 'Mountpoint')):
+            raise store.Refusal('Docker volume identity is incomplete')
+        identity.update({key: value[key] for key in ('Driver', 'CreatedAt', 'Mountpoint')})
+    else:
+        if not isinstance(value.get('Id'), str) or not value['Id']:
+            raise store.Refusal('Docker native resource ID is unavailable')
+        identity['id'] = value['Id']
+    return identity, kind == 'container' and value.get('State', {}).get('Running') is True
+
+
+def uninstall_inventory(home, *, expected=None):
+    from . import supervision
+    home = _home(home)
+    saved = next((row for row in expected or [] if row['kind'] == 'docker'), None)
+    locations = paths(home)
+    evidence = any(os.path.lexists(path) for path in
+                   (locations['compose'] / 'compose.yaml', locations['compose'] / 'release-lock.json',
+                    locations['secrets']))
+    if not evidence and not saved:
+        return []
+    target = saved['identity']['target'] if saved else supervision.runtime_home_identity(home)
+    project = 'agdobs' + target['home_id'].replace('-', '')[:12]
+    identity = {'target': target, 'project': project, 'engine': None,
+                'roots': {'compose': str(locations['compose']), 'secrets': str(locations['secrets'])}, 'objects': []}
+    row = {'key': 'docker:' + project, 'kind': 'docker', 'identity': identity,
+           'presence': 'unknown', 'ownership': 'unknown', 'blockers': []}
+    try:
+        if evidence:
+            _existing_private_directory(home, 'state', 'observability', 'compose')
+            _existing_private_directory(home, 'data', 'observability')
+            if os.path.lexists(locations['secrets']):
+                _read_secrets(home)
+            lock = _read_json(locations['compose'] / 'release-lock.json')
+            if lock is not None:
+                _validate_lock(lock)
+            config = read_config(home)
+            if config.get('project', project) != project:
+                raise store.Refusal('observability project binding differs')
+        identity['engine'] = _uninstall_engine()
+        if saved and identity['engine'] != saved['identity']['engine']:
+            raise store.Refusal('Docker context or engine changed')
+        names = {'container': set(), 'network': {project + '_network'},
+                 'volume': {project + suffix for suffix in ('_postgres', '_clickhouse', '_redis', '_minio')}}
+        for kind in names:
+            argv = ['docker', 'ps', '-aq'] if kind == 'container' else ['docker', kind, 'ls', '-q']
+            result = _ownership_command([*argv, '--filter', 'label=agd.home_id=' + target['home_id']])
+            if result.returncode:
+                raise store.Refusal('Docker resource enumeration failed')
+            names[kind].update(result.stdout.split())
+        current = []
+        for kind, items in names.items():
+            for name in sorted(items):
+                item, _ = _uninstall_docker_object(kind, name, target, project)
+                if item is not None and item not in current:
+                    current.append(item)
+        identity['objects'] = sorted(current, key=lambda item: (item['kind'], item['name']))
+        if saved:
+            if any(item not in saved['identity']['objects'] for item in current):
+                raise store.Refusal('Docker resources changed after approval')
+            identity = saved['identity']
+            row['identity'] = identity
+        row.update(presence='present' if current else 'absent', ownership='owned')
+    except (store.Refusal, OSError, ValueError, KeyError, TypeError) as error:
+        row['blockers'] = [{'code': 'docker-uncertain', 'reason': str(error) if isinstance(error, store.Refusal)
+                            else 'Docker evidence is malformed or unavailable'}]
+    return [row]
+
+
+def _uninstall_docker_scope(home, resource, operation):
+    from . import uninstall_state
+    approved = uninstall_state.require_scope(home, operation, resource['key'])
+    fresh = uninstall_inventory(home, expected=[approved])[0]
+    if fresh['blockers'] or fresh['ownership'] != 'owned':
+        raise store.Refusal('Docker scope changed or inspection failed')
+    return approved
+
+
+def uninstall_quiesce(home, resources, operation):
+    from . import uninstall_state
+    for resource in resources:
+        if resource['kind'] != 'docker':
+            continue
+        approved = _uninstall_docker_scope(home, resource, operation)
+        identity = approved['identity']
+        for item in identity['objects']:
+            if item['kind'] != 'container':
+                continue
+            _uninstall_docker_scope(home, resource, operation)
+            fresh, running = _uninstall_docker_object('container', item['id'], identity['target'], identity['project'])
+            if fresh is not None and fresh != item:
+                raise store.Refusal('Docker container identity changed')
+            if running:
+                result = _ownership_command(['docker', 'container', 'stop', '--time', '10', item['id']])
+                if result.returncode:
+                    raise store.Refusal('Docker container stop failed')
+            fresh, running = _uninstall_docker_object('container', item['id'], identity['target'], identity['project'])
+            if running or fresh is not None and fresh != item:
+                raise store.Refusal('Docker container stop is unconfirmed')
+        uninstall_state.checkpoint(home, operation, phase='quiescing')
+
+
+def uninstall_remove(home, resources, operation):
+    from . import uninstall_state
+    for resource in resources:
+        if resource['kind'] != 'docker':
+            continue
+        approved = _uninstall_docker_scope(home, resource, operation)
+        identity = approved['identity']
+        for item in sorted(identity['objects'], key=lambda item: ('container', 'network', 'volume').index(item['kind'])):
+            _uninstall_docker_scope(home, resource, operation)
+            name = item.get('id', item['name'])
+            fresh, running = _uninstall_docker_object(item['kind'], name, identity['target'], identity['project'])
+            if fresh is None:
+                continue
+            if fresh != item or running:
+                raise store.Refusal('Docker resource changed or is still running')
+            uninstall_state.checkpoint(home, operation, phase='removing', irreversible=True)
+            result = _ownership_command(['docker', item['kind'], 'rm', name])
+            if result.returncode:
+                raise store.Refusal('Docker resource removal failed')
+            remaining, _ = _uninstall_docker_object(item['kind'], name, identity['target'], identity['project'])
+            if remaining is not None:
+                raise store.Refusal('Docker resource remains after removal')
+        if uninstall_inventory(home, expected=[approved])[0]['presence'] != 'absent':
+            raise store.Refusal('Docker resource absence is unconfirmed')
+        uninstall_state.checkpoint(home, operation, phase='removing', completed=approved['key'])
