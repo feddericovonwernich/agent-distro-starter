@@ -122,154 +122,171 @@ def context(home: Path, task_id: str, incarnation: str) -> dict:
 def launch(home, task_id, selected_backend=None, unattended=False, approval_id=None,
            pr_grant=None):
     task = tasks.read(home, task_id)
-    if task['phase'] != 'prepared' or task['executor'] != 'central':
-        raise store.Refusal('task already launched or not prepared')
-    harness = task.get('harness', 'omp')
-    selection = task.get('worker_skill_selection', {
-        'schema': 2, 'mode': 'none', 'profile': None,
-        'skills': [], 'sources': {},
-    })
-    if (not isinstance(selection, dict) or selection.get('schema') != 2
-            or not isinstance(selection.get('skills'), list)):
-        raise store.Refusal('task worker skill selection is invalid')
-    worker_skills.require_protocol(home, task, pr_grant)
-    projects_data = projects.read(home, task['project'])
-    if harness == 'cursor' and not projects_data['trusted']:
-        raise store.Refusal('Cursor project trust requires an explicit user grant')
-    work = tasks.verify_workspace(home, task)
-    if task.get('worker_skills'):
-        worker_skills.ensure(home, task)
-    if unattended:
-        tasks.authorization(home, task, approval_id or '', 'unattended', task_id)
-    if selected_backend is None:
-        selected_backend = launcher.active_backend(home, dict(os.environ)) or launcher.resolve_backend(home, None)
-    if selected_backend not in ('tmux', 'herdr') or harness not in ('omp', 'cursor'):
-        raise ValueError('unsupported backend or harness')
-    if pr_grant:
-        if selection['skills']:
-            raise store.Refusal('PR grant requires a task created with no ordinary worker skills')
-        grant = tasks.authorize_pr_publish(home, task, pr_grant)
-        from . import pr, relay
-        try:
-            repository = pr.github_repository(grant['remote_url'])
-            relay.start_project_service(home, task['project'], repository)
-        except (store.Refusal, store.DependencyError) as error:
-            store.atomic_json(tasks.task_file(home, task_id).parent/'relay-blocked.json',
-                              {'reason': str(error)[:400]})
-            raise
-    preflight = dict(task, backend=selected_backend, pr_grant=pr_grant)
-    harnesses.launch_argv(
-        preflight, tasks.task_file(home, task_id).parent/'brief.md', unattended)
-    module = backend(preflight)
-    if selected_backend == 'tmux' and not shutil.which('tmux'):
-        raise store.DependencyError('tmux is not installed')
-    if selected_backend == 'herdr':
-        module.available()
-    with store.lock(home):
-        current = tasks.read(home, task_id)
-        if current['phase'] != 'prepared' or current['executor'] != 'central':
-            raise store.Refusal('task launch raced another owner; no endpoint created')
+    from .uninstall_state import admission
+    with admission(home):
+        if task['phase'] != 'prepared' or task['executor'] != 'central':
+            raise store.Refusal('task already launched or not prepared')
+        harness = task.get('harness', 'omp')
+        selection = task.get('worker_skill_selection', {
+            'schema': 2, 'mode': 'none', 'profile': None,
+            'skills': [], 'sources': {},
+        })
+        if (not isinstance(selection, dict) or selection.get('schema') != 2
+                or not isinstance(selection.get('skills'), list)):
+            raise store.Refusal('task worker skill selection is invalid')
+        worker_skills.require_protocol(home, task, pr_grant)
+        projects_data = projects.read(home, task['project'])
+        if harness == 'cursor' and not projects_data['trusted']:
+            raise store.Refusal('Cursor project trust requires an explicit user grant')
+        work = tasks.verify_workspace(home, task)
+        if task.get('worker_skills'):
+            worker_skills.ensure(home, task)
+        if unattended:
+            tasks.authorization(home, task, approval_id or '', 'unattended', task_id)
+        if selected_backend is None:
+            selected_backend = launcher.active_backend(home, dict(os.environ)) or launcher.resolve_backend(home, None)
+        if selected_backend not in ('tmux', 'herdr') or harness not in ('omp', 'cursor'):
+            raise ValueError('unsupported backend or harness')
         if pr_grant:
-            manifest = worker_skills.add_scoped_pr(home, current, pr_grant)
-            current['worker_skills'] = manifest
-            current['worker_skill_selection'] = manifest['selection']
-            current['pr_grant'] = pr_grant
+            if selection['skills']:
+                raise store.Refusal('PR grant requires a task created with no ordinary worker skills')
+            grant = tasks.authorize_pr_publish(home, task, pr_grant)
+            from . import pr, relay
+            try:
+                repository = pr.github_repository(grant['remote_url'])
+                relay.start_project_service(home, task['project'], repository)
+            except (store.Refusal, store.DependencyError) as error:
+                store.atomic_json(tasks.task_file(home, task_id).parent/'relay-blocked.json',
+                                  {'reason': str(error)[:400]})
+                raise
+        preflight = dict(task, backend=selected_backend, pr_grant=pr_grant)
+        harnesses.launch_argv(
+            preflight, tasks.task_file(home, task_id).parent/'brief.md', unattended)
+        module = backend(preflight)
+        if selected_backend == 'tmux' and not shutil.which('tmux'):
+            raise store.DependencyError('tmux is not installed')
         if selected_backend == 'herdr':
-            module.prepare(home)
-        task = current
-        task['backend'] = selected_backend
-        incarnation = str(uuid.uuid4())
-        task.update(executor='worker', incarnation=incarnation, phase='running',
-                    worker_alive=None, unattended=unattended)
-        if harness == 'omp':
-            task['observability'] = observability.worker_binding_locked(
-                home, task_id, incarnation)
-        tasks.save(home, task)
-    endpoint = module.create(home, task_id, incarnation, work,
-                             ['env', f'AGD_TASK_ID={task_id}', f'AGD_INCARNATION={incarnation}',
-                              str(Path(__file__).resolve().parents[1]/'agd'), '--home', str(home),
-                              'worker', 'run', task_id, '--incarnation', incarnation])
-    with store.lock(home):
-        task['endpoint'] = endpoint
-        tasks.save(home, task)
-    return task
+            module.available()
+        with store.lock(home):
+            current = tasks.read(home, task_id)
+            if current['phase'] != 'prepared' or current['executor'] != 'central':
+                raise store.Refusal('task launch raced another owner; no endpoint created')
+            if pr_grant:
+                manifest = worker_skills.add_scoped_pr(home, current, pr_grant)
+                current['worker_skills'] = manifest
+                current['worker_skill_selection'] = manifest['selection']
+                current['pr_grant'] = pr_grant
+            if selected_backend == 'herdr':
+                module.prepare(home)
+            task = current
+            task['backend'] = selected_backend
+            incarnation = str(uuid.uuid4())
+            task.update(executor='worker', incarnation=incarnation, phase='running',
+                        worker_alive=None, unattended=unattended)
+            if harness == 'omp':
+                task['observability'] = observability.worker_binding_locked(
+                    home, task_id, incarnation)
+            tasks.save(home, task)
+        endpoint = module.create(home, task_id, incarnation, work,
+                                 ['env', f'AGD_TASK_ID={task_id}', f'AGD_INCARNATION={incarnation}',
+                                  str(Path(__file__).resolve().parents[1]/'agd'), '--home', str(home),
+                                  'worker', 'run', task_id, '--incarnation', incarnation])
+        with store.lock(home):
+            task['endpoint'] = endpoint
+            tasks.save(home, task)
+        return task
 
 
 def run_worker(home, task_id, incarnation):
-    task = tasks.read(home, task_id)
-    if task.get('incarnation') != incarnation:
-        raise store.Refusal('obsolete runner')
-    if os.environ.get('AGD_TASK_ID') != task_id or os.environ.get('AGD_INCARNATION') != incarnation:
-        raise store.Refusal('runner requires its scoped task environment')
-    deadline = time.monotonic() + 10
-    while not task.get('endpoint') and time.monotonic() < deadline:
-        time.sleep(0.05)
+    from contextlib import ExitStack
+    from .uninstall_state import admission
+    with ExitStack() as startup:
+        startup.enter_context(admission(home))
         task = tasks.read(home, task_id)
-    if not task.get('endpoint'):
-        raise store.Refusal('endpoint identity was not published; retaining task')
-    tasks.verify_workspace(home, task)
-    if task.get('worker_skills'):
-        worker_skills.verify(home, task)
-    if task['harness'] == 'omp':
-        child_env, generation, warning = observability.managed_environment(home, 'worker', task, incarnation)
-        session_dir = Path(task['observability']['session_dir'])
-    else:
-        child_env = dict(os.environ, AGD_HOME=str(home), AGD_TASK_ID=task_id, AGD_INCARNATION=incarnation)
-        session_dir = None
-        warning = None
-    child_env.pop('AGD_OWNER', None)
-    child_env.pop('AGD_PR_GRANT', None)
-    if task['harness'] == 'omp':
-        child_env['AGD_CLI'] = str(Path(__file__).resolve().parents[1]/'agd')
-        if task.get('pr_grant'):
-            child_env['AGD_PR_GRANT'] = task['pr_grant']
-    child_env.pop('AGD_WORKER_RESUME_READY', None)
-    if task['harness'] == 'omp' and task['phase'] == 'ready':
-        child_env['AGD_WORKER_RESUME_READY'] = '1'
-    import subprocess
-    from .supervision import process_start
-    args = harnesses.launch_argv(task, tasks.task_file(home, task_id).parent/'brief.md', task['unattended'],
-                                session_dir=session_dir)
-    receipt = home/'state'/'tasks'/task_id/'runner.json'
-    runner = dict(incarnation=incarnation, pid=os.getpid(), start=process_start(os.getpid()),
-                  phase='spawning')
-    if warning:
-        runner['observability_warning'] = warning
-    if task['harness'] == 'omp':
-        runner['observability_generation'] = generation
-    store.atomic_json(receipt, runner)
-    with store.lock(home):
-        current = tasks.read(home, task_id)
-        if current.get('incarnation') != incarnation:
-            raise store.Refusal('worker incarnation changed before process spawn')
-        current['worker_alive'] = True
-        tasks.save(home, current)
-    child = None
-    try:
-        child = subprocess.Popen(args, cwd=task['worktree'], env=child_env, stdin=None)
-        runner.update(phase='spawned', child_pid=child.pid, child_start=process_start(child.pid))
+        if task.get('incarnation') != incarnation:
+            raise store.Refusal('obsolete runner')
+        if os.environ.get('AGD_TASK_ID') != task_id or os.environ.get('AGD_INCARNATION') != incarnation:
+            raise store.Refusal('runner requires its scoped task environment')
+        deadline = time.monotonic() + 10
+        while not task.get('endpoint') and time.monotonic() < deadline:
+            time.sleep(0.05)
+            task = tasks.read(home, task_id)
+        if not task.get('endpoint'):
+            raise store.Refusal('endpoint identity was not published; retaining task')
+        tasks.verify_workspace(home, task)
+        if task.get('worker_skills'):
+            worker_skills.verify(home, task)
         if task['harness'] == 'omp':
-            observability.record_process_generation(home, 'worker', generation, task_id, incarnation,
-                                                    child.pid, runner['child_start'])
+            child_env, generation, warning = observability.managed_environment(home, 'worker', task, incarnation)
+            session_dir = Path(task['observability']['session_dir'])
+        else:
+            child_env = dict(os.environ, AGD_HOME=str(home), AGD_TASK_ID=task_id, AGD_INCARNATION=incarnation)
+            session_dir = None
+            warning = None
+        child_env.pop('AGD_OWNER', None)
+        child_env.pop('AGD_PR_GRANT', None)
+        if task['harness'] == 'omp':
+            child_env['AGD_CLI'] = str(Path(__file__).resolve().parents[1]/'agd')
+            if task.get('pr_grant'):
+                child_env['AGD_PR_GRANT'] = task['pr_grant']
+        child_env.pop('AGD_WORKER_RESUME_READY', None)
+        if task['harness'] == 'omp' and task['phase'] == 'ready':
+            child_env['AGD_WORKER_RESUME_READY'] = '1'
+        import subprocess
+        from .supervision import process_identity, runtime_home_identity
+        args = harnesses.launch_argv(task, tasks.task_file(home, task_id).parent/'brief.md', task['unattended'],
+                                    session_dir=session_dir)
+        receipt = home/'state'/'tasks'/task_id/'runner.json'
+        runner = process_identity(os.getpid())
+        runner.pop('state')
+        runner.update(incarnation=incarnation, phase='preparing', target=runtime_home_identity(home))
+        if warning:
+            runner['observability_warning'] = warning
+        if task['harness'] == 'omp':
+            runner['observability_generation'] = generation
         store.atomic_json(receipt, runner)
-        status = child.wait()
-    except Exception as error:
-        if child is not None:
-            raise store.Refusal('worker child started but receipt/exit uncertain; retain lease') from error
-        status = -1
-        reason = str(error)
-    else:
-        reason = f'worker process exited {status}'
-    if tasks.read(home, task_id).get('incarnation') == incarnation:
-        note = tasks.task_file(home, task_id).parent/'runner-exit.txt'
         with store.lock(home):
             current = tasks.read(home, task_id)
-            if current.get('incarnation') == incarnation:
-                current['worker_alive'] = False
-                tasks.save(home, current)
-        note.write_text(reason)
-        event(home, task_id, incarnation, 'failed' if status else 'idle', 'runner-exit', note)
-    return {'exit': status}
+            if current.get('incarnation') != incarnation:
+                raise store.Refusal('worker incarnation changed before process spawn')
+            current['worker_alive'] = True
+            tasks.save(home, current)
+        child = None
+        try:
+            runner['phase'] = 'spawning'
+            store.atomic_json(receipt, runner)
+            child = subprocess.Popen(args, cwd=task['worktree'], env=child_env, stdin=None)
+            identity = process_identity(child.pid)
+            identity.pop('state')
+            runner.update(phase='spawned', child_pid=child.pid, child_start=identity['start'],
+                          child=identity)
+            if task['harness'] == 'omp':
+                observability.record_process_generation(home, 'worker', generation, task_id, incarnation,
+                                                        child.pid, runner['child_start'])
+            store.atomic_json(receipt, runner)
+            startup.close()
+            status = child.wait()
+        except Exception as error:
+            if child is not None:
+                raise store.Refusal('worker child started but receipt/exit uncertain; retain lease') from error
+            status = -1
+            reason = str(error)
+        else:
+            reason = f'worker process exited {status}'
+        if tasks.read(home, task_id).get('incarnation') == incarnation:
+            note = tasks.task_file(home, task_id).parent/'runner-exit.txt'
+            with store.lock(home):
+                current = tasks.read(home, task_id)
+                if current.get('incarnation') == incarnation:
+                    current['worker_alive'] = False
+                    tasks.save(home, current)
+            note.write_text(reason)
+            event(home, task_id, incarnation, 'failed' if status else 'idle', 'runner-exit', note)
+        with store.lock(home):
+            if tasks.read(home, task_id).get('incarnation') == incarnation:
+                runner['phase'] = 'exited'
+                store.atomic_json(receipt, runner)
+        return {'exit': status}
 
 
 def inspect(home, task_id):
@@ -534,42 +551,152 @@ def stop(home, task_id):
 
 def relaunch(home, task_id):
     task = tasks.read(home, task_id)
-    worker_skills.require_protocol(home, task, task.get('pr_grant'))
-    if task.get('executor') != 'worker' or task['phase'] not in ('running', 'ready'):
-        raise store.Refusal('only running or ready worker tasks can relaunch')
-    if task['phase'] == 'ready' and task.get('harness') != 'omp':
-        raise store.Refusal('ready worker relaunch requires OMP')
-    if task.get('worker_alive') is not False or not task.get('endpoint'):
-        raise store.Refusal('prior worker process absence unconfirmed')
-    if inspect(home, task_id)['endpoint']['presence'] != 'missing':
-        raise store.Refusal('prior owned endpoint not proved absent')
-    work = tasks.verify_workspace(home, task)
-    if task.get('worker_skills'):
-        worker_skills.ensure(home, task)
-        worker_skills.verify(home, task)
-    if (task['phase'] == 'ready' and
-            (not store.clean(work) or store.git(work, 'rev-parse', 'HEAD') != task['ready_head'])):
-        raise store.Refusal('ready workspace no longer matches committed head')
-    harnesses.launch_argv(task, tasks.task_file(home, task_id).parent/'brief.md', task['unattended'])
-    if task['backend'] == 'herdr':
-        backend(task).prepare(home)
-    incarnation = str(uuid.uuid4())
-    task['prior_endpoint'] = task.pop('endpoint')
-    task.update(incarnation=incarnation, worker_alive=None, condition='normal')
-    with store.lock(home):
-        current = tasks.read(home, task_id)
-        if current.get('incarnation') != task['prior_endpoint']['incarnation'] or current.get('worker_alive') is not False:
-            raise store.Refusal('prior worker changed during relaunch; no endpoint created')
-        if current.get('pr_grant'):
-            tasks._authorize_pr_publish_locked(home, current, current['pr_grant'])
-        if task['harness'] == 'omp':
-            task['observability'] = observability.worker_binding_locked(home, task_id, incarnation)
-        tasks.save(home, task)
-    endpoint = backend(task).create(home, task_id, incarnation, work,
-                                    ['env', f'AGD_TASK_ID={task_id}', f'AGD_INCARNATION={incarnation}',
-                                     str(Path(__file__).resolve().parents[1]/'agd'), '--home', str(home),
-                                     'worker', 'run', task_id, '--incarnation', incarnation])
-    with store.lock(home):
-        task['endpoint'] = endpoint
-        tasks.save(home, task)
-    return task
+    from .uninstall_state import admission
+    with admission(home):
+        worker_skills.require_protocol(home, task, task.get('pr_grant'))
+        if task.get('executor') != 'worker' or task['phase'] not in ('running', 'ready'):
+            raise store.Refusal('only running or ready worker tasks can relaunch')
+        if task['phase'] == 'ready' and task.get('harness') != 'omp':
+            raise store.Refusal('ready worker relaunch requires OMP')
+        if task.get('worker_alive') is not False or not task.get('endpoint'):
+            raise store.Refusal('prior worker process absence unconfirmed')
+        if inspect(home, task_id)['endpoint']['presence'] != 'missing':
+            raise store.Refusal('prior owned endpoint not proved absent')
+        work = tasks.verify_workspace(home, task)
+        if task.get('worker_skills'):
+            worker_skills.ensure(home, task)
+            worker_skills.verify(home, task)
+        if (task['phase'] == 'ready' and
+                (not store.clean(work) or store.git(work, 'rev-parse', 'HEAD') != task['ready_head'])):
+            raise store.Refusal('ready workspace no longer matches committed head')
+        harnesses.launch_argv(task, tasks.task_file(home, task_id).parent/'brief.md', task['unattended'])
+        if task['backend'] == 'herdr':
+            backend(task).prepare(home)
+        incarnation = str(uuid.uuid4())
+        task['prior_endpoint'] = task.pop('endpoint')
+        task.update(incarnation=incarnation, worker_alive=None, condition='normal')
+        with store.lock(home):
+            current = tasks.read(home, task_id)
+            if current.get('incarnation') != task['prior_endpoint']['incarnation'] or current.get('worker_alive') is not False:
+                raise store.Refusal('prior worker changed during relaunch; no endpoint created')
+            if current.get('pr_grant'):
+                tasks._authorize_pr_publish_locked(home, current, current['pr_grant'])
+            if task['harness'] == 'omp':
+                task['observability'] = observability.worker_binding_locked(home, task_id, incarnation)
+            tasks.save(home, task)
+        endpoint = backend(task).create(home, task_id, incarnation, work,
+                                        ['env', f'AGD_TASK_ID={task_id}', f'AGD_INCARNATION={incarnation}',
+                                         str(Path(__file__).resolve().parents[1]/'agd'), '--home', str(home),
+                                         'worker', 'run', task_id, '--incarnation', incarnation])
+        with store.lock(home):
+            task['endpoint'] = endpoint
+            tasks.save(home, task)
+        return task
+
+
+def uninstall_inventory(home, *, expected=None):
+    import hashlib
+    from . import supervision, uninstall_state
+    expected = {row['key']: row for row in expected or [] if row['kind'].startswith('worker')}
+    rows = {}
+    fields = ('pid', 'start', 'uid', 'ppid', 'pgid', 'sid', 'argv_sha256')
+    for path in sorted((home / 'data/tasks').glob('*/task.json')):
+        task = uninstall_state.read_evidence(path, private=True)
+        task_id = store.validate_id(task['id'])
+        if path.parent.name != task_id:
+            raise store.Refusal('task receipt path differs from its identity')
+        incarnation = task.get('incarnation')
+        receipt = home / 'state/tasks' / task_id / 'runner.json'
+        if os.path.lexists(receipt):
+            runner = uninstall_state.read_evidence(receipt, private=True)
+            if runner.get('incarnation') != incarnation:
+                raise store.Refusal('worker runner incarnation differs from its task')
+            key = f'worker:{task_id}:{incarnation}'
+            coordinator = {name: runner.get(name) for name in fields}
+            child = runner.get('child')
+            if child is None and runner.get('child_pid'):
+                child = {'pid': runner['child_pid'], 'start': runner['child_start'],
+                         'uid': runner.get('uid')}
+            processes = [coordinator, *([child] if child else [])]
+            identity = {'target': runner.get('target'), 'task_id': task_id,
+                        'incarnation': incarnation, 'runner': coordinator, 'child': child}
+            blockers = []
+            active = processes[1:] if runner.get('phase') == 'exited' else processes
+            try:
+                live = [item for item in active if supervision.process_presence(item)]
+                if not live and runner.get('phase') == 'spawning' and child is None:
+                    presence, ownership = 'unknown', 'unknown'
+                    blockers.append({'code': 'worker-spawn-gap', 'reason': 'worker child outcome is unproven'})
+                elif live and (identity['target'] != supervision.runtime_home_identity(home)
+                               or any(any(name not in item or item[name] is None for name in fields)
+                                      for item in live)):
+                    presence, ownership = 'unknown', 'unknown'
+                    blockers.append({'code': 'worker-identity', 'reason': 'live worker launch identity is incomplete or foreign'})
+                else:
+                    presence, ownership = ('present' if live else 'absent'), 'owned'
+            except (store.Refusal, KeyError, TypeError) as error:
+                presence, ownership = 'unknown', 'unknown'
+                blockers.append({'code': 'worker-process', 'reason': type(error).__name__})
+            rows[key] = {'key': key, 'kind': 'worker', 'identity': identity,
+                         'presence': presence, 'ownership': ownership, 'blockers': blockers}
+        for field in ('endpoint', 'prior_endpoint'):
+            endpoint = task.get(field)
+            if not endpoint:
+                continue
+            endpoint_incarnation = endpoint.get('incarnation', incarnation)
+            key = f'worker-endpoint:{task_id}:{endpoint_incarnation}'
+            safe = {name: value for name, value in endpoint.items() if name not in {'token', 'command'}}
+            safe['token_sha256'] = hashlib.sha256(endpoint.get('token', '').encode()).hexdigest()
+            identity = {'backend': task['backend'], 'task_id': task_id,
+                        'incarnation': endpoint_incarnation, 'endpoint': safe,
+                        'endpoint_digest': uninstall_state.fingerprint(endpoint)}
+            module = backend(task)
+            probe = module._uninstall_probe(home, identity)
+            rows[key] = {'key': key, 'kind': 'worker-endpoint', 'identity': identity, **probe}
+    for key, saved in expected.items():
+        if key in rows:
+            continue
+        identity = saved['identity']
+        if saved['kind'] == 'worker':
+            processes = [item for item in (identity['runner'], identity['child']) if item]
+            presence = 'present' if any(supervision.process_presence(item) for item in processes) else 'absent'
+            rows[key] = {**saved, 'presence': presence, 'blockers': []}
+        else:
+            module = backend(identity)
+            rows[key] = {**saved, **module._uninstall_probe(home, identity)}
+    return list(rows.values())
+
+
+def uninstall_quiesce(home, resources, operation):
+    from . import supervision, uninstall_state
+    for resource in sorted(resources, key=lambda row: row['kind'] != 'worker'):
+        if resource['kind'] not in {'worker', 'worker-endpoint'}:
+            continue
+        approved = uninstall_state.require_scope(home, operation, resource['key'])
+        if approved['kind'] == 'worker-endpoint':
+            module = backend(approved['identity'])
+            module.uninstall_close(home, approved, operation)
+            continue
+        current = next((row for row in uninstall_inventory(home, expected=[approved])
+                        if row['key'] == approved['key']), None)
+        if (current is None or current['identity'] != approved['identity']
+                or current['ownership'] != 'owned' or current['presence'] == 'unknown'):
+            raise store.Refusal('worker uninstall identity changed or is unknown')
+        if current['presence'] == 'present':
+            identity = approved['identity']
+            processes = [item for item in (identity['runner'], identity['child']) if item]
+            endpoint_key = f"worker-endpoint:{identity['task_id']}:{identity['incarnation']}"
+            endpoint = next((row for row in resources if row['key'] == endpoint_key), None)
+            if endpoint:
+                endpoint = uninstall_state.require_scope(home, operation, endpoint_key)
+                module = backend(endpoint['identity'])
+                module._uninstall_grace(home, endpoint['identity'])
+                deadline = time.monotonic() + 2
+                while any(supervision.process_presence(item) for item in processes) and time.monotonic() < deadline:
+                    time.sleep(.05)
+            supervision.stop_owned_processes(processes)
+        remaining = next(row for row in uninstall_inventory(home, expected=[approved])
+                         if row['key'] == approved['key'])
+        if remaining['presence'] != 'absent':
+            raise store.Refusal('worker process absence unproven; lease and receipts retained')
+        uninstall_state.checkpoint(home, operation, phase='quiescing', completed=approved['key'])

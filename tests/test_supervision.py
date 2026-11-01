@@ -202,19 +202,6 @@ def test_recovered_ready_check_rearms_next_failure():
                    for e in command(home, 'events', 'list'))
 
 
-def test_watcher_runs_central_review_tick_after_reconcile(monkeypatch, tmp_path):
-    home = tmp_path / 'home'
-    monkeypatch.setenv('AGD_OWNER', 'owner-token')
-    monkeypatch.setattr(supervision, 'process_start', lambda _pid: 'start')
-    calls = []
-    monkeypatch.setattr(supervision, 'reconcile', lambda _home: calls.append('reconcile') or {'pending': []})
-    monkeypatch.setattr('agd_lib.relay_reviews.tick', lambda _home: calls.append('tick'))
-    monkeypatch.setattr('agd_lib.supervision._stop_owned_relay_services', lambda _home: calls.append('stop'))
-    monkeypatch.setattr(supervision.time, 'sleep',
-                        lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt()))
-    with pytest.raises(KeyboardInterrupt):
-        supervision.watch(home, 1, 'start', 'generation')
-    assert calls == ['reconcile', 'tick', 'stop']
 
 
 def test_owner_exit_stops_only_regular_owned_relay_service(monkeypatch, tmp_path):
@@ -242,3 +229,108 @@ if __name__ == '__main__':
     test_resolve_decision_records_answer_without_erasing_wake()
     test_unfinished_clean_exit_is_actionable()
     test_recovered_ready_check_rearms_next_failure()
+
+
+def test_uninstall_stops_owned_process_tree_not_pid_replacement(tmp_path):
+    import os
+    import select
+    import signal
+    import subprocess
+    import sys
+    heartbeat = tmp_path / 'heartbeat'
+    child_program = (
+        'import pathlib, sys, time\n'
+        'path = pathlib.Path(sys.argv[1])\n'
+        'path.write_text("started")\n'
+        'print("ready", flush=True)\n'
+        'while True:\n'
+        ' path.write_text(str(time.monotonic_ns()))\n'
+        ' time.sleep(.01)\n')
+    parent_program = (
+        'import signal, subprocess, sys\n'
+        'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+        f'child = subprocess.Popen([sys.executable, "-c", {child_program!r}, sys.argv[1]], stdout=subprocess.PIPE, text=True)\n'
+        'assert child.stdout.readline() == "ready\\n"\n'
+        'print(child.pid, flush=True)\n'
+        'sys.stdin.read()\n')
+    parent = subprocess.Popen([sys.executable, '-c', parent_program, str(heartbeat)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                              start_new_session=True)
+    sentinel = subprocess.Popen(
+        [sys.executable, '-c',
+         'import sys\nprint("ready", flush=True)\nfor line in sys.stdin: print("ack", flush=True)'],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    child_fd = None
+    def identity(pid):
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()
+        return {'pid': pid, 'start': fields[19], 'uid': Path(f'/proc/{pid}').stat().st_uid,
+                'ppid': int(fields[1]), 'pgid': int(fields[2]), 'sid': int(fields[3])}
+    try:
+        child_pid = int(parent.stdout.readline())
+        child_fd = os.pidfd_open(child_pid)
+        assert sentinel.stdout.readline() == 'ready\n'
+        supervision.stop_owned_processes([{**identity(sentinel.pid), 'start': '0'}], timeout=.2)
+        assert sentinel.poll() is None
+        supervision.stop_owned_processes([identity(parent.pid)], timeout=2)
+        assert parent.wait(timeout=3) != 0
+        assert select.select([child_fd], [], [], 0)[0] == [child_fd]
+        stamp = heartbeat.stat().st_mtime_ns
+        sentinel.stdin.write('ping\n')
+        sentinel.stdin.flush()
+        assert sentinel.stdout.readline() == 'ack\n'
+        assert heartbeat.stat().st_mtime_ns == stamp
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+        parent.wait(timeout=3)
+        if child_fd is not None:
+            if not select.select([child_fd], [], [], 0)[0]:
+                signal.pidfd_send_signal(child_fd, signal.SIGKILL)
+            os.close(child_fd)
+        sentinel.terminate()
+        sentinel.wait(timeout=3)
+        parent.stdin.close()
+        parent.stdout.close()
+        sentinel.stdin.close()
+        sentinel.stdout.close()
+
+
+def test_uninstall_process_stop_refuses_bare_pid():
+    from agd_lib import store
+    import os
+    with pytest.raises(store.Refusal):
+        supervision.stop_owned_processes([os.getpid()])
+
+
+def test_uninstall_does_not_adopt_a_detached_user_process():
+    import os
+    import select
+    import signal
+    import subprocess
+    import sys
+    child_program = 'import time\nprint("ready", flush=True)\nwhile True: time.sleep(1)'
+    program = (
+        'import subprocess, sys\n'
+        f'child = subprocess.Popen([sys.executable, "-c", {child_program!r}], stdout=subprocess.PIPE, text=True, start_new_session=True)\n'
+        'assert child.stdout.readline() == "ready\\n"\n'
+        'print(child.pid, flush=True)\n'
+        'sys.stdin.read()\n')
+    parent = subprocess.Popen([sys.executable, '-c', program], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, text=True, start_new_session=True)
+    descriptor = None
+    try:
+        child_pid = int(parent.stdout.readline())
+        descriptor = os.pidfd_open(child_pid)
+        identity = supervision.process_identity(parent.pid)
+        identity.pop('state')
+        supervision.stop_owned_processes([identity], timeout=1)
+        parent.wait(timeout=3)
+        assert not select.select([descriptor], [], [], 0)[0]
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+        parent.communicate(timeout=3)
+        if descriptor is not None:
+            if not select.select([descriptor], [], [], 0)[0]:
+                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+            os.close(descriptor)

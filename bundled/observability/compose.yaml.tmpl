@@ -1,5 +1,5 @@
 x-agd-ownership: &agd_ownership
-  labels: {agd.home_id: "{{HOME_ID}}"}
+  labels: {agd.home_id: "{{HOME_ID}}", agd.home_identity: "{{HOME_IDENTITY}}"}
 
 services:
   postgres:
@@ -114,9 +114,9 @@ services:
       - "{{LOG_ARCHIVE}}:{{LOG_ARCHIVE}}"
       - "{{METRIC_ARCHIVE}}:{{METRIC_ARCHIVE}}"
 networks:
-  default: {name: {{PROJECT}}_network, labels: {agd.home_id: "{{HOME_ID}}"}}
+  default: {name: {{PROJECT}}_network, <<: *agd_ownership}
 volumes:
-  {{PROJECT}}_postgres: {name: {{PROJECT}}_postgres, labels: {agd.home_id: "{{HOME_ID}}"}}
-  {{PROJECT}}_clickhouse: {name: {{PROJECT}}_clickhouse, labels: {agd.home_id: "{{HOME_ID}}"}}
-  {{PROJECT}}_redis: {name: {{PROJECT}}_redis, labels: {agd.home_id: "{{HOME_ID}}"}}
-  {{PROJECT}}_minio: {name: {{PROJECT}}_minio, labels: {agd.home_id: "{{HOME_ID}}"}}
+  {{PROJECT}}_postgres: {name: {{PROJECT}}_postgres, <<: *agd_ownership}
+  {{PROJECT}}_clickhouse: {name: {{PROJECT}}_clickhouse, <<: *agd_ownership}
+  {{PROJECT}}_redis: {name: {{PROJECT}}_redis, <<: *agd_ownership}
+  {{PROJECT}}_minio: {name: {{PROJECT}}_minio, <<: *agd_ownership}

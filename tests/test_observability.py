@@ -405,3 +405,137 @@ def test_ownership_preflight_sanitizes_missing_docker_and_timeout(monkeypatch, e
     monkeypatch.setattr(observability.subprocess, 'run', lambda *args, **kwargs: (_ for _ in ()).throw(error))
     with pytest.raises(store.Refusal, match='ownership inspection is unavailable'):
         observability._require_owned_resources({'project': 'agdobs-test', 'home_id': INCARNATION})
+
+
+def _uninstall_engine(monkeypatch, root):
+    from types import SimpleNamespace
+    from agd_lib import supervision, uninstall_state
+    # Teardown starts from a persisted stack; no fixture service binds these ports.
+    observability._runtime_directories(root)
+    store.atomic_json(observability.paths(root)['compose'] / 'release-lock.json',
+                      observability._load_lock())
+    rendered = observability.render_stack(root)
+    project, home_id = rendered['project'], rendered['home_id']
+    labels = {'agd.home_id': home_id, 'com.docker.compose.project': project,
+              'agd.home_identity': uninstall_state.fingerprint(supervision.runtime_home_identity(root))}
+    objects = {
+        'container': {'a' * 64: {'Id': 'a' * 64, 'Name': '/' + project + '-orphan',
+                               'Config': {'Labels': labels}, 'State': {'Running': True}}},
+        'network': {project + '_network': {'Id': 'b' * 64, 'Name': project + '_network', 'Labels': labels}},
+        'volume': {project + suffix: {'Name': project + suffix, 'Driver': 'local', 'Labels': labels,
+                                     'Mountpoint': '/owned/' + project + suffix, 'CreatedAt': '2026-10-31T00:00:00Z'}
+                   for suffix in ('_postgres', '_clickhouse', '_redis', '_minio')},
+    }
+    state = {'engine': 'owned-engine', 'objects': objects, 'changes': [], 'error': None}
+    def command(argv):
+        def result(value='', code=0, error=''):
+            return SimpleNamespace(returncode=code, stdout=value, stderr=error)
+        action = argv[1:]
+        if action[0] == 'context':
+            return result('fixture\n' if action[1] == 'show' else json.dumps('unix:///fixture/docker.sock'))
+        if action[0] == 'info':
+            return result(json.dumps(state['engine']))
+        kind = 'container' if action[0] == 'ps' else action[0]
+        if state['error'] and (action[0] == 'ps' or action[1] in {'ls', 'inspect'}):
+            return result('[]', 1, state['error'])
+        if action[0] == 'ps' or action[1] == 'ls':
+            return result('\n'.join(objects[kind]))
+        name = action[-1]
+        value = objects[kind].get(name)
+        if value is None:
+            value = next((v for v in objects[kind].values() if v.get('Id') == name), None)
+        if action[1] == 'inspect':
+            if value is not None:
+                return result(json.dumps([value]))
+            return result('[]', 1, f'Error: No such {kind}: {name}')
+        if value is None:
+            raise AssertionError(f'unowned mutation: {argv}')
+        state['changes'].append((kind, action[1], name))
+        if action[1] == 'stop':
+            value['State']['Running'] = False
+        elif action[1] == 'rm':
+            key = next(key for key, item in objects[kind].items() if item is value)
+            del objects[kind][key]
+        else:
+            raise AssertionError(argv)
+        return result()
+    monkeypatch.setattr(observability, '_ownership_command', command)
+    return state
+
+
+@pytest.mark.parametrize('error', ['permission denied while trying to connect to Docker',
+                                  'Cannot connect to the Docker daemon', 'invalid JSON response'])
+def test_docker_inspection_error_is_not_absence(monkeypatch, error):
+    with lab() as (root, _):
+        state = _uninstall_engine(monkeypatch, root)
+        original = json.dumps(state['objects'], sort_keys=True)
+        state['error'] = error
+        resources = observability.uninstall_inventory(root)
+        assert resources and any(row['presence'] == 'unknown' and row['blockers'] for row in resources)
+        assert json.dumps(state['objects'], sort_keys=True) == original
+        assert not state['changes']
+        assert observability.paths(root)['secrets'].is_file()
+
+
+def test_context_switch_prevents_deletion_of_other_engine(monkeypatch):
+    from support import uninstall_scope
+    with lab() as (root, _):
+        state = _uninstall_engine(monkeypatch, root)
+        resources = observability.uninstall_inventory(root)
+        original = json.dumps(state['objects'], sort_keys=True)
+        with uninstall_scope(root, resources) as operation:
+            state['engine'] = 'foreign-engine'
+            with pytest.raises(store.Refusal):
+                observability.uninstall_remove(root, resources, operation)
+            assert not operation['completed']
+        assert json.dumps(state['objects'], sort_keys=True) == original
+        assert not state['changes']
+
+
+def test_partial_render_can_be_purged_without_published_config(monkeypatch):
+    import hashlib
+    from support import uninstall_scope
+    with lab() as (root, _):
+        state = _uninstall_engine(monkeypatch, root)
+        locations = observability.paths(root)
+        assert not locations['config'].exists()
+        secret = hashlib.sha256(locations['secrets'].read_bytes()).hexdigest()
+        resources = observability.uninstall_inventory(root)
+        assert resources and all(row['ownership'] == 'owned' and not row['blockers'] for row in resources)
+        with uninstall_scope(root, resources) as operation:
+            observability.uninstall_quiesce(root, resources, operation)
+            assert not next(iter(state['objects']['container'].values()))['State']['Running']
+            observability.uninstall_remove(root, resources, operation)
+            assert all(row['presence'] == 'absent' for row in observability.uninstall_inventory(root, expected=resources))
+        assert all(not objects for objects in state['objects'].values())
+        assert hashlib.sha256(locations['secrets'].read_bytes()).hexdigest() == secret
+        assert not locations['config'].exists()
+
+
+def test_copied_home_cannot_adopt_original_docker_resources(monkeypatch):
+    import shutil
+    with lab() as (root, _):
+        state = _uninstall_engine(monkeypatch, root)
+        original = json.dumps(state['objects'], sort_keys=True)
+        copied = root.parent / 'copied'
+        shutil.copytree(root, copied, symlinks=True)
+        resources = observability.uninstall_inventory(copied)
+        assert resources and any(row['blockers'] and row['ownership'] != 'owned' for row in resources)
+        assert json.dumps(state['objects'], sort_keys=True) == original
+        assert not state['changes']
+
+
+def test_docker_absence_can_be_verified_after_home_removal(monkeypatch):
+    import shutil
+    from agd_lib import uninstall_state
+    from support import uninstall_scope
+    with lab() as (root, _):
+        _uninstall_engine(monkeypatch, root)
+        resources = observability.uninstall_inventory(root)
+        with uninstall_scope(root, resources) as operation:
+            observability.uninstall_quiesce(root, resources, operation)
+            observability.uninstall_remove(root, resources, operation)
+            uninstall_state.checkpoint(root, operation, phase='verifying', irreversible=True)
+            shutil.rmtree(root)
+            assert all(row['presence'] == 'absent' for row in
+                       observability.uninstall_inventory(root, expected=resources))

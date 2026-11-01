@@ -513,8 +513,10 @@ def _enqueue_intent_locked(home, *, kind, retrospective_review_run_ids=()):
 
 
 def enqueue_intent(home, *, kind, retrospective_review_run_ids=()):
-    with store.lock(store.home(home)):
-        return _enqueue_intent_locked(store.home(home), kind=kind, retrospective_review_run_ids=retrospective_review_run_ids)
+    from .uninstall_state import admission
+    with admission(home):
+        with store.lock(store.home(home)):
+            return _enqueue_intent_locked(store.home(home), kind=kind, retrospective_review_run_ids=retrospective_review_run_ids)
 
 
 def timer_intent(home, *, now=None):

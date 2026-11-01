@@ -971,3 +971,102 @@ if __name__ == '__main__':
     test_proved_absent_unpublished_start_returns_to_prepared()
     test_relaunch_restores_frozen_skill_after_catalog_changes()
     test_concurrent_skill_launch_has_one_winner_without_orphans()
+
+
+def test_uninstall_worker_stops_registered_runner_without_returning_lease():
+    import subprocess
+    from agd_lib import store, supervision
+    from support import uninstall_scope
+    with lab() as (home, _):
+        brief = home / 'brief.md'
+        brief.write_text('Read the fixture.')
+        task = command(home, 'task', 'create', 'retire-worker', '--project', 'sample',
+                       '--brief', str(brief), '--skill-mode', 'none')
+        incarnation = str(uuid.uuid4())
+        task.update(executor='worker', incarnation=incarnation, phase='running',
+                    worker_alive=True, harness='omp', backend='tmux')
+        tasks.save(home, task)
+        process = subprocess.Popen(
+            [sys.executable, '-c', 'import sys\nprint("ready", flush=True)\nsys.stdin.read()'],
+            cwd=task['worktree'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            assert process.stdout.readline() == 'ready\n'
+            identity = supervision.process_identity(process.pid)
+            identity.pop('state')
+            receipt = home / 'state/tasks/retire-worker/runner.json'
+            store.atomic_json(receipt, {
+                **identity, 'incarnation': incarnation, 'phase': 'preparing',
+                'target': supervision.runtime_home_identity(home)})
+            resources = workers.uninstall_inventory(home)
+            original = receipt.read_bytes()
+            with uninstall_scope(home, resources) as operation:
+                workers.uninstall_quiesce(home, resources, operation)
+                assert process.wait(timeout=3) != 0
+                assert receipt.read_bytes() == original
+                assert tasks.read(home, task['id'])['lease_id'] == task['lease_id']
+                assert tasks.verify_workspace(home, task).is_dir()
+                assert all(row['presence'] == 'absent'
+                           for row in workers.uninstall_inventory(home, expected=resources))
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.communicate(timeout=3)
+
+
+def test_uninstall_worker_does_not_adopt_unreceipted_orphan():
+    import select
+    import signal
+    import subprocess
+    import pytest
+    from agd_lib import store, supervision
+    from support import uninstall_scope
+    with lab() as (home, _):
+        brief = home / 'brief.md'
+        brief.write_text('Read the fixture.')
+        task = command(home, 'task', 'create', 'orphan-worker', '--project', 'sample',
+                       '--brief', str(brief), '--skill-mode', 'none')
+        incarnation = str(uuid.uuid4())
+        task.update(executor='worker', incarnation=incarnation, phase='running',
+                    worker_alive=True, harness='omp', backend='tmux')
+        tasks.save(home, task)
+        child_program = 'import time\nprint("ready", flush=True)\nwhile True: time.sleep(1)'
+        program = (
+            'import subprocess, sys\n'
+            f'child = subprocess.Popen([sys.executable, "-c", {child_program!r}], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)\n'
+            'assert child.stdout.readline() == "ready\\n"\n'
+            'print(child.pid, flush=True)\n'
+            'sys.stdin.read(1)\n'
+            'sys.exit(0)\n')
+        parent = subprocess.Popen(
+            [sys.executable, '-c', program], cwd=task['worktree'], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, text=True, env={**os.environ,
+                'AGD_HOME': str(home), 'AGD_TASK_ID': task['id'], 'AGD_INCARNATION': incarnation})
+        descriptor = None
+        try:
+            child_pid = int(parent.stdout.readline())
+            descriptor = os.pidfd_open(child_pid)
+            identity = supervision.process_identity(parent.pid)
+            identity.pop('state')
+            store.atomic_json(home / 'state/tasks/orphan-worker/runner.json', {
+                **identity, 'incarnation': incarnation, 'phase': 'spawning',
+                'target': supervision.runtime_home_identity(home)})
+            # An inherited task environment does not prove orphan ownership.
+            parent.kill()
+            parent.wait(timeout=3)
+            resources = workers.uninstall_inventory(home)
+            worker = next(row for row in resources if row['kind'] == 'worker')
+            assert worker['presence'] == 'unknown' and worker['ownership'] == 'unknown'
+            assert worker['blockers']
+            with pytest.raises(store.Refusal):
+                with uninstall_scope(home, resources):
+                    raise AssertionError('unknown ownership must not receive teardown authority')
+            assert not select.select([descriptor], [], [], 0)[0]
+            assert tasks.read(home, task['id'])['lease_id'] == task['lease_id']
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+            parent.communicate(timeout=3)
+            if descriptor is not None:
+                if not select.select([descriptor], [], [], 0)[0]:
+                    signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                os.close(descriptor)

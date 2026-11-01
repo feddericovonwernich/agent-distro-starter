@@ -61,6 +61,8 @@ def atomic_json(path, value):
             os.unlink(temporary)
 
 def require_owner(root, worker_scoped=False):
+    from .uninstall_state import require_active
+    require_active(root)
     if worker_scoped and os.environ.get('AGD_TASK_ID') and os.environ.get('AGD_INCARNATION'):
         return
     path = root/'state'/'owner.json'

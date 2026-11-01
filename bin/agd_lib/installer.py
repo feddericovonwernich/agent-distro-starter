@@ -381,126 +381,129 @@ def validate_dependencies(home, run):
 def setup(home, backend, prompt, fetch_json, stream_url, run, *, install_plugins=None):
     if backend not in {'tmux', 'herdr'}:
         raise Refusal('selected backend is invalid')
-    prior = read_dependencies(home)
-    tools = ['omp'] + (['herdr'] if backend == 'herdr' else []) + ['treehouse']
-    receipt = {'schema': 1}
-    for tool in tools:
-        path = shutil.which(tool)
-        if path:
-            path = Path(path).resolve()
-        if tool == 'omp':
-            omp_run = _omp_runner(home, run)
-            probe = lambda item, _runner: probe_omp(item, omp_run)
-        elif tool == 'herdr':
-            probe = lambda item, runner: probe_herdr(item, 'agd-probe', runner)
-        else:
-            probe = probe_treehouse
-        previous = prior.get(tool)
-        if previous and previous['source'] == 'managed':
-            recorded = Path(previous['path'])
-            if path is None or path != recorded.resolve():
-                raise Refusal('managed dependency path differs from receipt')
-            if _sha256(recorded) != previous['installed_sha256']:
-                raise Refusal('managed dependency digest differs from receipt')
-            existing = {**previous, **probe(recorded, run)}
-        else:
-            existing = None
+    from .uninstall_state import admission
+    with admission(home):
+        prior = read_dependencies(home)
+        tools = ['omp'] + (['herdr'] if backend == 'herdr' else []) + ['treehouse']
+        receipt = {'schema': 1}
+        for tool in tools:
+            path = shutil.which(tool)
             if path:
-                try:
-                    existing = {'source': 'existing', **probe(path, run)}
-                except Refusal:
-                    pass
-        if tool == 'treehouse':
-            if existing is not None:
-                receipt[tool] = existing
-            elif prompt('install pinned Treehouse v3.1.6?'):
-                receipt[tool] = install_treehouse(home, stream_url)
+                path = Path(path).resolve()
+            if tool == 'omp':
+                omp_run = _omp_runner(home, run)
+                probe = lambda item, _runner: probe_omp(item, omp_run)
+            elif tool == 'herdr':
+                probe = lambda item, runner: probe_herdr(item, 'agd-probe', runner)
             else:
-                raise Refusal('treehouse requirement is unmet')
-            continue
-        release = _stable_release(fetch_json, tool)
-        message = f'{tool} {release["tag_name"]} is available; install or update?'
-        if not prompt(message):
-            if existing is None:
-                raise Refusal(f'{tool} requirement is unmet')
-            receipt[tool] = existing
-            continue
-        receipt[tool] = _install(
-            release, tool, stream_url, _omp_runner(home, run) if tool == 'omp' else run)
-    write_dependencies(home, receipt)
-    omp_runtime.initialize(home, receipt['omp']['path'], run=run)
-    (install_plugins or omp_runtime.install_plugins)(
-        Path(home), receipt['omp']['path'], run=run)
-    return receipt
+                probe = probe_treehouse
+            previous = prior.get(tool)
+            if previous and previous['source'] == 'managed':
+                recorded = Path(previous['path'])
+                if path is None or path != recorded.resolve():
+                    raise Refusal('managed dependency path differs from receipt')
+                if _sha256(recorded) != previous['installed_sha256']:
+                    raise Refusal('managed dependency digest differs from receipt')
+                existing = {**previous, **probe(recorded, run)}
+            else:
+                existing = None
+                if path:
+                    try:
+                        existing = {'source': 'existing', **probe(path, run)}
+                    except Refusal:
+                        pass
+            if tool == 'treehouse':
+                if existing is not None:
+                    receipt[tool] = existing
+                elif prompt('install pinned Treehouse v3.1.6?'):
+                    receipt[tool] = install_treehouse(home, stream_url)
+                else:
+                    raise Refusal('treehouse requirement is unmet')
+                continue
+            release = _stable_release(fetch_json, tool)
+            message = f'{tool} {release["tag_name"]} is available; install or update?'
+            if not prompt(message):
+                if existing is None:
+                    raise Refusal(f'{tool} requirement is unmet')
+                receipt[tool] = existing
+                continue
+            receipt[tool] = _install(
+                release, tool, stream_url, _omp_runner(home, run) if tool == 'omp' else run)
+        write_dependencies(home, receipt)
+        omp_runtime.initialize(home, receipt['omp']['path'], run=run)
+        (install_plugins or omp_runtime.install_plugins)(
+            Path(home), receipt['omp']['path'], run=run)
+        return receipt
 
 
 def setup_reviewer(home, ask, report):
     from . import reviewer, reviewer_timer
-
-    report('Optional scheduled skill reviews inspect completed worker evidence and may incur model-provider charges.')
-    report('Reports/proposals only: no automatic skill edits. Independent of Langfuse; limits are not a dollar budget.')
-    answer = ask('Enable scheduled skill reviews? [y/N] ')
-    if answer is None or answer.lower() not in ('y', 'yes'):
-        report('Scheduled reviewer: unchanged; not enabled by this installer.')
-        return {'state': 'skipped'}
-    report('1) Daily at 02:00 UTC (default)\n2) Every 6 hours\n3) Every hour\n'
-           '4) Custom daily time and IANA timezone\n5) Custom interval in whole hours\n0) Cancel')
-    while True:
-        choice = ask('Reviewer schedule [1; 0 cancels]: ')
-        if choice is None or choice == '0':
-            report('Reviewer setup cancelled; existing configuration unchanged.')
-            return {'state': 'cancelled'}
-        choice = choice or '1'
-        schedule = {'mode': 'calendar', 'calendar': '02:00', 'timezone': 'UTC', 'interval_hours': None}
-        try:
-            if choice in ('2', '3', '5'):
-                hours = {'2': '6', '3': '1'}.get(choice)
-                if hours is None:
-                    hours = ask('Interval in positive whole hours [0 cancels]: ')
-                    if hours is None or hours == '0':
+    from .uninstall_state import admission
+    with admission(home):
+        report('Optional scheduled skill reviews inspect completed worker evidence and may incur model-provider charges.')
+        report('Reports/proposals only: no automatic skill edits. Independent of Langfuse; limits are not a dollar budget.')
+        answer = ask('Enable scheduled skill reviews? [y/N] ')
+        if answer is None or answer.lower() not in ('y', 'yes'):
+            report('Scheduled reviewer: unchanged; not enabled by this installer.')
+            return {'state': 'skipped'}
+        report('1) Daily at 02:00 UTC (default)\n2) Every 6 hours\n3) Every hour\n'
+               '4) Custom daily time and IANA timezone\n5) Custom interval in whole hours\n0) Cancel')
+        while True:
+            choice = ask('Reviewer schedule [1; 0 cancels]: ')
+            if choice is None or choice == '0':
+                report('Reviewer setup cancelled; existing configuration unchanged.')
+                return {'state': 'cancelled'}
+            choice = choice or '1'
+            schedule = {'mode': 'calendar', 'calendar': '02:00', 'timezone': 'UTC', 'interval_hours': None}
+            try:
+                if choice in ('2', '3', '5'):
+                    hours = {'2': '6', '3': '1'}.get(choice)
+                    if hours is None:
+                        hours = ask('Interval in positive whole hours [0 cancels]: ')
+                        if hours is None or hours == '0':
+                            report('Reviewer setup cancelled; existing configuration unchanged.')
+                            return {'state': 'cancelled'}
+                    schedule = {'mode': 'interval', 'calendar': None, 'timezone': None, 'interval_hours': int(hours)}
+                elif choice == '4':
+                    clock = ask('Daily time HH:MM [02:00; 0 cancels]: ')
+                    if clock is None or clock == '0':
                         report('Reviewer setup cancelled; existing configuration unchanged.')
                         return {'state': 'cancelled'}
-                schedule = {'mode': 'interval', 'calendar': None, 'timezone': None, 'interval_hours': int(hours)}
-            elif choice == '4':
-                clock = ask('Daily time HH:MM [02:00; 0 cancels]: ')
-                if clock is None or clock == '0':
-                    report('Reviewer setup cancelled; existing configuration unchanged.')
-                    return {'state': 'cancelled'}
-                zone = ask('IANA timezone [UTC; 0 cancels]: ')
-                if zone is None or zone == '0':
-                    report('Reviewer setup cancelled; existing configuration unchanged.')
-                    return {'state': 'cancelled'}
-                schedule.update(calendar=clock or '02:00', timezone=zone or 'UTC')
-            elif choice != '1':
-                raise Refusal('choose a listed schedule')
-            reviewer.validate_schedule(schedule)
-        except (ValueError, Refusal) as error:
-            report(f'Invalid schedule: {error}. Choose again, or 0 to cancel.')
-            continue
-        break
-    with reviewer.run_lease(home):
-        with store.lock(home):
-            previous = reviewer_timer._read_record(home)
-            if previous and previous.get('state') != 'disabled':
-                raise Refusal('disable the existing reviewer timer before reconfiguration')
-            config = reviewer.read_config(home)
-            config['schedule'] = schedule
-            config = reviewer.validate_config(config)
-            location = reviewer.paths(home)['config']
-            reviewer._private(location.parent)
-            store.atomic_json(location, config)
-    if schedule['mode'] == 'calendar':
-        report(f'Selected reviewer schedule: daily at {schedule["calendar"]} {schedule["timezone"]}.')
-    else:
-        report(f'Selected reviewer schedule: every {schedule["interval_hours"]} hours, anchored to UTC hours.')
-    try:
-        timer = reviewer_timer.enable(home, config)
-    except (Refusal, store.DependencyError, OSError, subprocess.SubprocessError) as error:
-        report(f'Scheduled reviewer configured, not enabled successfully: {error}')
-        report('Activation may be partial; retain this distro and inspect/disable any owned units.')
-        report('Later enable: bin/agd reviewer timer enable\n'
-               'Inspect: bin/agd reviewer timer status\nDisable: bin/agd reviewer timer disable')
-        return {'state': 'configured', 'schedule': schedule}
-    report('Scheduled reviewer enabled. OMP authentication/model readiness and completed reviews are not verified here.')
-    report('Inspect: bin/agd reviewer timer status\nDisable: bin/agd reviewer timer disable')
-    return {'state': 'enabled', 'schedule': schedule, 'timer': timer}
+                    zone = ask('IANA timezone [UTC; 0 cancels]: ')
+                    if zone is None or zone == '0':
+                        report('Reviewer setup cancelled; existing configuration unchanged.')
+                        return {'state': 'cancelled'}
+                    schedule.update(calendar=clock or '02:00', timezone=zone or 'UTC')
+                elif choice != '1':
+                    raise Refusal('choose a listed schedule')
+                reviewer.validate_schedule(schedule)
+            except (ValueError, Refusal) as error:
+                report(f'Invalid schedule: {error}. Choose again, or 0 to cancel.')
+                continue
+            break
+        with reviewer.run_lease(home):
+            with store.lock(home):
+                previous = reviewer_timer._read_record(home)
+                if previous and previous.get('state') != 'disabled':
+                    raise Refusal('disable the existing reviewer timer before reconfiguration')
+                config = reviewer.read_config(home)
+                config['schedule'] = schedule
+                config = reviewer.validate_config(config)
+                location = reviewer.paths(home)['config']
+                reviewer._private(location.parent)
+                store.atomic_json(location, config)
+        if schedule['mode'] == 'calendar':
+            report(f'Selected reviewer schedule: daily at {schedule["calendar"]} {schedule["timezone"]}.')
+        else:
+            report(f'Selected reviewer schedule: every {schedule["interval_hours"]} hours, anchored to UTC hours.')
+        try:
+            timer = reviewer_timer.enable(home, config)
+        except (Refusal, store.DependencyError, OSError, subprocess.SubprocessError) as error:
+            report(f'Scheduled reviewer configured, not enabled successfully: {error}')
+            report('Activation may be partial; retain this distro and inspect/disable any owned units.')
+            report('Later enable: bin/agd reviewer timer enable\n'
+                   'Inspect: bin/agd reviewer timer status\nDisable: bin/agd reviewer timer disable')
+            return {'state': 'configured', 'schedule': schedule}
+        report('Scheduled reviewer enabled. OMP authentication/model readiness and completed reviews are not verified here.')
+        report('Inspect: bin/agd reviewer timer status\nDisable: bin/agd reviewer timer disable')
+        return {'state': 'enabled', 'schedule': schedule, 'timer': timer}

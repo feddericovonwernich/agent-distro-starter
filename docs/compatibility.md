@@ -87,3 +87,14 @@ This proves native scheduling, runtime binding, and empty-evidence execution—n
 ## Guided installation and start acceptance
 
 On Linux x86-64 with Treehouse v3.1.6 at `/tmp/agd-treehouse-v3.1.6`, `tests/test_backends.py install-start-tmux` and `install-start-herdr` each ran tracked local `install.sh` through a fake Git/network boundary that asserted the canonical repository URL, copied the current test revision, declined compatible OMP/Herdr updates, and used real installed runtime tools. Each isolated temporary HOME/project/session then proved a ready central owner and watcher, PTY attach/detach/reattach, unchanged retained receipt, explicit conflicting-backend refusal, and owned tmux/Herdr cleanup.
+
+
+## Confirmed uninstall acceptance
+
+On Linux x86-64 with Python 3.12, Herdr 0.9.5, Treehouse 3.1.6, systemd 255 and Docker Engine 28.5.0, `python3 tests/smoke_uninstall.py --backend herdr --with-docker` completed from a disposable linked source checkout through its own CLI in a real PTY. Actual OMP 18.14.0 central/worker processes, watcher, reviewer service/lock, named backend, generated worker skills, leased task slot and Git registration were removed. The labelled container, network and four volumes disappeared; a second live home, its service/backend, foreign volume, shared cached image and backing Git refs survived. Cleanup then removed the sentinel fixture.
+
+The same check exercised partial-deletion and post-unlink crash recovery through the printed external executor. Removal repeated at least eight seconds of absence verification; a replacement home during that interval was separately refused without deleting it. CLI regressions also cover quoted/percent paths, inherited Python-cache controls, no-write preview/decline/EOF, changed-work consent and missing optional runtimes.
+
+The native check uses existing installed tools and an already-cached pinned image; it neither pulls images nor authorizes hosted inference. This is lifecycle/removal acceptance, not provider authentication, paid review or Langfuse ingestion acceptance. Native tmux teardown was not exercised on this host; the three pre-existing missing-tmux recovery cases remain excluded. A separate mount-boundary regression is skipped where unprivileged mount namespaces are unavailable.
+
+The final post-review serial gate passed 508 Python tests (one mount-namespace skip, three known tmux deselections, one existing importlib deprecation warning), the full native Herdr/Docker/recovery check, and 23 Bun tests with 119 assertions. Replacement-checkout consent and partial-recovery inode regressions passed. A real open Unix client proved that connected sockets can share the listener pathname; server ownership selects the kernel `SO_ACCEPTCON` listener before checking its unique FD owner, without opening a protocol connection.

@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- Add confirmed `agd --home . uninstall` with read-only pretty JSON, separate local-work consent, retirement admission fencing, an isolated foreground recovery bundle, exact owned process/backend/reviewer/Docker/Treehouse/Git teardown, and delayed non-recreation verification. Preserve shared tools/accounts/images/other homes and fail closed on legacy, foreign, changed or unproven ownership.
+- Reconfirm changed uninstall resource identities, not only new resource names, and revalidate the original home inode at partial-recovery deletion; replacement checkouts/homes are not silently adopted.
 - Add a fifth, default-No scheduled reviewer installer stage with daily/hourly presets, custom daily time/IANA timezone or whole-hour interval, cancellation and input correction. Preserve chosen config on missing prerequisites and keep telemetry/model settings independent.
 - Validate installed reviewer SDK/Bun/agent prerequisites without Bun auto-install, and bind the actual Python plus minimal runtime search path into clean-environment systemd services; verify native activation, retain partial-failure disable recovery, and refuse unsafe schedule reconfiguration.
 - Offer an explicit, default-No local Langfuse telemetry prompt as the fourth installer stage; reuse the existing private observability lifecycle without installing Docker or configuring OMP. Preserve a usable distro and recovery records after optional failure/interruption, retain mandatory rollback, and distinguish stack health from confirmed trace delivery.

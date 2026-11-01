@@ -262,3 +262,74 @@ if __name__ == '__main__':
     test_lease_survives_missing_environment_override()
     test_cleaned_history_does_not_block_unregister()
     test_cleanup_retry_after_return_marks_confirmed_absent_lease_cleaned()
+
+
+def test_return_is_not_destroy_and_skipped_slot_is_not_success(monkeypatch):
+    import json
+    import pytest
+    from types import SimpleNamespace
+    from support import lab, command, uninstall_scope
+    from agd_lib import tasks, worker_skills, store
+    with lab() as (home, project):
+        brief = home / 'brief.md'; brief.write_text('Inspect the fixture without a model.\n')
+        task = command(home, 'task', 'create', 'purge', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout', '--skill-mode', 'none')
+        worker_skills.remove(home, task)
+        resources = tasks.uninstall_inventory(home)
+        original = store.run
+        def skipped(argv, **kwargs):
+            if argv[0] == 'treehouse' and 'destroy' in argv:
+                return SimpleNamespace(returncode=0, stdout='not removed', stderr='')
+            return original(argv, **kwargs)
+        with uninstall_scope(home, resources, discard=any(row.get('work_loss') for row in resources)) as operation:
+            monkeypatch.setattr(store, 'run', skipped)
+            with pytest.raises(store.Refusal):
+                tasks.uninstall_remove(home, resources, operation)
+            assert Path(task['worktree']).is_dir()
+            assert resources[0]['key'] not in operation['completed']
+            rows = json.loads(original([*tasks.treehouse_args(task), 'status', '--json'], cwd=project).stdout)
+            exact = next(row for row in rows if row['path'] == task['worktree'])
+            assert not exact.get('lease_id')
+            monkeypatch.setattr(store, 'run', original)
+            tasks.uninstall_remove(home, resources, operation)
+            assert not Path(task['worktree']).exists()
+            assert str(task['worktree']) not in original(['git', 'worktree', 'list', '--porcelain'], cwd=project).stdout
+            assert resources[0]['key'] in operation['completed']
+        assert tasks.read(home, task['id'])['phase'] == 'prepared'
+
+
+def test_foreign_or_reassigned_lease_is_preserved(monkeypatch):
+    import json
+    import pytest
+    from support import lab, command, uninstall_scope
+    from agd_lib import tasks, worker_skills, store
+    with lab() as (home, project):
+        brief = home / 'brief.md'; brief.write_text('Inspect the fixture without a model.\n')
+        task = command(home, 'task', 'create', 'race', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout', '--skill-mode', 'none')
+        worker_skills.remove(home, task)
+        resources = tasks.uninstall_inventory(home)
+        original = store.run
+        acquired = []
+        def raced(argv, **kwargs):
+            result = original(argv, **kwargs)
+            if argv[0] == 'treehouse' and 'return' in argv and not acquired:
+                empty = home / 'empty-include'; empty.write_text('')
+                allocation = json.loads(original(
+                    [*tasks.treehouse_args(task), 'get', '--lease', '--json', '--no-fetch',
+                     '--lease-holder', 'foreign-owner', '--base', 'main', '--include-file', str(empty)],
+                    cwd=project).stdout)
+                acquired.append(allocation)
+                assert allocation['path'] == task['worktree']
+                (Path(allocation['path']) / 'foreign.txt').write_text('replacement owner\n')
+            return result
+        with uninstall_scope(home, resources, discard=any(row.get('work_loss') for row in resources)) as operation:
+            monkeypatch.setattr(store, 'run', raced)
+            with pytest.raises(store.Refusal):
+                tasks.uninstall_remove(home, resources, operation)
+            assert resources[0]['key'] not in operation['completed']
+            assert (Path(task['worktree']) / 'foreign.txt').read_text() == 'replacement owner\n'
+            rows = json.loads(original([*tasks.treehouse_args(task), 'status', '--json'], cwd=project).stdout)
+            exact = next(row for row in rows if row['path'] == task['worktree'])
+            assert exact['lease_id'] == acquired[0]['lease_id']
+            assert exact['lease_holder'] == 'foreign-owner'

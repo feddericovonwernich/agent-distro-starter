@@ -266,72 +266,278 @@ def _read_record(home):
 
 
 def enable(home, config, *, xdg_config_home=None, command_runner=store.run, source_cli=None, now=None):
-    root = store.home(home); schedule = validate_schedule(config.get('schedule'))
-    now = time.time() if now is None else float(now)
-    if schedule['mode'] == 'manual-only':
-        raise store.Refusal('manual-only schedule cannot enable a timer')
-    agreed_next = native_calendar_agrees(schedule, now) if schedule['mode'] == 'calendar' else None
-    runtime = runtime_environment(root)
-    rendered = render_units(root, config, runtime=runtime, source_cli=source_cli)
-    marker = f'X-AGD-Reviewer-Owner={_home_id(root)}:{os.getuid()}'
-    directory = _unit_directory(xdg_config_home)
-    if any((path.exists() or path.is_symlink()) and not _owned(path, marker)
-           for path in (directory / rendered['timer_name'], directory / rendered['service_name'])):
-        raise store.Refusal('existing unit is not owned by this home')
-    command_runner(['systemctl', '--user', 'show', '--property=Version', '--value'])
-    with store.lock(root):
-        previous = _read_record(root)
-        unchanged = previous and previous.get('schedule') == schedule and previous.get('state') == 'enabled'
-        anchor = previous.get('anchor') if unchanged and schedule['mode'] == 'interval' else float(int(now // 3600) * 3600)
-        checkpoint = previous.get('checkpoint') if unchanged else ({'next_due': agreed_next} if agreed_next is not None else {'anchor': anchor, 'last_due': anchor})
-        record = {'schema': 1, 'home_id': _home_id(root), 'uid': os.getuid(), 'schedule': schedule,
-                  'anchor': anchor if schedule['mode'] == 'interval' else None, 'checkpoint': checkpoint, 'state': 'enabling'}
-        reviewer._private(_timer_record(root).parent); store.atomic_json(_timer_record(root), record)
-    try:
-        changed = _write_unit(directory / rendered['timer_name'], rendered['timer'], marker)
-        changed = _write_unit(directory / rendered['service_name'], rendered['service'], marker) or changed
-        if not unchanged or changed:
-            command_runner(['systemctl', '--user', 'daemon-reload'])
-            command_runner(['systemctl', '--user', 'enable', rendered['timer_name']])
-        command_runner(['systemctl', '--user', 'start', rendered['timer_name']])
-        command_runner(['systemctl', '--user', 'is-active', '--quiet', rendered['timer_name']])
-    except Exception as error:
+    root = store.home(home)
+    from .uninstall_state import admission
+    with admission(home):
+        schedule = validate_schedule(config.get('schedule'))
+        now = time.time() if now is None else float(now)
+        if schedule['mode'] == 'manual-only':
+            raise store.Refusal('manual-only schedule cannot enable a timer')
+        agreed_next = native_calendar_agrees(schedule, now) if schedule['mode'] == 'calendar' else None
+        runtime = runtime_environment(root)
+        rendered = render_units(root, config, runtime=runtime, source_cli=source_cli)
+        marker = f'X-AGD-Reviewer-Owner={_home_id(root)}:{os.getuid()}'
+        directory = _unit_directory(xdg_config_home)
+        if any((path.exists() or path.is_symlink()) and not _owned(path, marker)
+               for path in (directory / rendered['timer_name'], directory / rendered['service_name'])):
+            raise store.Refusal('existing unit is not owned by this home')
+        command_runner(['systemctl', '--user', 'show', '--property=Version', '--value'])
         with store.lock(root):
-            store.atomic_json(_timer_record(root), {**record, 'state': 'failed', 'error': str(error)})
-        raise
-    with store.lock(root):
-        final = {**record, 'state': 'enabled'}
-        store.atomic_json(_timer_record(root), final)
-    return final
+            previous = _read_record(root)
+            unchanged = previous and previous.get('schedule') == schedule and previous.get('state') == 'enabled'
+            anchor = previous.get('anchor') if unchanged and schedule['mode'] == 'interval' else float(int(now // 3600) * 3600)
+            checkpoint = previous.get('checkpoint') if unchanged else ({'next_due': agreed_next} if agreed_next is not None else {'anchor': anchor, 'last_due': anchor})
+            record = {'schema': 1, 'home_id': _home_id(root), 'uid': os.getuid(), 'schedule': schedule,
+                      'anchor': anchor if schedule['mode'] == 'interval' else None, 'checkpoint': checkpoint, 'state': 'enabling',
+                      'unit_directory': str(directory)}
+            reviewer._private(_timer_record(root).parent); store.atomic_json(_timer_record(root), record)
+        try:
+            changed = _write_unit(directory / rendered['timer_name'], rendered['timer'], marker)
+            changed = _write_unit(directory / rendered['service_name'], rendered['service'], marker) or changed
+            if not unchanged or changed:
+                command_runner(['systemctl', '--user', 'daemon-reload'])
+                command_runner(['systemctl', '--user', 'enable', rendered['timer_name']])
+            command_runner(['systemctl', '--user', 'start', rendered['timer_name']])
+            command_runner(['systemctl', '--user', 'is-active', '--quiet', rendered['timer_name']])
+        except Exception as error:
+            with store.lock(root):
+                store.atomic_json(_timer_record(root), {**record, 'state': 'failed', 'error': str(error)})
+            raise
+        with store.lock(root):
+            final = {**record, 'state': 'enabled'}
+            store.atomic_json(_timer_record(root), final)
+        return final
 
 
 def disable(home, *, xdg_config_home=None, command_runner=store.run):
-    root = store.home(home); name = unit_name(root); service = name[:-6] + '.service'; marker = f'X-AGD-Reviewer-Owner={_home_id(root)}:{os.getuid()}'
-    directory = _unit_directory(xdg_config_home); paths = [directory / item for item in (name, service)]
-    present = [path for path in paths if path.exists() or path.is_symlink()]
-    if any(not _owned(path, marker) for path in present): raise store.Refusal('existing unit is not owned by this home')
-    with store.lock(root):
-        record = _read_record(root) or {'schema': 1, 'home_id': _home_id(root), 'uid': os.getuid()}
-        if record.get('state') == 'disabled' and not present: return
-        store.atomic_json(_timer_record(root), {**record, 'state': 'disabling'})
-    try:
-        if present: command_runner(['systemctl', '--user', 'disable', '--now', name])
-        for path in present: path.unlink()
-        command_runner(['systemctl', '--user', 'daemon-reload'])
-    except Exception as error:
-        with store.lock(root): store.atomic_json(_timer_record(root), {**record, 'state': 'disabling', 'error': str(error)})
-        raise
-    with store.lock(root): store.atomic_json(_timer_record(root), {**record, 'state': 'disabled'})
+    root = store.home(home)
+    from .uninstall_state import admission
+    with admission(home):
+        name = unit_name(root); service = name[:-6] + '.service'; marker = f'X-AGD-Reviewer-Owner={_home_id(root)}:{os.getuid()}'
+        directory = _unit_directory(xdg_config_home); paths = [directory / item for item in (name, service)]
+        present = [path for path in paths if path.exists() or path.is_symlink()]
+        if any(not _owned(path, marker) for path in present): raise store.Refusal('existing unit is not owned by this home')
+        with store.lock(root):
+            record = _read_record(root) or {'schema': 1, 'home_id': _home_id(root), 'uid': os.getuid()}
+            if record.get('state') == 'disabled' and not present: return
+            store.atomic_json(_timer_record(root), {**record, 'state': 'disabling'})
+        try:
+            if present: command_runner(['systemctl', '--user', 'disable', '--now', name])
+            for path in present: path.unlink()
+            command_runner(['systemctl', '--user', 'daemon-reload'])
+        except Exception as error:
+            with store.lock(root): store.atomic_json(_timer_record(root), {**record, 'state': 'disabling', 'error': str(error)})
+            raise
+        with store.lock(root): store.atomic_json(_timer_record(root), {**record, 'state': 'disabled'})
 
 
 def timer_tick(home, *, now=None):
     """Durably write the immutable intent before consuming its due occurrence."""
-    root = store.home(home); now = time.time() if now is None else float(now)
-    with store.lock(root):
-        record = _read_record(root)
-        if not record or record.get('state') != 'enabled': raise store.Refusal('reviewer timer is not enabled')
-        due = calculate_due(record['schedule'], record['checkpoint'], now)
-        if due['due_at'] is None: return None
-        intent = reviewer._enqueue_intent_locked(root, kind='timer')
-        store.atomic_json(_timer_record(root), {**record, 'checkpoint': due['checkpoint']})
-        return intent
+    from .uninstall_state import admission
+    with admission(home):
+        root = store.home(home); now = time.time() if now is None else float(now)
+        with store.lock(root):
+            record = _read_record(root)
+            if not record or record.get('state') != 'enabled': raise store.Refusal('reviewer timer is not enabled')
+            due = calculate_due(record['schedule'], record['checkpoint'], now)
+            if due['due_at'] is None: return None
+            intent = reviewer._enqueue_intent_locked(root, kind='timer')
+            store.atomic_json(_timer_record(root), {**record, 'checkpoint': due['checkpoint']})
+            return intent
+
+
+def _uninstall_unit_status(name):
+    result = store.run(['systemctl', '--user', 'show', name,
+                        '--property=Id,LoadState,ActiveState,SubState,FragmentPath,DropInPaths,MainPID,ControlGroup'],
+                       check=False)
+    value = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+    if value.get('LoadState') == 'not-found' and value.get('ActiveState') in {'inactive', 'failed'}:
+        return value
+    if result.returncode or value.get('Id') != name or value.get('LoadState') != 'loaded':
+        raise store.Refusal('reviewer unit inspection is unavailable')
+    if value.get('DropInPaths'):
+        raise store.Refusal('reviewer unit has unapproved drop-ins')
+    return value
+
+
+def _uninstall_unit_processes(status):
+    from . import supervision
+    pids = set()
+    main = status.get('MainPID', '0')
+    if not main.isdigit():
+        raise store.Refusal('reviewer service PID is malformed')
+    if int(main):
+        pids.add(int(main))
+    group = status.get('ControlGroup')
+    if group:
+        if not group.startswith('/') or '..' in Path(group).parts:
+            raise store.Refusal('reviewer cgroup path is unsafe')
+        path = Path('/sys/fs/cgroup') / group.lstrip('/')
+        if os.path.lexists(path):
+            if path.is_symlink() or not path.is_dir():
+                raise store.Refusal('reviewer cgroup is unsafe')
+            pids.update(int(line) for line in (path / 'cgroup.procs').read_text().splitlines())
+    processes = []
+    for pid in sorted(pids):
+        try:
+            identity = supervision.process_identity(pid)
+        except FileNotFoundError:
+            continue
+        identity.pop('state', None)
+        if identity['uid'] != os.getuid():
+            raise store.Refusal('reviewer service UID differs')
+        processes.append(identity)
+    return processes
+
+
+def uninstall_inventory(home, *, expected=None):
+    import hashlib
+    from . import reviewer_runner, supervision, uninstall_state
+    home = store.home(home)
+    saved = next((row for row in expected or [] if row['kind'] == 'systemd-reviewer'), None)
+    record_path = _timer_record(home)
+    record = uninstall_state.read_evidence(record_path, private=True) if os.path.lexists(record_path) else None
+    target = saved['identity']['target'] if saved else supervision.runtime_home_identity(home)
+    timer = 'agd-reviewer-' + target['home_id'].replace('-', '') + '.timer'
+    names = [timer, timer[:-6] + '.service']
+    directories = {Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'systemd/user'}
+    if record:
+        if record.get('home_id') != target['home_id'] or record.get('uid') != os.getuid():
+            raise store.Refusal('reviewer timer receipt belongs to another home')
+        if record.get('unit_directory'):
+            directories.add(Path(record['unit_directory']))
+    if saved:
+        directories.update(Path(item['path']).parent for item in saved['identity']['files']
+                           if item['kind'] == 'fragment')
+    if not record and not saved and not any(os.path.lexists(directory / name)
+                                           for directory in directories for name in names):
+        return []
+    identity = {'target': target, 'units': names, 'files': [], 'links': [], 'native': {},
+                'processes': [], 'run_lock': None}
+    row = {'key': 'reviewer-units:' + target['home_id'], 'kind': 'systemd-reviewer', 'identity': identity,
+           'presence': 'unknown', 'ownership': 'unknown', 'blockers': []}
+    marker = f"X-AGD-Reviewer-Owner={target['home_id']}:{os.getuid()}"
+    try:
+        for directory in sorted(directories):
+            if not directory.is_absolute() or directory.name != 'user' or directory.parent.name != 'systemd':
+                raise store.Refusal('reviewer unit directory is unsafe')
+            if any(parent.is_symlink() for parent in directory.parents):
+                raise store.Refusal('reviewer unit directory ancestry is unsafe')
+            for parent in (directory.parent.parent, directory.parent, directory):
+                if os.path.lexists(parent):
+                    mode = parent.lstat()
+                    if (not stat.S_ISDIR(mode.st_mode) or mode.st_uid != os.getuid()
+                            or mode.st_mode & 0o022):
+                        raise store.Refusal('reviewer unit directory is unsafe')
+            for name in names:
+                path = directory / name
+                if os.path.lexists(path):
+                    mode = path.lstat()
+                    if (not stat.S_ISREG(mode.st_mode) or mode.st_uid != os.getuid()
+                            or mode.st_nlink != 1 or mode.st_mode & 0o022):
+                        raise store.Refusal('reviewer fragment is unsafe')
+                    content = path.read_text()
+                    if marker not in content.splitlines():
+                        raise store.Refusal('reviewer fragment owner differs')
+                    if name.endswith('.service'):
+                        commands = [line for line in content.splitlines() if line.startswith('ExecStart=')]
+                        if (len(commands) != 1 or not commands[0].startswith('ExecStart=/usr/bin/env -i ')
+                                or not commands[0].endswith(' --home=' + _escape(str(home)) + ' reviewer run --timer')):
+                            raise store.Refusal('reviewer service home or command differs')
+                    if (directory / (name + '.d')).exists():
+                        raise store.Refusal('reviewer unit has unapproved drop-ins')
+                    identity['files'].append({'kind': 'fragment', 'path': str(path), 'device': mode.st_dev,
+                                              'inode': mode.st_ino, 'sha256': hashlib.sha256(content.encode()).hexdigest()})
+                for path in directory.glob('*.wants/' + name):
+                    parent = path.parent.lstat()
+                    if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid()
+                            or parent.st_mode & 0o022):
+                        raise store.Refusal('reviewer activation directory is unsafe')
+                    mode = path.lstat()
+                    if (not stat.S_ISLNK(mode.st_mode) or mode.st_uid != os.getuid()
+                            or (path.parent / os.readlink(path)).resolve() != (directory / name).resolve()):
+                        raise store.Refusal('reviewer activation link differs')
+                    identity['links'].append({'path': str(path), 'device': mode.st_dev, 'inode': mode.st_ino,
+                                              'target': os.readlink(path)})
+        for name in names:
+            status = _uninstall_unit_status(name)
+            fragment = status.get('FragmentPath')
+            if fragment and fragment not in {item['path'] for item in identity['files']}:
+                if not saved or fragment not in {item['path'] for item in saved['identity']['files']}:
+                    raise store.Refusal('loaded reviewer fragment is foreign')
+            identity['native'][name] = {'id': name, 'fragment': fragment, 'cgroup': status.get('ControlGroup', '')}
+            if name.endswith('.service'):
+                identity['processes'] = _uninstall_unit_processes(status)
+        lease = reviewer_runner._uninstall_lease(home)
+        if lease and any(item['pid'] in lease['holders'] for item in identity['processes']):
+            identity['run_lock'] = lease['identity']
+        present = bool(identity['files'] or identity['links'] or identity['processes']
+                       or any(_uninstall_unit_status(name).get('LoadState') == 'loaded' for name in names))
+        if saved:
+            for kind in ('files', 'links', 'processes'):
+                if any(item not in saved['identity'][kind] for item in identity[kind]):
+                    raise store.Refusal('reviewer unit evidence changed after approval')
+            for name, native in identity['native'].items():
+                previous = saved['identity']['native'].get(name)
+                if (native['fragment'] and previous['fragment'] != native['fragment']
+                        or native['cgroup'] and previous['cgroup'] != native['cgroup']):
+                    raise store.Refusal('reviewer native unit changed after approval')
+            row['identity'] = saved['identity']
+        row.update(presence='present' if present else 'absent', ownership='owned')
+    except (store.Refusal, OSError, ValueError, KeyError, TypeError) as error:
+        row['blockers'] = [{'code': 'reviewer-units-uncertain',
+                            'reason': str(error) if isinstance(error, store.Refusal) else 'reviewer unit evidence is unavailable'}]
+    return [row]
+
+
+def _uninstall_unit_scope(home, resource, operation):
+    from . import uninstall_state
+    approved = uninstall_state.require_scope(home, operation, resource['key'])
+    fresh = uninstall_inventory(home, expected=[approved])[0]
+    if fresh['blockers'] or fresh['ownership'] != 'owned':
+        raise store.Refusal('reviewer unit scope changed or inspection failed')
+    return approved
+
+
+def uninstall_quiesce(home, resources, operation):
+    from . import uninstall_state
+    for resource in resources:
+        if resource['kind'] != 'systemd-reviewer':
+            continue
+        approved = _uninstall_unit_scope(home, resource, operation)
+        timer, service = approved['identity']['units']
+        loaded = [name for name in (timer, service) if _uninstall_unit_status(name).get('LoadState') == 'loaded']
+        if loaded:
+            store.run(['systemctl', '--user', 'stop', *loaded])
+        if timer in loaded:
+            uninstall_state.checkpoint(home, operation, phase='quiescing', irreversible=True)
+            store.run(['systemctl', '--user', 'disable', '--no-reload', timer])
+            store.run(['systemctl', '--user', 'clean', '--what=state', timer])
+        for name in (timer, service):
+            status = _uninstall_unit_status(name)
+            if status.get('ActiveState') not in {'inactive', 'failed'} or _uninstall_unit_processes(status):
+                raise store.Refusal('reviewer unit stop is unconfirmed')
+        uninstall_state.checkpoint(home, operation, phase='quiescing')
+
+
+def uninstall_remove(home, resources, operation):
+    from . import uninstall_state
+    for resource in resources:
+        if resource['kind'] != 'systemd-reviewer':
+            continue
+        approved = _uninstall_unit_scope(home, resource, operation)
+        for name in approved['identity']['units']:
+            status = _uninstall_unit_status(name)
+            if status.get('ActiveState') not in {'inactive', 'failed'} or _uninstall_unit_processes(status):
+                raise store.Refusal('reviewer service is still active')
+        for item in [*approved['identity']['links'], *approved['identity']['files']]:
+            path = Path(item['path'])
+            if not os.path.lexists(path):
+                continue
+            _uninstall_unit_scope(home, resource, operation)
+            uninstall_state.checkpoint(home, operation, phase='removing', irreversible=True)
+            path.unlink()
+        store.run(['systemctl', '--user', 'daemon-reload'])
+        if uninstall_inventory(home, expected=[approved])[0]['presence'] != 'absent':
+            raise store.Refusal('reviewer unit absence is unconfirmed')
+        uninstall_state.checkpoint(home, operation, phase='removing', completed=approved['key'])

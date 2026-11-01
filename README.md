@@ -40,6 +40,20 @@ bin/agd start
 
 Use `AGD_HOME` with an absolute private-home path, or `bin/agd --home /absolute/home ...`, to operate another initialized instance. See [operations](docs/operations.md) for the Herdr split and lifecycle constraints, and [compatibility](docs/compatibility.md) for observed compatibility evidence.
 
+## Uninstall a distro
+
+From an independent ordinary terminal, inspect first, then remove the exact initialized home:
+
+```sh
+./bin/agd --home . uninstall --dry-run
+./bin/agd --home . uninstall && cd ..
+```
+
+The command always prints pretty JSON. Destruction requires typing the canonical home path; dirty, unpublished or unverified local work requires a separate displayed `DISCARD` token. Unknown ownership is a blocker, not a force prompt. Shared tools, global account configuration, Docker images, remote repositories and other distros remain untouched.
+
+Uninstall stages its own code and prints an outside `Recovery:` command before stopping owned runtimes. Retain that command/journal after interruption; a fresh process asks for consent again. Verified removal waits at least eight seconds for non-recreation. Python cannot change the parent shell's directory, hence `&& cd ..`. See [uninstall operations](docs/operations.md#uninstall-and-recovery) for owned resources, recovery and legacy blockers.
+
+
 ## Worker skills
 
 `bin/agd init --backend tmux|herdr` seeds an empty home with a `default` profile naming nine canonical upstream skills. It does not copy skill payloads. After setup installs the official Ponytail and Superpowers project plugins, `worker skills list` resolves those exact upstream names, metadata, resources, versions, and paths from OMP's validated native registry. Existing private-home state is untouched; init never upgrades or overwrites it. Operators may add private custom skills under `config/worker-skills/NAME/` and select them in `config/workers.json`; a custom/plugin name collision refuses rather than overriding either source.

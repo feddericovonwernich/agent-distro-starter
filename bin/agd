@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
+import sys
+if 'uninstall' in sys.argv[1:]:
+    sys.dont_write_bytecode = True
 import argparse
 import shutil
 import subprocess
 import os
 import json
 import pwd
-import sys
 import uuid
 from pathlib import Path
 from urllib.request import urlopen
@@ -16,6 +18,8 @@ def parser():
     p = argparse.ArgumentParser(prog='agd')
     p.add_argument('--home')
     sub = p.add_subparsers(dest='command', required=True)
+    uninstall = sub.add_parser('uninstall', help='confirm and remove this distro and its owned resources')
+    uninstall.add_argument('--dry-run', action='store_true', help='read-only pretty JSON inventory')
     init = sub.add_parser('init')
     init.add_argument('--backend', choices=('tmux', 'herdr'), required=True)
     start = sub.add_parser('start')
@@ -179,6 +183,27 @@ def parse_args(argv=None):
 
 
 def main(args):
+    if args.command == 'uninstall':
+        from agd_lib import uninstall
+        color = (sys.stdin.isatty() and sys.stderr.isatty() and os.environ.get('TERM', 'dumb') != 'dumb'
+                 and 'NO_COLOR' not in os.environ)
+        def report(message):
+            heading = message == 'Agent Distro Uninstall' or message[:1] in {'1', '2', '3'}
+            print(('\033[1;36m' + message + '\033[0m') if color and heading else message,
+                  file=sys.stderr, flush=True)
+        def ask(message):
+            if not sys.stdin.isatty():
+                raise store.Refusal('uninstall requires an interactive terminal; use --dry-run for inspection')
+            print(message, end='', file=sys.stderr, flush=True)
+            answer = sys.stdin.readline()
+            return answer.rstrip('\n') if answer else None
+        try:
+            home = uninstall.resolve_home(args.home or os.environ.get('AGD_HOME') or Path(__file__).resolve().parents[1])
+            result, code = uninstall.command(home, dry_run=args.dry_run, ask=ask, report=report)
+        except store.Refusal as error:
+            result, code = {'outcome': 'blocked', 'reason': str(error)}, 3
+        print(json.dumps(result, indent=2))
+        raise SystemExit(code)
     home = store.home(args.home)
     mutation = (args.command == 'init' or
                 args.command == 'installer' and args.installer_operation != 'reviewer' or
@@ -194,12 +219,30 @@ def main(args):
                                                                            'relay-poll', 'relay-reply') or
                          args.command == 'task' and args.operation == 'ready')
         store.require_owner(home, worker_scoped)
+    from agd_lib.uninstall_state import admission
+    fresh = None
+    if args.command == 'init':
+        if home == Path(__file__).resolve().parents[1]:
+            fresh = not any((home / name).exists() or (home / name).is_symlink()
+                            for name in ('config', 'projects', 'data', 'state'))
+        else:
+            fresh = not home.exists() or not any(home.iterdir())
+        if not fresh:
+            raise store.Refusal('fresh non-symlink launcher home required')
+    reviewer_write = args.command == 'reviewer' and (
+        args.reviewer_op == 'run' or args.reviewer_op == 'timer' and args.timer_op != 'status'
+        or args.reviewer_op == 'proposals' and args.proposal_op == 'dispose')
+    managed_loop = (args.command == 'worker' and args.operation == 'run'
+                    or args.command == 'reviewer' and args.reviewer_op == 'run')
+    if (mutation or reviewer_write) and not managed_loop:
+        with admission(home, initializing=args.command == 'init'):
+            return _dispatch(args, home, fresh)
+    return _dispatch(args, home, fresh)
+
+
+def _dispatch(args, home, fresh):
     if args.command == 'omp':
-        omp_runtime.validate_native_args(args.omp_args)
-        executable = omp_runtime.executable(home)
-        os.chdir(home)
-        os.execvpe(executable, [executable, *args.omp_args],
-                   omp_runtime.environment(home, os.environ))
+        omp_runtime.exec_native(home, args.omp_args)
     if args.command == 'observability' and args.operation == 'central':
         argv, env, warning = observability.central_argv(home, args.omp_args)
         if warning:
@@ -207,14 +250,10 @@ def main(args):
         os.chdir(home)
         os.execvpe(argv[0], argv, env)
     if args.command == 'init':
-        if home == Path(__file__).resolve().parents[1]:
-            fresh = not any((home/name).exists() or (home/name).is_symlink()
-                            for name in ('config', 'projects', 'data', 'state'))
-        else:
-            fresh = not home.exists() or not any(home.iterdir())
+        # Freshness was captured before admission created its own lock.
         checkout_home = home == Path(__file__).resolve().parents[1]
         with store.lock(home):
-            lock_only = all(path.name == 'mutation.lock' for path in (home/'state').iterdir())
+            lock_only = all(path.name in {'mutation.lock', 'activity.lock'} for path in (home/'state').iterdir())
             if checkout_home:
                 still_fresh = fresh and lock_only and not any(
                     (home/name).exists() or (home/name).is_symlink()

@@ -26,6 +26,195 @@ def gone(pid, start):
 
 
 
+def _process_stat(pid):
+    if type(pid) is not int or pid <= 0:
+        raise store.Refusal('positive process identity required')
+    directory = Path(f'/proc/{pid}')
+    fields = (directory / 'stat').read_text(errors='replace').rsplit(') ', 1)[1].split()
+    identity = {'pid': pid, 'start': fields[19], 'uid': directory.stat().st_uid,
+                'ppid': int(fields[1]), 'pgid': int(fields[2]), 'sid': int(fields[3]),
+                'state': fields[0]}
+    return identity
+
+
+def process_identity(pid):
+    """Read non-secret process evidence; argv is retained only as a digest."""
+    import hashlib
+    identity = _process_stat(pid)
+    identity['argv_sha256'] = hashlib.sha256(Path(f'/proc/{pid}/cmdline').read_bytes()).hexdigest()
+    return identity
+
+
+def runtime_home_identity(home):
+    """Bind a runtime to its directory; pre-init utilities have no home UUID."""
+    import stat
+    root = store.home(home)
+    mode = root.lstat()
+    if not stat.S_ISDIR(mode.st_mode) or mode.st_uid != os.getuid():
+        raise store.Refusal('runtime home identity is unsafe')
+    home_id = None
+    marker_path = root / 'data/home.json'
+    if os.path.lexists(marker_path):
+        from .uninstall_state import read_evidence
+        marker = read_evidence(marker_path)
+        if (not isinstance(marker, dict) or marker.get('schema') != 1
+                or not isinstance(marker.get('home_id'), str)
+                or str(uuid.UUID(marker['home_id'])) != marker['home_id']):
+            raise store.Refusal('runtime home marker is malformed')
+        home_id = marker['home_id']
+    return {'canonical_home': str(root), 'home_id': home_id, 'uid': mode.st_uid,
+            'device': mode.st_dev, 'inode': mode.st_ino}
+
+
+def process_presence(identity):
+    """A reused PID or exited/zombie identity is absent, never a signal target."""
+    try:
+        current = _process_stat(identity['pid'])
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    if current['start'] != identity['start'] or current['state'] in {'Z', 'X'}:
+        return False
+    if current['uid'] != identity['uid'] or current['uid'] != os.getuid():
+        raise store.Refusal('process user identity differs')
+    return True
+
+
+
+
+
+
+def _open_process(identity):
+    import signal
+    if (not isinstance(identity, dict) or type(identity.get('pid')) is not int
+            or identity['pid'] <= 0 or identity.get('uid') != os.getuid()
+            or not isinstance(identity.get('start'), str) or not identity['start'].isdigit()
+            or not callable(getattr(os, 'pidfd_open', None))
+            or not callable(getattr(signal, 'pidfd_send_signal', None))):
+        raise store.Refusal('bound process identity or kernel signaling is unavailable')
+    if not process_presence(identity):
+        return None
+    try:
+        descriptor = os.pidfd_open(identity['pid'])
+    except ProcessLookupError:
+        return None
+    except OSError as error:
+        raise store.Refusal('kernel-bound process handle is unavailable') from error
+    try:
+        if process_presence(identity):
+            return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+    os.close(descriptor)
+    return None
+
+
+def signal_owned_process(identity, requested):
+    """Send one signal without a PID-reuse window or escalation policy."""
+    import signal
+    descriptor = _open_process(identity)
+    if descriptor is None:
+        return False
+    try:
+        signal.pidfd_send_signal(descriptor, requested)
+        return True
+    except ProcessLookupError:
+        return False
+    finally:
+        os.close(descriptor)
+
+
+def stop_owned_processes(identities, *, timeout=15.0):
+    """Stop already-authorized identities and witnessed descendants via pidfds."""
+    import math
+    import select
+    import signal
+    if (not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0
+            or not callable(getattr(os, 'pidfd_open', None))
+            or not callable(getattr(signal, 'pidfd_send_signal', None))):
+        raise store.Refusal('bounded kernel-bound process signaling is unavailable')
+    fields = ('pid', 'uid', 'ppid', 'pgid', 'sid')
+    for identity in identities:
+        if (not isinstance(identity, dict) or any(type(identity.get(key)) is not int for key in fields)
+                or identity['pid'] <= 0 or identity['uid'] != os.getuid()
+                or not isinstance(identity.get('start'), str) or not identity['start'].isdigit()):
+            raise store.Refusal('complete PID/start/current-user evidence required')
+    ancestors, pid = set(), os.getpid()
+    while pid > 0 and pid not in ancestors:
+        ancestors.add(pid)
+        try:
+            pid = _process_stat(pid)['ppid']
+        except (FileNotFoundError, ProcessLookupError):
+            break
+    handles = {}
+    def exited(descriptor):
+        poller = select.poll()
+        poller.register(descriptor, select.POLLIN)
+        return bool(poller.poll(0))
+    def pin(identity):
+        key = identity['pid'], identity['start']
+        if key in handles or not process_presence(identity):
+            return
+        if identity['pid'] in ancestors:
+            raise store.Refusal('uninstall cannot stop its coordinator or ancestors')
+        descriptor = _open_process(identity)
+        if descriptor is not None:
+            handles[key] = (descriptor, identity)
+    def discover():
+        parents = {identity['pid']: identity for descriptor, identity in handles.values()
+                   if not exited(descriptor)}
+        pending = []
+        for path in Path('/proc').iterdir():
+            if not path.name.isdigit():
+                continue
+            try:
+                candidate = _process_stat(int(path.name))
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+            pending.append(candidate)
+        changed = True
+        while changed:
+            changed = False
+            for candidate in pending:
+                key = candidate['pid'], candidate['start']
+                parent = parents.get(candidate['ppid'])
+                if (key in handles or parent is None or candidate['sid'] != parent['sid']
+                        or not process_presence(parent)):
+                    continue
+                pin(candidate)
+                if key in handles:
+                    parents[candidate['pid']] = candidate
+                    changed = True
+    started = time.monotonic()
+    deadline, graceful = started + timeout, started + min(3, timeout / 2)
+    sent = {}
+    try:
+        for identity in identities:
+            pin(identity)
+        while handles:
+            discover()
+            live = [(key, pair) for key, pair in handles.items() if not exited(pair[0])]
+            if not live:
+                return
+            now = time.monotonic()
+            if now >= deadline:
+                raise store.Refusal('owned process termination timed out; identities retained')
+            requested = signal.SIGTERM if now < graceful else signal.SIGKILL
+            for key, (descriptor, identity) in reversed(live):
+                if sent.get(key) == requested:
+                    continue
+                if process_presence(identity):
+                    try:
+                        signal.pidfd_send_signal(descriptor, requested)
+                    except ProcessLookupError:
+                        pass
+                sent[key] = requested
+            time.sleep(min(.025, max(0, deadline - time.monotonic())))
+    finally:
+        for descriptor, _ in handles.values():
+            os.close(descriptor)
+
+
 def episode(home, task, kind, failing):
     path = home/'state'/'tasks'/task['id']/f'{kind}.json'
     previous = json.loads(path.read_text()) if path.exists() else {}
@@ -205,33 +394,42 @@ def process_start(pid):
 
 
 def watch(home, owner_pid, owner_start, generation):
-    lock_path = home/'state'/'session.lock'
-    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    from contextlib import ExitStack
+    from .uninstall_state import admission
     owned = False
     try:
-        with lock_path.open('a+') as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise store.Refusal('another central watcher owns this home') from error
-            if process_start(owner_pid) != owner_start:
-                raise store.Refusal('central owner identity is no longer alive')
-            token = os.environ.get('AGD_OWNER')
-            if not token:
-                raise store.Refusal('central owner token required')
-            previous_path = home/'state'/'owner.json'
-            if previous_path.exists():
-                previous = json.loads(previous_path.read_text())
+        with ExitStack() as lifetime:
+            with admission(home):
+                lock_path = home/'state'/'session.lock'
+                lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                lock = lifetime.enter_context(lock_path.open('a+'))
                 try:
-                    still_alive = process_start(previous['owner_pid']) == previous['owner_start']
-                except (FileNotFoundError, ProcessLookupError):
-                    still_alive = False
-                if still_alive and (previous['owner_pid'] != owner_pid or previous.get('token') != token):
-                    raise store.Refusal('prior central remains alive; foreign watcher cannot take over')
-            owned = True
-            owner = dict(owner_pid=owner_pid, owner_start=owner_start, generation=generation,
-                         token=token, watcher_pid=os.getpid(), watcher_start=process_start(os.getpid()), heartbeat=time.time())
-            store.atomic_json(home/'state'/'owner.json', owner)
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as error:
+                    raise store.Refusal('another central watcher owns this home') from error
+                if process_start(owner_pid) != owner_start:
+                    raise store.Refusal('central owner identity is no longer alive')
+                token = os.environ.get('AGD_OWNER')
+                if not token:
+                    raise store.Refusal('central owner token required')
+                previous_path = home/'state'/'owner.json'
+                if previous_path.exists():
+                    previous = json.loads(previous_path.read_text())
+                    try:
+                        still_alive = process_start(previous['owner_pid']) == previous['owner_start']
+                    except (FileNotFoundError, ProcessLookupError):
+                        still_alive = False
+                    if still_alive and (previous['owner_pid'] != owner_pid or previous.get('token') != token):
+                        raise store.Refusal('prior central remains alive; foreign watcher cannot take over')
+                owned = True
+                owner = dict(owner_pid=owner_pid, owner_start=owner_start, generation=generation, uid=os.getuid(),
+                             token=token, watcher_pid=os.getpid(), watcher_start=process_start(os.getpid()), heartbeat=time.time())
+                owner['target'] = runtime_home_identity(home)
+                owner['owner_identity'] = process_identity(owner_pid)
+                owner['owner_identity'].pop('state')
+                owner['watcher_identity'] = process_identity(os.getpid())
+                owner['watcher_identity'].pop('state')
+                store.atomic_json(home/'state'/'owner.json', owner)
             print(json.dumps({'type': 'ready', 'generation': generation}), flush=True)
             seen, next_review = set(), 0.0
             from . import relay_reviews

@@ -162,3 +162,91 @@ def test_capability_uses_omp_package_from_arbitrary_cwd_without_local_modules(mo
     assert set(capability) == {'ai_url', 'core_url', 'sdk_url', 'registry_url', 'manager_url', 'session_url', 'telemetry_url', 'resolver_url', 'omp_version'}
     assert all(capability[key].startswith('file:') for key in capability if key.endswith('_url'))
     assert capability['omp_version']
+
+
+def test_legacy_busy_reviewer_without_safe_identity_blocks(tmp_path):
+    import subprocess
+    from support import command
+    home = tmp_path / 'home'
+    command(home, 'init', '--backend', 'tmux')
+    program = (
+        'import sys\nfrom pathlib import Path\n'
+        f'sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "bin")!r})\n'
+        'from agd_lib import reviewer\n'
+        'with reviewer.run_lease(Path(sys.argv[1])):\n'
+        ' print("held", flush=True)\n'
+        ' sys.stdin.read()\n')
+    holder = subprocess.Popen([sys.executable, '-c', program, str(home)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline() == 'held\n'
+        before = set(home.rglob('*'))
+        resources = reviewer_runner.uninstall_inventory(home)
+        assert any(row['presence'] == 'unknown' and row['ownership'] == 'unknown'
+                   and row['blockers'] for row in resources)
+        assert set(home.rglob('*')) == before
+        assert holder.poll() is None
+    finally:
+        holder.terminate()
+        holder.wait(timeout=5)
+        holder.stdin.close()
+        holder.stdout.close()
+
+
+def test_manual_reviewer_records_identity_before_spawn_and_preserves_timeout(monkeypatch):
+    import subprocess
+    import uuid
+    import pytest
+    from agd_lib import store, tasks, supervision
+    from support import uninstall_scope
+    from test_reviewer import ended_worker, message
+    with lab() as (home, _):
+        task, _, _ = ended_worker(home, 'evidence', str(uuid.uuid4()), [message('fixture evidence')])
+        program = (
+            'import json, sys\nfrom pathlib import Path\n'
+            f'sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "bin")!r})\n'
+            'from agd_lib import reviewer, reviewer_runner\n'
+            'select = reviewer.select_packet\n'
+            'def paused(*args, **kwargs):\n'
+            ' packet = select(*args, **kwargs)\n'
+            ' assert packet["excerpts"]\n'
+            ' print("collected", flush=True)\n'
+            ' sys.stdin.read(1)\n'
+            ' return packet\n'
+            'reviewer.select_packet = paused\n'
+            'home = Path(sys.argv[1])\n'
+            'result = reviewer_runner.run_native_reviewer(home, reviewer.enqueue_intent(home, kind="manual"))\n'
+            'print(json.dumps(result), flush=True)\n')
+        coordinator = subprocess.Popen(
+            [sys.executable, '-c', program, str(home)], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            assert coordinator.stdout.readline() == 'collected\n'
+            resources = reviewer_runner.uninstall_inventory(home)
+            run = next(row for row in resources if row['kind'] == 'reviewer-run')
+            assert run['identity']['coordinator']['pid'] == coordinator.pid
+            assert run['identity']['coordinator']['start'] == supervision.process_start(coordinator.pid)
+            assert run['identity']['child'] is None
+            receipt = reviewer.paths(home)['receipts'] / f"{run['identity']['review_run_id']}.json"
+            with uninstall_scope(home, resources) as operation:
+                before = receipt.read_bytes()
+                monkeypatch.setattr(reviewer_runner, 'UNINSTALL_TIMEOUT', 1e-12, raising=False)
+                with pytest.raises(store.Refusal):
+                    reviewer_runner.uninstall_quiesce(home, resources, operation)
+                assert coordinator.poll() is None
+                assert receipt.read_bytes() == before
+                assert operation['completed'] == []
+                tasks.verify_workspace(home, task)
+                monkeypatch.setattr(reviewer_runner, 'UNINSTALL_TIMEOUT', 15.0)
+                coordinator.stdin.write('continue\n')
+                coordinator.stdin.flush()
+                stdout, stderr = coordinator.communicate(timeout=20)
+                assert coordinator.returncode == 0, stderr
+                assert json.loads(stdout)['dispatch_state'] == 'final'
+                assert json.loads(receipt.read_text()).get('child') is None
+                reviewer_runner.uninstall_quiesce(home, resources, operation)
+                assert run['key'] in operation['completed']
+        finally:
+            if coordinator.poll() is None:
+                coordinator.terminate()
+            coordinator.communicate(timeout=10)

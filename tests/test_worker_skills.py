@@ -1223,3 +1223,56 @@ if __name__ == '__main__':
     test_init_seeds_default_worker_profile_from_native_catalog()
     test_task_snapshot_survives_plugin_removal()
     test_init_seeds_checkout_home_with_tracked_files()
+
+
+def test_staged_skill_teardown_uses_frozen_proof_not_stage_source_path():
+    import shutil
+    import subprocess
+    from support import lab
+    from agd_lib import tasks, worker_skills
+    from test_projects import run
+    source = Path(__file__).resolve().parents[1]
+    with lab() as (home, project):
+        worktree = home.parent / 'frozen-work'
+        run(['git', 'worktree', 'add', '-b', 'frozen-fixture', worktree, 'main'], cwd=project)
+        add_skill(home, 'agd-one'); add_skill(home, 'agd-two')
+        task = {'id': 'frozen', 'worktree': str(worktree), 'harness': 'omp', 'lease_id': 'fixture-lease'}
+        selection = {'schema': 1, 'mode': 'curated', 'profile': None, 'skills': ['agd-one', 'agd-two']}
+        worker_skills.prepare(home, task, selection)
+        tasks.save(home, task)
+        other = {**task, 'id': 'other', 'lease_id': 'other-lease'}
+        worker_skills._exclude(home, other, ['other-generated'], True)
+        info = project / '.git/info'
+        registry = info / 'agd-worker-skills.json'
+        other_key = str(home / 'data/home.json') + ':other:other-lease'
+        with (info / 'exclude').open('a') as stream:
+            stream.write('\ncustom-user-entry\n')
+        custom = worktree / '.omp/skills/agd-one/.env'
+        custom.write_text('keep custom user data\n')
+        shutil.rmtree(home / 'config/worker-skills')
+        stage = home.parent / 'stage'
+        shutil.copytree(source / 'bin', stage / 'bin', ignore=shutil.ignore_patterns('__pycache__'))
+        program = '''
+import sys
+from pathlib import Path
+sys.path[:0] = [sys.argv[2], sys.argv[3]]
+from agd_lib import worker_skills
+from support import uninstall_scope
+home = Path(sys.argv[1])
+resources = worker_skills.uninstall_inventory(home)
+assert resources and all(not row["blockers"] for row in resources)
+with uninstall_scope(home, resources) as operation:
+    worker_skills.uninstall_remove(home, resources, operation)
+    assert all(row["presence"] == "absent" for row in worker_skills.uninstall_inventory(home, expected=resources))
+'''
+        result = subprocess.run([sys.executable, '-I', '-S', '-B', '-c', program, str(home),
+                                 str(stage / 'bin'), str(source / 'tests')],
+                                capture_output=True, text=True, timeout=30, cwd=home.parent)
+        assert result.returncode == 0, result.stderr
+        assert custom.read_text() == 'keep custom user data\n'
+        assert not (worktree / '.omp/skills/agd-one/SKILL.md').exists()
+        assert not (worktree / '.omp/skills/agd-two').exists()
+        owners = json.loads(registry.read_text())['owners']
+        assert owners == {other_key: ['other-generated']}
+        assert 'custom-user-entry\n' in (info / 'exclude').read_text()
+        assert '/other-generated/\n' in (info / 'exclude').read_text()
