@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Accept relative `--home` paths consistently across all CLI commands, resolving them from the caller directory while preserving explicit-home precedence and symlink rejection.
 - Add confirmed `agd --home . uninstall` with read-only pretty JSON, separate local-work consent, retirement admission fencing, an isolated foreground recovery bundle, exact owned process/backend/reviewer/Docker/Treehouse/Git teardown, and delayed non-recreation verification. Preserve shared tools/accounts/images/other homes and fail closed on legacy, foreign, changed or unproven ownership.
 - Reconfirm changed uninstall resource identities, not only new resource names, and revalidate the original home inode at partial-recovery deletion; replacement checkouts/homes are not silently adopted.
 - Add a fifth, default-No scheduled reviewer installer stage with daily/hourly presets, custom daily time/IANA timezone or whole-hour interval, cancellation and input correction. Preserve chosen config on missing prerequisites and keep telemetry/model settings independent.

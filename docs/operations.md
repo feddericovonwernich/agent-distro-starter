@@ -2,6 +2,8 @@
 
 All commands below are `bin/agd` from the distro checkout. Set `AGD_HOME` to an absolute private-home path, or pass `--home /absolute/home`, to target another initialized home. An active central exports its owner token to tool commands; another shell receives a read-only refusal. This is an accidental-misuse guard, **not** an OS sandbox.
 
+Every command also accepts relative `--home` paths, including `--home .`, `--home ..`, and named relative directories. They are made absolute against the invoking shell's current directory before dispatch; symlink home arguments remain refused. Explicit `--home` still takes precedence over `AGD_HOME`, whose default remains an absolute path. For example, run a manual reviewer from its distro directory with `./bin/agd --home . reviewer run`.
+
 ## Guided central lifecycle
 
 The installer initializes a fresh home and writes private launcher and dependency receipts. Start its selected central from an ordinary terminal:

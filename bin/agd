@@ -204,7 +204,7 @@ def main(args):
             result, code = {'outcome': 'blocked', 'reason': str(error)}, 3
         print(json.dumps(result, indent=2))
         raise SystemExit(code)
-    home = store.home(args.home)
+    home = store.home(Path(args.home).absolute() if args.home else None)
     mutation = (args.command == 'init' or
                 args.command == 'installer' and args.installer_operation != 'reviewer' or
                 args.command == 'project' and args.operation not in ('list', 'inspect') or

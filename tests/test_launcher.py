@@ -332,3 +332,40 @@ def test_native_omp_exit_does_not_claim_worker_or_relay_absence():
                     if process.poll() is None:
                         process.terminate()
                     process.communicate(timeout=5)
+
+
+def test_relative_home_selects_requested_distro(tmp_path):
+    from support import lab
+    with lab() as (home, project):
+        caller = home.parent / 'caller'
+        caller.mkdir()
+        nested = home / 'nested'
+        nested.mkdir()
+        for selected, cwd in (('.', home), ('..', nested), ('../home', caller)):
+            result = subprocess.run(
+                [str(CLI), '--home', selected, 'project', 'inspect', 'sample'],
+                cwd=cwd, env=dict(os.environ, AGD_HOME=str(tmp_path / 'wrong-home')),
+                capture_output=True, text=True, timeout=30)
+            assert result.returncode == 0, result.stderr
+            assert json.loads(result.stdout)['path'] == str(project)
+
+
+def test_relative_home_does_not_follow_a_symlink(tmp_path):
+    home = tmp_path / 'home'
+    command(home, 'init', '--backend', 'tmux')
+    marker = (home / 'data/home.json').read_bytes()
+    alias = tmp_path / 'alias'
+    alias.symlink_to(home, target_is_directory=True)
+    result = subprocess.run([str(CLI), '--home', 'alias', 'project', 'list'],
+                            cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 2
+    assert alias.is_symlink()
+    assert (home / 'data/home.json').read_bytes() == marker
+
+
+def test_relative_home_initializes_named_directory(tmp_path):
+    result = subprocess.run([str(CLI), '--home', 'new distro', 'init', '--backend', 'tmux'],
+                            cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)['home'] == str(tmp_path / 'new distro')
+    assert (tmp_path / 'new distro/data/home.json').is_file()
