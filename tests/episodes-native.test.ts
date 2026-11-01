@@ -35,6 +35,18 @@ async function waitForNativeFinal(path: string): Promise<void> {
     await new Promise(resolve => setTimeout(resolve, 25));
   }
 }
+
+async function waitForNativePredicate(path: string, predicate: (rows: Array<Record<string, unknown>>) => boolean): Promise<void> {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    try {
+      const rows = nativeRows(path);
+      if (predicate(rows)) return;
+    } catch { /* writer may not have opened yet */ }
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  throw new Error(`native predicate timeout: ${path}`);
+}
 function completionRecords(path: string): Array<Record<string, unknown>> {
   if (!existsSync(path)) return [];
   const records: Array<Record<string, unknown>> = [];
@@ -51,6 +63,40 @@ function completionSnapshot(path: string): string {
   return completionRecords(path).map(value =>
     JSON.stringify({ source_id: value.source_id, interaction_id: value.interaction_id, recorded_at: value.recorded_at, final: value.final }),
   ).sort().join('\n');
+}
+
+function reviewerBridge(repo: string, home: string, cutoff: number, finalize: boolean): Record<string, unknown> {
+  const script = String.raw`
+import json, sys, time, uuid
+from pathlib import Path
+from agd_lib import reviewer
+home = Path(sys.argv[1])
+cutoff = float(sys.argv[2])
+finalize = sys.argv[3] == '1'
+config = reviewer.read_config(home)
+packet = reviewer.select_packet(home, cutoff=cutoff, config_snapshot=config)
+result = {'packet': packet}
+if finalize:
+    started = time.time()
+    intent = reviewer.enqueue_intent(home, kind='manual')
+    run = reviewer.reserve_run(home, intent, config_snapshot=config,
+                               instruction_snapshot=b'native-episode-bridge',
+                               started_at=started,
+                               deadline_epoch_ms=int((started + 1800) * 1000))
+    reviewer.begin_run(home, run, packet, model='fixture/native-bridge',
+                       observed_omp_version='native-test')
+    reviewer.submit_report(home, run['review_run_id'], str(uuid.uuid4()),
+                           {'schema': 1, 'summary': 'native lifecycle proof', 'findings': []})
+    result['final'] = reviewer.finalize_run(home, run['review_run_id'], 'exited')
+print(json.dumps(result, separators=(',', ':')))
+`;
+  const result = Bun.spawnSync(['python3', '-c', script, home, String(cutoff), finalize ? '1' : '0'], {
+    cwd: repo,
+    env: { ...process.env, PYTHONPATH: `${join(repo, 'bin')}:${join(repo, 'tests')}` },
+    stdout: 'pipe', stderr: 'pipe',
+  });
+  assert.equal(result.exitCode, 0, result.stderr.toString());
+  return JSON.parse(result.stdout.toString()) as Record<string, unknown>;
 }
 
 function textFingerprint(content: unknown): string {
@@ -223,9 +269,14 @@ async function nativeProbe(role: 'worker' | 'central') {
     toolNames: ['read'], enableMCP: false, enableLsp: false, enableIrc: false,
     extensions: [extensionWithStaleGate],
   });
-  let mode: 'final' | 'wait' | 'error' | 'abort' = 'final';
+  let mode: 'final' | 'wait' | 'error' | 'abort' | 'hold' = 'final';
   let waitTurn = 0;
   const abortStarted = Promise.withResolvers<void>();
+  const heldStarted = Promise.withResolvers<void>();
+  const releaseHeld = Promise.withResolvers<void>();
+  let heldProviderRelease: (() => void) | undefined;
+  const heldFinalText = `Native held final ${randomUUID()}`;
+  const heldPromptSentinel = `UNFINISHED_NATIVE_SENTINEL_${randomUUID()}`;
   session.agent.streamFn = (model: { api: string; provider: string; id: string }, context: Input, _options: { signal?: AbortSignal }) => {
     inputs.push(structuredClone({ systemPrompt: context.systemPrompt, messages: context.messages }));
     const stream = new ai.AssistantMessageEventStream();
@@ -249,6 +300,14 @@ async function nativeProbe(role: 'worker' | 'central') {
       void (async () => { await releaseWait.promise; fail('error'); })();
     } else if (mode === 'error') {
       queueMicrotask(() => fail('error'));
+    } else if (mode === 'hold') {
+      heldStarted.resolve();
+      heldProviderRelease = () => {
+        message.content = [{ type: 'text', text: heldFinalText }];
+        stream.push({ type: 'done', reason: message.stopReason, message });
+        stream.end(message);
+      };
+      void releaseHeld.promise.then(() => heldProviderRelease?.());
     } else {
       queueMicrotask(() => { stream.push({ type: 'done', reason: message.stopReason, message }); stream.end(message); });
     }
@@ -282,7 +341,7 @@ async function nativeProbe(role: 'worker' | 'central') {
     assert.equal(typeof oldReceipt.source_id, 'string');
     assert.equal(typeof oldReceipt.path, 'string');
     const oldRows = nativeRows(join(data.home, oldReceipt.path as string));
-    const oldMarker = oldRows.find(row => row.type === 'custom_message' &&
+    const oldMarker = oldRows.findLast(row => row.type === 'custom_message' &&
       row.customType === 'agd:episode-binding' && typeof row.details === 'object' && row.details !== null &&
       (row.details as Record<string, unknown>).source_id === oldReceipt.source_id) as Record<string, unknown> | undefined;
     assert(oldMarker);
@@ -294,6 +353,7 @@ async function nativeProbe(role: 'worker' | 'central') {
     assert(capturedMarker);
     const markerDetails = capturedMarker.details as Record<string, unknown>;
     assert.equal(typeof markerDetails.interaction_id, 'string');
+    assert.equal((oldMarker.details as Record<string, unknown>).interaction_id, markerDetails.interaction_id);
     const oldFinal = nativeFinal(oldRows);
     assert(oldFinal, JSON.stringify({
       home: data.home, sourcePath: oldReceipt.path,
@@ -478,6 +538,77 @@ async function nativeProbe(role: 'worker' | 'central') {
     const resumedMatches = resumedFinalRecord.timestamp === resumedMessage.timestamp &&
       resumedFinalRecord.text_sha256 === textFingerprint(resumedMessage.content);
     assert(resumedMatches);
+    const heldRowsPath = join(data.home, currentReceipt.path as string);
+    const heldCompletionCount = completionRecords(completionDir).length;
+    mode = 'hold';
+    const heldTerminal = awaitTerminal('held');
+    const heldPrompt = session.prompt(`Start held native turn ${heldPromptSentinel}`);
+    await heldStarted.promise;
+    await waitForNativePredicate(heldRowsPath, rows =>
+      rows.some(row => row.type === 'message' && JSON.stringify(row.message).includes(heldPromptSentinel)) &&
+      rows.some(row => row.type === 'custom_message' && row.customType === 'agd:episode-binding'));
+    await manager.flush();
+    const producerAlive = (() => {
+      try { process.kill(process.pid, 0); return true; } catch { return false; }
+    })();
+    assert(producerAlive);
+    const firstBridge = reviewerBridge(repo, data.home, Date.now() / 1000 + 5, true);
+    const firstPacket = firstBridge.packet as Record<string, unknown>;
+    const firstExcerpts = (Array.isArray(firstPacket.excerpts) ? firstPacket.excerpts : []) as Array<Record<string, unknown>>;
+    const firstSources = (Array.isArray(firstPacket.sources) ? firstPacket.sources : []) as Array<Record<string, unknown>>;
+    const firstEpisodes = (Array.isArray(firstPacket.episodes) ? firstPacket.episodes : []) as Array<Record<string, unknown>>;
+    assert(firstExcerpts.length > 0);
+    const firstSentinelExcluded = !JSON.stringify(firstExcerpts).includes(heldPromptSentinel);
+    assert(firstSentinelExcluded);
+    const firstSource = firstSources.find(source =>
+      source.session_id === currentReceipt.session_id && source.role === data.role);
+    const firstSourceScoped = firstSource !== undefined;
+    assert(firstSourceScoped);
+    assert.equal(firstSource.role, data.role);
+    const episodeRoleScoped = data.role === 'worker'
+      ? firstEpisodes.some(episode => episode.role === 'worker' && episode.task_id === data.task?.id)
+      : firstEpisodes.some(episode => episode.role === 'central' &&
+          (!('task_id' in episode) || episode.task_id == null));
+    assert(episodeRoleScoped);
+    if (data.role === 'worker') assert.equal(firstSource.task_id, data.task?.id);
+    else assert(!('task_id' in firstSource) || firstSource.task_id == null);
+    assert(firstExcerpts.every(row => typeof row.material_id === 'string'));
+    const firstMaterialIds = new Set(firstExcerpts.map(row => row.material_id as string));
+    assert(firstMaterialIds.size === firstExcerpts.length);
+    const firstFinalized = typeof firstBridge.final === 'object' && firstBridge.final !== null;
+    assert(firstFinalized);
+    releaseHeld.resolve();
+    await heldPrompt;
+    await heldTerminal;
+    await manager.flush();
+    await waitForNativePredicate(heldRowsPath, rows =>
+      rows.some(row => row.type === 'message' && JSON.stringify(row.message).includes(heldPromptSentinel)) &&
+      rows.some(row => row.type === 'message' && JSON.stringify(row.message).includes(heldFinalText)));
+    const heldRowsAfterRelease = nativeRows(heldRowsPath);
+    const heldUserPersisted = heldRowsAfterRelease.some(row =>
+      row.type === 'message' && JSON.stringify(row.message).includes(heldPromptSentinel));
+    const heldFinalPersisted = heldRowsAfterRelease.some(row =>
+      row.type === 'message' && JSON.stringify(row.message).includes(heldFinalText));
+    assert(heldUserPersisted);
+    assert(heldFinalPersisted);
+    assert(completionRecords(completionDir).length > heldCompletionCount);
+    const secondBridge = reviewerBridge(repo, data.home, Date.now() / 1000 + 5, true);
+    const secondPacket = secondBridge.packet as Record<string, unknown>;
+    const secondExcerpts = (Array.isArray(secondPacket.excerpts) ? secondPacket.excerpts : []) as Array<Record<string, unknown>>;
+    assert(secondExcerpts.every(row => typeof row.material_id === 'string'));
+    const secondMaterialIds = new Set(secondExcerpts.map(row => row.material_id as string));
+    const incrementalMaterialDisjoint = secondMaterialIds.size > 0 &&
+      secondMaterialIds.size === secondExcerpts.length &&
+      [...secondMaterialIds].every(id => !firstMaterialIds.has(id));
+    const secondFinalized = typeof secondBridge.final === 'object' && secondBridge.final !== null;
+    assert(incrementalMaterialDisjoint);
+    assert(secondFinalized);
+    assert(JSON.stringify(secondExcerpts).includes(heldFinalText));
+    const thirdBridge = reviewerBridge(repo, data.home, Date.now() / 1000 + 5, false);
+    const thirdPacket = thirdBridge.packet as Record<string, unknown>;
+    const freshPacketEmpty = Array.isArray(thirdPacket.excerpts) && thirdPacket.excerpts.length === 0;
+    assert(freshPacketEmpty);
+    mode = 'final';
     return { role: data.role, sourceCount: readdirSync(sourceDir).length, completionCount: completionRecords(completionDir).length,
       oldSourceId: oldReceipt.source_id, oldInteractionId: markerDetails.interaction_id,
       markerHidden: inputs.every(input => !JSON.stringify(input.messages).includes('agd:episode-binding') && !JSON.stringify(input.messages).includes('agd:episode-gap')),
@@ -488,8 +619,11 @@ async function nativeProbe(role: 'worker' | 'central') {
       waitsExcluded: completionsAfterWait === completionsAfterSwitch,
       errorsExcluded: completionsAfterError === completionsAfterSwitch,
       reviveObserved: lifecycleReasons.includes('revive'),
-      switchedSession: manager.getSessionId() !== previousSessionId };
+      switchedSession: manager.getSessionId() !== previousSessionId,
+      producerAlive, firstSourceScoped, episodeRoleScoped, firstSentinelExcluded, firstFinalized,
+      heldUserPersisted, heldFinalPersisted, incrementalMaterialDisjoint, secondFinalized, freshPacketEmpty };
   } finally {
+    releaseHeld.resolve();
     session.beginDispose(); await session.dispose(); await manager.close();
     rmSync(isolated, { recursive: true, force: true });
     if (generatedRoot) rmSync(generatedRoot, { recursive: true, force: true });
@@ -520,6 +654,16 @@ if (process.env.AGD_NATIVE_EPISODES_CHECK === '1') {
       expect(result.resumedMatches).toBe(true);
       expect(result.waitsExcluded).toBe(true);
       expect(result.errorsExcluded).toBe(true);
+      expect(result.producerAlive).toBe(true);
+      expect(result.firstSourceScoped).toBe(true);
+      expect(result.episodeRoleScoped).toBe(true);
+      expect(result.firstSentinelExcluded).toBe(true);
+      expect(result.firstFinalized).toBe(true);
+      expect(result.heldUserPersisted).toBe(true);
+      expect(result.heldFinalPersisted).toBe(true);
+      expect(result.incrementalMaterialDisjoint).toBe(true);
+      expect(result.secondFinalized).toBe(true);
+      expect(result.freshPacketEmpty).toBe(true);
       expect(result.oldSourceId).toMatch(/^[0-9a-f]{64}$/);
       expect(result.oldInteractionId).toMatch(/^[0-9a-f-]{36}$/);
     }
