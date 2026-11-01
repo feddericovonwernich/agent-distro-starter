@@ -147,7 +147,7 @@ def _read_record(stream, number, budget, deadline_epoch_ms, hasher):
             'size': line_size, 'value': value, 'malformed': malformed}
 
 
-def _scan(session_path, budget, deadline_epoch_ms, visit):
+def _scan(session_path, budget, deadline_epoch_ms, visit, *, stop_at=None):
     _check_deadline(deadline_epoch_ms)
     if type(budget) is not int or budget <= 0:
         raise store.Refusal('native read budget is invalid')
@@ -167,7 +167,7 @@ def _scan(session_path, budget, deadline_epoch_ms, visit):
             number += 1
             watermark = record['byte_end']
             visit(record)
-            if not record['complete']:
+            if not record['complete'] or stop_at is not None and watermark >= stop_at:
                 break
     return hasher.hexdigest(), watermark
 
@@ -177,24 +177,6 @@ def _material_digest(session_id, rows):
     hasher.update(_json_bytes({'session_id': session_id}) + b'\n')
     for row in rows:
         hasher.update(_json_bytes({'message_id': row['message_id'], 'text': row['text']}) + b'\n')
-    return hasher.hexdigest()
-
-
-def _prefix_digest(session_path, end, budget, deadline_epoch_ms):
-    hasher = hashlib.sha256()
-    remaining = end
-    path = Path(session_path)
-    if path.is_symlink() or not path.is_file():
-        raise store.Refusal('unsafe native JSONL')
-    with path.open('rb') as stream:
-        while remaining:
-            _check_deadline(deadline_epoch_ms)
-            chunk = stream.read(min(budget, remaining))
-            _check_deadline(deadline_epoch_ms)
-            if not chunk:
-                raise store.Refusal('native evidence changed during read')
-            hasher.update(chunk)
-            remaining -= len(chunk)
     return hasher.hexdigest()
 
 
@@ -310,27 +292,40 @@ class _MetadataIndex:
         return self._connection.execute('SELECT 1 FROM selected_chain WHERE id=?', (ident,)).fetchone() is not None
 
 
-def read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_ms: int | None = None, *, completion: dict | None = None) -> dict:
+def read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_ms: int | None = None, *, completion: dict | None = None, skip_row=None) -> dict:
     index = None
     try:
         index = _MetadataIndex() if completion is not None else None
-        return _read_native(session_path, cutoff, budget, deadline_epoch_ms, completion=completion, _index=index)
+        return _read_native(session_path, cutoff, budget, deadline_epoch_ms, completion=completion, skip_row=skip_row, _index=index)
     finally:
         if index is not None:
             index.close()
 
 
-def _read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_ms: int | None = None, *, completion: dict | None = None, _index=None) -> dict:
+def _read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_ms: int | None = None, *, completion: dict | None = None, skip_row=None, _index=None) -> dict:
     if not isinstance(cutoff, (int, float)) or isinstance(cutoff, bool) or not math.isfinite(cutoff):
         raise store.Refusal('native cutoff is invalid')
     state = {'header': None, 'header_record': None, 'header_index': None,
              'index': _index if completion is not None else None,
-             'rows': [], 'candidates': [], 'retained': 0, 'late': False,
+             'rows': [], 'retained': 0, 'late': False,
              'limited': False, 'withheld': []}
 
     def withhold(reason, record, message_id=None):
         state['withheld'].append({'reason': reason, 'line_start': record['line_start'],
                                   **({'message_id': message_id} if message_id is not None else {})})
+
+    def retain(value, record, text):
+        row = {'message_id': value['id'], 'text': text,
+               'line_start': record['line_start'], 'line_end': record['line_start'],
+               'byte_start': record['byte_start'], 'byte_end': record['byte_end']}
+        if skip_row is not None and skip_row(row):
+            return
+        size = len(text.encode())
+        if state['retained'] + size <= budget:
+            state['retained'] += size
+            state['rows'].append(row)
+        else:
+            state['limited'] = True
 
     def visit(record):
         value = record.pop('value')
@@ -389,18 +384,8 @@ def _read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_
                 entry['_unsupported'] = unsupported
                 if unsupported:
                     withhold('unsupported-content-block', record, value.get('id'))
-                if text and at <= cutoff and isinstance(value.get('id'), str):
-                    if state['retained'] + len(encoded) <= budget:
-                        state['retained'] += len(encoded)
-                        if completion is None:
-                            state['rows'].append(
-                                {'message_id': value['id'], 'text': text,
-                                 'line_start': record['line_start'], 'line_end': record['line_start'],
-                                 'byte_start': record['byte_start'], 'byte_end': record['byte_end']})
-                        else:
-                            state['candidates'].append((entry, text))
-                    else:
-                        state['limited'] = True
+                if completion is None and text and at <= cutoff and isinstance(value.get('id'), str):
+                    retain(value, record, text)
         if completion is not None:
             state['index'].add(entry)
         if at > cutoff:
@@ -474,19 +459,33 @@ def _read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_
         raise store.Refusal('native interaction window crossed')
     boundary_record = final_entry['_reader_record']
     result['byte_watermark'] = boundary_record['byte_end']
-    result['content_sha256'] = _prefix_digest(session_path, boundary_record['byte_end'], budget, deadline_epoch_ms)
     result['boundary'] = {'interaction_id': interaction_id, 'entry_id': final_entry['id'],
                           'parent_id': final_entry.get('parentId'),
                           'closed_at': max(published, final_entry['_reader_epoch'])}
-    result['rows'] = [
-        {'message_id': entry['id'], 'text': text,
-         'line_start': entry['_reader_record']['line_start'], 'line_end': entry['_reader_record']['line_start'],
-         'byte_start': entry['_reader_record']['byte_start'], 'byte_end': entry['_reader_record']['byte_end']}
-        for entry, text in sorted(
-            ((entry, text) for entry, text in state['candidates']
-             if index.in_chain(entry.get('id')) and entry['_reader_record']['byte_end'] <= boundary_record['byte_end']),
-            key=lambda item: item[0]['_reader_record']['byte_start'])
-    ]
+    def retain_proved(record):
+        value = record.get('value')
+        if (not isinstance(value, dict) or value.get('type') != 'message'
+                or not isinstance(value.get('id'), str) or not index.in_chain(value['id'])):
+            return
+        entry = index._row(value['id'])
+        message = value.get('message')
+        text, _ = _render_content(message.get('content')) if isinstance(message, dict) else (None, False)
+        if (record['byte_start'] != entry['_reader_record']['byte_start']
+                or record['byte_end'] != entry['_reader_record']['byte_end']
+                or value.get('parentId') != entry.get('parentId')
+                or text is None or hashlib.sha256(text.encode()).hexdigest() != entry['_text_sha256']):
+            raise store.Refusal('native source changed while selecting material')
+        if text and entry['_reader_epoch'] <= cutoff:
+            retain(value, record, text)
+
+    # Proof selects the branch first; unrelated or consumed rows cannot spend its text budget.
+    digest, watermark = _scan(session_path, budget, deadline_epoch_ms, retain_proved,
+                              stop_at=boundary_record['byte_end'])
+    if watermark != boundary_record['byte_end']:
+        raise store.Refusal('native source changed while selecting material')
+    result['content_sha256'] = digest
+    result['rows'] = state['rows']
+    result['limited'] = state['limited']
     result['material_sha256'] = _material_digest(header['id'], result['rows'])
     result['late'] = False
     result['withheld'] = [item for item in result['withheld']

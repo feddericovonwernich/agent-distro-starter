@@ -70,6 +70,39 @@ def test_read_native_title_and_proved_boundary_preserve_utf8_coordinates(tmp_pat
     assert [row['message_id'] for row in result['rows']] == ['11111111', '22222222']
     assert b'marker title' not in admitted_native_line and b'marker never excerpt' not in admitted_native_line
 
+@pytest.mark.parametrize('proved', [False, True])
+def test_read_native_skips_consumed_material_before_retention_budget(tmp_path, proved):
+    path = tmp_path / 'native.jsonl'
+    user, binding, final, _ = episode_entries()
+    user['message']['content'] = 'x' * 3500
+    final['message']['content'] = 'n' * 1000
+    value = completion(path, 'session')
+    value['final']['text_sha256'] = hashlib.sha256(final['message']['content'].encode()).hexdigest()
+    binding['details']['source_id'] = value['source_id']
+    write_native(path, 'session', [user, binding, final])
+    read = reviewer_episodes.read_native(
+        path, 300, 4096, completion=value if proved else None,
+        skip_row=lambda row: row['message_id'] == user['id'])
+    assert [row['message_id'] for row in read['rows']] == [final['id']]
+    assert read['rows'][0]['text'] == final['message']['content']
+    assert read['limited'] is False
+
+
+def test_proved_native_chain_budget_excludes_other_branches(tmp_path):
+    path = tmp_path / 'native.jsonl'
+    user, binding, final, _ = episode_entries()
+    value = completion(path, 'session')
+    user['message']['content'] = 'u' * 1000
+    final['message']['content'] = 'n' * 1000
+    value['final']['text_sha256'] = hashlib.sha256(final['message']['content'].encode()).hexdigest()
+    binding['details']['source_id'] = value['source_id']
+    unrelated = message('other', None, 'x' * 3500, 99.0)
+    write_native(path, 'session', [unrelated, user, binding, final])
+    read = reviewer_episodes.read_native(path, 300, 4096, completion=value)
+    assert [row['message_id'] for row in read['rows']] == [user['id'], final['id']]
+    assert read['limited'] is False
+
+
 
 def test_read_native_material_digest_ignores_title_and_coordinate_shift(tmp_path):
     path = tmp_path / 'native.jsonl'
