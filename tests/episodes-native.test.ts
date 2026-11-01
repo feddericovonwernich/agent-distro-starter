@@ -565,10 +565,12 @@ async function nativeProbe(role: 'worker' | 'central') {
     const firstSourceScoped = firstSource !== undefined;
     assert(firstSourceScoped);
     assert.equal(firstSource.role, data.role);
+    assert(firstExcerpts.some(row => row.source_id === firstSource.source_id));
     const episodeRoleScoped = data.role === 'worker'
-      ? firstEpisodes.some(episode => episode.role === 'worker' && episode.task_id === data.task?.id)
+      ? firstEpisodes.some(episode => episode.role === 'worker' &&
+          episode.task_id === data.task?.id && episode.source_id === firstSource.source_id)
       : firstEpisodes.some(episode => episode.role === 'central' &&
-          (!('task_id' in episode) || episode.task_id == null));
+          episode.source_id === firstSource.source_id && (!('task_id' in episode) || episode.task_id == null));
     assert(episodeRoleScoped);
     if (data.role === 'worker') assert.equal(firstSource.task_id, data.task?.id);
     else assert(!('task_id' in firstSource) || firstSource.task_id == null);
