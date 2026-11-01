@@ -34,13 +34,11 @@ export type EpisodeOptions = {
 };
 
 type Binding = { source_id: string; [key: string]: unknown };
-
-type Marker = {
-  customType: 'agd:episode-binding';
-  display: false;
-  content: string;
-  details: { schema: 1; source_id: string; interaction_id: string };
-};
+type Pending = { binding?: Binding };
+type BindingDetails = { schema: 1; source_id: string; interaction_id: string };
+type GapDetails = { schema: 1; interaction_id: string };
+type Carrier = { customType: 'agd:episode-binding'; details?: BindingDetails } |
+  { customType: 'agd:episode-gap'; details?: GapDetails };
 
 function record(value: unknown): value is RecordValue {
   return typeof value === 'object' && value !== null;
@@ -66,9 +64,14 @@ function runCli(cli: string, home: string, operation: 'bind' | 'complete', body:
   return parsed;
 }
 
-function markerDetails(value: unknown): Marker['details'] | undefined {
+function bindingDetails(value: unknown): BindingDetails | undefined {
   if (!record(value) || value.schema !== 1 || !sourceId(value.source_id) || !uuid(value.interaction_id)) return;
   return { schema: 1, source_id: value.source_id, interaction_id: value.interaction_id };
+}
+
+function gapDetails(value: unknown): GapDetails | undefined {
+  if (!record(value) || value.schema !== 1 || !uuid(value.interaction_id)) return;
+  return { schema: 1, interaction_id: value.interaction_id };
 }
 
 function finalProjection(messages: unknown[]): RecordValue | undefined {
@@ -99,51 +102,68 @@ function finalProjection(messages: unknown[]): RecordValue | undefined {
   return { role: 'assistant', timestamp: candidate.timestamp, stopReason: 'stop', content };
 }
 
-function latestBinding(messages: unknown[]): { details?: Marker['details'] } | undefined {
+function latestCarrier(messages: unknown[]): Carrier | undefined {
   for (let index = messages.length - 1; index >= 0; index--) {
     const value = messages[index];
-    if (!record(value) || value.customType !== 'agd:episode-binding') continue;
-    return { details: markerDetails(value.details) };
+    if (!record(value) || (value.customType !== 'agd:episode-binding' && value.customType !== 'agd:episode-gap')) continue;
+    if (value.customType === 'agd:episode-binding') {
+      return { customType: value.customType, details: bindingDetails(value.details) };
+    }
+    return { customType: value.customType, details: gapDetails(value.details) };
   }
 }
 
 /** Install independent native recording hooks without changing agent supervision. */
 export function registerEpisodeCapture(api: EpisodeAPI, options: EpisodeOptions): void {
-  const bindings = new Map<string, Binding>();
+  const pending = new Map<string, Pending>();
+  let latestInteractionId: string | undefined;
   const home = resolve(options.home);
 
   const diagnose = (message: string) => {
     try { options.diagnostic(message); } catch { /* diagnostics cannot affect agent work */ }
   };
+  const gapCarrier = (interactionId: string) => ({
+    message: {
+      customType: 'agd:episode-gap' as const,
+      display: false as const,
+      content: 'Episode capture gap',
+      details: { schema: 1 as const, interaction_id: interactionId },
+    },
+  });
 
   api.on('before_agent_start', async (event, context) => {
-    if (event.reason === 'revive') return;
+    if (event.reason === 'revive') {
+      if (!latestInteractionId) return;
+      return gapCarrier(latestInteractionId);
+    }
+    const interactionId = randomUUID();
+    latestInteractionId = interactionId;
+    pending.set(interactionId, {});
     const manager = context?.sessionManager;
     if (!manager) {
       diagnose('Episode capture unavailable: native session manager is missing.');
-      return;
+      return gapCarrier(interactionId);
     }
     const sessionId = manager.getSessionId();
     const sessionFile = manager.getSessionFile();
     if (!sessionId || !sessionFile || !isAbsolute(sessionFile)) {
       diagnose('Episode capture unavailable: native session identity/file is missing.');
-      return;
+      return gapCarrier(interactionId);
     }
-    const interactionId = randomUUID();
     try {
       await manager.ensureOnDisk();
       if (options.beforeBind && !(await options.beforeBind())) {
         diagnose('Episode capture skipped: managed owner readiness was not proved.');
-        return;
+        return gapCarrier(interactionId);
       }
       if (manager.getSessionId() !== sessionId || manager.getSessionFile() !== sessionFile) {
         diagnose('Episode capture skipped: native session changed while binding.');
-        return;
+        return gapCarrier(interactionId);
       }
       const relativeFile = relative(home, sessionFile);
       if (!relativeFile || relativeFile.startsWith('..') || isAbsolute(relativeFile)) {
         diagnose('Episode capture unavailable: native session is outside AGD home.');
-        return;
+        return gapCarrier(interactionId);
       }
       const binding = runCli(options.cli, home, 'bind', {
         role: options.role,
@@ -151,38 +171,58 @@ export function registerEpisodeCapture(api: EpisodeAPI, options: EpisodeOptions)
         session_file: sessionFile,
       });
       if (!sourceId(binding.source_id)) throw new Error('episode bind returned no source receipt');
-      bindings.set(interactionId, binding as Binding);
-      const marker: Marker = {
-        customType: 'agd:episode-binding',
-        display: false,
-        content: 'Episode binding',
-        details: { schema: 1, source_id: binding.source_id, interaction_id: interactionId },
+      pending.set(interactionId, { binding: binding as Binding });
+      return {
+        message: {
+          customType: 'agd:episode-binding' as const,
+          display: false as const,
+          content: 'Episode binding',
+          details: { schema: 1 as const, source_id: binding.source_id, interaction_id: interactionId },
+        },
       };
-      return { message: marker };
     } catch (error) {
       diagnose(`Episode capture unavailable: ${error instanceof Error ? error.message : String(error)}`);
-      return;
+      return gapCarrier(interactionId);
     }
   });
 
   api.on('context', event => ({
-    messages: (event.messages ?? []).filter(message => !record(message) || message.customType !== 'agd:episode-binding'),
+    messages: (event.messages ?? []).filter(message => !record(message) ||
+      (message.customType !== 'agd:episode-binding' && message.customType !== 'agd:episode-gap')),
   }));
 
+  // Ponytail ceiling: compaction/revive can erase a provable binding; native event-bound
+  // session/turn IDs are the upgrade path for eliminating this explicit eligibility gap.
   api.on('agent_end', event => {
     if (event.willContinue === true || event.awaitingAsyncWork === true) return;
-    const marker = latestBinding(event.messages ?? []);
+    const marker = latestCarrier(event.messages ?? []);
     if (!marker) {
       diagnose('Episode capture gap: terminal event has no native binding marker.');
       return;
     }
-    const details = marker.details;
-    if (!details) {
+    if (!marker.details) {
       diagnose('Episode capture gap: terminal event has an invalid native binding marker.');
       return;
     }
-    const binding = bindings.get(details.interaction_id);
-    if (!binding || binding.source_id !== details.source_id) {
+    if (marker.details.interaction_id !== latestInteractionId) {
+      diagnose('Episode capture gap: terminal event marker belongs to an older interaction.');
+      return;
+    }
+    const markerCount = (event.messages ?? []).filter(message =>
+      record(message) &&
+      (message.customType === 'agd:episode-binding' || message.customType === 'agd:episode-gap') &&
+      record(message.details) && message.details.interaction_id === marker.details?.interaction_id).length;
+    if (markerCount !== 1) {
+      diagnose('Episode capture gap: terminal event has ambiguous current interaction metadata.');
+      return;
+    }
+    if (marker.customType === 'agd:episode-gap') {
+      diagnose('Episode capture gap: current interaction has no authorized native source.');
+      return;
+    }
+    const pendingInteraction = pending.get(marker.details.interaction_id);
+    const binding = pendingInteraction?.binding;
+    if (!binding || binding.source_id !== marker.details.source_id) {
       diagnose('Episode capture gap: terminal event has no registered native binding.');
       return;
     }
@@ -191,11 +231,12 @@ export function registerEpisodeCapture(api: EpisodeAPI, options: EpisodeOptions)
     try {
       runCli(options.cli, home, 'complete', {
         source_id: binding.source_id,
-        interaction_id: details.interaction_id,
+        interaction_id: marker.details.interaction_id,
         will_continue: false,
         awaiting_async_work: false,
         message,
       });
+      pending.delete(marker.details.interaction_id);
     } catch (error) {
       diagnose(`Episode completion unavailable: ${error instanceof Error ? error.message : String(error)}`);
     }

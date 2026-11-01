@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -15,6 +16,18 @@ type Fixture = {
 };
 
 type Input = { systemPrompt: string[]; messages: Array<Record<string, unknown>> };
+function nativeRows(path: string): Array<Record<string, unknown>> {
+  return readFileSync(path, 'utf8').trim().split(/\r?\n/).filter(Boolean)
+    .map(line => JSON.parse(line) as Record<string, unknown>);
+}
+
+function textFingerprint(content: unknown): string {
+  const text = Array.isArray(content) ? content
+    .filter((block): block is Record<string, unknown> =>
+      typeof block === 'object' && block !== null && block.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text as string).join('') : typeof content === 'string' ? content : '';
+  return createHash('sha256').update(text).digest('hex');
+}
 
 let generatedRoot: string | undefined;
 function fixture(repo: string, role: 'worker' | 'central'): Fixture {
@@ -74,26 +87,52 @@ async function nativeProbe(role: 'worker' | 'central') {
     delete process.env.AGD_TASK_ID;
     delete process.env.AGD_INCARNATION;
   }
+  const cwd = data.task?.worktree ?? data.home;
   const sdk = await import(data.capability.sdk_url);
   const ai = await import(data.capability.ai_url);
   const { SessionManager } = await import(data.capability.manager_url);
   const { ModelRegistry } = await import(data.capability.registry_url);
   const runtime = await import(new URL('./modes/runtime-init.ts', data.capability.sdk_url).href);
-  const settings = await sdk.Settings.init({ cwd: data.task?.worktree ?? repo, agentDir, readOnly: true, overrides: {
+  const settings = await sdk.Settings.init({ cwd, agentDir, readOnly: true, overrides: {
     'skills.includeSkills': [], 'compaction.enabled': false, 'compaction.midTurnEnabled': false,
     'compaction.autoContinue': false, 'compaction.asyncEnabled': false, 'retry.enabled': false,
     'retry.maxRetries': 0, 'retry.modelFallback': false, 'retry.usageAwareFallback': false,
     'advisor.enabled': false, 'autolearn.enabled': false, 'autolearn.autoContinue': false,
   }});
-  const auth = await sdk.discoverAuthStorage(agentDir, { cwd: data.task?.worktree ?? repo, settings });
+  const auth = await sdk.discoverAuthStorage(agentDir, { cwd, settings });
   const modelRegistry = new ModelRegistry(auth, undefined, { settings });
-  const manager = SessionManager.create(data.task?.worktree ?? repo, data.session_dir ?? join(isolated, 'sessions'));
+  const manager = SessionManager.create(cwd, data.session_dir ?? join(isolated, 'sessions'));
+  const extensionModule = await import(pathToFileURL(join(repo, data.extension)).href);
+  const extension = extensionModule.default ?? extensionModule;
+  const inputs: Input[] = [];
   const oldEndSeen = Promise.withResolvers<void>();
   const releaseOldEnd = Promise.withResolvers<void>();
   let holdOldEnd = true;
-  const extensionWithStaleGate = (api: { on: (name: string, handler: (event: { willContinue?: boolean }) => unknown) => void }) => {
+  let injectGap = false;
+  let injectAmbiguous = false;
+  let gapInjected = false;
+  let ambiguousInjected = false;
+  const extensionWithStaleGate = (api: { on: (name: string, handler: (event: { willContinue?: boolean; messages?: unknown[] }) => unknown) => void }) => {
     api.on('agent_end', async event => {
-      if (!holdOldEnd || event.willContinue === true) return;
+      if (event.willContinue === true) return;
+      if ((injectGap || injectAmbiguous) && event.messages) {
+        const binding = [...event.messages].reverse().find(message =>
+          typeof message === 'object' && message !== null &&
+          (message as Record<string, unknown>).customType === 'agd:episode-binding') as Record<string, unknown> | undefined;
+        const details = binding?.details;
+        if (details && typeof details === 'object') {
+          if (injectGap) {
+            event.messages.push({ customType: 'agd:episode-gap', display: false, content: 'Injected native gap', details });
+            gapInjected = true;
+          } else {
+            event.messages.push({ ...binding, details });
+            ambiguousInjected = true;
+          }
+        }
+        injectGap = false;
+        injectAmbiguous = false;
+      }
+      if (!holdOldEnd) return;
       holdOldEnd = false;
       oldEndSeen.resolve();
       await releaseOldEnd.promise;
@@ -101,27 +140,35 @@ async function nativeProbe(role: 'worker' | 'central') {
     (extension as (api: unknown) => unknown)(api);
   };
   const { session } = await sdk.createAgentSession({
-    cwd: data.task?.worktree ?? repo, agentDir, settings,
+    cwd, agentDir, settings,
     model: modelRegistry.find('openai', 'gpt-4o-mini'), modelRegistry, sessionManager: manager,
     rules: [], contextFiles: [], noContextFiles: true, disableExtensionDiscovery: true,
     toolNames: [], enableMCP: false, enableLsp: false, enableIrc: false,
     skipPythonPreflight: true, spawns: '', autoTitle: false, systemPrompt: ['NATIVE-EPISODE-POLICY'],
     extensions: [extensionWithStaleGate],
   });
-  let mode: 'final' | 'wait' | 'error' = 'final';
+  let mode: 'final' | 'wait' | 'error' | 'abort' = 'final';
+  const abortStarted = Promise.withResolvers<void>();
   session.agent.streamFn = (model: { api: string; provider: string; id: string }, context: Input, _options: { signal?: AbortSignal }) => {
     inputs.push(structuredClone({ systemPrompt: context.systemPrompt, messages: context.messages }));
     const stream = new ai.AssistantMessageEventStream();
     const message = { role: 'assistant', content: mode === 'final' ? [{ type: 'text', text: 'Native final episode.' }] : [],
       api: model.api, provider: model.provider, model: model.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-      stopReason: mode === 'error' ? 'error' : 'stop', timestamp: Date.now() };
-    queueMicrotask(() => { stream.push({ type: 'done', reason: message.stopReason, message }); stream.end(message); });
-    return stream;
+      stopReason: mode === 'error' ? 'error' : mode === 'abort' ? 'aborted' : 'stop', timestamp: Date.now() };
+    if (mode === 'abort') {
+      abortStarted.resolve();
+      const aborted = () => { stream.push({ type: 'error', reason: 'aborted', error: message }); stream.end(message); };
+      if (_options.signal?.aborted) queueMicrotask(aborted);
+      else _options.signal?.addEventListener('abort', aborted, { once: true });
+    } else {
+      queueMicrotask(() => { stream.push({ type: 'done', reason: message.stopReason, message }); stream.end(message); });
+    }
   };
   try {
     await runtime.initializeExtensions(session, { reportSendError: (_action: string, error: Error) => { throw error; }, reportRuntimeError: (error: unknown) => { throw new Error(String(error)); } });
     const previousSessionFile = manager.getSessionFile();
     assert(previousSessionFile);
+    const previousSessionId = manager.getSessionId();
     const firstPrompt = session.prompt('Produce a final response.');
     await oldEndSeen.promise;
     assert.equal(await session.newSession(), true);
@@ -133,32 +180,80 @@ async function nativeProbe(role: 'worker' | 'central') {
     const completionDir = join(data.home, 'state/reviewer/episodes/completions');
     assert(inputs.length > 0);
     assert(inputs.every(input => !JSON.stringify(input.messages).includes('agd:episode-binding')));
-    const sources = readdirSync(sourceDir).filter(name => name.endsWith('.json'));
-    assert(sources.length >= 1);
-    assert(existsSync(completionDir));
-    const completionsAfterFinal = readdirSync(completionDir);
-    assert(completionsAfterFinal.length >= 1);
+    const sourceReceipts = readdirSync(sourceDir).filter(name => name.endsWith('.json'))
+      .map(name => JSON.parse(readFileSync(join(sourceDir, name), 'utf8')) as Record<string, unknown>);
+    const oldReceipt = sourceReceipts.find(row => row.session_id === previousSessionId);
+    assert(oldReceipt);
+    assert.equal(typeof oldReceipt.source_id, 'string');
+    assert.equal(typeof oldReceipt.path, 'string');
+    const oldRows = nativeRows(join(data.home, oldReceipt.path as string));
+    const oldMarker = oldRows.find(row => row.type === 'custom_message' &&
+      row.customType === 'agd:episode-binding' && typeof row.details === 'object' && row.details !== null &&
+      (row.details as Record<string, unknown>).source_id === oldReceipt.source_id) as Record<string, unknown> | undefined;
+    assert(oldMarker);
+    const markerDetails = oldMarker.details as Record<string, unknown>;
+    assert.equal(typeof markerDetails.interaction_id, 'string');
+    const oldFinal = oldRows.find(row => {
+      if (row.type !== 'message' || typeof row.message !== 'object' || row.message === null) return false;
+      const message = row.message as Record<string, unknown>;
+      return message.role === 'assistant' && message.stopReason === 'stop' && typeof message.timestamp === 'number';
+    });
+    assert(oldFinal);
+    const oldMessage = oldFinal.message as Record<string, unknown>;
+    const completionPath = join(completionDir, oldReceipt.source_id as string, `${markerDetails.interaction_id}.json`);
+    assert(existsSync(completionPath));
+    const oldCompletion = JSON.parse(readFileSync(completionPath, 'utf8')) as Record<string, unknown>;
+    assert.equal(oldCompletion.source_id, oldReceipt.source_id);
+    assert.equal(oldCompletion.interaction_id, markerDetails.interaction_id);
+    const finalRecord = oldCompletion.final as Record<string, unknown>;
+    assert.equal(finalRecord.timestamp, oldMessage.timestamp);
+    assert.equal(finalRecord.text_sha256, textFingerprint(oldMessage.content));
     mode = 'final';
     await session.prompt('Produce a final response after switching native sessions.');
     await manager.flush();
-    assert(readdirSync(sourceDir).length >= sources.length + 1);
+    assert(readdirSync(sourceDir).length >= sourceReceipts.length + 1);
     const completionsAfterSwitch = readdirSync(completionDir);
-    mode = 'wait';
+    injectGap = true;
+    await session.prompt('Exercise a lost current binding.');
+    await manager.flush();
+    const completionsAfterGap = readdirSync(completionDir);
+    const gapRejected = gapInjected && completionsAfterGap.length === completionsAfterSwitch.length;
+    assert(gapRejected);
+    injectAmbiguous = true;
+    await session.prompt('Exercise ambiguous current metadata.');
+    await manager.flush();
+    const completionsAfterAmbiguous = readdirSync(completionDir);
+    const ambiguousRejected = ambiguousInjected && completionsAfterAmbiguous.length === completionsAfterSwitch.length;
+    assert(ambiguousRejected);
     await session.prompt('Wait for delegated work.');
     await manager.flush();
-    assert.equal(readdirSync(completionDir).length, completionsAfterSwitch.length);
+    const completionsAfterWait = readdirSync(completionDir);
+    assert.equal(completionsAfterWait.length, completionsAfterSwitch.length);
     mode = 'error';
     await session.prompt('Exercise a provider error.');
     await manager.flush();
-    assert.equal(readdirSync(completionDir).length, completionsAfterSwitch.length);
-
-    mode = 'final';
-    await session.prompt('Produce another reusable final response.');
+    const completionsAfterError = readdirSync(completionDir);
+    assert.equal(completionsAfterError.length, completionsAfterSwitch.length);
+    mode = 'abort';
+    const completionCountBeforeAbort = readdirSync(completionDir).length;
+    const interrupted = session.prompt('Interrupt this native turn.');
+    await abortStarted.promise;
+    await session.abort();
+    await interrupted;
     await manager.flush();
-    assert(readdirSync(completionDir).length >= completionsAfterSwitch.length);
-    return { role: data.role, sources: readdirSync(sourceDir).length, providerInputs: inputs.length,
-      completionDirectories: readdirSync(completionDir).length, markerHidden: true, waitsExcluded: true, errorsExcluded: true,
-      switchedSession: true };
+    assert.equal(readdirSync(completionDir).length, completionCountBeforeAbort);
+    mode = 'final';
+    await session.resume();
+    await manager.flush();
+    assert(readdirSync(completionDir).length > completionCountBeforeAbort);
+    return { role: data.role, sourceCount: readdirSync(sourceDir).length, completionCount: readdirSync(completionDir).length,
+      oldSourceId: oldReceipt.source_id, oldInteractionId: markerDetails.interaction_id,
+      markerHidden: inputs.every(input => !JSON.stringify(input.messages).includes('agd:episode-binding') && !JSON.stringify(input.messages).includes('agd:episode-gap')),
+      gapsRejected: gapRejected,
+      ambiguousRejected,
+      waitsExcluded: completionsAfterWait.length === completionsAfterSwitch.length,
+      errorsExcluded: completionsAfterError.length === completionsAfterSwitch.length,
+      switchedSession: manager.getSessionId() !== previousSessionId };
   } finally {
     session.beginDispose(); await session.dispose(); await manager.close();
     rmSync(isolated, { recursive: true, force: true });
@@ -183,8 +278,12 @@ if (process.env.AGD_NATIVE_EPISODES_CHECK === '1') {
     const evidence = JSON.parse(stdout);
     for (const result of [evidence.worker, evidence.central]) {
       expect(result.markerHidden).toBe(true);
+      expect(result.gapsRejected).toBe(true);
+      expect(result.ambiguousRejected).toBe(true);
       expect(result.waitsExcluded).toBe(true);
       expect(result.errorsExcluded).toBe(true);
+      expect(result.oldSourceId).toMatch(/^[0-9a-f]{64}$/);
+      expect(result.oldInteractionId).toMatch(/^[0-9a-f-]{36}$/);
     }
   }, 190000);
 }
