@@ -519,3 +519,19 @@ def test_copied_home_cannot_adopt_original_docker_resources(monkeypatch):
         assert resources and any(row['blockers'] and row['ownership'] != 'owned' for row in resources)
         assert json.dumps(state['objects'], sort_keys=True) == original
         assert not state['changes']
+
+
+def test_docker_absence_can_be_verified_after_home_removal(monkeypatch):
+    import shutil
+    from agd_lib import uninstall_state
+    from support import uninstall_scope
+    with lab() as (root, _):
+        _uninstall_engine(monkeypatch, root)
+        resources = observability.uninstall_inventory(root)
+        with uninstall_scope(root, resources) as operation:
+            observability.uninstall_quiesce(root, resources, operation)
+            observability.uninstall_remove(root, resources, operation)
+            uninstall_state.checkpoint(root, operation, phase='verifying', irreversible=True)
+            shutil.rmtree(root)
+            assert all(row['presence'] == 'absent' for row in
+                       observability.uninstall_inventory(root, expected=resources))

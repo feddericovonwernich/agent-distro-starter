@@ -165,6 +165,8 @@ def read_operation(home):
     root = _path(home)
     directory = operation_dir(root)
     if not os.path.lexists(directory):
+        if os.path.lexists(root / 'state/uninstall.json'):
+            _refuse('retirement pointer lacks its authoritative external journal')
         return None
     _directory(directory, private=True)
     value = read_evidence(directory / 'operation.json', private=True)
@@ -313,7 +315,7 @@ def retirement(home, inventory, *, discard_digest):
     directory = operation_dir(root)
     with _parent_lock(root, exclusive=True):
         previous = read_operation(root)
-        if previous is None:
+        if previous is None or previous['phase'] in _TERMINAL:
             if target_identity(root) != inventory['target']:
                 _refuse('uninstall target changed after preview')
         else:
@@ -409,6 +411,27 @@ def checkpoint(home, operation, *, phase, completed=None, irreversible=False, er
             current['completed'].append(completed)
     current.update(phase=phase, irreversible_started=current['irreversible_started'] or irreversible,
                    failure=error)
+    _write(root, current)
+    operation.clear()
+    operation.update(current)
+    return operation
+
+
+def reapprove(home, operation, inventory, *, discard_digest):
+    """Replace a held grant only after the coordinator obtains any newly required consent."""
+    root = _path(home)
+    current = _owned(root, operation)
+    _validate_inventory(inventory)
+    if (inventory['target'] != current['target'] or inventory.get('source') != current['inventory'].get('source')
+            or inventory.get('blockers') or any(row.get('ownership') != 'owned' or row.get('blockers')
+                                               for row in inventory['resources'])):
+        _refuse('refreshed uninstall scope is not independently owned')
+    if inventory['work_loss'] and discard_digest != inventory['discard_digest']:
+        _refuse('refreshed local work requires bound discard approval')
+    keys = {row['key'] for row in inventory['resources']}
+    if any(key not in keys for key in current['completed']):
+        _refuse('refreshed inventory lost completed resource evidence')
+    current.update(inventory=inventory, discard_digest=discard_digest)
     _write(root, current)
     operation.clear()
     operation.update(current)

@@ -275,6 +275,9 @@ def uninstall_inventory(home, *, expected=None):
                 rows.append(row)
             continue
         row = checkout_inventory(path)
+        if path == home:
+            row['identity']['retirement_home'] = str(home)
+            row['work_loss'] = [item for item in row['work_loss'] if item.get('path') != 'state/uninstall.json']
         if not row['identity']['linked']:
             foreign = [item for item in row['identity']['registrations']
                        if item['path'] != str(path) and item['path'] not in task_paths
@@ -292,16 +295,19 @@ def remove_checkout(home, resource, operation):
     approved = uninstall_state.require_scope(home, operation, resource['key'])
     identity = approved['identity']
     path, common = Path(identity['path']), Path(identity['common']['path'])
+    phase = 'verifying' if operation['phase'] == 'verifying' else 'removing'
     if not os.path.lexists(path):
         if identity['linked'] and common.is_dir():
             remaining = [item for item in _registrations(common) if item['path'] == str(path)]
             if remaining:
-                uninstall_state.checkpoint(home, operation, phase='removing', irreversible=True)
+                uninstall_state.checkpoint(home, operation, phase=phase, irreversible=True)
                 _checkout_git(common, 'worktree', 'remove', '--force', str(path))
         if common.is_dir() and any(item['path'] == str(path) for item in _registrations(common)):
             raise store.Refusal('checkout registration remains')
     else:
         fresh = checkout_inventory(path)
+        if identity.get('retirement_home') == str(home) and path == home:
+            fresh['work_loss'] = [item for item in fresh['work_loss'] if item.get('path') != 'state/uninstall.json']
         current = fresh['identity']
         for key in ('path', 'device', 'inode', 'uid', 'common', 'git_dir', 'linked', 'head'):
             if current[key] != identity[key]:
@@ -312,7 +318,7 @@ def remove_checkout(home, resource, operation):
             raise store.Refusal('checkout work changed after approval')
         if not identity['linked'] and any(item['path'] != str(path) for item in current['registrations']):
             raise store.Refusal('backing clone still has linked worktrees')
-        uninstall_state.checkpoint(home, operation, phase='removing', irreversible=True)
+        uninstall_state.checkpoint(home, operation, phase=phase, irreversible=True)
         if identity['linked']:
             argv = ['worktree', 'remove']
             if approved.get('work_loss'):
@@ -324,4 +330,4 @@ def remove_checkout(home, resource, operation):
             raise store.Refusal('checkout removal is unconfirmed')
         if identity['linked'] and any(item['path'] == str(path) for item in _registrations(common)):
             raise store.Refusal('linked checkout registration remains')
-    uninstall_state.checkpoint(home, operation, phase='removing', completed=approved['key'])
+    uninstall_state.checkpoint(home, operation, phase=phase, completed=approved['key'])

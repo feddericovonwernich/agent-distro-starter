@@ -433,6 +433,8 @@ def uninstall_inventory(home, *, expected=None, service=None):
 def uninstall_quiesce(home, resources, operation):
     from . import supervision, uninstall_state
     for resource in resources:
+        if resource['kind'] not in {'reviewer-run', 'reviewer-lease'}:
+            continue
         approved = uninstall_state.require_scope(home, operation, resource['key'])
         current = next((row for row in uninstall_inventory(home, expected=[approved])
                         if row['key'] == approved['key']), None)

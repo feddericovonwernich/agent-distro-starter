@@ -244,7 +244,8 @@ def _herdr_call(endpoint: dict, *args, check=True):
     if identity.st_dev != endpoint['device'] or identity.st_ino != endpoint['inode']:
         raise store.Refusal('Herdr server replaced; endpoint identity unknown')
     try:
-        env = dict(os.environ, HERDR_CONFIG_PATH=endpoint['config_path']) if endpoint.get('config_path') else None
+        from . import herdr
+        env = herdr.control_environment(endpoint)
         result = store.run(['herdr', '--session', endpoint['session'], *args], check=False, timeout=10, env=env)
     except subprocess.TimeoutExpired as error:
         raise store.Refusal('Herdr command timed out; endpoint state unknown') from error
@@ -310,7 +311,7 @@ def _herdr_create(home: Path, launch_id: str, endpoint_token: str, managed: list
     endpoint['server'] = herdr.server_identity(endpoint)
     endpoint['server']['target'] = supervision.runtime_home_identity(home)
     endpoint['target'] = supervision.runtime_home_identity(home)
-    endpoint['config_path'] = herdr.config_path()
+    endpoint['config_env'] = herdr.config_environment()
     if checkpoint:
         checkpoint(endpoint)
     created_workspace = _herdr_response(_herdr_call(
@@ -632,7 +633,7 @@ def uninstall_inventory(home, *, expected=None):
         workspace = uninstall_state.read_evidence(workspace_path, private=True)
         key = f"backend-workspace:herdr:{workspace['workspace']}"
         identity = {name: workspace.get(name) for name in (
-            'target', 'session', 'socket', 'device', 'inode', 'protocol', 'workspace', 'anchor', 'server', 'config_path')}
+            'target', 'session', 'socket', 'device', 'inode', 'protocol', 'workspace', 'anchor', 'server', 'config_env')}
         rows[key] = {'key': key, 'kind': 'backend-workspace', 'identity': identity,
                      **_uninstall_workspace_probe(home, identity)}
         for server in servers.values():
@@ -737,7 +738,7 @@ def uninstall_quiesce(home, resources, operation):
 
 
 def uninstall_remove(home, resources, operation):
-    from . import tmux, uninstall_state
+    from . import herdr, tmux, uninstall_state
     for resource in sorted(resources, key=lambda row: row['kind'] == 'backend-server'):
         if resource['kind'] not in {'backend-workspace', 'backend-server'}:
             continue
@@ -781,7 +782,7 @@ def uninstall_remove(home, resources, operation):
                 path.unlink()
             if identity['backend'] == 'herdr':
                 endpoint = identity['endpoint']
-                env = dict(os.environ, HERDR_CONFIG_PATH=endpoint['config_path']) if endpoint.get('config_path') else None
+                env = herdr.control_environment(endpoint)
                 listed = json.loads(store.run(['herdr', 'session', 'list', '--json'], env=env).stdout)
                 sessions = listed['sessions'] if isinstance(listed, dict) else listed
                 selected = [item for item in sessions if item['name'] == endpoint['session']]

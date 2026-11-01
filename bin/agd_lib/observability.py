@@ -17,7 +17,10 @@ from . import omp_runtime, store
 
 
 def paths(home):
-    home = _home(home)
+    return _paths(_home(home))
+
+
+def _paths(home):
     data = home / 'data' / 'observability'
     state = home / 'state' / 'observability'
     return {
@@ -926,7 +929,12 @@ def _private_write(path, text):
 
 def _uninstall_engine():
     def query(argv):
-        result = _ownership_command(['docker', *argv])
+        try:
+            result = _ownership_command(['docker', *argv])
+        except store.Refusal as error:
+            if isinstance(error.__cause__, FileNotFoundError):
+                raise store.DependencyError('Docker is required to inspect retained observability resources') from error
+            raise
         if result.returncode:
             raise store.Refusal('Docker engine inspection failed')
         return result.stdout.strip()
@@ -983,9 +991,11 @@ def _uninstall_docker_object(kind, name, target, project):
 
 def uninstall_inventory(home, *, expected=None):
     from . import supervision
-    home = _home(home)
+    home = store.home(home)
     saved = next((row for row in expected or [] if row['kind'] == 'docker'), None)
-    locations = paths(home)
+    if not saved or os.path.lexists(home):
+        _home(home)
+    locations = _paths(home)
     evidence = any(os.path.lexists(path) for path in
                    (locations['compose'] / 'compose.yaml', locations['compose'] / 'release-lock.json',
                     locations['secrets']))

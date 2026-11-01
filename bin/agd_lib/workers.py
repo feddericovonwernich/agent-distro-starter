@@ -650,7 +650,7 @@ def uninstall_inventory(home, *, expected=None):
             identity = {'backend': task['backend'], 'task_id': task_id,
                         'incarnation': endpoint_incarnation, 'endpoint': safe,
                         'endpoint_digest': uninstall_state.fingerprint(endpoint)}
-            module = tmux if task['backend'] == 'tmux' else herdr
+            module = backend(task)
             probe = module._uninstall_probe(home, identity)
             rows[key] = {'key': key, 'kind': 'worker-endpoint', 'identity': identity, **probe}
     for key, saved in expected.items():
@@ -662,7 +662,7 @@ def uninstall_inventory(home, *, expected=None):
             presence = 'present' if any(supervision.process_presence(item) for item in processes) else 'absent'
             rows[key] = {**saved, 'presence': presence, 'blockers': []}
         else:
-            module = tmux if identity['backend'] == 'tmux' else herdr
+            module = backend(identity)
             rows[key] = {**saved, **module._uninstall_probe(home, identity)}
     return list(rows.values())
 
@@ -670,9 +670,11 @@ def uninstall_inventory(home, *, expected=None):
 def uninstall_quiesce(home, resources, operation):
     from . import supervision, uninstall_state
     for resource in sorted(resources, key=lambda row: row['kind'] != 'worker'):
+        if resource['kind'] not in {'worker', 'worker-endpoint'}:
+            continue
         approved = uninstall_state.require_scope(home, operation, resource['key'])
         if approved['kind'] == 'worker-endpoint':
-            module = tmux if approved['identity']['backend'] == 'tmux' else herdr
+            module = backend(approved['identity'])
             module.uninstall_close(home, approved, operation)
             continue
         current = next((row for row in uninstall_inventory(home, expected=[approved])
@@ -687,7 +689,7 @@ def uninstall_quiesce(home, resources, operation):
             endpoint = next((row for row in resources if row['key'] == endpoint_key), None)
             if endpoint:
                 endpoint = uninstall_state.require_scope(home, operation, endpoint_key)
-                module = tmux if endpoint['identity']['backend'] == 'tmux' else herdr
+                module = backend(endpoint['identity'])
                 module._uninstall_grace(home, endpoint['identity'])
                 deadline = time.monotonic() + 2
                 while any(supervision.process_presence(item) for item in processes) and time.monotonic() < deadline:

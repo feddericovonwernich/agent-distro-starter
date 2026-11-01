@@ -14,6 +14,38 @@ bin/agd start
 
 For central Herdr, `bin/agd start --backend herdr` runs from an ordinary terminal and uses the generated non-default session recorded in the launcher receipt. It refuses a pre-existing unreceipted same-name server and preserves it. This central path does not use the pane-worker contract.
 
+## Uninstall and recovery
+
+Use an independent ordinary terminal, not a central/worker process tree being retired. Relative `--home .` is normalized before handoff:
+
+```sh
+./bin/agd --home . uninstall --dry-run
+./bin/agd --home . uninstall && cd ..
+```
+
+Dry-run is read-only, works without a TTY, and returns the target identity, exact resource identities, local-work findings, shared exclusions and blockers as pretty JSON. It does not render Compose, create secrets, reconcile tasks, install tools or take over a live owner. Features with no installation/runtime evidence do not require their optional runtimes. Git is required for Git identity and dependency inspection.
+
+Destructive execution requires an interactive terminal and the exact canonical home path. A distinct displayed `DISCARD` token binds any dirty/ignored custom data, unpublished refs/commits or unverified work; changed work requires refreshed consent. Publication evidence uses existing local remote refs, never a network fetch. Fetch separately before preview if newer publication evidence is needed. Decline/EOF before consent changes nothing. A managed caller, foreign/reassigned lease, unknown PID/socket/pane, unsafe mount or conflicting journal cannot be overridden by extra confirmation.
+
+Owned removal covers central/watcher and native OMP processes; worker runners/children and exact tmux/Herdr endpoints; bounded reviewer runs and the active scheduled service/cgroup, timer, activation link and persistent timer state; Relay processes; owned local Docker containers (including proven orphans), networks and data volumes; frozen generated skill files and their exact shared-Git exclusion owner; conditional Treehouse lease return followed by single-slot destroy; Git registrations, project/source checkouts and private distro data. Normal `task cleanup`, `project remove`, reviewer disable and observability disable retain their existing narrower meanings.
+
+Shared OMP/Bun/Python/Herdr/tmux/Treehouse/Relay installations, account-global config/auth, Docker images/daemon, unrelated units/panes/pools/homes, remote repositories and external Git common directories/refs survive. An external unowned worktree blocks deletion of its backing clone. A linked distro source is removed with native Git worktree removal, preserving its common repo and sibling registrations.
+
+After confirmation, a private sibling `.agd-uninstall-…/` journal fences all new distro activity. The foreground coordinator copies only its fixed application allowlist and release-lock asset, uses an outside interpreter with `-I -S -B`, moves its own cwd outside removal roots, and prints a `Recovery:` invocation of its private `bootstrap.py`. No OMP auth/plugin/session payload is staged. Run that exact printed command after a crash, even when the original `bin/agd` or home has disappeared. A different process receives a fresh preview/consent; it cannot reuse an old grant for a replacement path/inode/UUID.
+
+Before irreversible removal, declining a resumed operation clears retirement but does not restart stopped services. After irreversible removal, refusal/interruption retains the external journal/stage; resolve the stated blocker and resume instead of deleting evidence or rerunning `rm -rf`. Native absence is checked before data deletion, then the missing home/resources are checked again over at least eight seconds. A recreated home is a failure, never permission for another blind delete. Success removes the executor and retains non-secret result/journal evidence.
+
+Legacy evidence is deliberately conservative: bare/reused PIDs, busy reviewer locks without a proven owner, unreceipted native slots, Herdr records lacking the captured control namespace, UUID-only Docker labels or changed engine/context may block automatic cleanup. Do not relabel/adopt such resources merely to make uninstall pass; establish ownership independently first.
+
+| Exit | Meaning |
+|---|---|
+| `0` | Ready dry-run, handled cancellation, verified uninstall or already absent without pending retirement |
+| `2` | Malformed arguments |
+| `3` | Unsafe/uncertain state or incomplete retirement |
+| `4` | Missing essential inspection dependency |
+
+`python3 tests/smoke_uninstall.py --backend herdr --with-docker` is an opt-in disposable native check; it accepts no existing-home target and never pulls an image. Use `--backend tmux` only where that runtime is available. It retains scoped evidence after a failed proof rather than widening native force flags.
+
 ## Projects and task workspaces
 
 After guided installation, run `project add ID --source URL_OR_PATH --base main` or register an existing clone at `projects/ID` with `project register ID --path ABSOLUTE_PATH`. `project refresh ID` requires a clean base branch and fast-forward. `project trust ID --instruction FILE` records explicit Cursor trust for that exact clone; registration alone does not grant it. `project remove ID` only unregisters. For irreversible deletion, obtain user instruction, run `project approve ID --action delete-clone --instruction FILE`, then `project remove ID --delete-clone --approval APPROVAL_ID`; tasks, dirty work, extra refs and unpublished reflog commits prevent deletion.

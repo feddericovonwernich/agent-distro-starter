@@ -600,6 +600,33 @@ def uninstall_inventory(home, *, expected=None):
                 if item.get('path') not in generated or item.get('sha256') != generated[item['path']]]
         rows[key] = {'key': key, 'kind': 'treehouse-slot', 'identity': identity, 'presence': 'present',
                      'ownership': 'unknown' if blockers else 'owned', 'blockers': blockers, 'work_loss': loss}
+    roots = {Path(home / 'data/treehouse')}
+    roots.update(Path(task['treehouse_root']) for candidates in grouped.values() for task in candidates
+                 if task.get('treehouse_root'))
+    for receipt in (home / 'data/projects').glob('*.json'):
+        if receipt.name.endswith('.approval.json'):
+            continue
+        project = uninstall_state.read_evidence(receipt)
+        if not Path(project['path']).is_dir():
+            continue
+        for root in sorted(roots):
+            if not (root / '.treehouse').is_dir():
+                continue
+            slots = json.loads(store.run(['treehouse', '--root', str(root), 'status', '--json'],
+                                         cwd=project['path']).stdout)
+            for slot in slots:
+                key = 'treehouse:' + slot['path']
+                if slot['path'] in grouped or key in saved or key in rows:
+                    continue
+                rows[key] = {
+                    'key': key, 'kind': 'treehouse-slot', 'presence': 'present', 'ownership': 'unknown',
+                    'identity': {'path': slot['path'], 'root': str(root), 'slot': slot['name'],
+                                 'lease_id': slot.get('lease_id'), 'lease_holder': slot.get('lease_holder'),
+                                 'project_path': project['path']},
+                    'blockers': [{'code': 'unrecorded-native-slot',
+                                  'reason': 'native slot has no frozen task receipt; it is not an ordinary checkout'}],
+                    'work_loss': [],
+                }
     for key, resource in saved.items():
         if key not in rows:
             slot = _uninstall_slot(resource['identity'])

@@ -38,7 +38,8 @@ def available():
     if not stat.S_ISSOCK(identity.st_mode):
         raise store.DependencyError('selected Herdr server socket is unverified')
     return {'session': session, 'socket': str(socket), 'device': identity.st_dev,
-            'inode': identity.st_ino, 'protocol': fields.get('protocol') or fields['private_protocol']}
+            'inode': identity.st_ino, 'protocol': fields.get('protocol') or fields['private_protocol'],
+            'config_env': config_environment()}
 
 
 def call(endpoint, *args, check=True):
@@ -91,7 +92,7 @@ def prepare(home: Path) -> tuple[dict, str]:
                   ('pane_id', 'workspace_id', 'tab_id', 'terminal_id')} if created.get('root_pane') else None
         store.atomic_json(workspace_path, {**server, 'workspace': workspace_id,
             'target': supervision.runtime_home_identity(home), 'anchor': anchor,
-            'server': server_identity(server), 'config_path': config_path()})
+            'server': server_identity(server), 'config_env': config_environment()})
     return server, workspace_id
 
 
@@ -103,7 +104,7 @@ def create(home: Path, task_id: str, incarnation: str, cwd: Path, argv: list[str
                 'task': task_id, 'incarnation': incarnation, 'token': str(uuid.uuid4()),
                 'command': argv[3:] if argv[:1] == ['env'] else argv,
                 'target': supervision.runtime_home_identity(home), 'server': server_identity(server)}
-    endpoint['config_path'] = config_path()
+    endpoint['config_env'] = config_environment()
     store.atomic_json(receipt, endpoint)
     created = response(call(endpoint, 'tab', 'create', '--workspace', workspace_id,
                             '--cwd', str(cwd), '--label', task_id, '--no-focus'))
@@ -294,6 +295,16 @@ def uninstall_close(home, resource, operation):
     uninstall_state.checkpoint(home, operation, phase='quiescing', completed=approved['key'])
 
 
-def config_path():
-    return os.environ.get('HERDR_CONFIG_PATH') or str(
-        Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'herdr/config.toml')
+def config_environment():
+    home = str(Path.home())
+    config = os.environ.get('XDG_CONFIG_HOME') or str(Path(home) / '.config')
+    return {'HOME': home, 'XDG_CONFIG_HOME': config,
+            'HERDR_CONFIG_PATH': os.environ.get('HERDR_CONFIG_PATH') or str(Path(config) / 'herdr/config.toml')}
+
+
+def control_environment(endpoint):
+    value = endpoint.get('config_env')
+    if (not isinstance(value, dict) or set(value) != {'HOME', 'XDG_CONFIG_HOME', 'HERDR_CONFIG_PATH'}
+            or any(not isinstance(path, str) or not Path(path).is_absolute() for path in value.values())):
+        raise store.Refusal('Herdr control namespace is missing or unsafe')
+    return dict(os.environ, **value)

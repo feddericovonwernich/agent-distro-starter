@@ -767,6 +767,8 @@ def uninstall_inventory(home, *, expected=None):
 def uninstall_quiesce(home, resources, operation):
     from . import supervision, uninstall_state
     for resource in resources:
+        if resource['kind'] != 'relay':
+            continue
         approved = uninstall_state.require_scope(home, operation, resource['key'])
         current = next((row for row in uninstall_inventory(home, expected=[approved])
                         if row['key'] == approved['key']), None)

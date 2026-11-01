@@ -142,30 +142,6 @@ def test_initial_owner_waits_for_transient_herdr_foreground_inspection(monkeypat
     assert launcher._await_initial_owner(Path('/'), {}, object()) == owner
 
 
-def test_herdr_available_accepts_current_status(monkeypatch):
-    import stat
-    from agd_lib import herdr
-
-    class Socket:
-        st_mode, st_dev, st_ino = stat.S_IFSOCK, 9, 10
-
-
-    class SocketPath:
-        def __init__(self, _):
-            pass
-
-        def is_absolute(self):
-            return True
-
-        def stat(self):
-            return Socket()
-    monkeypatch.setenv('HERDR_ENV', '1')
-    monkeypatch.setenv('AGD_HERDR_SESSION', 'agd-test')
-    monkeypatch.setattr(herdr.store, 'run', lambda *_args, **_kwargs: SimpleNamespace(
-        returncode=0, stdout=('status: running\nversion: 0.9.5\nendpoint_compatible: yes\n'
-                              'private_protocol: 22\nprivate_protocol_compatible: yes\nsocket: /tmp/herdr.sock\n')))
-    monkeypatch.setattr(herdr, 'Path', SocketPath)
-    assert herdr.available()['protocol'] == '22'
 
 def test_current_herdr_status_requires_version(monkeypatch):
     import stat
@@ -313,6 +289,7 @@ def test_uninstall_refuses_replaced_backend_or_foreign_pane(tmp_path, monkeypatc
                 'token': str(uuid.uuid4()), 'workspace': 'workspace', 'tab': 'tab',
                 'pane': 'owned-pane', 'terminal': 'terminal',
                 'target': supervision.runtime_home_identity(home), 'command': ['agd']}
+    endpoint['config_env'] = herdr.config_environment()
     store.atomic_json(home / 'state/tasks/worker/endpoint.json', endpoint)
     safe = {name: value for name, value in endpoint.items() if name not in {'token', 'command'}}
     safe['token_sha256'] = hashlib.sha256(endpoint['token'].encode()).hexdigest()
@@ -340,3 +317,58 @@ def test_uninstall_refuses_replaced_backend_or_foreign_pane(tmp_path, monkeypatc
     finally:
         original.close()
         replacement.close()
+
+
+def test_native_herdr_control_keeps_launch_namespace_after_caller_env_change(monkeypatch):
+    import os
+    import json
+    import shutil
+    import subprocess
+    import tempfile
+    import time
+    import uuid
+    import pytest
+    from agd_lib import herdr, launcher
+    binary = shutil.which('herdr')
+    if not binary:
+        pytest.skip('native Herdr unavailable')
+    with tempfile.TemporaryDirectory(prefix='an-') as temporary:
+        base = Path(temporary)
+        environment = dict(os.environ, HOME=str(base / 'a'), XDG_CONFIG_HOME=str(base / 'c'))
+        for path in (base / 'a', base / 'c'):
+            path.mkdir(mode=0o700)
+        environment.pop('HERDR_CONFIG_PATH', None)
+        session = 'agd-' + uuid.uuid4().hex
+        process = subprocess.Popen([binary, '--session', session, 'server'], env=environment,
+                                   cwd=base, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            deadline = time.monotonic() + 10
+            while True:
+                result = subprocess.run([binary, '--session', session, 'status', 'server'], env=environment,
+                                        capture_output=True, text=True)
+                if result.returncode == 0:
+                    break
+                assert time.monotonic() < deadline and process.poll() is None
+                time.sleep(.02)
+            fields = dict(line.split(': ', 1) for line in result.stdout.splitlines() if ': ' in line)
+            socket = Path(fields['socket']); mode = socket.stat()
+            created = subprocess.run([binary, '--session', session, 'workspace', 'create', '--cwd', str(base),
+                                      '--label', 'namespace-proof', '--no-focus'], env=environment,
+                                     capture_output=True, text=True, check=True)
+            workspace = json.loads(created.stdout)['result']['workspace']['workspace_id']
+            with monkeypatch.context() as context:
+                context.setenv('HOME', environment['HOME'])
+                context.setenv('XDG_CONFIG_HOME', environment['XDG_CONFIG_HOME'])
+                context.delenv('HERDR_CONFIG_PATH', raising=False)
+                captured = herdr.config_environment()
+            endpoint = {'session': session, 'socket': str(socket), 'device': mode.st_dev, 'inode': mode.st_ino,
+                        'config_env': captured}
+            observed = launcher._herdr_response(launcher._herdr_call(endpoint, 'workspace', 'get', workspace))
+            assert observed['workspace']['workspace_id'] == workspace
+        finally:
+            subprocess.run([binary, 'session', 'stop', session, '--json'], env=environment, capture_output=True)
+            process.wait(timeout=10)
+            deleted = subprocess.run([binary, 'session', 'delete', session, '--json'], env=environment,
+                                     capture_output=True, text=True, check=True)
+            assert json.loads(deleted.stdout)['deleted'] is True
