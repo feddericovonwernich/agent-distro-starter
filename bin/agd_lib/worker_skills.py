@@ -472,7 +472,7 @@ def _selection_ids(selection):
     return selected
 
 
-def _manifest(home, task):
+def _manifest(home, task, *, teardown=False):
     path = _journal(home, task)
     if not path.is_file() or path.is_symlink():
         _refusal('worker skill journal is missing')
@@ -502,7 +502,7 @@ def _manifest(home, task):
         if data['schema'] == 1:
             scoped = record['id'] == 'agd-scoped-pr-relay' and task.get('pr_grant')
             expected = Path(__file__).resolve().parents[2]/'bundled'/'worker-skills'/record['id'] if scoped else _private_path(home, 'config', 'worker-skills', record['id'])
-            if source != expected:
+            if source != expected and not (teardown and scoped):
                 _refusal('worker skill source path escaped catalog')
         else:
             descriptor = selection.get('sources', {}).get(record['id'])
@@ -754,12 +754,16 @@ def remove(home: Path, task: dict) -> None:
 
 
 def _exclude(home, task, paths, add):
-    import fcntl
     info = _exclude_info(task)
+    key = f'{_private_path(home, "data", "home.json")}:{task["id"]}:{task.get("lease_id", "")}'
+    _exclude_owner(info, key, paths, add)
+
+
+def _exclude_owner(info, key, paths, add):
+    import fcntl
     lock = info/'agd-worker-skills.lock'
     registry = info/'agd-worker-skills.json'
     excludes = info/'exclude'
-    key = f'{_private_path(home, "data", "home.json")}:{task["id"]}:{task.get("lease_id", "")}'
     for metadata in (lock, registry, excludes):
         if metadata.exists() or metadata.is_symlink():
             identity = os.lstat(metadata)
@@ -788,3 +792,107 @@ def _exclude(home, task, paths, add):
             managed.intersection_update(remaining)
         data['managed'] = sorted(managed)
         store.atomic_json(registry, data)
+
+
+def uninstall_inventory(home, *, expected=None):
+    from . import projects, supervision, tasks, uninstall_state
+    saved = {row['key']: row for row in expected or [] if row['kind'] == 'worker-skills'}
+    rows = {}
+    for journal in sorted((home / 'data/tasks').glob('*/worker-skills.json')):
+        task = tasks.read(home, journal.parent.name)
+        manifest = _manifest(home, task, teardown=True)
+        worktree = Path(task['worktree'])
+        key = f"skills:{task['id']}:{task.get('lease_id', '')}"
+        if not worktree.exists() and key in saved:
+            continue
+        checkout = projects.checkout_inventory(worktree)['identity']
+        info = Path(checkout['common']['path']) / 'info'
+        owner_key = f'{home / "data/home.json"}:{task["id"]}:{task.get("lease_id", "")}'
+        entries, loss = [], []
+        for skill in manifest['skills']:
+            root = Path(skill['destination'])
+            for record in skill['files']:
+                relative = Path(record['path'])
+                if relative.is_absolute() or '..' in relative.parts:
+                    _refusal('generated skill file escaped its frozen root')
+                path = root / relative
+                if any(parent.is_symlink() for parent in (path, *path.parents)):
+                    _refusal('generated skill path is symlinked')
+                digest = projects._loss_file(path) if os.path.lexists(path) and record['kind'] == 'file' else None
+                entry = {'path': str(path), 'kind': record['kind'], 'original_sha256': record.get('sha256'),
+                         'sha256': digest}
+                entries.append(entry)
+                if digest is not None and digest != record.get('sha256'):
+                    loss.append({'kind': 'modified-generated-skill', 'path': str(path), 'sha256': digest})
+            entries.append({'path': str(root), 'kind': 'directory', 'original_sha256': None, 'sha256': None})
+        identity = {'target': supervision.runtime_home_identity(home), 'task_id': task['id'],
+                    'lease_id': task.get('lease_id'), 'worktree': {name: checkout[name] for name in ('path', 'device', 'inode', 'uid')},
+                    'common': checkout['common'], 'owner_key': owner_key, 'info': str(info),
+                    'info_identity': projects._removal_identity(info),
+                    'excludes': manifest.get('excludes', []), 'files': entries}
+        registry = uninstall_state.read_evidence(info / 'agd-worker-skills.json') if (info / 'agd-worker-skills.json').exists() else {}
+        owned = registry.get('owners', {}).get(owner_key)
+        if owned is not None and owned != identity['excludes']:
+            _refusal('generated skill exclusion ownership changed')
+        present = owned is not None or any(entry['kind'] == 'file' and entry['sha256'] is not None for entry in entries)
+        rows[key] = {'key': key, 'kind': 'worker-skills', 'identity': identity, 'presence': 'present' if present else 'absent',
+                     'ownership': 'owned', 'blockers': [], 'work_loss': loss}
+    for key, resource in saved.items():
+        identity = resource['identity']
+        if key not in rows:
+            present = any(item['kind'] == 'file' and os.path.lexists(item['path']) for item in identity['files'])
+            registry = Path(identity['info']) / 'agd-worker-skills.json'
+            if registry.exists():
+                data = uninstall_state.read_evidence(registry)
+                present = present or identity['owner_key'] in data.get('owners', {})
+            rows[key] = dict(resource, presence='present' if present else 'absent')
+    return list(rows.values())
+
+
+def uninstall_remove(home, resources, operation):
+    import errno
+    from . import projects, uninstall_state
+    for resource in resources:
+        if resource['kind'] != 'worker-skills':
+            continue
+        approved = uninstall_state.require_scope(home, operation, resource['key'])
+        identity = approved['identity']
+        worktree, common = Path(identity['worktree']['path']), Path(identity['common']['path'])
+        if worktree.exists() and projects._removal_identity(worktree) != identity['worktree']:
+            _refusal('generated skill worktree identity changed')
+        if common.exists() and projects._removal_identity(common) != identity['common']:
+            _refusal('generated skill Git common identity changed')
+        for entry in identity['files']:
+            if entry['kind'] != 'file':
+                continue
+            path = Path(entry['path'])
+            if not os.path.lexists(path):
+                continue
+            if any(parent.is_symlink() for parent in (path, *path.parents)):
+                _refusal('generated skill path is symlinked')
+            if projects._loss_file(path) != entry['sha256']:
+                _refusal('generated skill file changed after approval')
+            uninstall_state.checkpoint(home, operation, phase='removing', irreversible=True)
+            path.unlink()
+        directories = {Path(entry['path']) for entry in identity['files'] if entry['kind'] == 'directory'}
+        for path in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+            if path.exists():
+                try:
+                    path.rmdir()
+                except OSError as error:
+                    if error.errno != errno.ENOTEMPTY:
+                        raise
+        if common.exists():
+            info = Path(identity['info'])
+            if projects._removal_identity(info) != identity['info_identity']:
+                _refusal('generated skill exclusion directory changed')
+            registry = info / 'agd-worker-skills.json'
+            owners = uninstall_state.read_evidence(registry).get('owners', {}) if registry.exists() else {}
+            if identity['owner_key'] in owners:
+                if owners[identity['owner_key']] != identity['excludes']:
+                    _refusal('generated skill exclusion owner changed')
+                uninstall_state.checkpoint(home, operation, phase='removing', irreversible=True)
+                _exclude_owner(info, identity['owner_key'], identity['excludes'], False)
+        if uninstall_inventory(home, expected=[approved])[0]['presence'] != 'absent':
+            _refusal('generated skill removal is incomplete')
+        uninstall_state.checkpoint(home, operation, phase='removing', completed=approved['key'])

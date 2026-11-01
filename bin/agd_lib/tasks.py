@@ -517,3 +517,140 @@ def publication_record(home, task_id, approval_id, remote, branch, url, evidence
         task['publication'] = dict(url=url, remote=remote, branch=branch, head=task['ready_head'], approval=approval['id'])
         save(home, task)
     return task
+
+
+def _uninstall_slot(identity):
+    project = Path(identity['project_path'])
+    path = Path(identity['path'])
+    if not project.exists():
+        if not path.exists() and not Path(identity['common']['path']).exists():
+            return None
+        raise store.Refusal('task backing clone is unavailable for native slot inspection')
+    argv = ['treehouse', '--root', identity['root'], 'status', '--json']
+    values = json.loads(store.run(argv, cwd=project).stdout)
+    if not isinstance(values, list):
+        raise store.Refusal('Treehouse slot inspection is malformed')
+    matches = [row for row in values if row.get('path') == identity['path']]
+    if len(matches) > 1:
+        raise store.Refusal('Treehouse slot identity is ambiguous')
+    if not matches:
+        if path.exists():
+            raise store.Refusal('task worktree lacks its native slot registration')
+        return None
+    slot = matches[0]
+    if slot.get('flavor') != 'git' or slot.get('name') != identity['slot']:
+        raise store.Refusal('Treehouse slot type or name changed')
+    if slot.get('lease_id') and (slot['lease_id'] != identity['lease_id']
+                               or slot.get('lease_holder') != identity['lease_holder']):
+        raise store.Refusal('task slot belongs to another lease holder')
+    return slot
+
+
+def uninstall_inventory(home, *, expected=None):
+    from . import supervision, uninstall_state, worker_skills
+    saved = {row['key']: row for row in expected or [] if row['kind'] == 'treehouse-slot'}
+    rows, grouped = {}, {}
+    for path in sorted((home / 'data/tasks').glob('*/task.json')):
+        task = uninstall_state.read_evidence(path)
+        if task.get('worktree'):
+            grouped.setdefault(task['worktree'], []).append(task)
+        elif task.get('phase') == 'preparing':
+            raise store.Refusal('task allocation is incomplete; reconcile it before uninstall')
+    for path, candidates in grouped.items():
+        task = next((item for item in reversed(candidates) if item.get('phase') != 'cleaned'), candidates[-1])
+        key = 'treehouse:' + path
+        if key in saved and not Path(path).exists():
+            continue
+        project = projects.read(home, task['project'])
+        checkout = projects.checkout_inventory(Path(path))
+        if checkout['identity']['common']['path'] != project['common_dir']:
+            raise store.Refusal('task worktree belongs to another Git common directory')
+        native = json.loads(store.run([*treehouse_args(task), 'status', '--json'], cwd=project['path']).stdout)
+        matches = [row for row in native if row.get('path') == path]
+        if not matches and not Path(path).exists():
+            continue
+        if len(matches) != 1:
+            raise store.Refusal('task slot registration is missing or ambiguous')
+        slot = matches[0]
+        matching = [item for item in candidates if item.get('lease_id') == slot.get('lease_id')
+                    and item.get('lease_holder') == slot.get('lease_holder')]
+        if matching:
+            task = matching[-1]
+        root = task.get('treehouse_root')
+        if not root:
+            raise store.Refusal('task lacks its frozen Treehouse root')
+        identity = {'target': supervision.runtime_home_identity(home), 'task_id': task['id'], 'path': path,
+                    'root': root, 'project': task['project'], 'project_path': project['path'],
+                    'common': checkout['identity']['common'],
+                    'worktree': {name: checkout['identity'][name] for name in ('path', 'device', 'inode', 'uid')},
+                    'slot': slot['name'], 'lease_id': task.get('lease_id'), 'lease_holder': task.get('lease_holder'),
+                    'start': task.get('start'), 'head': checkout['identity']['head']}
+        blockers = []
+        if slot.get('flavor') != 'git' or (slot.get('lease_id') and not matching):
+            blockers.append({'code': 'foreign-slot', 'reason': 'task slot has a foreign lease or type'})
+        generated = {}
+        if (task_file(home, task['id']).parent / 'worker-skills.json').exists():
+            manifest = worker_skills._manifest(home, task, teardown=True)
+            for skill in manifest['skills']:
+                for record in skill['files']:
+                    if record['kind'] == 'file':
+                        name = str((Path(skill['destination']) / record['path']).relative_to(path))
+                        generated[name] = record.get('sha256')
+        loss = [item for item in checkout['work_loss']
+                if item.get('path') not in generated or item.get('sha256') != generated[item['path']]]
+        rows[key] = {'key': key, 'kind': 'treehouse-slot', 'identity': identity, 'presence': 'present',
+                     'ownership': 'unknown' if blockers else 'owned', 'blockers': blockers, 'work_loss': loss}
+    for key, resource in saved.items():
+        if key not in rows:
+            slot = _uninstall_slot(resource['identity'])
+            rows[key] = dict(resource, presence='present' if slot else 'absent')
+    return list(rows.values())
+
+
+def uninstall_remove(home, resources, operation):
+    from . import uninstall_state, workers
+    for resource in resources:
+        if resource['kind'] != 'treehouse-slot':
+            continue
+        approved = uninstall_state.require_scope(home, operation, resource['key'])
+        identity = approved['identity']
+        path, project = Path(identity['path']), Path(identity['project_path'])
+        slot = _uninstall_slot(identity)
+        if slot is None:
+            if path.exists():
+                raise store.Refusal('unregistered task worktree remains')
+            uninstall_state.checkpoint(home, operation, phase='removing', completed=approved['key'])
+            continue
+        if projects._removal_identity(path) != identity['worktree']:
+            raise store.Refusal('task worktree physical identity changed')
+        checkout = projects.checkout_inventory(path)
+        if checkout['identity']['common'] != identity['common']:
+            raise store.Refusal('task Git common identity changed')
+        if any(item not in approved.get('work_loss', []) for item in checkout['work_loss']):
+            raise store.Refusal('task work changed after approval')
+        live = [row for row in workers.uninstall_inventory(home)
+                if row['identity'].get('task_id') == identity['task_id'] and row['presence'] != 'absent']
+        if live or slot.get('processes'):
+            raise store.Refusal('task worker, endpoint or native process absence is unconfirmed')
+        argv = ['treehouse', '--root', identity['root']]
+        if slot.get('lease_id'):
+            uninstall_state.checkpoint(home, operation, phase='removing', irreversible=True)
+            command = [*argv, 'return', identity['path'], '--if-lease-id', identity['lease_id'],
+                       '--if-lease-holder', identity['lease_holder']]
+            if approved.get('work_loss'):
+                command.append('--force')
+            store.run(command, cwd=project, timeout=120)
+        slot = _uninstall_slot(identity)
+        if slot and (slot.get('lease_id') or slot.get('processes') or slot.get('status') != 'available'):
+            raise store.Refusal('returned slot was reacquired or is not idle')
+        if slot:
+            uninstall_state.checkpoint(home, operation, phase='removing', irreversible=True)
+            command = [*argv, 'destroy', identity['path'], '--yes']
+            if approved.get('work_loss'):
+                command.append('--include-unlanded')
+            store.run(command, cwd=project, timeout=120)
+        if _uninstall_slot(identity) is not None or path.exists():
+            raise store.Refusal('exact Treehouse slot removal is unconfirmed')
+        if any(row['path'] == identity['path'] for row in projects._registrations(Path(identity['common']['path']))):
+            raise store.Refusal('task Git registration remains')
+        uninstall_state.checkpoint(home, operation, phase='removing', completed=approved['key'])
