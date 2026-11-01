@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -19,6 +19,38 @@ type Input = { systemPrompt: string[]; messages: Array<Record<string, unknown>> 
 function nativeRows(path: string): Array<Record<string, unknown>> {
   return readFileSync(path, 'utf8').trim().split(/\r?\n/).filter(Boolean)
     .map(line => JSON.parse(line) as Record<string, unknown>);
+}
+function nativeFinal(rows: Array<Record<string, unknown>>): Record<string, unknown> | undefined {
+  return rows.findLast(row => {
+    if (row.type !== 'message' || typeof row.message !== 'object' || row.message === null) return false;
+    const message = row.message as Record<string, unknown>;
+    return message.role === 'assistant' && message.stopReason === 'stop' && typeof message.timestamp === 'number';
+  });
+}
+async function waitForNativeFinal(path: string): Promise<void> {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    try { if (nativeFinal(nativeRows(path))) return; } catch { /* writer may not have opened yet */ }
+    // The SDK exposes no native-write completion promise; this brief integration poll observes the actual file.
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+}
+function completionRecords(path: string): Array<Record<string, unknown>> {
+  if (!existsSync(path)) return [];
+  const records: Array<Record<string, unknown>> = [];
+  for (const source of readdirSync(path)) {
+    const sourcePath = join(path, source);
+    for (const interaction of readdirSync(sourcePath)) {
+      if (!interaction.endsWith('.json')) continue;
+      records.push(JSON.parse(readFileSync(join(sourcePath, interaction), 'utf8')) as Record<string, unknown>);
+    }
+  }
+  return records;
+}
+function completionSnapshot(path: string): string {
+  return completionRecords(path).map(value =>
+    JSON.stringify({ source_id: value.source_id, interaction_id: value.interaction_id, recorded_at: value.recorded_at, final: value.final }),
+  ).sort().join('\n');
 }
 
 function textFingerprint(content: unknown): string {
@@ -44,7 +76,7 @@ from support import run
 from agd_lib import tasks, store, supervision, observability, reviewer_runner
 root=Path(sys.argv[1]); repo=Path(sys.argv[2]); owner=int(sys.argv[3]); role=sys.argv[4]; home=root/'distro'
 def agd(*args): return json.loads(run([repo/'bin/agd','--home',home,*args]).stdout)
-agd('init','--backend','tmux')
+agd('init','--backend','tmux'); (home/'native-probe.txt').write_text('Native episode fixture.')
 if role == 'worker':
  brief=home/'brief.md'; brief.write_text('Native episode fixture.')
  seed=root/'seed'; seed.mkdir(); run(['git','init','-b','main',seed]); run(['git','config','user.name','Native Probe'],cwd=seed); run(['git','config','user.email','probe@example.invalid'],cwd=seed)
@@ -53,8 +85,9 @@ if role == 'worker':
  task=agd('task','create','native','--project','sample','--brief',str(brief),'--kind','scout','--skill-mode','none')
  task.update(executor='worker',phase='running',incarnation=str(uuid.uuid4()),worker_alive=True)
  binding=observability.worker_binding(home,task['id'],task['incarnation']); task['observability']={'session_dir':binding['session_dir']}; tasks.save(home,task)
- runner=supervision.process_identity(owner); runner.pop('state',None); runner.update(incarnation=task['incarnation'],phase='spawned',child_pid=owner,child_start=runner['start'],child=runner)
+ runner=supervision.process_identity(owner); runner.pop('state',None); child=dict(runner); runner.update(incarnation=task['incarnation'],phase='spawned',child_pid=owner,child_start=runner['start'],child=child)
  store.atomic_json(home/'state/tasks'/task['id']/'runner.json',runner)
+ observability.record_process_generation(home,'worker','1',task_id=task['id'],incarnation=task['incarnation'],pid=owner,start=runner['start'])
  session_dir=binding['session_dir']; extension='lib/omp-worker.ts'
 else:
  task=None; session_dir=str(home/'data/observability/central/omp'); Path(session_dir).mkdir(parents=True,exist_ok=True); extension='.omp/extensions/agd-primary.ts'
@@ -112,9 +145,46 @@ async function nativeProbe(role: 'worker' | 'central') {
   let injectAmbiguous = false;
   let gapInjected = false;
   let ambiguousInjected = false;
-  const extensionWithStaleGate = (api: { on: (name: string, handler: (event: { willContinue?: boolean; messages?: unknown[] }) => unknown) => void }) => {
+  const terminalWaiters: Array<{ stage: string; resolve: (messages: unknown[]) => void }> = [];
+  const capturedTerminalEvents: Array<{ stage: string; messages: unknown[] }> = [];
+  const runtimeErrors: unknown[] = [];
+  const lifecycleReasons: string[] = [];
+  const waitStarted = Promise.withResolvers<void>();
+  const releaseWait = Promise.withResolvers<void>();
+  const waitContinuationObserved = Promise.withResolvers<void>();
+  let waitContinuationRequested = false;
+  function awaitTerminal(stage: string): Promise<unknown[]> {
+    const deferred = Promise.withResolvers<unknown[]>();
+    terminalWaiters.push({ stage, resolve: deferred.resolve });
+    return Promise.race([
+      deferred.promise,
+      new Promise<unknown[]>((_, reject) => setTimeout(() => reject(new Error(JSON.stringify({
+        stage, home: data.home, session_file: manager.getSessionFile(), session_id: manager.getSessionId(),
+        pending_terminal_waiters: terminalWaiters.map(waiter => waiter.stage), lifecycleReasons, runtimeErrors,
+      }))), 10000)),
+    ]);
+  }
+  function awaitWaitContinuation(): Promise<void> {
+    return Promise.race([
+      waitContinuationObserved.promise,
+      new Promise<void>((_, reject) => setTimeout(() => reject(new Error(JSON.stringify({
+        stage: 'wait-continuation', role: data.role, home: data.home, session_file: manager.getSessionFile(),
+        lifecycleReasons, runtimeErrors,
+      }))), 10000)),
+    ]);
+  }
+  const extensionWithStaleGate = (api: { on: (name: string, handler: (event: { reason?: string; willContinue?: boolean; messages?: unknown[] }) => unknown) => void }) => {
+    api.on('before_agent_start', event => { if (event.reason) lifecycleReasons.push(event.reason); });
+    api.on('session_stop', () => {
+      if (mode !== 'wait' || waitContinuationRequested) return;
+      waitContinuationRequested = true;
+      return { continue: true, additionalContext: 'Continue this native lifecycle probe before final completion.' };
+    });
     api.on('agent_end', async event => {
-      if (event.willContinue === true) return;
+      if (event.willContinue === true) {
+        if (mode === 'wait') waitContinuationObserved.resolve();
+        return;
+      }
       if ((injectGap || injectAmbiguous) && event.messages) {
         const binding = [...event.messages].reverse().find(message =>
           typeof message === 'object' && message !== null &&
@@ -138,43 +208,68 @@ async function nativeProbe(role: 'worker' | 'central') {
       await releaseOldEnd.promise;
     });
     (extension as (api: unknown) => unknown)(api);
+    api.on('agent_end', event => {
+      if (event.willContinue === true) return;
+      const messages = structuredClone(event.messages ?? []);
+      const waiter = terminalWaiters.shift();
+      capturedTerminalEvents.push({ stage: waiter?.stage ?? 'unmatched', messages });
+      waiter?.resolve(messages);
+    });
   };
   const { session } = await sdk.createAgentSession({
     cwd, agentDir, settings,
     model: modelRegistry.find('openai', 'gpt-4o-mini'), modelRegistry, sessionManager: manager,
     rules: [], contextFiles: [], noContextFiles: true, disableExtensionDiscovery: true,
-    toolNames: [], enableMCP: false, enableLsp: false, enableIrc: false,
-    skipPythonPreflight: true, spawns: '', autoTitle: false, systemPrompt: ['NATIVE-EPISODE-POLICY'],
+    toolNames: ['read'], enableMCP: false, enableLsp: false, enableIrc: false,
     extensions: [extensionWithStaleGate],
   });
   let mode: 'final' | 'wait' | 'error' | 'abort' = 'final';
+  let waitTurn = 0;
   const abortStarted = Promise.withResolvers<void>();
   session.agent.streamFn = (model: { api: string; provider: string; id: string }, context: Input, _options: { signal?: AbortSignal }) => {
     inputs.push(structuredClone({ systemPrompt: context.systemPrompt, messages: context.messages }));
     const stream = new ai.AssistantMessageEventStream();
-    const message = { role: 'assistant', content: mode === 'final' ? [{ type: 'text', text: 'Native final episode.' }] : [],
-      api: model.api, provider: model.provider, model: model.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-      stopReason: mode === 'error' ? 'error' : mode === 'abort' ? 'aborted' : 'stop', timestamp: Date.now() };
+    const waitInitial = mode === 'wait' && waitTurn++ === 0;
+    const content = waitInitial ? [{ type: 'text', text: 'Intermediate native continuation step.' }]
+      : mode === 'final' ? [{ type: 'text', text: 'Native final episode.' }] : [];
+    const stopReason = mode === 'error' ? 'error' : mode === 'abort' ? 'aborted' : 'stop';
+    const message = { role: 'assistant', content, api: model.api, provider: model.provider, model: model.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason, timestamp: Date.now() };
+    const fail = (reason: 'error' | 'aborted') => {
+      const error = { ...message, stopReason: reason, errorMessage: 'Scripted provider failure.' };
+      stream.push({ type: 'error', reason, error });
+      stream.end(error);
+    };
     if (mode === 'abort') {
       abortStarted.resolve();
-      const aborted = () => { stream.push({ type: 'error', reason: 'aborted', error: message }); stream.end(message); };
-      if (_options.signal?.aborted) queueMicrotask(aborted);
-      else _options.signal?.addEventListener('abort', aborted, { once: true });
+      if (_options.signal?.aborted) queueMicrotask(() => fail('aborted'));
+      else _options.signal?.addEventListener('abort', () => fail('aborted'), { once: true });
+    } else if (mode === 'wait' && !waitInitial) {
+      waitStarted.resolve();
+      void (async () => { await releaseWait.promise; fail('error'); })();
+    } else if (mode === 'error') {
+      queueMicrotask(() => fail('error'));
     } else {
       queueMicrotask(() => { stream.push({ type: 'done', reason: message.stopReason, message }); stream.end(message); });
     }
+    return stream;
   };
   try {
-    await runtime.initializeExtensions(session, { reportSendError: (_action: string, error: Error) => { throw error; }, reportRuntimeError: (error: unknown) => { throw new Error(String(error)); } });
+    await runtime.initializeExtensions(session, { reportSendError: (_action: string, error: Error) => { runtimeErrors.push(error); throw error; }, reportRuntimeError: (error: unknown) => { runtimeErrors.push(error); throw new Error(String(error)); } });
     const previousSessionFile = manager.getSessionFile();
     assert(previousSessionFile);
     const previousSessionId = manager.getSessionId();
+    const firstTerminal = awaitTerminal('first');
     const firstPrompt = session.prompt('Produce a final response.');
     await oldEndSeen.promise;
-    assert.equal(await session.newSession(), true);
+    // Native JSONL persistence is not fenced by agent_end hook delivery; poll the captured old file before switching.
+    await waitForNativeFinal(previousSessionFile);
+    const switchedFile = await manager.newSession();
+    assert(switchedFile);
     assert.notEqual(manager.getSessionFile(), previousSessionFile);
     releaseOldEnd.resolve();
     await firstPrompt;
+    const firstMessages = await firstTerminal;
     await manager.flush();
     const sourceDir = join(data.home, 'state/reviewer/episodes/sources');
     const completionDir = join(data.home, 'state/reviewer/episodes/completions');
@@ -191,15 +286,29 @@ async function nativeProbe(role: 'worker' | 'central') {
       row.customType === 'agd:episode-binding' && typeof row.details === 'object' && row.details !== null &&
       (row.details as Record<string, unknown>).source_id === oldReceipt.source_id) as Record<string, unknown> | undefined;
     assert(oldMarker);
-    const markerDetails = oldMarker.details as Record<string, unknown>;
+    const capturedMarker = [...firstMessages].reverse().find(message =>
+      typeof message === 'object' && message !== null &&
+      (message as Record<string, unknown>).customType === 'agd:episode-binding' &&
+      typeof (message as Record<string, unknown>).details === 'object' &&
+      ((message as Record<string, unknown>).details as Record<string, unknown>).source_id === oldReceipt.source_id) as Record<string, unknown> | undefined;
+    assert(capturedMarker);
+    const markerDetails = capturedMarker.details as Record<string, unknown>;
     assert.equal(typeof markerDetails.interaction_id, 'string');
-    const oldFinal = oldRows.find(row => {
-      if (row.type !== 'message' || typeof row.message !== 'object' || row.message === null) return false;
-      const message = row.message as Record<string, unknown>;
-      return message.role === 'assistant' && message.stopReason === 'stop' && typeof message.timestamp === 'number';
-    });
-    assert(oldFinal);
+    const oldFinal = nativeFinal(oldRows);
+    assert(oldFinal, JSON.stringify({
+      home: data.home, sourcePath: oldReceipt.path,
+      messages: oldRows.filter(row => row.type === 'message').map(row => row.message),
+      rows: oldRows.map(row => ({ type: row.type, timestamp: row.timestamp, customType: row.customType })),
+    }));
     const oldMessage = oldFinal.message as Record<string, unknown>;
+    const capturedFinal = [...firstMessages].reverse().find(message => {
+      if (typeof message !== 'object' || message === null) return false;
+      const value = message as Record<string, unknown>;
+      return value.role === 'assistant' && value.stopReason === 'stop' && typeof value.timestamp === 'number';
+    }) as Record<string, unknown> | undefined;
+    assert(capturedFinal);
+    assert.equal(capturedFinal.timestamp, oldMessage.timestamp);
+    assert.equal(textFingerprint(capturedFinal.content), textFingerprint(oldMessage.content));
     const completionPath = join(completionDir, oldReceipt.source_id as string, `${markerDetails.interaction_id}.json`);
     assert(existsSync(completionPath));
     const oldCompletion = JSON.parse(readFileSync(completionPath, 'utf8')) as Record<string, unknown>;
@@ -208,51 +317,177 @@ async function nativeProbe(role: 'worker' | 'central') {
     const finalRecord = oldCompletion.final as Record<string, unknown>;
     assert.equal(finalRecord.timestamp, oldMessage.timestamp);
     assert.equal(finalRecord.text_sha256, textFingerprint(oldMessage.content));
+    const completionsBeforeSwitch = completionSnapshot(completionDir);
     mode = 'final';
+    const switchedTerminal = awaitTerminal('switched');
     await session.prompt('Produce a final response after switching native sessions.');
-    await manager.flush();
+    const switchedMessages = await switchedTerminal;
     assert(readdirSync(sourceDir).length >= sourceReceipts.length + 1);
-    const completionsAfterSwitch = readdirSync(completionDir);
+    const currentSessionId = manager.getSessionId();
+    const currentReceipts = readdirSync(sourceDir).filter(name => name.endsWith('.json'))
+      .map(name => JSON.parse(readFileSync(join(sourceDir, name), 'utf8')) as Record<string, unknown>);
+    const currentReceipt = currentReceipts.find(row => row.session_id === currentSessionId);
+    assert(currentReceipt);
+    const currentRows = nativeRows(join(data.home, currentReceipt.path as string));
+    const currentMarker = currentRows.findLast(row => row.type === 'custom_message' &&
+      row.customType === 'agd:episode-binding' && typeof row.details === 'object' && row.details !== null &&
+      (row.details as Record<string, unknown>).source_id === currentReceipt.source_id) as Record<string, unknown> | undefined;
+    assert(currentMarker);
+    const capturedCurrentMarker = [...switchedMessages].reverse().find(message =>
+      typeof message === 'object' && message !== null &&
+      (message as Record<string, unknown>).customType === 'agd:episode-binding' &&
+      typeof (message as Record<string, unknown>).details === 'object' &&
+      ((message as Record<string, unknown>).details as Record<string, unknown>).source_id === currentReceipt.source_id) as Record<string, unknown> | undefined;
+    assert(capturedCurrentMarker);
+    const currentDetails = capturedCurrentMarker.details as Record<string, unknown>;
+    assert.equal((currentMarker.details as Record<string, unknown>).interaction_id, currentDetails.interaction_id);
+    const currentFinal = currentRows.findLast(row => {
+      if (row.type !== 'message' || typeof row.message !== 'object' || row.message === null) return false;
+      const message = row.message as Record<string, unknown>;
+      return message.role === 'assistant' && message.stopReason === 'stop' && typeof message.timestamp === 'number';
+    });
+    assert(currentFinal);
+    const currentMessage = currentFinal.message as Record<string, unknown>;
+    const currentRecord = completionRecords(completionDir).find(row =>
+      row.source_id === currentReceipt.source_id && row.interaction_id === currentDetails.interaction_id);
+    assert(currentRecord);
+    const currentFinalRecord = currentRecord.final as Record<string, unknown>;
+    assert.equal(currentFinalRecord.timestamp, currentMessage.timestamp);
+    assert.equal(currentFinalRecord.text_sha256, textFingerprint(currentMessage.content));
+    const completionsAfterSwitch = completionSnapshot(completionDir);
+    assert.notEqual(completionsAfterSwitch, completionsBeforeSwitch);
     injectGap = true;
+    const gapTerminal = awaitTerminal('gap');
     await session.prompt('Exercise a lost current binding.');
+    await gapTerminal;
     await manager.flush();
-    const completionsAfterGap = readdirSync(completionDir);
-    const gapRejected = gapInjected && completionsAfterGap.length === completionsAfterSwitch.length;
+    const completionsAfterGap = completionSnapshot(completionDir);
+    const gapRejected = gapInjected && completionsAfterGap === completionsAfterSwitch;
     assert(gapRejected);
     injectAmbiguous = true;
+    const ambiguousTerminal = awaitTerminal('ambiguous');
     await session.prompt('Exercise ambiguous current metadata.');
+    await ambiguousTerminal;
     await manager.flush();
-    const completionsAfterAmbiguous = readdirSync(completionDir);
-    const ambiguousRejected = ambiguousInjected && completionsAfterAmbiguous.length === completionsAfterSwitch.length;
+    const completionsAfterAmbiguous = completionSnapshot(completionDir);
+    const ambiguousRejected = ambiguousInjected && completionsAfterAmbiguous === completionsAfterSwitch;
     assert(ambiguousRejected);
-    await session.prompt('Wait for delegated work.');
+    mode = 'wait';
+    waitTurn = 0;
+    waitContinuationRequested = false;
+    const waitTerminal = awaitTerminal('wait');
+    const waiting = session.prompt('Exercise an actual native continuation.');
+    await awaitWaitContinuation();
+    assert(waitContinuationRequested);
+    await waitStarted.promise;
+    const completionsWhileWaiting = completionSnapshot(completionDir);
+    assert.equal(completionsWhileWaiting, completionsAfterSwitch);
+    releaseWait.resolve();
+    await waiting;
+    await waitTerminal;
     await manager.flush();
-    const completionsAfterWait = readdirSync(completionDir);
-    assert.equal(completionsAfterWait.length, completionsAfterSwitch.length);
+    const completionsAfterWait = completionSnapshot(completionDir);
+    assert.equal(completionsAfterWait, completionsAfterSwitch);
     mode = 'error';
+    const errorTerminal = awaitTerminal('error');
     await session.prompt('Exercise a provider error.');
+    await errorTerminal;
     await manager.flush();
-    const completionsAfterError = readdirSync(completionDir);
-    assert.equal(completionsAfterError.length, completionsAfterSwitch.length);
+    const completionsAfterError = completionSnapshot(completionDir);
+    assert.equal(completionsAfterError, completionsAfterSwitch);
+    if (data.task) {
+      const reportPath = join(data.home, 'data/tasks', data.task.id, 'native-episode-report.md');
+      writeFileSync(reportPath, 'Verified value.txt remains base and the workspace is unchanged.\n');
+      const readyResult = Bun.spawnSync([join(repo, 'bin/agd'), '--home', data.home, 'task', 'ready', data.task.id, '--report', reportPath], {
+        cwd: repo, env: { ...process.env, PYTHONPATH: join(repo, 'bin') + ':' + join(repo, 'tests') },
+        stdout: 'pipe', stderr: 'pipe',
+      });
+      assert.equal(readyResult.exitCode, 0, readyResult.stderr.toString());
+    }
     mode = 'abort';
-    const completionCountBeforeAbort = readdirSync(completionDir).length;
+    const completionsBeforeAbort = completionSnapshot(completionDir);
+    const abortTerminal = awaitTerminal('abort');
     const interrupted = session.prompt('Interrupt this native turn.');
     await abortStarted.promise;
     await session.abort();
     await interrupted;
-    await manager.flush();
-    assert.equal(readdirSync(completionDir).length, completionCountBeforeAbort);
+    await abortTerminal;
+    const completionsAfterAbort = completionSnapshot(completionDir);
+    assert.equal(completionsAfterAbort, completionsBeforeAbort);
+    const abortRows = nativeRows(join(data.home, currentReceipt.path as string));
+    const abortMarker = abortRows.findLast(row => row.type === 'custom_message' &&
+      row.customType === 'agd:episode-binding' && typeof row.details === 'object' && row.details !== null &&
+      (row.details as Record<string, unknown>).source_id === currentReceipt.source_id) as Record<string, unknown> | undefined;
+    assert(abortMarker);
+    const abortDetails = abortMarker.details as Record<string, unknown>;
+    assert.equal(typeof abortDetails.interaction_id, 'string');
+    const recoveryMessages = session.agent.state.messages;
+    const cutoff = recoveryMessages.at(-1) as Record<string, unknown> | undefined;
+    assert(cutoff);
+    assert.equal(cutoff.role, 'assistant');
+    assert.equal(cutoff.stopReason, 'aborted');
+    assert(Array.isArray(cutoff.content));
+    assert(!(cutoff.content as unknown[]).some(block =>
+      typeof block === 'object' && block !== null &&
+      ((block as Record<string, unknown>).type === 'text' || (block as Record<string, unknown>).type === 'toolCall')));
+    session.agent.replaceMessages(recoveryMessages.slice(0, -1));
     mode = 'final';
-    await session.resume();
+    type ExtensionRunnerSession = typeof session & {
+      extensionRunner?: { emitBeforeAgentStart: (prompt: string, images: undefined, systemPrompt: string[], reason: 'revive') => Promise<unknown> };
+    };
+    const nativeSession = session as ExtensionRunnerSession;
+    const extensionRunner = nativeSession.extensionRunner;
+    assert(extensionRunner);
+    const revivedTerminal = awaitTerminal('revive');
+    await extensionRunner.emitBeforeAgentStart('', undefined, session.baseSystemPrompt, 'revive');
+    await session.agent.continue();
+    const resumedMessages = await revivedTerminal;
     await manager.flush();
-    assert(readdirSync(completionDir).length > completionCountBeforeAbort);
-    return { role: data.role, sourceCount: readdirSync(sourceDir).length, completionCount: readdirSync(completionDir).length,
+    const resumedRows = nativeRows(join(data.home, currentReceipt.path as string));
+    const resumedMarker = resumedRows.findLast(row => row.type === 'custom_message' &&
+      row.customType === 'agd:episode-binding' && typeof row.details === 'object' && row.details !== null &&
+      (row.details as Record<string, unknown>).source_id === currentReceipt.source_id) as Record<string, unknown> | undefined;
+    assert(resumedMarker);
+    const capturedResumedMarker = [...resumedMessages].reverse().find(message =>
+      typeof message === 'object' && message !== null &&
+      (message as Record<string, unknown>).customType === 'agd:episode-binding' &&
+      typeof (message as Record<string, unknown>).details === 'object' &&
+      ((message as Record<string, unknown>).details as Record<string, unknown>).source_id === currentReceipt.source_id) as Record<string, unknown> | undefined;
+    assert(capturedResumedMarker);
+    const resumedDetails = capturedResumedMarker.details as Record<string, unknown>;
+    assert.equal((resumedMarker.details as Record<string, unknown>).interaction_id, resumedDetails.interaction_id);
+    assert.equal(resumedDetails.interaction_id, abortDetails.interaction_id, JSON.stringify({
+      lifecycleReasons,
+      bindingIds: resumedRows.filter(row => row.type === 'custom_message' && row.customType === 'agd:episode-binding' &&
+        typeof row.details === 'object' && row.details !== null &&
+        (row.details as Record<string, unknown>).source_id === currentReceipt.source_id)
+        .map(row => (row.details as Record<string, unknown>).interaction_id),
+      capturedTerminalEvents,
+    }));
+    const resumedRecord = completionRecords(completionDir).find(row =>
+      row.source_id === currentReceipt.source_id && row.interaction_id === resumedDetails.interaction_id);
+    assert(resumedRecord);
+    const resumedFinal = resumedRows.findLast(row => {
+      if (row.type !== 'message' || typeof row.message !== 'object' || row.message === null) return false;
+      const message = row.message as Record<string, unknown>;
+      return message.role === 'assistant' && message.stopReason === 'stop' && typeof message.timestamp === 'number';
+    });
+    assert(resumedFinal);
+    const resumedMessage = resumedFinal.message as Record<string, unknown>;
+    const resumedFinalRecord = resumedRecord.final as Record<string, unknown>;
+    const resumedMatches = resumedFinalRecord.timestamp === resumedMessage.timestamp &&
+      resumedFinalRecord.text_sha256 === textFingerprint(resumedMessage.content);
+    assert(resumedMatches);
+    return { role: data.role, sourceCount: readdirSync(sourceDir).length, completionCount: completionRecords(completionDir).length,
       oldSourceId: oldReceipt.source_id, oldInteractionId: markerDetails.interaction_id,
       markerHidden: inputs.every(input => !JSON.stringify(input.messages).includes('agd:episode-binding') && !JSON.stringify(input.messages).includes('agd:episode-gap')),
       gapsRejected: gapRejected,
       ambiguousRejected,
-      waitsExcluded: completionsAfterWait.length === completionsAfterSwitch.length,
-      errorsExcluded: completionsAfterError.length === completionsAfterSwitch.length,
+      continuationObserved: waitContinuationRequested,
+      resumedMatches,
+      waitsExcluded: completionsAfterWait === completionsAfterSwitch,
+      errorsExcluded: completionsAfterError === completionsAfterSwitch,
+      reviveObserved: lifecycleReasons.includes('revive'),
       switchedSession: manager.getSessionId() !== previousSessionId };
   } finally {
     session.beginDispose(); await session.dispose(); await manager.close();
@@ -280,6 +515,9 @@ if (process.env.AGD_NATIVE_EPISODES_CHECK === '1') {
       expect(result.markerHidden).toBe(true);
       expect(result.gapsRejected).toBe(true);
       expect(result.ambiguousRejected).toBe(true);
+      expect(result.continuationObserved).toBe(true);
+      expect(result.reviveObserved).toBe(true);
+      expect(result.resumedMatches).toBe(true);
       expect(result.waitsExcluded).toBe(true);
       expect(result.errorsExcluded).toBe(true);
       expect(result.oldSourceId).toMatch(/^[0-9a-f]{64}$/);

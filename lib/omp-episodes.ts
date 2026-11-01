@@ -133,8 +133,10 @@ export function registerEpisodeCapture(api: EpisodeAPI, options: EpisodeOptions)
 
   api.on('before_agent_start', async (event, context) => {
     if (event.reason === 'revive') {
-      if (!latestInteractionId) return;
-      return gapCarrier(latestInteractionId);
+      const interactionId = latestInteractionId;
+      if (!interactionId) return;
+      if (pending.get(interactionId)?.binding) return;
+      return gapCarrier(interactionId);
     }
     const interactionId = randomUUID();
     latestInteractionId = interactionId;
