@@ -646,7 +646,7 @@ def _managed_process_receipt_once(home, role, caller, task_id=None, incarnation=
     for path in directory.glob('*.json'):
         value = _read_private_json(path)
         expected = {'schema', 'role', 'generation', 'pid', 'start', 'uid', 'recorded_at'}
-        if role == 'worker':
+        if value.get('role') == 'worker':
             expected |= {'task_id', 'incarnation'}
         if (set(value) != expected or value.get('schema') != 1
                 or value.get('role') not in ('central', 'worker')

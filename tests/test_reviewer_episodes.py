@@ -349,6 +349,25 @@ def _complete_request(source_id, *, text='answer', **message):
             'will_continue': False, 'awaiting_async_work': False, 'message': payload}
 
 
+@pytest.mark.parametrize('role', ['central', 'worker'])
+def test_valid_other_role_process_history_does_not_block_registration(tmp_path, monkeypatch, role):
+    if role == 'central':
+        home, _, session = _central_case(tmp_path)
+        _fake_identity(monkeypatch, 1234, '4567')
+        _central_env(monkeypatch)
+        observability.record_process_generation(
+            home, 'worker', '0', task_id='other', incarnation=str(uuid.uuid4()), pid=4321, start='6543')
+    else:
+        home, _, task_id, incarnation, session = _worker_case(tmp_path)
+        _fake_identity(monkeypatch, 2222, '3333')
+        monkeypatch.setenv('AGD_TASK_ID', task_id)
+        monkeypatch.setenv('AGD_INCARNATION', incarnation)
+        observability.record_process_generation(home, 'central', '0', pid=4321, start='6543')
+    source = reviewer_episodes.register_source(
+        home, {'role': role, 'session_id': role + '-session', 'session_file': str(session)})
+    assert source['role'] == role and source['path'] == str(session.relative_to(home))
+
+
 def test_register_central_authority_and_immutable_idempotent_completion(tmp_path, monkeypatch):
     home, central, session = _central_case(tmp_path)
     _fake_identity(monkeypatch, 1234, '4567')
