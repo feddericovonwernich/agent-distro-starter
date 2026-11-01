@@ -11,7 +11,7 @@ import pwd
 import uuid
 from pathlib import Path
 from urllib.request import urlopen
-from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr, relay, observability, reviewer, reviewer_runner, reviewer_timer, launcher, installer, omp_runtime
+from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr, relay, observability, reviewer, reviewer_runner, reviewer_timer, launcher, installer, omp_runtime, reviewer_episodes
 
 
 def parser():
@@ -161,6 +161,9 @@ def parser():
     dispose = proposals.add_parser('dispose'); dispose.add_argument('proposal_id'); dispose.add_argument('--status', required=True, choices=('accepted', 'rejected', 'deferred', 'superseded')); dispose.add_argument('--reason'); dispose.add_argument('--replacement')
     timer_p = reviewer_p.add_parser('timer').add_subparsers(dest='timer_op', required=True)
     for action in ('enable', 'disable', 'status'): timer_p.add_parser(action)
+    episode = reviewer_p.add_parser('episode').add_subparsers(dest='episode_op', required=True)
+    episode.add_parser('bind')
+    episode.add_parser('complete')
     return p
 
 def parse_args(argv=None):
@@ -205,6 +208,7 @@ def main(args):
         print(json.dumps(result, indent=2))
         raise SystemExit(code)
     home = store.home(Path(args.home).absolute() if args.home else None)
+    episode_write = args.command == 'reviewer' and args.reviewer_op == 'episode'
     mutation = (args.command == 'init' or
                 args.command == 'installer' and args.installer_operation != 'reviewer' or
                 args.command == 'project' and args.operation not in ('list', 'inspect') or
@@ -214,7 +218,7 @@ def main(args):
                 args.command == 'session' and args.operation == 'reconcile' or
                 args.command == 'events' and args.operation == 'acknowledge' or
                 args.command == 'observability' and args.operation != 'status')
-    if mutation:
+    if mutation and not episode_write:
         worker_scoped = (args.command == 'worker' and args.operation in ('run', 'event', 'complete', 'publish-pr', 'verify-pr',
                                                                            'relay-poll', 'relay-reply') or
                          args.command == 'task' and args.operation == 'ready')
@@ -230,15 +234,38 @@ def main(args):
         if not fresh:
             raise store.Refusal('fresh non-symlink launcher home required')
     reviewer_write = args.command == 'reviewer' and (
-        args.reviewer_op == 'run' or args.reviewer_op == 'timer' and args.timer_op != 'status'
+        args.reviewer_op == 'episode' or args.reviewer_op == 'run' or args.reviewer_op == 'timer' and args.timer_op != 'status'
         or args.reviewer_op == 'proposals' and args.proposal_op == 'dispose')
     managed_loop = (args.command == 'worker' and args.operation == 'run'
                     or args.command == 'reviewer' and args.reviewer_op == 'run')
-    if (mutation or reviewer_write) and not managed_loop:
+    if (mutation or reviewer_write) and not managed_loop and not episode_write:
         with admission(home, initializing=args.command == 'init'):
             return _dispatch(args, home, fresh)
     return _dispatch(args, home, fresh)
 
+
+
+def _episode_stdin():
+    stream = getattr(sys.stdin, 'buffer', sys.stdin)
+    body = stream.read(1048577)
+    if isinstance(body, str):
+        if len(body.encode()) > 1048576:
+            raise store.Refusal('episode input exceeds 1048576 bytes')
+        text = body
+    else:
+        if len(body) > 1048576:
+            raise store.Refusal('episode input exceeds 1048576 bytes')
+        try:
+            text = body.decode('utf-8')
+        except UnicodeDecodeError as error:
+            raise store.Refusal('episode input is not UTF-8') from error
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise store.Refusal('episode input is not JSON') from error
+    if not isinstance(value, dict):
+        raise store.Refusal('episode input must be an object')
+    return value
 
 def _dispatch(args, home, fresh):
     if args.command == 'omp':
@@ -413,6 +440,11 @@ def _dispatch(args, home, fresh):
             return workers.stop(home, args.id)
         if args.operation == 'relaunch':
             return workers.relaunch(home, args.id)
+    if args.command == 'reviewer' and args.reviewer_op == 'episode':
+        request = _episode_stdin()
+        if args.episode_op == 'bind':
+            return reviewer_episodes.register_source(home, request)
+        return reviewer_episodes.record_completion(home, request)
     if args.command == 'reviewer':
         if args.reviewer_op == 'run':
             if args.timer and args.retrospective_review_run: raise store.Refusal('timer runs cannot be retrospective')
