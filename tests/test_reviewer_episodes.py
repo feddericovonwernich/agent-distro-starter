@@ -587,3 +587,15 @@ def test_idempotent_reuse_refuses_tampered_source_and_completion(tmp_path, monke
     completion_path.write_text(json.dumps(tampered_completion))
     with pytest.raises(store.Refusal):
         reviewer_episodes.record_completion(home, _complete_request(source['source_id']))
+
+
+@pytest.mark.parametrize('value', [None, [], 'invalid', 4])
+def test_non_object_managed_process_record_refuses_cleanly(tmp_path, monkeypatch, value):
+    home, _, session = _central_case(tmp_path)
+    _fake_identity(monkeypatch, 1234, '4567')
+    _central_env(monkeypatch)
+    receipt = next((home / 'state' / 'observability' / 'processes').glob('*.json'))
+    receipt.write_text(json.dumps(value))
+    with pytest.raises(store.Refusal):
+        reviewer_episodes.register_source(
+            home, {'role': 'central', 'session_id': 'central-session', 'session_file': str(session)})

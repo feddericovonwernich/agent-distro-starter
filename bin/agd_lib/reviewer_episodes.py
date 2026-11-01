@@ -645,6 +645,8 @@ def _managed_process_receipt_once(home, role, caller, task_id=None, incarnation=
     matches = []
     for path in directory.glob('*.json'):
         value = _read_private_json(path)
+        if not isinstance(value, dict):
+            raise store.Refusal('managed native process receipt is malformed')
         expected = {'schema', 'role', 'generation', 'pid', 'start', 'uid', 'recorded_at'}
         if value.get('role') == 'worker':
             expected |= {'task_id', 'incarnation'}
