@@ -1,6 +1,6 @@
 # Reviewable final-response episodes in live sessions
 
-Status: design for approval; no implementation authorized yet.
+Status: approved by the user; implementation awaits review of the implementation plan and execution-method selection.
 
 ## Intent and user decisions
 
