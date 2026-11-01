@@ -406,16 +406,19 @@ def _cap(packet, limit):
         if 'episodes' not in packet:
             return
         retained = {excerpt['source_id'] for excerpt in packet['excerpts']}
-        packet['episodes'] = [episode for episode in packet['episodes'] if any(
-            source['source_id'] in retained
-            and ((episode.get('role') == 'central' and source.get('role') == 'central'
-                  and source.get('session_id') == episode.get('session_id'))
-                 or (episode.get('role') != 'central'
-                     and ((source.get('task_id') == episode.get('task_id')
-                           and source.get('incarnation') == episode.get('incarnation'))
-                          or (source.get('linked_task_id') == episode.get('task_id')
-                              and source.get('incarnation') == episode.get('incarnation')))))
-            for source in packet['sources'])]
+        packet['episodes'] = [episode for episode in packet['episodes'] if (
+            bool(set(episode.get('source_ids', ())) & retained)
+            or (episode.get('source_id') in retained)
+            or (not episode.get('source_ids') and not episode.get('source_id') and any(
+                source['source_id'] in retained
+                and ((episode.get('role') == 'central' and source.get('role') == 'central'
+                      and source.get('session_id') == episode.get('session_id'))
+                     or (episode.get('role') != 'central'
+                         and ((source.get('task_id') == episode.get('task_id')
+                               and source.get('incarnation') == episode.get('incarnation'))
+                              or (source.get('linked_task_id') == episode.get('task_id')
+                                  and source.get('incarnation') == episode.get('incarnation')))))
+                for source in packet['sources'])))]
     while len(_json_bytes(packet)) > limit and packet['excerpts']:
         removed = packet['excerpts'].pop()
         if not any(excerpt['source_id'] == removed['source_id'] for excerpt in packet['excerpts']):
@@ -533,16 +536,18 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
                        'closed_at': item['closed_at']}
             if item['completion'] is None:
                 episode['exit_observation_id'] = event.get('id')
+                episode['source_ids'] = [source['source_id'] for source in candidate_sources]
             else:
                 episode['interaction_id'] = item['completion']['interaction_id']
                 episode['boundary'] = primary.get('completion')
+                episode['source_id'] = primary['source_id']
             provenance.append({'task_id': source_scope['task_id'],
                                'assigned': _manifest(root, task_dir, task, coverage, deadline_epoch_ms),
                                'usage': 'unknown'})
         else:
             episode = {'role': 'central', 'session_id': source_scope['session_id'], 'closed_at': item['closed_at'],
                        'interaction_id': item['completion']['interaction_id'],
-                       'boundary': primary.get('completion')}
+                       'boundary': primary.get('completion'), 'source_id': primary['source_id']}
             provenance.append({'role': 'central', 'usage': 'unknown'})
         episodes.append(episode)
         sources.extend(candidate_sources)
@@ -607,44 +612,50 @@ def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids
     packet = {'schema': 1, 'purpose': 'background-skill-review', 'cutoff': cutoff, 'episodes': episodes, 'sources': sources, 'excerpts': excerpts, 'catalog': _catalog(root, coverage, deadline_epoch_ms), 'skill_provenance': provenance, 'coverage': coverage, 'retrospective_review_run_ids': list(retrospective_review_run_ids), 'retrospective_episodes': retrospective, 'config_snapshot_sha256': _digest(config)}
     _cap(packet, config['limits']['max_input_bytes'])
     retained_source_ids = {excerpt['source_id'] for excerpt in packet['excerpts']}
-    packet['episodes'] = [episode for episode in packet['episodes'] if any(
-        source['source_id'] in retained_source_ids
-        and ((episode.get('role') == 'central' and source.get('role') == 'central'
-              and source.get('session_id') == episode.get('session_id'))
-             or (episode.get('role') != 'central'
-                 and ((source.get('task_id') == episode.get('task_id')
-                       and source.get('incarnation') == episode.get('incarnation'))
-                      or (source.get('linked_task_id') == episode.get('task_id')
-                          and source.get('incarnation') == episode.get('incarnation')))))
-        for source in packet['sources'])]
+    packet['episodes'] = [episode for episode in packet['episodes'] if (
+        bool(set(episode.get('source_ids', ())) & retained_source_ids)
+        or episode.get('source_id') in retained_source_ids
+        or (not episode.get('source_ids') and not episode.get('source_id') and any(
+            source['source_id'] in retained_source_ids
+            and ((episode.get('role') == 'central' and source.get('role') == 'central'
+                  and source.get('session_id') == episode.get('session_id'))
+                 or (episode.get('role') != 'central'
+                     and ((source.get('task_id') == episode.get('task_id')
+                           and source.get('incarnation') == episode.get('incarnation'))
+                          or (source.get('linked_task_id') == episode.get('task_id')
+                              and source.get('incarnation') == episode.get('incarnation')))))
+            for source in packet['sources'])))]
     candidates = []
     for episode in packet['episodes']:
         _check_deadline(deadline_epoch_ms)
-        retained, candidate_ids = [], set()
+        retained_by_candidate = {}
         for excerpt in packet['excerpts']:
             source = next((source for source in packet['sources'] if source['source_id'] == excerpt['source_id']), None)
             if source is None:
                 continue
             if episode.get('role') == 'central':
                 matches = source.get('role') == 'central' and source.get('session_id') == episode.get('session_id')
+            elif episode.get('source_id') or episode.get('source_ids'):
+                matches = source['source_id'] in set(episode.get('source_ids', ())) | {episode.get('source_id')}
             else:
                 matches = ((source.get('task_id') == episode.get('task_id') and source.get('incarnation') == episode.get('incarnation'))
                            or (source.get('linked_task_id') == episode.get('task_id') and source.get('incarnation') == episode.get('incarnation')))
-            if matches:
-                retained.append(excerpt.get('material_id', _legacy_material_id(excerpt)))
-                if source.get('kind') == 'central-decision' and episode.get('role') != 'central':
-                    contextual = next((candidate_source for candidate_source in packet['sources']
-                                       if candidate_source.get('role') == 'worker'
-                                       and candidate_source.get('task_id') == episode.get('task_id')
-                                       and candidate_source.get('incarnation') == episode.get('incarnation')),
-                                      None)
-                    candidate_ids.add(contextual.get('candidate_id') if contextual else
-                                      _candidate_id(episode.get('task_id'), episode.get('incarnation')))
-                else:
-                    candidate_ids.add(source.get('candidate_id', _candidate_id(
-                        episode.get('task_id'), episode.get('incarnation'))))
-        if retained:
-            candidate_id = sorted(candidate_ids)[0]
+            if not matches:
+                continue
+            if source.get('kind') == 'central-decision' and episode.get('role') != 'central':
+                contextual = next((candidate_source for candidate_source in packet['sources']
+                                   if candidate_source.get('role') == 'worker'
+                                   and candidate_source.get('task_id') == episode.get('task_id')
+                                   and candidate_source.get('incarnation') == episode.get('incarnation')),
+                                  None)
+                candidate_id = contextual.get('candidate_id') if contextual else _candidate_id(
+                    episode.get('task_id'), episode.get('incarnation'))
+            else:
+                candidate_id = source.get('candidate_id', _candidate_id(
+                    episode.get('task_id'), episode.get('incarnation')))
+            retained_by_candidate.setdefault(candidate_id, []).append(
+                excerpt.get('material_id', _legacy_material_id(excerpt)))
+        for candidate_id, retained in retained_by_candidate.items():
             candidates.append({'candidate_id': candidate_id, 'material_basis': _digest(retained),
                                'excerpt_ids': sorted(set(retained)), 'material_ids': sorted(set(retained))})
     material_basis = _digest({'sources': [(source['source_id'], source.get('material_sha256', source.get('content_sha256')),

@@ -359,6 +359,42 @@ def test_legacy_reviewed_packet_migrates_only_matching_source_scope():
                  'task_id': task['id'], 'incarnation': task['incarnation']}
         assert f"legacy-message:{hashlib.sha256(b'legacy answer').hexdigest()}" in reviewer._reviewed_material(home, scope)
 
+def test_exited_worker_multiple_native_sessions_each_stay_reviewed():
+    with lab() as (home, _):
+        task, binding, first_session = ended_worker(
+            home, 'multi-native', str(uuid.uuid4()), [message('first source', 100)], 0)
+        second_session = str(uuid.uuid4())
+        second = Path(binding['session_dir']) / f'{second_session}.jsonl'
+        header = {'type': 'session', 'version': 3, 'id': second_session,
+                  'timestamp': '2026-01-01T00:00:00.000Z', 'cwd': str(home)}
+        second.write_text('\n'.join(json.dumps(row) for row in [
+            header, message('second source', 100)]) + '\n')
+        first = packet(home, cutoff=time.time() + 10)
+        assert {source['session_id'] for source in first['sources']
+                if source['kind'] == 'native-jsonl'} >= {first_session, second_session}
+        complete_review(home, first)
+        retry = packet(home, cutoff=time.time() + 20)
+        assert retry['excerpts'] == []
+
+
+def test_capped_completion_episodes_keep_exact_source_boundaries():
+    with lab() as (home, _):
+        completed_session(home, texts=('a' * 3000, 'b' * 3000))
+        full_config = reviewer.read_config(home)
+        full_config['limits']['max_input_bytes'] = 1000000
+        full = reviewer.select_packet(home, cutoff=250, config_snapshot=full_config)
+        full_size = len(reviewer._json_bytes({key: value for key, value in full.items()
+                                              if key != 'packet_id'}))
+        config = reviewer.read_config(home)
+        config['limits']['max_input_bytes'] = full_size - 1
+        selected = reviewer.select_packet(home, cutoff=251, config_snapshot=config)
+        assert selected['coverage']['late_basis']
+        source_ids = {source['source_id'] for source in selected['sources']}
+        excerpt_sources = {excerpt['source_id'] for excerpt in selected['excerpts']}
+        for episode in selected['episodes']:
+            if episode.get('source_id'):
+                assert episode['source_id'] in source_ids & excerpt_sources
+
 def test_packet_collects_closed_failure_and_success_with_stable_cited_spans():
     with lab() as (home, _):
         failed, _, _ = ended_worker(home, 'failed', str(uuid.uuid4()), [message('failure')])
