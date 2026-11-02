@@ -56,6 +56,12 @@ The private smoke home is under `/tmp`; raw transcripts and credentials are not 
 
 ## Background reviewer acceptance
 
+### Incremental episode admission
+
+The native episode lifecycle smoke passed with the official importable OMP SDK and a scripted provider, using real native CLI/session recording, production packet selection, and the report/finalize path while the producer remained alive. It admitted a proved worker response and a taskless central response, excluded the unfinished active tail, finalized retained material, admitted a later response with disjoint scoped material IDs, and returned an empty fresh scan. The proof also exercised the controlled SDK revive path and native `willContinue` continuation control; it was not a parked-subagent or background-delegation test.
+
+This is lifecycle evidence only: it makes no paid-model quality, backend process-recovery, model-authentication, or telemetry-delivery claim. Native capture remains available regardless of telemetry opt-in. Existing live sessions are supported by reloading through the official harness command (`/reload` where provided) and obtaining a subsequent proved response; no historical boundary is fabricated and no agent is stopped. Scoped, title-independent material deduplication, retained-only finalization, direct taskless central episodes, linked-decision context, and selection-time-frozen citations are described in [operations](operations.md#background-reviewer).
+
 The following is the acceptance matrix for the bounded reviewer. “Executable coverage” identifies the named fake-child, Python, CLI, or build proof; it is not a substitute for a real native OMP acceptance where that is required.
 
 | # | Approved criterion / concrete scenario | Status | Evidence |

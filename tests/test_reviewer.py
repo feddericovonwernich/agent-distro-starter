@@ -1,3 +1,4 @@
+import hashlib
 import io
 import os
 import json
@@ -11,7 +12,7 @@ import pytest
 from support import command, lab
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
-from agd_lib import observability, reviewer, reviewer_runner, store, supervision, tasks, worker_skills, workers
+from agd_lib import observability, reviewer, reviewer_episodes, reviewer_runner, store, supervision, tasks, worker_skills, workers
 
 
 def ended_worker(home, task_id, incarnation, rows, status=1):
@@ -39,18 +40,417 @@ def packet(home, cutoff=None, limit=262144, retrospective=()):
     return reviewer.select_packet(home, cutoff=cutoff, config_snapshot=config,
                                   retrospective_review_run_ids=retrospective)
 
+def completed_session(home, *, role='central', task_id=None, texts=('answer',), cutoff=200.0,
+                      active='unfinished', title=None, start_at=10.0, stable_ids=False, alive=False):
+    incarnation = str(uuid.uuid4()) if role == 'worker' else None
+    if role == 'worker':
+        task, binding, session_id = ended_worker(home, task_id, incarnation, [], 0)
+        if alive:
+            task.update(worker_alive=True)
+            tasks.save(home, task)
+        native = Path(binding['session_dir']) / f'{session_id}.jsonl'
+    else:
+        session_id = str(uuid.uuid4())
+        native = home / 'data' / 'observability' / 'central' / 'omp' / f'{session_id}.jsonl'
+        native.parent.mkdir(parents=True, exist_ok=True)
+    source = {'schema': 1, 'source_id': '', 'home': str(home.resolve()), 'role': role,
+              'session_id': session_id, 'path': str(native.relative_to(home.resolve())),
+              'cwd': str(home.resolve()), 'pid': 1, 'start': '1', 'uid': os.getuid(),
+              'recorded_at': 1.0}
+    if role == 'worker':
+        source.update(task_id=task_id, incarnation=incarnation)
+    source['source_id'] = reviewer_episodes.source_fingerprint(source)
+    entries = []
+    parent = None
+    completions = []
+    for number, text in enumerate(texts):
+        prompt_id = 'prompt' if stable_ids else f'{session_id}-prompt-{number}'
+        binding_id = 'binding' if stable_ids else f'{session_id}-binding-{number}'
+        final_id = 'final' if stable_ids else f'{session_id}-final-{number}'
+        prompt_at = start_at + number * 20
+        binding_at = prompt_at + 1
+        final_at = prompt_at + 2
+        prompt = message('prompt', prompt_at)
+        prompt.update(id=prompt_id, parentId=parent)
+        entries.append(prompt)
+        entries.append({'type': 'custom_message', 'id': binding_id, 'parentId': prompt_id,
+                        'timestamp': binding_at, 'customType': 'agd:episode-binding', 'display': False,
+                        'details': {'schema': 1, 'source_id': source['source_id'],
+                                    'interaction_id': str(uuid.uuid5(uuid.NAMESPACE_URL, binding_id))}})
+        final = message(text, final_at, role='assistant', content=text)
+        final.update(id=final_id, parentId=binding_id)
+        final['message'].update(stopReason='stop', isError=False)
+        entries.append(final)
+        interaction_id = str(uuid.uuid5(uuid.NAMESPACE_URL, binding_id))
+        completions.append((interaction_id, final_at, text))
+        parent = final_id
+    active_row = message(active, cutoff + 1)
+    active_row.update(id='active', parentId=parent)
+    entries.append(active_row)
+    header = {'type': 'session', 'version': 3, 'id': session_id,
+              'timestamp': '2026-01-01T00:00:00.000Z', 'cwd': str(home.resolve())}
+    lines = []
+    if title is not None:
+        lines.append({'type': 'title', 'v': 1, 'title': title,
+                      'updatedAt': '2026-01-01T00:00:00.000Z', 'pad': ''})
+    lines.extend([header, *entries])
+    native.write_text('\n'.join(json.dumps(row) for row in lines) + '\n')
+    episode_paths = reviewer_episodes._episode_paths(home)
+    reviewer_episodes._publish_immutable(episode_paths['sources'] / f"{source['source_id']}.json", source)
+    for interaction_id, final_at, text in completions:
+        record = {'schema': 1, 'source_id': source['source_id'], 'interaction_id': interaction_id,
+                  'recorded_at': final_at + 0.1, 'will_continue': False,
+                  'awaiting_async_work': False,
+                  'final': {'timestamp': final_at * 1000,
+                            'text_sha256': hashlib.sha256(text.encode()).hexdigest(),
+                            'stop_reason': 'stop'}}
+        reviewer_episodes._publish_immutable(
+            episode_paths['completions'] / source['source_id'] / f'{interaction_id}.json', record)
+    return source, native, task if role == 'worker' else None
+
+
+def complete_review(home, selected):
+    started = time.time()
+    intent = reviewer.enqueue_intent(home, kind='manual')
+    config = reviewer.read_config(home)
+    run = reviewer.reserve_run(
+        home, intent, config_snapshot=config, instruction_snapshot=b'fixture',
+        started_at=started, deadline_epoch_ms=int((started + 1800) * 1000))
+    reviewer.begin_run(home, run, selected, model='fixture/model', observed_omp_version='fixture')
+    reviewer.submit_report(
+        home, run['review_run_id'], str(uuid.uuid4()),
+        {'schema': 1, 'summary': 'fixture', 'findings': []})
+    return reviewer.finalize_run(home, run['review_run_id'], 'exited')
+
+def append_episode(source, native, text, number, *, cutoff=200.0):
+    rows = [json.loads(line) for line in native.read_text().splitlines()]
+    active = rows.pop()
+    parent = next(row['id'] for row in reversed(rows) if row.get('type') == 'message')
+    binding_id = f'{source["session_id"]}-binding-{number}'
+    final_id = f'{source["session_id"]}-final-{number}'
+    prompt_id = f'{source["session_id"]}-prompt-{number}'
+    prompt_at = 10 + number * 20
+    prompt = message('prompt', prompt_at)
+    prompt.update(id=prompt_id, parentId=parent)
+    rows.append(prompt)
+    rows.append({'type': 'custom_message', 'id': binding_id, 'parentId': prompt_id,
+                 'timestamp': prompt_at + 1, 'customType': 'agd:episode-binding', 'display': False,
+                 'details': {'schema': 1, 'source_id': source['source_id'],
+                             'interaction_id': str(uuid.uuid5(uuid.NAMESPACE_URL, binding_id))}})
+    final = message(text, prompt_at + 2, role='assistant', content=text)
+    final.update(id=final_id, parentId=binding_id)
+    final['message'].update(stopReason='stop', isError=False)
+    rows.append(final)
+    rows.append({**active, 'parentId': final_id})
+    native.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+    interaction_id = str(uuid.uuid5(uuid.NAMESPACE_URL, binding_id))
+    record = {'schema': 1, 'source_id': source['source_id'], 'interaction_id': interaction_id,
+              'recorded_at': prompt_at + 2.1, 'will_continue': False, 'awaiting_async_work': False,
+              'final': {'timestamp': (prompt_at + 2) * 1000,
+                        'text_sha256': hashlib.sha256(text.encode()).hexdigest(),
+                        'stop_reason': 'stop'}}
+    paths = reviewer_episodes._episode_paths(Path(source['home']))
+    reviewer_episodes._publish_immutable(
+        paths['completions'] / source['source_id'] / f'{interaction_id}.json', record)
+
+
+def rewrite_title(native, title):
+    rows = [json.loads(line) for line in native.read_text().splitlines()]
+    title_row = {'type': 'title', 'v': 1, 'title': title,
+                 'updatedAt': '2026-01-01T00:00:00.000Z', 'pad': ''}
+    native.write_text(json.dumps(title_row) + '\n' + '\n'.join(json.dumps(row) for row in rows) + '\n')
+
+def append_unfinished(native, text, when=300.0):
+    rows = [json.loads(line) for line in native.read_text().splitlines()]
+    active = rows.pop()
+    parent = next(row['id'] for row in reversed(rows) if row.get('type') == 'message')
+    tail = message(text, when)
+    tail.update(id='unfinished-tail', parentId=parent)
+    rows.append(tail)
+    rows.append({**active, 'parentId': 'unfinished-tail'})
+    native.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+
 
 def test_messages_tracks_physical_prefix_across_malformed_rows(tmp_path):
-    header = b'{"type":"session","version":3,"id":"native"}\n'
+    header = b'{\"type\":\"session\",\"version\":3,\"id\":\"native\"}\n'
     bad = b'{bad}\n'; array = b'[]\n'
     late = json.dumps(message('late', 300)).encode() + b'\n'
     valid = json.dumps(message('kept', 100)).encode() + b'\n'
     path = tmp_path / 'native.jsonl'; path.write_bytes(header + bad + array + late + valid)
-    _, watermark, digest, rows, late_seen, _, withheld = reviewer._messages(path, 200, 4096)
+    result = reviewer_episodes.read_native(path, 200, 4096)
     body = path.read_bytes()
-    assert watermark == len(body) and digest == __import__('hashlib').sha256(body).hexdigest()
-    assert rows[0]['text'] == 'kept' and body[rows[0]['byte_start']:rows[0]['byte_end']] == valid
-    assert late_seen and [item['reason'] for item in withheld].count('native-row-malformed') == 2
+    assert result['byte_watermark'] == len(body) and result['content_sha256'] == __import__('hashlib').sha256(body).hexdigest()
+    assert result['rows'][0]['text'] == 'kept' and body[result['rows'][0]['byte_start']:result['rows'][0]['byte_end']] == valid
+    assert result['late'] and [item['reason'] for item in result['withheld']].count('native-row-malformed') == 2
+
+
+def test_native_followup_identity_excludes_physical_proof():
+    first = {'kind': 'native-jsonl', 'task_id': 'task', 'incarnation': 'inc', 'session_id': 'session',
+             'path': 'session.jsonl', 'byte_watermark': 100, 'content_sha256': 'a' * 64,
+             'material_sha256': 'b' * 64}
+    second = {**first, 'byte_watermark': 356, 'content_sha256': 'c' * 64}
+    row1 = {'message_id': 'message', 'text': 'evidence', 'line_start': 2, 'line_end': 2,
+            'byte_start': 20, 'byte_end': 100}
+    row2 = {**row1, 'line_start': 3, 'line_end': 3, 'byte_start': 276, 'byte_end': 356}
+    assert reviewer._digest(reviewer._native_material_identity(first)) == reviewer._digest(reviewer._native_material_identity(second))
+    assert reviewer._native_excerpt_id('source', row1) == reviewer._native_excerpt_id('source', row2)
+
+
+def test_material_identity_is_scoped_to_home_role_session_and_native_message():
+    scope = {'home': '/tmp/home', 'role': 'worker', 'session_id': 'session',
+             'task_id': 'task', 'incarnation': 'incarnation'}
+    row = {'message_id': 'same', 'text': 'same'}
+    assert reviewer._source_candidate_id(scope) != reviewer._source_candidate_id(
+        {**scope, 'session_id': 'other'})
+    assert reviewer._source_candidate_id(scope) != reviewer._source_candidate_id(
+        {'home': '/tmp/home', 'role': 'central', 'session_id': 'session'})
+    assert reviewer._material_id(scope, row) != reviewer._material_id(
+        scope, {'message_id': 'other', 'text': 'same'})
+    assert reviewer._material_id(scope, row) != reviewer._material_id(
+        scope, {'message_id': 'same', 'text': 'changed'})
+
+def test_completed_worker_and_taskless_central_admit_only_closed_material():
+    with lab() as (home, _):
+        worker_source, _, _ = completed_session(home, role='worker', task_id='alive',
+                                                texts=('worker answer',), alive=True)
+        central_source, _, _ = completed_session(home, texts=('central answer',))
+        selected = packet(home, cutoff=200)
+        assert {episode['role'] for episode in selected['episodes']} == {'worker', 'central'}
+        assert all('task_id' not in episode for episode in selected['episodes']
+                   if episode['role'] == 'central')
+        assert {row['text'] for row in selected['excerpts']} >= {'worker answer', 'central answer'}
+        assert 'unfinished' not in '\n'.join(row['text'] for row in selected['excerpts'])
+        assert worker_source['source_id'] != central_source['source_id']
+
+def test_confirmed_exit_preserves_unreviewed_tail_after_proved_completion():
+    with lab() as (home, _):
+        _, native, _ = completed_session(home, role='worker', task_id='exit-tail',
+                                         texts=('proved answer',))
+        append_unfinished(native, 'post-exit evidence')
+        selected = packet(home, cutoff=time.time() + 10)
+        assert {row['text'] for row in selected['excerpts']} >= {'proved answer', 'post-exit evidence'}
+
+def test_finalization_consumes_first_response_and_admits_next_response():
+    with lab() as (home, _):
+        source, native, _ = completed_session(home, texts=('first answer',))
+        first = packet(home, cutoff=200)
+        complete_review(home, first)
+        append_episode(source, native, 'second answer', 1)
+        second = packet(home, cutoff=250)
+        assert 'first answer' not in {row['text'] for row in second['excerpts']}
+        assert 'second answer' in {row['text'] for row in second['excerpts']}
+        complete_review(home, second)
+        assert packet(home, cutoff=300)['excerpts'] == []
+
+def test_multiple_episodes_and_repeated_native_ids_are_source_isolated():
+    with lab() as (home, _):
+        first_source, _, _ = completed_session(home, texts=('same answer',), stable_ids=True)
+        second_source, _, _ = completed_session(home, texts=('same answer',), stable_ids=True)
+        third_source, _, _ = completed_session(home, texts=('next answer', 'later answer'))
+        selected = packet(home, cutoff=200)
+        material_ids = [row['material_id'] for row in selected['excerpts']]
+        assert len(material_ids) == len(set(material_ids))
+        assert {row['text'] for row in selected['excerpts']} >= {'same answer', 'next answer'}
+        native = [source for source in selected['sources'] if source['kind'] == 'native-jsonl']
+        assert {source['candidate_id'] for source in native} >= {
+            reviewer._source_candidate_id({'home': str(home.resolve()), 'role': 'central',
+                                           'session_id': first_source['session_id']}),
+            reviewer._source_candidate_id({'home': str(home.resolve()), 'role': 'central',
+                                           'session_id': second_source['session_id']})}
+
+def test_title_only_native_rewrite_does_not_create_new_material():
+    with lab() as (home, _):
+        _, native, _ = completed_session(home, texts=('stable answer',))
+        first = packet(home, cutoff=200)
+        complete_review(home, first)
+        rewrite_title(native, 'renamed session')
+        unchanged = packet(home, cutoff=250)
+        assert unchanged['excerpts'] == []
+
+@pytest.mark.parametrize('outcome', ['failed', 'no-work'])
+def test_failed_or_no_work_review_does_not_consume_retained_material(outcome):
+    with lab() as (home, _):
+        completed_session(home, texts=('retryable answer',))
+        first = packet(home, cutoff=200)
+        started = time.time()
+        intent = reviewer.enqueue_intent(home, kind='manual')
+        config = reviewer.read_config(home)
+        run = reviewer.reserve_run(
+            home, intent, config_snapshot=config, instruction_snapshot=b'fixture',
+            started_at=started, deadline_epoch_ms=int((started + 1800) * 1000))
+        reviewer.begin_run(home, run, packet=first, model='fixture/model', observed_omp_version='fixture')
+        reviewer.close_run(home, run['review_run_id'], outcome, packet=first)
+        retry = packet(home, cutoff=250)
+        assert {row['text'] for row in retry['excerpts']} >= {'retryable answer'}
+
+def test_single_session_cap_skips_consumed_prefix_and_eventually_retains_tail():
+    with lab() as (home, _):
+        texts = tuple(f'evidence-{number}-' + ('x' * 2200) for number in range(8))
+        completed_session(home, texts=texts)
+        config = reviewer.read_config(home)
+        config['limits'].update(max_input_bytes=15000, max_candidates=20)
+        consumed, packet_count = set(), 0
+        while packet_count < len(texts) + 2:
+            selected = reviewer.select_packet(home, cutoff=250 + packet_count,
+                                              config_snapshot=config)
+            retained = {(row['message_id'], row['text']) for row in selected['excerpts']}
+            if not retained:
+                break
+            assert not consumed.intersection(retained)
+            consumed.update(retained)
+            complete_review(home, selected)
+            packet_count += 1
+        assert set(texts) <= {text for _, text in consumed}
+        assert packet_count > 1
+
+def test_candidate_cap_leaves_omitted_episodes_eligible():
+    with lab() as (home, _):
+        texts = ('candidate-a', 'candidate-b', 'candidate-c')
+        for index, text in enumerate(texts):
+            completed_session(home, texts=(text,), stable_ids=True)
+        config = reviewer.read_config(home)
+        config['limits']['max_candidates'] = 1
+        seen = set()
+        for offset in range(5):
+            selected = reviewer.select_packet(home, cutoff=250 + offset, config_snapshot=config)
+            retained = {row['text'] for row in selected['excerpts']}
+            if not retained:
+                break
+            seen.update(retained)
+            complete_review(home, selected)
+        assert set(texts) <= seen
+
+def test_pending_completion_waits_for_fresh_cutoff_without_mutating_old_packet():
+    with lab() as (home, _):
+        completed_session(home, texts=('future answer',), cutoff=200, start_at=1000)
+        frozen = packet(home, cutoff=200)
+        assert frozen['episodes'] == [] and frozen['excerpts'] == []
+        later = packet(home, cutoff=1100)
+        assert {row['text'] for row in later['excerpts']} >= {'future answer'}
+        assert packet(home, cutoff=200)['packet_id'] == frozen['packet_id']
+
+def test_pending_native_proof_marks_incomplete_and_later_finalizes_without_mutating_packet():
+    with lab() as (home, _):
+        source, native, _ = completed_session(home, texts=('pending answer',))
+        lines = native.read_text().splitlines()
+        native.write_text('\n'.join(lines[:2]) + '\n')
+        pending = packet(home, cutoff=200)
+        assert pending['episodes'] == [] and pending['excerpts'] == []
+        assert pending['coverage']['complete'] is False
+        assert {'source_id': source['source_id'],
+                'interaction_id': str(uuid.uuid5(uuid.NAMESPACE_URL,
+                                                 f'{source["session_id"]}-binding-0')),
+                'reason': 'native-proof-pending'} in pending['coverage']['unavailable']
+        native_packet_id = pending['packet_id']
+        with native.open('a') as stream:
+            stream.write('\n'.join(lines[2:]) + '\n')
+        later = packet(home, cutoff=250)
+        assert {row['text'] for row in later['excerpts']} >= {'pending answer'}
+        complete_review(home, later)
+        assert packet(home, cutoff=300)['excerpts'] == []
+        assert packet(home, cutoff=200) == pending
+
+def test_legacy_reviewed_packet_migrates_only_matching_source_scope():
+    with lab() as (home, _):
+        source, native, task = completed_session(home, role='worker', task_id='legacy',
+                                                texts=('legacy answer',))
+        row = {'message_id': 'legacy-message', 'text': 'legacy answer',
+               'line_start': 2, 'line_end': 2, 'byte_start': 0, 'byte_end': 1}
+        old_source = {'kind': 'native-jsonl', 'task_id': task['id'], 'incarnation': task['incarnation'],
+                      'session_id': source['session_id'], 'path': str(native.relative_to(home)),
+                      'byte_watermark': 1, 'content_sha256': 'a' * 64, 'material_sha256': 'b' * 64}
+        packet_value = {'schema': 1, 'purpose': 'background-skill-review', 'cutoff': 200,
+                        'episodes': [{'task_id': task['id'], 'incarnation': task['incarnation']}],
+                        'sources': [{**old_source, 'source_id': 'c' * 64}],
+                        'excerpts': [{**row, 'source_id': 'c' * 64, 'excerpt_id': 'd' * 64}],
+                        'catalog': [], 'skill_provenance': [], 'coverage': {'followup_id': 'e' * 64},
+                        'retrospective_review_run_ids': [], 'retrospective_episodes': [],
+                        'config_snapshot_sha256': 'f' * 64}
+        packet_id = reviewer._digest(packet_value)
+        reviewer.publish_immutable(reviewer.paths(home)['packets'] / f'{packet_id}.json', packet_value)
+        reviewer.store.atomic_json(
+            reviewer.paths(home)['followups'] / f"{'e' * 64}.json",
+            {'schema': 1, 'material_basis': 'e' * 64, 'state': 'reviewed',
+             'candidates': [{'candidate_id': reviewer._candidate_id(task['id'], task['incarnation']),
+                             'excerpt_ids': [f"legacy-message:{hashlib.sha256(b'legacy answer').hexdigest()}"]}]})
+        reviewer.store.atomic_json(
+            reviewer.paths(home)['checkpoints'] / 'legacy.json',
+            {'scope': {}, 'packet_id': packet_id, 'material_basis': 'e' * 64})
+        scope = {'home': str(home.resolve()), 'role': 'worker', 'session_id': source['session_id'],
+                 'task_id': task['id'], 'incarnation': task['incarnation']}
+        assert reviewer._material_id(scope, row) in reviewer._reviewed_material(home, scope)
+        assert reviewer._legacy_material_id(row) not in reviewer._reviewed_material(home, scope)
+
+def test_legacy_reviewed_prefix_skips_before_budget_for_new_same_session_completion():
+    with lab() as (home, _):
+        old_texts = tuple(f'old answer {index} ' + ('o' * 5000) for index in range(4))
+        source, native, task = completed_session(
+            home, role='worker', task_id='legacy-prefix', texts=old_texts)
+        original = packet(home, cutoff=200, limit=100000)
+        old_ids = {row['message_id'] for row in original['excerpts']}
+        followup_id = 'a' * 64
+        legacy = json.loads(json.dumps(original))
+        legacy.pop('packet_id', None)
+        legacy['coverage']['followup_id'] = followup_id
+        legacy_ids = []
+        for row in legacy['excerpts']:
+            row.pop('material_id', None)
+            legacy_ids.append(reviewer._legacy_material_id(row))
+        packet_id = reviewer._digest(legacy)
+        reviewer.publish_immutable(reviewer.paths(home)['packets'] / f'{packet_id}.json', legacy)
+        scope = reviewer._source_scope(home, source)
+        reviewer.store.atomic_json(
+            reviewer.paths(home)['followups'] / f'{followup_id}.json',
+            {'schema': 1, 'material_basis': followup_id, 'state': 'reviewed',
+            'candidates': [{'candidate_id': reviewer._candidate_id(task['id'], task['incarnation']),
+                             'excerpt_ids': legacy_ids}]})
+        reviewer.store.atomic_json(
+            reviewer.paths(home)['checkpoints'] / 'legacy-prefix.json',
+            {'scope': {}, 'packet_id': packet_id, 'material_basis': followup_id})
+        append_episode(source, native, 'new answer', len(old_texts))
+        selected = packet(home, cutoff=250, limit=16000)
+        selected_ids = {row['message_id'] for row in selected['excerpts']}
+        assert not old_ids.intersection(selected_ids)
+        assert 'new answer' in {row['text'] for row in selected['excerpts']}
+        complete_review(home, selected)
+        assert packet(home, cutoff=300, limit=16000)['excerpts'] == []
+
+
+def test_exited_worker_multiple_native_sessions_each_stay_reviewed():
+    with lab() as (home, _):
+        task, binding, first_session = ended_worker(
+            home, 'multi-native', str(uuid.uuid4()), [message('first source', 100)], 0)
+        second_session = str(uuid.uuid4())
+        second = Path(binding['session_dir']) / f'{second_session}.jsonl'
+        header = {'type': 'session', 'version': 3, 'id': second_session,
+                  'timestamp': '2026-01-01T00:00:00.000Z', 'cwd': str(home)}
+        second.write_text('\n'.join(json.dumps(row) for row in [
+            header, message('second source', 100)]) + '\n')
+        first = packet(home, cutoff=time.time() + 10)
+        assert {source['session_id'] for source in first['sources']
+                if source['kind'] == 'native-jsonl'} >= {first_session, second_session}
+        complete_review(home, first)
+        retry = packet(home, cutoff=time.time() + 20)
+        assert retry['excerpts'] == []
+
+
+def test_capped_completion_episodes_keep_exact_source_boundaries():
+    with lab() as (home, _):
+        completed_session(home, texts=('a' * 3000, 'b' * 3000))
+        full_config = reviewer.read_config(home)
+        full_config['limits']['max_input_bytes'] = 1000000
+        full = reviewer.select_packet(home, cutoff=250, config_snapshot=full_config)
+        full_size = len(reviewer._json_bytes({key: value for key, value in full.items()
+                                              if key != 'packet_id'}))
+        config = reviewer.read_config(home)
+        config['limits']['max_input_bytes'] = full_size - 1
+        selected = reviewer.select_packet(home, cutoff=251, config_snapshot=config)
+        assert selected['coverage']['late_basis']
+        source_ids = {source['source_id'] for source in selected['sources']}
+        excerpt_sources = {excerpt['source_id'] for excerpt in selected['excerpts']}
+        for episode in selected['episodes']:
+            if episode.get('source_id'):
+                assert episode['source_id'] in source_ids & excerpt_sources
 
 def test_packet_collects_closed_failure_and_success_with_stable_cited_spans():
     with lab() as (home, _):
@@ -285,35 +685,38 @@ def test_reviewed_candidates_advance_and_new_material_resurfaces_once():
         reviewer.mark_material_reviewed(home, resurfaced['coverage']['followup_id'])
         assert reviewer.select_packet(home, cutoff=cutoff + 3, config_snapshot=config)['episodes'] == []
 
-def test_shared_cap_does_not_consume_clipped_candidate_material():
-    with lab() as (home, _):
-        ended_worker(home, 'first', str(uuid.uuid4()), [message('a' * 3000, 100)])
-        ended_worker(home, 'second', str(uuid.uuid4()), [message('b' * 3000, 100)])
-        config = reviewer.read_config(home)
-        config['limits'].update(max_candidates=2, max_input_bytes=15000)
-        cutoff = time.time() + 100
-        first = reviewer.select_packet(home, cutoff=cutoff, config_snapshot=config)
-        assert {source['task_id'] for source in first['sources'] if source['kind'] == 'native-jsonl'} == {'first', 'second'}
-        assert {source['task_id'] for source in first['sources'] if any(excerpt['source_id'] == source['source_id'] for excerpt in first['excerpts'])} == {'first'}
-        reviewer.mark_material_reviewed(home, first['coverage']['followup_id'])
-        second = reviewer.select_packet(home, cutoff=cutoff + 1, config_snapshot=config)
-        assert {source['task_id'] for source in second['sources'] if source['kind'] == 'native-jsonl'} == {'second'}
-        reviewer.mark_material_reviewed(home, second['coverage']['followup_id'])
-        assert reviewer.select_packet(home, cutoff=cutoff + 2, config_snapshot=config)['episodes'] == []
 
-def test_shared_cap_revisits_only_clipped_candidate_excerpt_without_starving_next():
+def test_shared_cap_revisits_clipped_material_without_starving_next():
     with lab() as (home, _):
-        ended_worker(home, 'a', str(uuid.uuid4()), [message('a' * 2500, 100)])
-        ended_worker(home, 'b', str(uuid.uuid4()), [message('b1' * 1200, 100), message('b2' * 1200, 101)])
-        ended_worker(home, 'c', str(uuid.uuid4()), [message('c' * 2500, 100)])
-        config = reviewer.read_config(home); config['limits'].update(max_candidates=3, max_input_bytes=17000)
-        first = reviewer.select_packet(home, cutoff=time.time() + 100, config_snapshot=config)
-        b_first = [row['text'] for row in first['excerpts'] if any(source['source_id'] == row['source_id'] and source.get('task_id') == 'b' for source in first['sources'])]
-        assert b_first == ['b1' * 1200]
-        reviewer.mark_material_reviewed(home, first['coverage']['followup_id'])
-        second = reviewer.select_packet(home, cutoff=time.time() + 101, config_snapshot=config)
-        b_second = [row['text'] for row in second['excerpts'] if any(source['source_id'] == row['source_id'] and source.get('task_id') == 'b' for source in second['sources'])]
-        assert b_second == ['b2' * 1200]
+        fixtures = {
+            'a': [message('a' * 2500, 100)],
+            'b': [message('b1' * 1200, 100), message('b2' * 1200, 101)],
+            'c': [message('c' * 2500, 100)],
+        }
+        expected = set()
+        for task_id, rows in fixtures.items():
+            task, _, _ = ended_worker(home, task_id, str(uuid.uuid4()), rows)
+            expected.update((task['id'], row['id']) for row in rows)
+        config = reviewer.read_config(home)
+        cap = 17000
+        config['limits'].update(max_candidates=3, max_input_bytes=cap)
+        consumed = set()
+        packets = 0
+        while True:
+            selected = reviewer.select_packet(home, cutoff=time.time() + packets + 100, config_snapshot=config)
+            assert len(reviewer._json_bytes({key: value for key, value in selected.items() if key != 'packet_id'})) <= cap
+            sources = {source['source_id']: source for source in selected['sources']}
+            retained = {(sources[excerpt['source_id']]['task_id'], excerpt['message_id'])
+                        for excerpt in selected['excerpts']}
+            if not retained:
+                assert selected['episodes'] == []
+                break
+            assert not consumed.intersection(retained)
+            consumed.update(retained)
+            reviewer.mark_material_reviewed(home, selected['coverage']['followup_id'])
+            packets += 1
+            assert packets <= len(expected)
+        assert consumed == expected
 
 
 def test_reviewed_oversized_candidate_does_not_repeat_its_admitted_prefix():

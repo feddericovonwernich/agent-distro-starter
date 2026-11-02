@@ -1,3 +1,5 @@
+import { registerEpisodeCapture, type EpisodeAPI, type EpisodeSessionManager } from '../../lib/omp-episodes';
+
 import { randomUUID } from 'node:crypto';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { readFileSync } from 'node:fs';
@@ -46,7 +48,7 @@ async function readSessionHealth(): Promise<Health> {
 }
 
 
-type Context = { isIdle: () => boolean; ui: {
+type Context = { isIdle: () => boolean; sessionManager: EpisodeSessionManager; ui: {
   setStatus: (key: string, text: string | undefined) => void;
   notify: (message: string, type?: 'info' | 'warning' | 'error') => void;
 } };
@@ -64,6 +66,26 @@ export default function primary(api: ExtensionAPI) {
   let restarted = false;
   let inFlight = new Set<string>();
   let sessionContext: Context | undefined;
+  let readiness: { generation: number; settled: boolean; promise: Promise<boolean>; resolve: (value: boolean) => void } | undefined;
+  function newReadiness(active: number) {
+    const { promise, resolve } = Promise.withResolvers<boolean>();
+    readiness = { generation: active, settled: false, promise, resolve };
+  }
+  function settleReadiness(active: number, value: boolean) {
+    if (!readiness || readiness.generation !== active || readiness.settled) return;
+    readiness.settled = true;
+    readiness.resolve(value);
+  }
+  async function waitForReady(): Promise<boolean> {
+    const current = readiness;
+    if (!current || current.generation !== generation) return false;
+    const timeout = Promise.withResolvers<boolean>();
+    const timer = setTimeout(() => timeout.resolve(false), 5000);
+    timer.unref?.();
+    const result = await Promise.race([current.promise, timeout.promise]);
+    clearTimeout(timer);
+    return result;
+  }
 
   function showStatus(context: Context, result = command('session', 'status')) {
     const data = result.ok && result.data && typeof result.data === 'object'
@@ -127,6 +149,7 @@ export default function primary(api: ExtensionAPI) {
           const item: unknown = JSON.parse(row);
           if (!item || typeof item !== 'object' || !('type' in item)) continue;
           if (item.type === 'ready') {
+            settleReadiness(active, true);
             startup = 'Supervision watcher ready.';
             if (sessionContext) showStatus(sessionContext);
           }
@@ -149,6 +172,7 @@ export default function primary(api: ExtensionAPI) {
         startup = 'Supervision watcher exited; attempting one restart.';
         launchWatch(active);
       } else {
+        settleReadiness(active, false);
         startup = 'Supervision watcher stopped; delegated work is not monitored.';
         sessionContext?.ui.setStatus('agd', 'Distro · watcher unavailable');
         sessionContext?.ui.notify(startup, 'error');
@@ -157,16 +181,26 @@ export default function primary(api: ExtensionAPI) {
   }
 
   async function startSession(_event: unknown, context: Context) {
+    settleReadiness(generation, false);
     process.env.AGD_OWNER = token;
     sessionContext = context;
     context.ui.setStatus('agd', 'Distro · starting');
     const active = ++generation;
+    newReadiness(active);
     outstanding = new Set();
     restarted = false;
     inFlight = new Set();
     await stop();
     if (active === generation) launchWatch(active);
   }
+  registerEpisodeCapture(api as unknown as EpisodeAPI, {
+    home, cli, role: 'central',
+    diagnostic: message => {
+      console.error(message);
+      sessionContext?.ui.notify(message, 'warning');
+    },
+    beforeBind: waitForReady,
+  });
   api.on('session_start', startSession);
   api.on('session_switch', startSession);
   api.on('before_agent_start', (_event, context) => {
@@ -181,6 +215,7 @@ export default function primary(api: ExtensionAPI) {
   });
   api.on('session_stop', async event => stopDecision(event.stop_hook_active === true, await readSessionHealth()));
   api.on('session_shutdown', () => {
+    settleReadiness(generation, false);
     generation++;
     sessionContext?.ui.setStatus('agd', undefined);
     if (process.env.AGD_OWNER === token) delete process.env.AGD_OWNER;
