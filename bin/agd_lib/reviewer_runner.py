@@ -119,10 +119,12 @@ def run_native_reviewer(home, intent, *, omp_binary='omp'):
                 receipt.update(packet_id=packet['packet_id'], omp_version=capability['omp_version'])
                 store.atomic_json(reviewer.paths(home)['receipts'] / f"{run['review_run_id']}.json", receipt)
             env, _, _ = observability.reviewer_environment(home, run['review_run_id'])
+            langfuse_query = observability.reviewer_query_status(home, env)
             runtime = _runtime_boundary(home, run['review_run_id'])
             payload = {'urls': {key: capability[f'{key}_url'] for key in ('ai', 'core', 'sdk', 'registry', 'manager', 'session', 'telemetry', 'resolver')},
                        'input': {'cwd': str(runtime), 'agentDir': str(directory.resolve()), 'sessionDir': observability.reviewer_session_dir(home, run['review_run_id']),
-                                 'reviewRunId': run['review_run_id'], 'receipt': {'deadline_epoch_ms': run['deadline_epoch_ms'], 'omp_version': capability['omp_version']},
+                                 'reviewRunId': run['review_run_id'], 'langfuse_query': langfuse_query,
+                                 'receipt': {'deadline_epoch_ms': run['deadline_epoch_ms'], 'omp_version': capability['omp_version']},
                                  'modelSelector': config['review_model'], 'reviewPrompt': reviewer._read_json(reviewer.paths(home)['manifests'] / f"{run['instruction_snapshot_ref']}.json")['text']}}
         except Exception:
             return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='preparation', packet=packet)

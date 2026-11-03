@@ -167,6 +167,22 @@ def langfuse_query_context(home):
         return None
 
 
+def reviewer_query_status(home, inherited=None):
+    """Return sanitized local Langfuse query availability for reviewer metadata."""
+    try:
+        from . import langfuse_cli
+        _, availability = langfuse_cli.reviewer_environment(home, os.environ if inherited is None else inherited)
+    except (OSError, ValueError, TypeError, store.Refusal, store.DependencyError):
+        return {'available': False, 'reason': 'local Langfuse query is unavailable'}
+    if not isinstance(availability, dict):
+        return {'available': False, 'reason': 'local Langfuse query is unavailable'}
+    available = availability.get('available') is True
+    reason = availability.get('reason') if not available else None
+    if reason is not None and not isinstance(reason, str):
+        reason = 'local Langfuse query is unavailable'
+    return {'available': available, 'reason': reason}
+
+
 def worker_binding_locked(home, task_id, incarnation):
     home = _home(home)
     task_id = store.validate_id(task_id)
