@@ -154,6 +154,8 @@ def parser():
     central.add_argument('omp_args', nargs=argparse.REMAINDER)
     reviewer_p = sub.add_parser('reviewer').add_subparsers(dest='reviewer_op', required=True)
     run_p = reviewer_p.add_parser('run'); run_p.add_argument('--timer', action='store_true'); run_p.add_argument('--retrospective-review-run', type=lambda value: str(uuid.UUID(value)), action='append', default=[])
+    execute_p = reviewer_p.add_parser('execute'); execute_p.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
+    bind_p = reviewer_p.add_parser('session-bind'); bind_p.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value))); bind_p.add_argument('--session-id', required=True); bind_p.add_argument('--session-file', required=True)
     reviewer_p.add_parser('status')
     reports = reviewer_p.add_parser('reports').add_subparsers(dest='report_op', required=True)
     reports.add_parser('list'); reports.add_parser('show').add_argument('report_id')
@@ -235,7 +237,8 @@ def main(args):
         if not fresh:
             raise store.Refusal('fresh non-symlink launcher home required')
     reviewer_write = args.command == 'reviewer' and (
-        args.reviewer_op == 'episode' or args.reviewer_op == 'run' or args.reviewer_op == 'timer' and args.timer_op != 'status'
+        args.reviewer_op in ('execute', 'session-bind', 'episode')
+        or args.reviewer_op == 'run' or args.reviewer_op == 'timer' and args.timer_op != 'status'
         or args.reviewer_op == 'proposals' and args.proposal_op == 'dispose')
     managed_loop = (args.command == 'worker' and args.operation == 'run'
                     or args.command == 'reviewer' and args.reviewer_op == 'run')
@@ -454,6 +457,10 @@ def _dispatch(args, home, fresh):
             return reviewer_episodes.register_source(home, request)
         return reviewer_episodes.record_completion(home, request)
     if args.command == 'reviewer':
+        if args.reviewer_op == 'execute':
+            return reviewer_runner.execute(home, args.review_run_id)
+        if args.reviewer_op == 'session-bind':
+            return reviewer_runner.bind_session(home, args.review_run_id, args.session_id, Path(args.session_file))
         if args.reviewer_op == 'run':
             if args.timer and args.retrospective_review_run: raise store.Refusal('timer runs cannot be retrospective')
             if args.timer: return reviewer_runner.launch_timer(home)
@@ -497,6 +504,8 @@ def _dispatch(args, home, fresh):
 if __name__ == '__main__':
     try:
         result = main(parse_args())
+        if isinstance(result, int):
+            raise SystemExit(result)
         if result is not None:
             print(json.dumps(result, indent=2 if sys.stdout.isatty() else None))
     except (ValueError, store.Refusal, store.DependencyError) as error:

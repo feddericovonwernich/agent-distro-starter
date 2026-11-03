@@ -303,7 +303,8 @@ def reviewer_environment(home, review_run_id):
     config = read_config(home)
     env = omp_runtime.environment(
         home, {key: value for key, value in os.environ.items()
-               if not key.startswith('OTEL_') and key not in {'AGD_TASK_ID', 'AGD_INCARNATION', 'AGD_MANAGED_CENTRAL', 'AGD_OWNER'}})
+               if not key.startswith(('OTEL_', 'LANGFUSE_'))
+               and key not in {'AGD_TASK_ID', 'AGD_INCARNATION', 'AGD_MANAGED_CENTRAL', 'AGD_OWNER'}})
     env['AGD_HOME'] = str(home)
     try:
         from . import langfuse_cli
