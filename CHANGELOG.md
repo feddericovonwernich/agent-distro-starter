@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Add the independent optional Langfuse CLI installer stage and rerunnable `agd installer langfuse` command. Pin `@langfuse/cli@1.2.4`, verify archive/package provenance before execution, preserve external/foreign/partial installs, keep Node/npm and global packages untouched, and retain probe-free default-No behavior.
 - Admit incremental reviewer episodes from guarded native final-response boundaries for living workers and taskless central sessions. Deduplicate scoped message material independently of titles or physical coordinates, consume only retained material after successful report finalization, preserve pending/partial coverage and frozen packet citations, and document the real native SDK/CLI lifecycle proof without claiming paid-model quality or backend recovery.
 - Accept relative `--home` paths consistently across all CLI commands, resolving them from the caller directory while preserving explicit-home precedence and symlink rejection.
 - Add confirmed `agd --home . uninstall` with read-only pretty JSON, separate local-work consent, retirement admission fencing, an isolated foreground recovery bundle, exact owned process/backend/reviewer/Docker/Treehouse/Git teardown, and delayed non-recreation verification. Preserve shared tools/accounts/images/other homes and fail closed on legacy, foreign, changed or unproven ownership.

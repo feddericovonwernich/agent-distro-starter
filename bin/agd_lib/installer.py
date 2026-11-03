@@ -436,6 +436,16 @@ def setup(home, backend, prompt, fetch_json, stream_url, run, *, install_plugins
         return receipt
 
 
+def setup_langfuse(home, input_fn=input, output=print, *, run=store.run,
+                   which=shutil.which, fetch_bytes=None):
+    if fetch_bytes is None:
+        raise Refusal('Langfuse archive fetcher is unavailable')
+    from . import langfuse_cli
+    return langfuse_cli.setup_langfuse(
+        home, input_fn=input_fn, output=output, run=run, which=which,
+        fetch_bytes=fetch_bytes)
+
+
 def setup_reviewer(home, ask, report):
     from . import reviewer, reviewer_timer
     from .uninstall_state import admission

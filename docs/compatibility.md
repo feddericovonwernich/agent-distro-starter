@@ -32,6 +32,12 @@ A separate disposable run used actual Docker Engine 28.5.0 and Compose 2.40.0, w
 
 Final review exposed an incomplete-first-enable `stop|disable` metadata lookup failure. Six regressions demonstrated the failure before the fix and now exercise recovery plus missing/changed lock, foreign secrets, and missing project refusals. A separate disposable real-CLI/real-Docker smoke created only the retained first-enable render, then ran `observability disable` without a completed config: it reported disabled/stopped and preserved Compose/secret bytes. No services were started in that recovery smoke, so it is not proof of stopping a live stack.
 
+### Optional Langfuse CLI
+
+The fifth guided-install stage is independent of telemetry and reviewer scheduling. It offers the official `@langfuse/cli@1.2.4` only after explicit consent, requires existing Node.js 20+ and npm, and never installs runtimes, mutates global packages, uses sudo, or enables cloud access. The pinned archive SHA-256 is `0fc4e39b38bfa45d77f045a2d3a79e165411e4de0737eb7893bec57b246e574f`. Blank/No/EOF is probe-free and writes no optional package state.
+
+The managed package is staged privately with lifecycle scripts disabled and atomically promoted with an owned launcher and strict provenance receipt. A canonical external `@langfuse/cli@1.2.4` is reused only after every package asset, Node identity and offline `--version`/`api schema --json` probe matches the pinned archive. Modified, legacy, foreign or partial trees are retained. This task's controller-owned GREEN suite and scoped CLI smoke are the required acceptance evidence; no live credentialed query is claimed.
+
 ### Other runtime observations
 
 | Scenario | Observed outcome |

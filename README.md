@@ -21,8 +21,19 @@ Setup uses OMP's official project marketplace flow to install `ponytail@ponytail
 The fourth installer stage asks `Enable local Langfuse telemetry? [y/N]`. Blank, No, or EOF leaves export off without probing Docker; native local session recording remains available. Yes uses the existing observability lifecycle to provision a distro-owned, loopback-only Langfuse + Collector stack before the first central starts. Docker/Compose access is required; the installer does not install Docker or elevate for telemetry. This pulls images, uses disk/memory, and can capture sensitive prompts, instructions, and tool inputs/results. It is not Langfuse Cloud, and healthy services alone do not prove trace delivery.
 
 If optional telemetry setup fails, installation warns and still enters the usable distro shell. The distro and its recovery files are retained, even if services were partially created; mandatory clone/dependency/plugin failures still remove the installer-owned clone. Inspect with `bin/agd observability status`, retry with `bin/agd observability enable`, or stop and disable with `bin/agd observability disable`. Existing installs are unchanged; use those commands explicitly and restart existing managed sessions to pick up a mode change.
+The fifth stage independently offers the official `@langfuse/cli@1.2.4`:
 
-The fifth stage asks `Enable scheduled skill reviews? [y/N]`, independently of telemetry. After consent, choose daily at 02:00 UTC, every 6 hours, every hour, a custom daily HH:MM/IANA timezone, or a custom positive whole-hour interval. Blank/No skips setup; menu `0` or EOF cancels without changing config. Reviews inspect completed worker evidence, can incur model-provider charges, and produce reports/proposals—not automatic skill edits.
+```text
+Install optional Langfuse CLI? [y/N]
+```
+
+The warning immediately before the default-No question discloses the existing Node.js 20+ and npm prerequisite and that credential-capable queries are possible. Blank, No, or EOF performs no Node/npm/package/network probe and writes no optional state. With explicit consent, AGD verifies the pinned archive SHA-256 `0fc4e39b38bfa45d77f045a2d3a79e165411e4de0737eb7893bec57b246e574f` before a private, lifecycle-disabled npm staging install. It never installs Node/npm, uses sudo, changes global packages, enables telemetry, selects a cloud project or configures a schedule.
+
+An already-installed canonical `@langfuse/cli` is reused only when version `1.2.4`, every package asset, Node identity and offline `--version`/`api schema --json` probe match the pinned release. The home-owned launcher and receipt live under `data/langfuse-cli/`; an external package remains unowned and untouched. Different, modified, legacy, foreign or partial installations are retained and never receive credentials. Optional failure is nonfatal; retry with `bin/agd --home . installer langfuse`.
+
+The sixth stage asks `Enable scheduled skill reviews? [y/N]`, independently of telemetry and CLI installation. 
+
+After consent, choose daily at 02:00 UTC, every 6 hours, every hour, a custom daily HH:MM/IANA timezone, or a custom positive whole-hour interval. Blank/No skips setup; menu `0` or EOF cancels without changing config. Reviews inspect completed worker evidence, can incur model-provider charges, and produce reports/proposals—not automatic skill edits.
 
 Reviewer activation reuses installed Bun, an importable compatible OMP SDK, the distro's native agent directory, and the user-systemd manager; no runtime is downloaded, no sudo/linger is used, and authentication/model settings remain OMP's responsibility. The normal standalone OMP release does not expose that SDK. Missing prerequisites retain the selected schedule and clearly report configured/not enabled, without claiming a review can run. Retry selection with `bin/agd installer reviewer`, or after fixing prerequisites run `bin/agd reviewer timer enable`; inspect/disable with the corresponding timer commands. Existing active or partially configured timers must be explicitly disabled before changing their schedule.
 

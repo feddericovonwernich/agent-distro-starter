@@ -132,9 +132,17 @@ The reviewer uses the distro-local OMP settings/auth agent directory but runs th
 
 `reviewer timer enable|disable|status` manages the UUID/UID-owned systemd user timer and requires explicit home-scoped approval. Configuration, `init`, central startup, and manual runs do not authorize activation. The installer can obtain that approval through its dedicated default-No reviewer prompt; AGD installs no cron job and does not enable lingering. Calendar scheduling defaults to 02:00 UTC, validates native/IANA agreement, skips a DST gap, and runs once in a fold. Intervals use positive whole hours anchored to UTC hours; persistent catch-up coalesces missed occurrences without drifting from completion. `manual-only` has no timer. Timer status retains lifecycle/checkpoint evidence, not proof of model authentication or completed reviews.
 
+### Install-time Langfuse CLI
+
+Stage `5 / 6  Install optional Langfuse CLI`, or `bin/agd installer langfuse` later, independently offers the official `@langfuse/cli@1.2.4`. The warning before `Install optional Langfuse CLI? [y/N]` discloses the existing Node.js 20+ and npm prerequisite and that credential-capable queries are possible. Blank, No, or EOF performs no runtime, package-manager, network, or Docker probe and writes no optional receipt.
+
+With explicit consent, AGD verifies archive SHA-256 `0fc4e39b38bfa45d77f045a2d3a79e165411e4de0737eb7893bec57b246e574f` before a private npm staging install with lifecycle scripts disabled. It never installs Node/npm, uses sudo, mutates global packages, enables telemetry, chooses a cloud project, or enables a schedule. A reused external CLI must be canonical `@langfuse/cli` exactly `1.2.4`; all package assets, Node identity and offline `--version`/`api schema --json` probes are revalidated before use. The external tree remains unowned; only `data/langfuse-cli/bin/langfuse` and its strict receipt are home-owned.
+
+Different, modified, legacy, foreign, or partial installations are retained and refused rather than overwritten. Managed runtime, package assets, launcher and provenance are promoted atomically under `data/langfuse-cli/runtime`; failure is nonfatal and preserves any previous valid installation. Retry with `bin/agd --home . installer langfuse`. This optional CLI stage does not enable telemetry or scheduled reviews.
+
 ### Install-time reviewer scheduling
 
-Stage `5 / 5  Configure scheduled reviewer`, or `bin/agd installer reviewer` later, offers daily 02:00 UTC, every 6 hours, every hour, custom daily time/timezone, and a custom whole-hour interval. Explicit opt-in warns about evidence sent to the configured model provider and potential charges; bounded call/byte/runtime limits are not a dollar budget. Review proposals remain inert until separate human action. This feature neither requires nor enables Langfuse.
+Stage `6 / 6  Configure scheduled reviewer`, or `bin/agd installer reviewer` later, offers daily 02:00 UTC, every 6 hours, every hour, custom daily time/timezone, and a custom whole-hour interval. Explicit opt-in warns about evidence sent to the configured model provider and potential charges; bounded call/byte/runtime limits are not a dollar budget. Review proposals remain inert until separate human action. This feature neither requires nor enables Langfuse.
 
 Custom daily time uses HH:MM and an IANA zone (UTC by default); custom intervals must be positive whole hours. Invalid input can be corrected or cancelled. Blank/No at consent, menu 0, or EOF before a complete valid selection writes no reviewer config or units. A complete choice preserves existing model and limits, writes private validated config, and only then attempts activation. An active reviewer lease or non-disabled timer receipt refuses reconfiguration; inspect and explicitly disable the timer first.
 
@@ -156,7 +164,7 @@ bin/agd --home "$AGD_HOME" observability start
 bin/agd --home "$AGD_HOME" observability disable
 ```
 
-Fresh installation offers this lifecycle in stage `4 / 5  Configure observability`, defaulting to No. Consent starts the local stack before the first central launch; declining starts no Docker activity and leaves local native session recording available. The prompt warns about image downloads, resource use, and sensitive captured content. It does not configure Langfuse Cloud or install Docker/Compose.
+Fresh installation offers this lifecycle in stage `4 / 6  Configure observability`, defaulting to No. Consent starts the local stack before the first central launch; declining starts no Docker activity and leaves local native session recording available. The prompt warns about image downloads, resource use, and sensitive captured content. It does not configure Langfuse Cloud or install Docker/Compose.
 
 Optional enablement failure does not undo the mandatory installation. A visible incomplete warning and recovery commands accompany public status when available; generated Compose files, identity, credentials, and queues remain in the distro so partial services can be inspected and stopped. Interruption after mandatory setup also retains the home. Do not delete that directory while services remain: run the home-scoped `observability status`, retry `enable`, or use `disable` to stop its stack. Disabled desired mode after a failed attempt is not proof that no containers were created. Existing installations require explicit enablement and normal central/worker restart; the installer changes no active sessions.
 

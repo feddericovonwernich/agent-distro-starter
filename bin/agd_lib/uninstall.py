@@ -12,10 +12,9 @@ from pathlib import Path
 from . import store, uninstall_state as state
 
 MODULES = (
-    'github', 'harnesses', 'herdr', 'installer', 'launcher', 'observability', 'omp_runtime',
+    'github', 'harnesses', 'herdr', 'installer', 'langfuse_cli', 'launcher', 'observability', 'omp_runtime',
     'pr', 'projects', 'relay', 'relay_reviews', 'review_feedback', 'reviewer', 'reviewer_episodes', 'reviewer_runner',
     'reviewer_timer', 'store', 'supervision', 'tasks', 'tmux', 'worker_skills', 'workers',
-    'uninstall_state', 'uninstall',
 )
 FILES = ('bin/agd', *(f'bin/agd_lib/{name}.py' for name in MODULES),
          'bundled/observability/release-lock.json')

@@ -29,6 +29,7 @@ def parser():
     installer_setup = installer_command.add_parser('setup')
     installer_setup.add_argument('--backend', choices=('tmux', 'herdr'), required=True)
     installer_command.add_parser('shell')
+    installer_command.add_parser('langfuse')
     installer_command.add_parser('reviewer')
     omp = sub.add_parser('omp')
     omp.add_argument('omp_args', nargs=argparse.REMAINDER)
@@ -322,6 +323,9 @@ def _dispatch(args, home, fresh):
         def stream_url(url):
             with urlopen(url) as response:
                 yield from iter(lambda: response.read(1024 * 1024), b'')
+        def fetch_bytes(url):
+            with urlopen(url) as response:
+                yield from iter(lambda: response.read(1024 * 1024), b'')
         def ask(message):
             color = sys.stderr.isatty() and os.environ.get('TERM', 'dumb') != 'dumb' and 'NO_COLOR' not in os.environ
             label = f'\033[36m{message}\033[0m' if color else message
@@ -330,6 +334,10 @@ def _dispatch(args, home, fresh):
                 return input().strip()
             except EOFError:
                 return None
+        if args.installer_operation == 'langfuse':
+            return installer.setup_langfuse(
+                home, input_fn=ask, output=lambda message: print(message, file=sys.stderr),
+                fetch_bytes=fetch_bytes, run=store.run, which=shutil.which)
         if args.installer_operation == 'reviewer':
             installer.setup_reviewer(home, ask, lambda message: print(message, file=sys.stderr))
             return None

@@ -43,8 +43,13 @@ if [ "$3" = observability ]; then
   if [ "${AGD_TELEMETRY:-}" = status ] && [ "$4" = status ]; then exit 3; fi
   exec /usr/bin/python3 "$AGD_SOURCE/bin/agd" "$@"
 fi
-if [ "$3" = installer ] && [ "$4" = setup ]; then
-  /bin/mkdir -p "$2/data/omp/home/.omp/agent"
+if [ "$3" = installer ] && [ "$4" = langfuse ]; then
+  printf 'Install optional Langfuse CLI? [y/N] ' >&2
+  IFS= read -r answer || answer=
+  case "$answer" in
+    y|Y|yes|YES) printf 'Langfuse CLI setup incomplete: fixture refusal\n' >&2 ;;
+  esac
+  exit 0
 fi
 if [ "$3" = installer ] && [ "$4" = reviewer ]; then
   exec /usr/bin/python3 "$AGD_SOURCE/bin/agd" "$@"
@@ -159,7 +164,7 @@ def test_guided_install_initializes_before_setup_and_enters_clone_shell(backend)
         root = Path(directory)
         fixture = make_fixture(root)
         tools = make_tools(root, fixture)
-        result = run_install(root, tools, f'distro-{backend}\n{backend}\nn\nn\n')
+        result = run_install(root, tools, f'distro-{backend}\n{backend}\nn\nn\nn\n')
         assert result.returncode == 0, (result.stdout, result.stderr)
         log = (root / 'log').read_text().splitlines()
         init = f'agd --home {root}/distro-{backend} init --backend {backend}'
@@ -210,7 +215,7 @@ def test_bootstrap_installs_only_missing_selected_tmux():
         root = Path(directory)
         fixture = make_fixture(root)
         tools = make_tools(root, fixture, include_tmux=False)
-        result = run_install(root, tools, 'distro\ntmux\ny\nn\nn\n')
+        result = run_install(root, tools, 'distro\ntmux\ny\nn\nn\nn\n')
         assert result.returncode == 0, (result.stdout, result.stderr)
         log = (root / 'log').read_text()
         assert 'sudo -v' in log
@@ -244,7 +249,7 @@ def test_install_leaves_omp_configuration_alone_and_respects_terminal(monkeypatc
         root = Path(directory)
         fixture = make_fixture(root)
         tools = make_tools(root, fixture)
-        result = run_install(root, tools, 'distro\nherdr\nn\nn\n')
+        result = run_install(root, tools, 'distro\nherdr\nn\nn\nn\n')
         assert result.returncode == 0, result.stdout
         log = (root / 'log').read_text().splitlines()
         assert any(line.startswith(f'shell cwd={root}/distro ') for line in log)
@@ -257,7 +262,7 @@ def test_install_leaves_omp_configuration_alone_and_respects_terminal(monkeypatc
 def test_declined_telemetry_keeps_install_usable(tmp_path, backend, answer):
     fixture = make_fixture(tmp_path)
     tools = make_tools(tmp_path, fixture)
-    result = run_install(tmp_path, tools, f'distro\n{backend}\n' + answer + 'n\n')
+    result = run_install(tmp_path, tools, f'distro\n{backend}\n' + answer + 'n\nn\n')
     assert result.returncode == 0, result.stdout
     assert (tmp_path / 'distro').is_dir()
     assert not (tmp_path / 'distro/data/observability').exists()
@@ -271,7 +276,7 @@ def test_enabled_telemetry_applies_before_first_launch(tmp_path):
     (fixture / '.omp').mkdir()
     (fixture / '.omp/settings.json').write_text('{"defaultModel":"preserve-me"}')
     tools = make_tools(tmp_path, fixture)
-    result = run_install(tmp_path, tools, 'distro\nherdr\nYeS\nn\n')
+    result = run_install(tmp_path, tools, 'distro\nherdr\nYeS\nn\nn\n')
     assert result.returncode == 0, result.stdout
     home = tmp_path / 'distro'
     config = observability.read_config(home)
@@ -292,7 +297,7 @@ def test_failed_telemetry_preserves_home_and_recovery_state(tmp_path, failure):
     tools = make_tools(tmp_path, fixture)
     if failure == 'missing':
         (tools / 'docker').unlink()
-    result = run_install(tmp_path, tools, 'distro\nherdr\ny\nn\n', telemetry=failure)
+    result = run_install(tmp_path, tools, 'distro\nherdr\ny\nn\nn\n', telemetry=failure)
     assert result.returncode == 0, result.stdout
     home = tmp_path / 'distro'
     assert home.is_dir()
@@ -312,7 +317,7 @@ def test_failed_telemetry_can_be_stopped_without_completed_configuration(tmp_pat
     from agd_lib import observability
     fixture = make_fixture(tmp_path)
     tools = make_tools(tmp_path, fixture)
-    installed = run_install(tmp_path, tools, 'distro\nherdr\ny\nn\n', telemetry='partial')
+    installed = run_install(tmp_path, tools, 'distro\nherdr\ny\nn\nn\n', telemetry='partial')
     assert installed.returncode == 0, installed.stdout
     home = tmp_path / 'distro'
     assert not (home / 'data/observability/config.json').exists()
@@ -334,7 +339,7 @@ def test_incomplete_telemetry_recovery_refuses_invalid_records(tmp_path, monkeyp
     from agd_lib import observability, store
     fixture = make_fixture(tmp_path)
     tools = make_tools(tmp_path, fixture)
-    installed = run_install(tmp_path, tools, 'distro\nherdr\ny\nn\n', telemetry='partial')
+    installed = run_install(tmp_path, tools, 'distro\nherdr\ny\nn\nn\n', telemetry='partial')
     assert installed.returncode == 0, installed.stdout
     home = tmp_path / 'distro'
     lock = home / 'state/observability/compose/release-lock.json'
@@ -383,7 +388,7 @@ def test_telemetry_prompt_preserves_next_shell_command(tmp_path):
     root.mkdir()
     fixture = make_fixture(root)
     tools = make_tools(root, fixture)
-    result = run_install(root, tools, 'distro\nherdr\nn\nn\nprintf marker > shell-marker\nexit\n', shell='/bin/bash')
+    result = run_install(root, tools, 'distro\nherdr\nn\nn\nn\nprintf marker > shell-marker\nexit\n', shell='/bin/bash')
     assert result.returncode == 0, result.stdout
     assert (root / 'distro/shell-marker').read_text() == 'marker'
 
@@ -399,7 +404,7 @@ def test_reviewer_stage_preserves_shell_handoff_and_telemetry_choice(tmp_path, a
     fixture = make_fixture(root)
     tools = make_tools(root, fixture)
     observed = run_install(
-        root, tools, 'distro\nherdr\nn\n' + answers + 'printf marker > reviewer-shell-marker\nexit\n',
+        root, tools, 'distro\nherdr\nn\nn\n' + answers + 'printf marker > reviewer-shell-marker\nexit\n',
         shell='/bin/bash')
     assert observed.returncode == 0, observed.stdout
     home = root / 'distro'
@@ -412,3 +417,43 @@ def test_reviewer_stage_preserves_shell_handoff_and_telemetry_choice(tmp_path, a
         assert 'not enabled' in observed.stdout.lower()
     assert not (home / 'data/observability/config.json').exists()
     assert not list((root / 'xdg').glob('systemd/user/*.timer'))
+
+
+def test_langfuse_optional_answers_do_not_change_telemetry_or_reviewer(tmp_path):
+    fixture = make_fixture(tmp_path)
+    tools = make_tools(tmp_path, fixture)
+    result = run_install(
+        tmp_path, tools,
+        'distro\nherdr\nn\nn\ny\n2\nprintf marker > shell-marker\nexit\n',
+        shell='/bin/bash',
+    )
+    assert result.returncode == 0, result.stdout
+    home = tmp_path / 'distro'
+    assert not (home / 'data/observability/config.json').exists()
+    assert json.loads((home / 'data/reviewer/config.json').read_text())['schedule'] == {
+        'mode': 'interval', 'calendar': None, 'timezone': None, 'interval_hours': 6,
+    }
+    assert (home / 'shell-marker').read_text() == 'marker'
+
+
+def test_langfuse_failure_retains_home_and_shell_handoff(tmp_path):
+    fixture = make_fixture(tmp_path)
+    tools = make_tools(tmp_path, fixture)
+    result = run_install(
+        tmp_path, tools,
+        'distro\nherdr\nn\ny\nn\nprintf marker > shell-marker\nexit\n',
+        shell='/bin/bash',
+    )
+    assert result.returncode == 0, result.stdout
+    assert (tmp_path / 'distro').is_dir()
+    assert (tmp_path / 'distro/shell-marker').read_text() == 'marker'
+
+
+def test_langfuse_eof_does_not_invoke_package_tools(tmp_path):
+    fixture = make_fixture(tmp_path)
+    tools = make_tools(tmp_path, fixture)
+    result = run_install(tmp_path, tools, 'distro\nherdr\nn\n\x04\x04\x04\x04')
+    assert result.returncode == 0, result.stdout
+    assert not (tmp_path / 'distro/data/langfuse-cli').exists()
+    log = (tmp_path / 'log').read_text()
+    assert 'node ' not in log and 'npm ' not in log
