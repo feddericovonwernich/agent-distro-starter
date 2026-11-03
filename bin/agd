@@ -241,7 +241,7 @@ def main(args):
         or args.reviewer_op == 'run' or args.reviewer_op == 'timer' and args.timer_op != 'status'
         or args.reviewer_op == 'proposals' and args.proposal_op == 'dispose')
     managed_loop = (args.command == 'worker' and args.operation == 'run'
-                    or args.command == 'reviewer' and args.reviewer_op == 'run')
+                    or args.command == 'reviewer' and args.reviewer_op in ('run', 'execute'))
     if (mutation or reviewer_write) and not managed_loop and not episode_write:
         with admission(home, initializing=args.command == 'init'):
             return _dispatch(args, home, fresh)

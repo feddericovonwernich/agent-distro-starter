@@ -20,7 +20,7 @@ SCHEDULE_KEYS = {'mode', 'timezone', 'calendar', 'interval_hours'}
 
 
 def default_config():
-    return {'schedule': dict(reviewer.DEFAULT_CONFIG['schedule']), 'limits': dict(reviewer.DEFAULT_LIMITS)}
+    return json.loads(json.dumps(reviewer.DEFAULT_CONFIG))
 
 
 def validate_schedule(schedule):
@@ -28,26 +28,24 @@ def validate_schedule(schedule):
 
 
 def runtime_environment(home):
-    from .reviewer_runner import assert_runtime_capability
-
+    from . import launcher
     directory = omp_runtime.agent_dir(home)
     if directory.is_symlink() or not directory.is_dir():
         raise store.DependencyError('reviewer native OMP agent directory is unavailable')
-    selected = {}
-    for name in ('omp', 'bun'):
-        executable = shutil.which(name)
-        if executable is None:
-            raise store.DependencyError(f'reviewer {name} is unavailable')
-        selected[name] = os.path.abspath(executable)
-    assert_runtime_capability(int((time.time() + 10) * 1000), home=home, omp_binary=selected['omp'])
-    directories = {str(Path(path).parent) for path in selected.values()}
-    # Preserve command precedence without forwarding the rest of the shell environment.
-    search = [os.path.abspath(path or os.curdir) for path in os.get_exec_path()
-              if os.path.abspath(path or os.curdir) in directories]
-    path = os.pathsep.join(dict.fromkeys([*search, *os.defpath.split(os.pathsep)]))
-    if any(shutil.which(name, path=path) != executable for name, executable in selected.items()):
+    try:
+        executable = str(Path(omp_runtime.executable(home)).resolve(strict=True))
+        backend = launcher.resolve_backend(home, None)
+    except (OSError, store.Refusal, store.DependencyError, KeyError, TypeError) as error:
+        raise store.DependencyError('reviewer native runtime is unavailable') from error
+    skill = Path(__file__).resolve().parents[2] / 'bundled' / 'reviewer-skills' / 'agd-reviewer'
+    if not (skill / 'SKILL.md').is_file() or not (skill / 'references' / 'commands.md').is_file():
+        raise store.DependencyError('reviewer skill is unavailable')
+    parent = str(Path(executable).parent)
+    path = os.pathsep.join(dict.fromkeys([parent, *os.defpath.split(os.pathsep)]))
+    if shutil.which(Path(executable).name, path=path) != executable:
         raise store.DependencyError('reviewer runtime search path changed executable identity')
-    return {'python': str(Path(sys.executable).resolve()), 'path': path}
+    return {'python': str(Path(sys.executable).resolve()), 'path': path,
+            'omp': executable, 'backend': backend, 'skill': str(skill)}
 
 
 def _native_run(argv):

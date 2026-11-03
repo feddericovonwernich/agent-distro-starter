@@ -1,5 +1,4 @@
 import hashlib
-import io
 import os
 import json
 import sys
@@ -12,7 +11,7 @@ import pytest
 from support import command, lab
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
-from agd_lib import observability, reviewer, reviewer_episodes, reviewer_runner, store, supervision, tasks, worker_skills, workers
+from agd_lib import observability, reviewer, reviewer_episodes, store, supervision, tasks, worker_skills, workers
 
 
 def ended_worker(home, task_id, incarnation, rows, status=1):
@@ -928,41 +927,6 @@ def test_reviewer_environment_sanitizes_ambient_identity_and_otel(monkeypatch):
         assert not any(key.startswith('OTEL_') for key in env)
 
 
-def test_broker_only_exposes_frozen_packet_and_persists_report():
-    with lab() as (home, _):
-        run, selected = produced_run(home)
-        requests = [
-            {'id': str(uuid.uuid4()), 'op': 'packet', 'args': {}},
-            {'id': str(uuid.uuid4()), 'op': 'reviewer_excerpt', 'args': {'source_id': 'outside'}},
-            {'id': str(uuid.uuid4()), 'op': 'reviewer_search', 'args': {'query': 'failure'}},
-            {'id': str(uuid.uuid4()), 'op': 'reviewer_submit', 'args': {'report': build_report(selected)}},
-            {'id': str(uuid.uuid4()), 'op': 'result', 'args': {}},
-        ]
-        output = io.StringIO()
-        reviewer_runner.serve_broker(home, run['review_run_id'],
-                                     io.StringIO(''.join(json.dumps(row) + '\n' for row in requests)), output)
-        responses = [json.loads(row) for row in output.getvalue().splitlines()]
-        assert json.loads(responses[0]['value'])['packet_id'] == selected['packet_id']
-        assert responses[1]['ok'] is False
-        assert responses[2]['ok'] is True
-        assert json.loads(responses[3]['value'])['reportId'] == responses[4]['value']['reportId']
-        assert reviewer.report_path(home, responses[4]['value']['reportId']).is_file()
-        assert reviewer._receipt(home, run['review_run_id'])['dispatch_state'] == 'report-committed'
-
-
-def test_broker_refuses_symlinked_config_manifest_before_consuming_request_budget():
-    with lab() as (home, _):
-        run, _ = produced_run(home)
-        config = reviewer.read_config(home); config['limits']['max_input_bytes'] += 1
-        outside = home / 'attacker-config.json'; outside.write_text(json.dumps(config))
-        manifest = reviewer.paths(home)['manifests'] / f"{run['config_snapshot_ref']}.json"
-        manifest.unlink(); manifest.symlink_to(outside)
-        request = {'id': str(uuid.uuid4()), 'op': 'packet', 'args': {}}
-        with pytest.raises(store.Refusal):
-            reviewer_runner.serve_broker(home, run['review_run_id'], io.StringIO(json.dumps(request) + '\n'), io.StringIO())
-        receipt = reviewer._receipt(home, run['review_run_id'])
-        assert receipt['counters'].get('input_bytes', 0) == 0 and not receipt.get('broker_replies')
-
 
 def test_retrospective_rejects_mismatched_receipt_and_session_symlink(tmp_path):
     with lab() as (home, _):
@@ -981,20 +945,6 @@ def test_retrospective_rejects_mismatched_receipt_and_session_symlink(tmp_path):
             packet(home, retrospective=(run['review_run_id'],))
 
 
-def test_broker_replay_charges_input_once_and_keeps_receipt_dispatchable():
-    with lab() as (home, _):
-        run, _ = produced_run(home); request_id = str(uuid.uuid4())
-        assert reviewer_runner._replay_or_reserve_input(home, run['review_run_id'], request_id, 'packet', {}, 'abc', 5) == 'abc'
-        assert reviewer_runner._replay_or_reserve_input(home, run['review_run_id'], request_id, 'packet', {}, 'abc', 5) == 'abc'
-        assert reviewer._receipt(home, run['review_run_id'])['counters']['input_bytes'] == len('abc'.encode())
-        with pytest.raises(store.Refusal, match='cumulative'):
-            reviewer_runner._replay_or_reserve_input(home, run['review_run_id'], str(uuid.uuid4()), 'search', {}, 'abc', 5)
-        requests = [{'id': str(uuid.uuid4()), 'op': 'reserve', 'args': {}}, {'id': str(uuid.uuid4()), 'op': 'settle', 'args': {}}]
-        output = io.StringIO()
-        reviewer_runner.serve_broker(home, run['review_run_id'], io.StringIO(''.join(json.dumps(row) + '\n' for row in requests)), output)
-        receipt = reviewer._receipt(home, run['review_run_id'])
-        assert receipt['dispatch_state'] == 'begun'
-        assert receipt['counters']['model_calls'] == 1 and receipt['counters']['provider_inflight'] == 0
 
 
 def test_past_deadline_refuses_packet_before_publish():
@@ -1053,3 +1003,66 @@ def test_publish_immutable_refuses_symlink_swapped_before_no_follow_open(monkeyp
         with pytest.raises(store.Refusal):
             reviewer.publish_immutable(path, {'packet': 'new'})
         assert outside.read_bytes() == b'{"packet":"new"}'
+def test_schema1_config_preserves_values_and_drops_only_old_model_limit():
+    with lab() as (home, _):
+        path = reviewer.paths(home)['config']
+        current = reviewer.read_config(home)
+        legacy = {
+            'schema': 1, 'schedule': {
+                'mode': 'interval', 'timezone': None, 'calendar': None,
+                'interval_hours': 17,
+            }, 'review_model': 'private/reviewer',
+            'limits': {**current['limits'], 'max_model_calls': 7},
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        before = json.dumps(legacy, sort_keys=True, separators=(',', ':')).encode() + b'\n'
+        path.write_bytes(before)
+        normalized = reviewer.read_config(home)
+        assert normalized['schema'] == 2
+        assert normalized['schedule'] == legacy['schedule']
+        assert normalized['review_model'] == legacy['review_model']
+        assert normalized['limits'] == current['limits']
+        assert path.read_bytes() == before
+
+
+def test_native_receipt_does_not_fabricate_provider_counters():
+    with lab() as (home, _):
+        intent = reviewer.enqueue_intent(home, kind='manual')
+        started = time.time()
+        run = reviewer.reserve_run(
+            home, intent, config_snapshot=reviewer.read_config(home),
+            instruction_snapshot=b'fixture', started_at=started,
+            deadline_epoch_ms=int((started + 60) * 1000))
+        receipt = reviewer._receipt(home, run['review_run_id'])
+        assert receipt.get('execution') == 'native-cli'
+        assert receipt.get('backend') is None
+        assert 'counters' not in receipt
+
+
+def test_historical_receipt_and_report_bytes_remain_unchanged_after_config_migration():
+    with lab() as (home, _):
+        config_path = reviewer.paths(home)['config']
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy = {
+            **reviewer.DEFAULT_CONFIG, 'schema': 1,
+            'limits': {**reviewer.DEFAULT_LIMITS, 'max_model_calls': 20},
+        }
+        config_path.write_text(json.dumps(legacy, sort_keys=True) + '\n')
+        run_id = '11111111-1111-4111-8111-111111111111'
+        receipt_path = reviewer.paths(home)['receipts'] / f'{run_id}.json'
+        report_path = reviewer.paths(home)['reports'] / ('a' * 64 + '.json')
+        historical_receipt = {
+            'schema': 1, 'review_run_id': run_id, 'dispatch_state': 'final',
+            'outcome': 'exited', 'counters': {'model_calls': 1, 'provider_inflight': 0},
+        }
+        historical_report = {'schema': 1, 'summary': 'old', 'findings': []}
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(json.dumps(historical_receipt, sort_keys=True) + '\n')
+        report_path.write_text(json.dumps(historical_report, sort_keys=True) + '\n')
+        receipt_before, report_before = receipt_path.read_bytes(), report_path.read_bytes()
+        assert reviewer.read_config(home)['schema'] == 2
+        assert reviewer._receipt(home, run_id) == historical_receipt
+        assert reviewer._read_json(report_path) == historical_report
+        assert receipt_path.read_bytes() == receipt_before
+        assert report_path.read_bytes() == report_before

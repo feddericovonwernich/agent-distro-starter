@@ -80,10 +80,14 @@ function hasToolCall(messages: unknown[], name: string, argument?: string): bool
 }
 
 function sourceId(messages: unknown[]): string | undefined {
-  const content = ['read-reviewer-skill', 'read-evidence']
-    .map((callId) => resultText(toolResult(messages, callId)?.content))
-    .join('\n');
-  return content.match(/\b[a-f0-9]{64}\b/)?.[0];
+  const packet = resultText(toolResult(messages, 'read-packet')?.content);
+  try {
+    const value = JSON.parse(packet) as { sources?: Array<{ source_id?: unknown }> };
+    const source = value.sources?.find(item => typeof item.source_id === 'string');
+    return source?.source_id as string | undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 
@@ -142,13 +146,27 @@ export default async function fixture(pi: {
       res.writeHead(502).end('reserved agd-reviewer core skill read failed');
       return;
     }
-    const evidenceResult = toolResult(messages, 'read-evidence');
+    const requestResult = toolResult(messages, 'read-request');
+    const packetResult = toolResult(messages, 'read-packet');
+    const catalogResult = toolResult(messages, 'read-catalog');
     const bashResult = toolResult(messages, 'shell-diagnostic');
     const writeResult = toolResult(messages, 'write-report');
-    if (hasToolCall(messages, 'read', 'evidence.txt')
-      && (!evidenceResult || toolErrors.has('read-evidence')
-        || !resultText(evidenceResult.content).includes(SENTINEL))) {
-      res.writeHead(502).end('evidence read failed or lacked sentinel');
+    if (hasToolCall(messages, 'read', 'request.json')
+      && (!requestResult || toolErrors.has('read-request')
+        || !resultText(requestResult.content).includes('review_run_id'))) {
+      res.writeHead(502).end('request read failed or lacked run identity');
+      return;
+    }
+    const packetText = resultText(packetResult?.content);
+    if (hasToolCall(messages, 'read', 'packet.json')
+      && (!packetResult || toolErrors.has('read-packet')
+        || !packetText.includes(SENTINEL))) {
+      res.writeHead(502).end('packet read failed or lacked sentinel');
+      return;
+    }
+    if (hasToolCall(messages, 'read', 'catalog.json')
+      && (!catalogResult || toolErrors.has('read-catalog'))) {
+      res.writeHead(502).end('catalog read failed');
       return;
     }
     if (hasToolCall(messages, 'bash')
@@ -169,10 +187,20 @@ export default async function fixture(pi: {
             path: 'skill://agd-reviewer/references/commands.md',
           }) } }] },
         finish_reason: 'tool_calls' }] });
-    } else if (!hasToolCall(messages, 'read', 'evidence.txt')) {
+    } else if (!hasToolCall(messages, 'read', 'request.json')) {
       send({ id, object: 'chat.completion.chunk', choices: [{ index: 0,
-        delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'read-evidence', type: 'function',
-          function: { name: 'read', arguments: JSON.stringify({ path: 'evidence.txt' }) } }] },
+        delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'read-request', type: 'function',
+          function: { name: 'read', arguments: JSON.stringify({ path: 'request.json:raw' }) } }] },
+        finish_reason: 'tool_calls' }] });
+    } else if (!hasToolCall(messages, 'read', 'packet.json')) {
+      send({ id, object: 'chat.completion.chunk', choices: [{ index: 0,
+        delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'read-packet', type: 'function',
+          function: { name: 'read', arguments: JSON.stringify({ path: 'packet.json:raw' }) } }] },
+        finish_reason: 'tool_calls' }] });
+    } else if (!hasToolCall(messages, 'read', 'catalog.json')) {
+      send({ id, object: 'chat.completion.chunk', choices: [{ index: 0,
+        delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'read-catalog', type: 'function',
+          function: { name: 'read', arguments: JSON.stringify({ path: 'catalog.json:raw' }) } }] },
         finish_reason: 'tool_calls' }] });
     } else if (!hasToolCall(messages, 'bash')) {
       send({ id, object: 'chat.completion.chunk', choices: [{ index: 0,
@@ -182,16 +210,15 @@ export default async function fixture(pi: {
           }) } }] },
         finish_reason: 'tool_calls' }] });
     } else if (!hasToolCall(messages, 'write')) {
-      const evidence = toolText(messages);
       const source = sourceId(messages);
-      if (!source || !evidence.includes(SENTINEL) || !evidence.includes(SHELL_MARKER)) {
-        res.writeHead(502).end('fixture did not receive sentinel tool evidence');
+      if (!source || !packetText.includes(SENTINEL)) {
+        res.writeHead(502).end('fixture did not receive packet evidence');
         return;
       }
       send({ id, object: 'chat.completion.chunk', choices: [{ index: 0,
         delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'write-report', type: 'function',
           function: { name: 'write', arguments: JSON.stringify({
-            path: 'report-draft.json', content: reportFor(evidence, SHELL_MARKER, source),
+            path: 'report-draft.json', content: reportFor(packetText, SHELL_MARKER, source),
           }) } }] },
         finish_reason: 'tool_calls' }] });
     } else {

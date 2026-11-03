@@ -119,7 +119,8 @@ function fixture(repo: string, role: 'worker' | 'central'): Fixture {
 import json, os, sys, time, uuid
 from pathlib import Path
 from support import run
-from agd_lib import tasks, store, supervision, observability, reviewer_runner
+from native_omp_capability import capability
+from agd_lib import tasks, store, supervision, observability
 root=Path(sys.argv[1]); repo=Path(sys.argv[2]); owner=int(sys.argv[3]); role=sys.argv[4]; home=root/'distro'
 def agd(*args): return json.loads(run([repo/'bin/agd','--home',home,*args]).stdout)
 agd('init','--backend','tmux'); (home/'native-probe.txt').write_text('Native episode fixture.')
@@ -138,7 +139,7 @@ if role == 'worker':
 else:
  task=None; session_dir=str(home/'data/observability/central/omp'); Path(session_dir).mkdir(parents=True,exist_ok=True); extension='.omp/extensions/agd-primary.ts'
  observability.record_process_generation(home,'central','1',pid=owner,start=supervision.process_start(owner))
-capability=reviewer_runner.assert_runtime_capability(int(time.time()*1000)+20000)
+capability=capability(home)
 print(json.dumps({'home':str(home),'task':task,'session_dir':session_dir,'role':role,'extension':extension,'capability':capability}))
 `;
   const result = Bun.spawnSync(['python3', '-c', setup, generatedRoot, repo, String(process.pid), role], {

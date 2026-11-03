@@ -304,7 +304,8 @@ def reviewer_environment(home, review_run_id):
     env = omp_runtime.environment(
         home, {key: value for key, value in os.environ.items()
                if not key.startswith(('OTEL_', 'LANGFUSE_'))
-               and key not in {'AGD_TASK_ID', 'AGD_INCARNATION', 'AGD_MANAGED_CENTRAL', 'AGD_OWNER'}})
+               and key not in {'AGD_TASK_ID', 'AGD_INCARNATION', 'AGD_MANAGED_CENTRAL',
+                               'AGD_OWNER', 'HERDR_ENV', 'AGD_HERDR_SESSION'}})
     env['AGD_HOME'] = str(home)
     try:
         from . import langfuse_cli
@@ -811,6 +812,8 @@ def _require_owned_resources(rendered):
 def _ownership_command(command):
     try:
         return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+    except FileNotFoundError as error:
+        raise store.DependencyError('Docker is required to inspect retained observability resources') from error
     except (OSError, subprocess.TimeoutExpired) as error:
         raise store.Refusal('observability ownership inspection is unavailable') from error
 
@@ -1095,9 +1098,13 @@ def uninstall_inventory(home, *, expected=None):
             identity = saved['identity']
             row['identity'] = identity
         row.update(presence='present' if current else 'absent', ownership='owned')
-    except (store.Refusal, OSError, ValueError, KeyError, TypeError) as error:
-        row['blockers'] = [{'code': 'docker-uncertain', 'reason': str(error) if isinstance(error, store.Refusal)
-                            else 'Docker evidence is malformed or unavailable'}]
+    except (store.Refusal, store.DependencyError, OSError, ValueError, KeyError, TypeError) as error:
+        dependency = isinstance(error, store.DependencyError) or isinstance(
+            error.__cause__, FileNotFoundError)
+        row['blockers'] = [{
+            'code': 'inspection-dependency' if dependency else 'docker-uncertain',
+            'reason': str(error) if isinstance(error, (store.Refusal, store.DependencyError))
+            else 'Docker evidence is malformed or unavailable'}]
     return [row]
 
 

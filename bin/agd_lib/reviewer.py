@@ -13,9 +13,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import observability, reviewer_episodes, store, worker_skills
 INSTRUCTION_FILE = Path(__file__).resolve().parents[2] / 'lib' / 'agd-reviewer-instructions.md'
-DEFAULT_LIMITS = {'max_candidates': 20, 'max_input_bytes': 262144, 'max_model_calls': 20,
+DEFAULT_LIMITS = {'max_candidates': 20, 'max_input_bytes': 262144,
                   'max_output_bytes': 65536, 'max_runtime_seconds': 1800}
-DEFAULT_CONFIG = {'schema': 1, 'schedule': {'mode': 'calendar', 'timezone': 'UTC', 'calendar': '02:00', 'interval_hours': None},
+DEFAULT_CONFIG = {'schema': 2, 'schedule': {'mode': 'calendar', 'timezone': 'UTC', 'calendar': '02:00', 'interval_hours': None},
                   'limits': DEFAULT_LIMITS, 'review_model': None}
 
 
@@ -94,18 +94,44 @@ def validate_schedule(schedule):
 
 
 def validate_config(value):
-    if not isinstance(value, dict) or set(value) != {'schema', 'schedule', 'limits', 'review_model'} or value.get('schema') != 1: raise store.Refusal('config schema')
+    if not isinstance(value, dict) or set(value) != {'schema', 'schedule', 'limits', 'review_model'}:
+        raise store.Refusal('config schema')
+    if value.get('schema') != 2:
+        raise store.Refusal('config schema')
     limits = value.get('limits')
-    if not isinstance(limits, dict) or set(limits) != set(DEFAULT_LIMITS) or any(type(item) is not int or item <= 0 for item in limits.values()) or (value['review_model'] is not None and (not isinstance(value['review_model'], str) or not value['review_model'].strip())): raise store.Refusal('config values')
-    validate_schedule(value['schedule']); return json.loads(json.dumps(value))
+    if (not isinstance(limits, dict) or set(limits) != set(DEFAULT_LIMITS)
+            or any(type(item) is not int or item <= 0 for item in limits.values())
+            or (value['review_model'] is not None
+                and (not isinstance(value['review_model'], str) or not value['review_model'].strip()))):
+        raise store.Refusal('config values')
+    validate_schedule(value['schedule'])
+    return json.loads(json.dumps(value))
+
+
+def normalize_config(value):
+    if not isinstance(value, dict) or set(value) != {'schema', 'schedule', 'limits', 'review_model'}:
+        raise store.Refusal('config schema')
+    if value.get('schema') == 1:
+        limits = value.get('limits')
+        if not isinstance(limits, dict) or set(limits) != set(DEFAULT_LIMITS) | {'max_model_calls'}:
+            raise store.Refusal('config schema')
+        value = {**value, 'schema': 2, 'limits': {
+            key: item for key, item in limits.items() if key != 'max_model_calls'}}
+    return validate_config(value)
 
 
 def read_config(home):
     path = paths(home)['config']
-    try: os.lstat(path)
-    except FileNotFoundError: return {'schema': 1, 'schedule': dict(DEFAULT_CONFIG['schedule']), 'limits': dict(DEFAULT_LIMITS), 'review_model': None}
-    try: return validate_config(_read_json(path))
-    except (OSError, ValueError, json.JSONDecodeError) as error: raise store.Refusal('invalid config JSON') from error
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return json.loads(json.dumps(DEFAULT_CONFIG))
+    try:
+        return normalize_config(_read_json(path))
+    except (OSError, ValueError, json.JSONDecodeError, store.Refusal) as error:
+        if isinstance(error, store.Refusal):
+            raise
+        raise store.Refusal('invalid config JSON') from error
 
 
 def _hex_id(value):
@@ -409,7 +435,7 @@ def _candidate_material(root, task, event, task_dir, jsonls, cutoff, limit, cove
         'max_input_bytes': limit})
 
 def _cap(packet, limit):
-    # Remove newest evidence until the complete broker object—not merely text—fits the frozen cap.
+    # Remove newest evidence until the complete frozen packet—not merely text—fits the cap.
     def prune_episodes():
         if 'episodes' not in packet:
             return
@@ -756,13 +782,27 @@ def run_lease(home):
 
 def reserve_run(home, intent, *, config_snapshot, instruction_snapshot, started_at, deadline_epoch_ms):
     config = validate_config(config_snapshot)
-    if not isinstance(intent, dict) or not isinstance(intent.get('intent_id'), str) or not isinstance(instruction_snapshot, bytes) or not isinstance(started_at, (int, float)) or type(deadline_epoch_ms) is not int: raise store.Refusal('invalid reviewer reservation')
-    run_id = str(uuid.uuid4()); config_ref, instruction_ref = _digest(config), hashlib.sha256(instruction_snapshot).hexdigest(); publish_immutable(paths(home)['manifests'] / f'{config_ref}.json', config); publish_immutable(paths(home)['manifests'] / f'{instruction_ref}.json', {'text': instruction_snapshot.decode('utf-8'), 'raw_utf8_sha256': instruction_ref})
-    run = {'schema': 1, 'purpose': 'background-skill-review', 'review_run_id': run_id, 'intent': intent, 'config_snapshot_ref': config_ref, 'instruction_snapshot_ref': instruction_ref, 'started_at': started_at, 'deadline_epoch_ms': deadline_epoch_ms, 'counters': {'model_calls': 0, 'evidence_calls': 0, 'input_bytes': 0, 'provider_inflight': 0}, 'dispatch_state': 'reserved'}
+    if (not isinstance(intent, dict) or not isinstance(intent.get('intent_id'), str)
+            or not isinstance(instruction_snapshot, bytes)
+            or not isinstance(started_at, (int, float)) or type(deadline_epoch_ms) is not int):
+        raise store.Refusal('invalid reviewer reservation')
+    run_id = str(uuid.uuid4())
+    config_ref = _digest(config)
+    instruction_ref = hashlib.sha256(instruction_snapshot).hexdigest()
+    publish_immutable(paths(home)['manifests'] / f'{config_ref}.json', config)
+    publish_immutable(paths(home)['manifests'] / f'{instruction_ref}.json', {
+        'text': instruction_snapshot.decode('utf-8'), 'raw_utf8_sha256': instruction_ref})
+    run = {'schema': 2, 'purpose': 'background-skill-review', 'review_run_id': run_id,
+           'intent': intent, 'config_snapshot_ref': config_ref,
+           'instruction_snapshot_ref': instruction_ref, 'started_at': started_at,
+           'deadline_epoch_ms': deadline_epoch_ms, 'execution': 'native-cli',
+           'backend': None, 'dispatch_state': 'reserved'}
     with store.lock(store.home(home)):
         publish_immutable(paths(home)['receipts'] / f'{run_id}.json', run)
         pending = paths(home)['pending'] / f'{intent["intent_id"]}.json'
-        if pending.exists(): store.atomic_json(pending, {'intent_id': intent['intent_id'], 'state': 'consumed', 'review_run_id': run_id})
+        if pending.exists():
+            store.atomic_json(pending, {'intent_id': intent['intent_id'], 'state': 'consumed',
+                                        'review_run_id': run_id})
     return run
 
 
@@ -779,8 +819,21 @@ def begin_run(home, run, packet, *, model, observed_omp_version):
         store.atomic_json(receipt, stored)
     return stored
 
+
+def _sanitize_diagnostic(value):
+    if isinstance(value, bytes):
+        text = value.decode('utf-8', errors='replace')
+    else:
+        text = str(value)
+    text = re.sub(
+        r'(?i)\b(api[_-]?key|secret(?:[_-]?key)?|token|password|authorization)'
+        r'\s*[:=]\s*["\']?[^,\s}"\']+',
+        lambda match: f'{match.group(1)}=<redacted>',
+        text)
+    return text[:4096].encode('utf-8', errors='replace')
+
 def close_run(home, review_run_id, outcome, *, error_code=None, diagnostic=b'', packet=None):
-    """Persist controlled terminal diagnostics, never child exception text."""
+    diagnostic = _sanitize_diagnostic(diagnostic)
     if outcome not in ('no-work', 'failed', 'unknown'): raise store.Refusal('reviewer outcome')
     needs_finalize = False
     with store.lock(store.home(home)):
@@ -792,7 +845,12 @@ def close_run(home, review_run_id, outcome, *, error_code=None, diagnostic=b'', 
             if packet is not None: receipt['packet_id'] = packet['packet_id']
             receipt.update(dispatch_state='final', outcome=outcome, closed_at=time.time())
             if outcome == 'no-work': receipt['state'] = 'no-work'
-            if error_code: receipt['error'] = {'code': error_code, 'bytes': len(diagnostic), 'sha256': hashlib.sha256(diagnostic).hexdigest()}
+            if error_code:
+                receipt['error'] = {
+                    'code': error_code, 'bytes': len(diagnostic),
+                    'sha256': hashlib.sha256(diagnostic).hexdigest(),
+                    'message': diagnostic.decode('utf-8', errors='replace'),
+                }
             store.atomic_json(paths(home)['receipts'] / f"{receipt['review_run_id']}.json", receipt)
     return finalize_run(home, review_run_id, outcome) if needs_finalize else _receipt(home, review_run_id)
 

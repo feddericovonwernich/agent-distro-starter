@@ -12,6 +12,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from support import command, lab
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'bin'))
@@ -330,3 +331,53 @@ if __name__ == '__main__':
             check_herdr_blank_pane_is_not_worker()
             check_herdr_missing_socket_is_unavailable()
             check_herdr_timeout_preserves_unknown_state()
+
+
+@pytest.mark.parametrize('name', ['herdr', 'tmux'])
+def test_reviewer_backend_rejects_unscoped_endpoint_requests(name, tmp_path):
+    backend = importlib.import_module('agd_lib.' + name)
+    with pytest.raises(Refusal):
+        backend.reviewer_create(
+            tmp_path, 'not-a-uuid', ['/bin/true'], cwd=tmp_path, env={})
+
+
+def test_removed_home_herdr_reviewer_absence_requires_both_sockets(tmp_path):
+    import socket
+    import uuid
+    from agd_lib import herdr, supervision
+    home = tmp_path / 'removed-home'
+    home.mkdir()
+    socket_path = tmp_path / 'reviewer.sock'
+    client_socket_path = tmp_path / 'reviewer-client.sock'
+    process = subprocess.Popen(['/bin/sleep', '30'])
+    try:
+        process_identity = supervision.process_identity(process.pid)
+        process.terminate()
+        process.wait(timeout=5)
+        run_id = str(uuid.uuid4())
+        endpoint = {
+            'backend': 'herdr',
+            'review_run_id': run_id,
+            'home': str(home),
+            'session': f"agd-reviewer-{run_id.replace('-', '')}",
+            'target': {'home_id': str(uuid.uuid4())},
+            'server': {'process': process_identity},
+            'socket': str(socket_path),
+            'client_socket': {'path': str(client_socket_path)},
+        }
+        home.rmdir()
+        assert herdr.reviewer_inspect(home, endpoint)['presence'] == 'missing'
+        replacement = socket.socket(socket.AF_UNIX)
+        try:
+            replacement.bind(str(socket_path))
+            with pytest.raises(Refusal):
+                herdr.reviewer_inspect(home, endpoint)
+        finally:
+            replacement.close()
+            socket_path.unlink(missing_ok=True)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+

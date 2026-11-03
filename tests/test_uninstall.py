@@ -309,6 +309,31 @@ def test_work_changed_after_approval_requires_refreshed_discard(tmp_path):
     assert len(set(re.findall(r'Type (DISCARD [0-9a-f]{16}): ', stderr))) == 2
 
 
+def test_uninstall_removes_materialized_worker_skills_before_task_slot():
+    from support import command, lab, uninstall_scope
+    from agd_lib import tasks, uninstall, worker_skills
+    with lab() as (home, _):
+        brief = home / 'skill-uninstall.md'
+        brief.write_text('Inspect the unchanged fixture.\n')
+        task = command(home, 'task', 'create', 'skill-uninstall', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        worktree = Path(task['worktree'])
+        generated = worktree / '.omp' / 'skills' / 'ponytail' / 'SKILL.md'
+        assert generated.is_file()
+        resources = uninstall.inventory(home)['resources']
+        skill = next(row for row in resources
+                     if row['kind'] == 'worker-skills'
+                     and row['identity']['task_id'] == task['id'])
+        slot = next(row for row in resources
+                    if row['kind'] == 'treehouse-slot'
+                    and row['identity']['task_id'] == task['id'])
+        with uninstall_scope(home, [skill, slot]) as operation:
+            worker_skills.uninstall_remove(home, [skill, slot], operation)
+            assert not generated.exists()
+            tasks.uninstall_remove(home, [skill, slot], operation)
+        assert not worktree.exists()
+
+
 def test_unrecorded_foreign_native_lease_is_not_a_plain_git_checkout():
     from support import lab
     from agd_lib import store, uninstall
@@ -521,3 +546,5 @@ def test_uninstall_retains_external_cli_and_node(tmp_path):
     assert json.loads(stdout)['outcome'] == 'uninstalled'
     assert not home.exists()
     assert snapshot(external) == external_before
+
+

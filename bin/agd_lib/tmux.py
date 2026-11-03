@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 import hashlib
 import os
 import shlex
@@ -295,3 +296,136 @@ def uninstall_close(home, resource, operation):
     if _uninstall_probe(home, approved['identity'])['presence'] != 'absent':
         raise store.Refusal('tmux pane absence remains unproven')
     uninstall_state.checkpoint(home, operation, phase='quiescing', completed=approved['key'])
+
+
+def _reviewer_run_id(value):
+    import uuid
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise store.Refusal('review run ID') from error
+
+
+def reviewer_create(home: Path, review_run_id: str, command: list[str], *, cwd: Path,
+                    env: Mapping[str, str]) -> dict:
+    run_id = _reviewer_run_id(review_run_id)
+    if (not isinstance(command, list) or not command
+            or not all(isinstance(item, str) and item for item in command)):
+        raise store.Refusal('reviewer command is malformed')
+    home, cwd = Path(home).resolve(), Path(cwd).resolve()
+    if not cwd.is_relative_to(home) or not cwd.is_dir():
+        raise store.Refusal('reviewer cwd is outside its home')
+    if not isinstance(env, Mapping) or not all(isinstance(key, str) and key.isidentifier() and isinstance(value, str)
+                                               for key, value in env.items()):
+        raise store.Refusal('reviewer environment is malformed')
+    server = _ensure_server(home)
+    token = uuid.uuid4().hex
+    pane = None
+    env_file = cwd / '.reviewer-env'
+    try:
+        fd = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(''.join(f'{key}={shlex.quote(value)}\n' for key, value in sorted(env.items())))
+        script = f'set -a; . {shlex.quote(str(env_file))}; set +a; exec {shlex.join(command)}'
+        pane = store.run([*prefix(home), 'new-window', '-d', '-P', '-F',
+                          '#{pane_id}', '-t', 'agd', '-n', 'reviewer-' + run_id.replace('-', ''),
+                          '-c', str(cwd), script]).stdout.strip()
+        if not pane.startswith('%'):
+            raise store.Refusal('reviewer tmux pane identity is unverified')
+        endpoint = {'schema': 1, 'backend': 'tmux', 'review_run_id': run_id,
+                    'home': str(home), 'prefix': prefix(home), 'session': 'agd',
+                    'pane': pane, 'token': token, 'server': server,
+                    'target': supervision.runtime_home_identity(home),
+                    'expected_process_argv': list(command), 'env_file': str(env_file)}
+        call(endpoint, 'set-option', '-p', '-t', pane, '@agd_reviewer_owner', token)
+        return endpoint
+    except BaseException:
+        if pane:
+            try:
+                call({'prefix': prefix(home), 'server_pid': str(server['process']['pid']),
+                      'pane': pane, 'token': token}, 'kill-pane', '-t', pane)
+            except BaseException:
+                pass
+        try:
+            env_file.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _reviewer_endpoint(receipt):
+    if (not isinstance(receipt, dict) or receipt.get('backend') != 'tmux'
+            or not isinstance(receipt.get('review_run_id'), str)
+            or not isinstance(receipt.get('home'), str)
+            or receipt.get('session') != 'agd'):
+        raise store.Refusal('reviewer tmux endpoint is malformed')
+    _reviewer_run_id(receipt['review_run_id'])
+    return receipt
+
+
+def _reviewer_owned(endpoint):
+    server = endpoint.get('server', {}).get('process')
+    if not isinstance(server, dict) or not supervision.process_presence(server):
+        raise store.Refusal('reviewer tmux server is missing or replaced')
+    result = call(endpoint, 'display-message', '-p', '#{pid}', check=False)
+    if result.returncode or result.stdout.strip() != str(server['pid']):
+        raise store.Refusal('reviewer tmux server is missing or replaced')
+    panes = call(endpoint, 'list-panes', '-F', '#{pane_id}', '-t', endpoint['pane'],
+                 check=False)
+    if panes.returncode:
+        return False
+    token = call(endpoint, 'show-options', '-p', '-v', '-t', endpoint['pane'],
+                 '@agd_reviewer_owner', check=False)
+    if token.returncode:
+        raise store.Refusal('reviewer tmux pane owner is unconfirmed')
+    if token.stdout.strip() != endpoint['token']:
+        raise store.Refusal('reviewer tmux pane owner differs')
+    return True
+
+
+def reviewer_capture(home: Path, receipt: dict, lines: int = 120) -> str:
+    endpoint = _reviewer_endpoint(receipt)
+    if Path(endpoint['home']).resolve() != Path(home).resolve():
+        raise store.Refusal('reviewer tmux endpoint home differs')
+    if type(lines) is not int or lines <= 0 or lines > 200:
+        raise store.Refusal('reviewer capture limit is invalid')
+    if not _reviewer_owned(endpoint):
+        raise store.Refusal('reviewer tmux pane is missing')
+    return call(endpoint, 'capture-pane', '-p', '-S', f'-{lines}',
+                '-t', endpoint['pane']).stdout[-8192:]
+
+def reviewer_inspect(home: Path, receipt: dict) -> dict:
+    endpoint = _reviewer_endpoint(receipt)
+    if Path(endpoint['home']).resolve() != Path(home).resolve():
+        raise store.Refusal('reviewer tmux endpoint home differs')
+    if not _reviewer_owned(endpoint):
+        return {'presence': 'missing', 'backend': 'tmux', 'endpoint': endpoint}
+    pane = call(endpoint, 'list-panes', '-F', '#{pane_id} #{pane_pid} #{pane_dead}',
+                '-t', endpoint['pane'])
+    fields = pane.stdout.strip().split()
+    if len(fields) != 3 or fields[0] != endpoint['pane']:
+        raise store.Refusal('reviewer tmux pane identity differs')
+    return {'presence': 'present', 'backend': 'tmux', 'endpoint': endpoint,
+            'process': {'pid': int(fields[1]), 'dead': fields[2]}}
+
+
+def reviewer_close(home: Path, receipt: dict) -> None:
+    endpoint = _reviewer_endpoint(receipt)
+    observed = reviewer_inspect(home, endpoint)
+    if observed['presence'] == 'present':
+        call(endpoint, 'kill-pane', '-t', endpoint['pane'])
+    deadline = __import__('time').monotonic() + 10
+    while True:
+        try:
+            current = reviewer_inspect(home, endpoint)
+        except store.Refusal:
+            current = {'presence': 'unknown'}
+        if current['presence'] == 'missing':
+            break
+        if __import__('time').monotonic() >= deadline:
+            raise store.Refusal('reviewer tmux pane remains active')
+        __import__('time').sleep(.05)
+    try:
+        Path(endpoint['env_file']).unlink()
+    except (KeyError, OSError):
+        pass

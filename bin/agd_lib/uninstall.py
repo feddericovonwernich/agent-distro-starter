@@ -126,9 +126,11 @@ def _collect(home, previous=None):
     definitions = (
         (reviewer_timer, {'systemd-reviewer'}),
         (launcher, {'central', 'native-omp', 'backend-server', 'backend-workspace'}),
+        (observability, {'docker'}),
         (workers, {'worker', 'worker-endpoint'}),
-        (reviewer_runner, {'reviewer-run', 'reviewer-lease'}), (relay, {'relay'}),
-        (observability, {'docker'}), (worker_skills, {'worker-skills'}),
+        (worker_skills, {'worker-skills'}),
+        (reviewer_runner, {'reviewer-run', 'reviewer-lease', 'reviewer-backend'}),
+        (relay, {'relay'}),
         (tasks, {'treehouse-slot'}), (projects, {'checkout'}),
     )
     marker = (home / 'data/home.json').is_file()
@@ -143,7 +145,9 @@ def _collect(home, previous=None):
                                              and row['ownership'] == 'owned'), None)
             resources.extend(module.uninstall_inventory(home, **arguments))
         except (store.Refusal, store.DependencyError, OSError, ValueError, KeyError, TypeError) as error:
-            dependency = isinstance(error, store.DependencyError) or isinstance(error, FileNotFoundError)
+            dependency = (isinstance(error, store.DependencyError)
+                          or isinstance(error, FileNotFoundError)
+                          or isinstance(error.__cause__, FileNotFoundError))
             blockers.append({'code': 'inspection-dependency' if dependency else 'inspection-uncertain',
                              'source': module.__name__.rsplit('.', 1)[-1],
                              'reason': str(error) if isinstance(error, (store.Refusal, store.DependencyError))
