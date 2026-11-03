@@ -25,7 +25,8 @@ async function nativeProbe() {
 import json, os, sys, time, uuid
 from pathlib import Path
 from support import run, write_native_plugins
-from agd_lib import harnesses, reviewer_runner, store, tasks, supervision, worker_skills
+from native_omp_capability import capability
+from agd_lib import harnesses, store, tasks, supervision, worker_skills
 root=Path(sys.argv[1]); repo=Path(sys.argv[2]); home=root/'distro'; seed=root/'seed'
 run(['git','init','-b','main',seed]); run(['git','config','user.name','Native Probe'],cwd=seed); run(['git','config','user.email','probe@example.invalid'],cwd=seed)
 (seed/'value.txt').write_text('base\\n'); run(['git','add','.'],cwd=seed); run(['git','commit','-m','initial'],cwd=seed)
@@ -46,7 +47,7 @@ variants=[dict(task=row,argv=harnesses.launch_argv(row,home/'data/tasks'/row['id
 task.update(executor='worker',phase='running',incarnation=str(uuid.uuid4()),worker_alive=False); tasks.save(home,task)
 owner=int(sys.argv[3]); start=supervision.process_start(owner)
 store.atomic_json(home/'state/owner.json',dict(owner_pid=owner,owner_start=start,watcher_pid=owner,watcher_start=start,heartbeat=time.time(),token='native-central'))
-print(json.dumps(dict(home=str(home),task=task,variants=variants,capability=reviewer_runner.assert_runtime_capability(int(time.time()*1000)+20000))))
+print(json.dumps(dict(home=str(home),task=task,variants=variants,capability=capability(home))))
 `;
   try {
     const fixture = fixturePath ? JSON.parse(readFileSync(fixturePath, 'utf8')) :

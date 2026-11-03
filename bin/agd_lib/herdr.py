@@ -1,10 +1,13 @@
+from collections.abc import Mapping
 import json
 import os
 import re
 import shlex
 import stat
 import subprocess
+import threading
 import uuid
+import time
 from pathlib import Path
 from . import installer, store
 
@@ -309,3 +312,289 @@ def control_environment(endpoint):
             or any(not isinstance(path, str) or not Path(path).is_absolute() for path in value.values())):
         raise store.Refusal('Herdr control namespace is missing or unsafe')
     return dict(os.environ, **value)
+
+
+def _reviewer_run_id(value):
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise store.Refusal('review run ID') from error
+
+
+def _reviewer_command(command):
+    if (not isinstance(command, list) or not command
+            or not all(isinstance(item, str) and item for item in command)):
+        raise store.Refusal('reviewer command is malformed')
+
+
+def _reviewer_call(endpoint, *args, check=True):
+    from . import launcher
+    return launcher._herdr_call(endpoint, *args, check=check)
+def _reviewer_client_socket(endpoint):
+    api = Path(endpoint['socket'])
+    if api.suffix != '.sock':
+        raise store.Refusal('Herdr client socket path is unavailable')
+    return api.with_name(api.stem + '-client.sock')
+
+
+def _prove_reviewer_startup(endpoint):
+    client = _reviewer_client_socket(endpoint)
+    try:
+        identity = client.lstat()
+    except OSError as error:
+        raise store.Refusal('Herdr client listener is unavailable') from error
+    if not stat.S_ISSOCK(identity.st_mode) or identity.st_uid != os.getuid():
+        raise store.Refusal('Herdr client listener identity is unsafe')
+    try:
+        inode = next(
+            fields[6] for line in Path('/proc/net/unix').read_text().splitlines()[1:]
+            if len(fields := line.split(maxsplit=7)) == 8 and fields[7] == str(client)
+            and int(fields[3], 16) & 0x10000)
+        owners = []
+        for directory in Path('/proc').iterdir():
+            if not directory.name.isdigit():
+                continue
+            try:
+                if any(os.readlink(fd) == f'socket:[{inode}]'
+                       for fd in (directory / 'fd').iterdir()):
+                    owners.append(int(directory.name))
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+    except (OSError, StopIteration) as error:
+        raise store.Refusal('Herdr client listener ownership is unavailable') from error
+    process = endpoint['server']['process']
+    if owners != [process['pid']]:
+        raise store.Refusal('Herdr client listener owner differs')
+    endpoint['client_socket'] = {
+        'path': str(client), 'device': identity.st_dev, 'inode': identity.st_ino,
+        'uid': identity.st_uid,
+    }
+
+def reviewer_create(home: Path, review_run_id: str, command: list[str], *, cwd: Path,
+                    env: Mapping[str, str]) -> dict:
+    """Create a disposable, run-owned Herdr endpoint for a reviewer child."""
+    from . import launcher, supervision
+    run_id = _reviewer_run_id(review_run_id)
+    _reviewer_command(command)
+    home, cwd = Path(home).resolve(), Path(cwd).resolve()
+    if not cwd.is_relative_to(home) or not cwd.is_dir():
+        raise store.Refusal('reviewer cwd is outside its home')
+    if (not isinstance(env, Mapping) or not all(
+            isinstance(key, str) and key.isidentifier() and isinstance(value, str)
+            for key, value in env.items())):
+        raise store.Refusal('reviewer environment is malformed')
+    session = f'agd-reviewer-{run_id.replace("-", "")}'
+    config_env = config_environment()
+    server_env = dict(os.environ)
+    server_env.update(config_env)
+    server_env.pop('HERDR_ENV', None)
+    stderr_buffer = bytearray()
+    process = None
+    endpoint = None
+    stderr_thread = None
+    try:
+        process = subprocess.Popen(['herdr', '--session', session, 'server'],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.PIPE, start_new_session=True,
+                                   cwd=str(home), env=server_env)
+        def capture_stderr():
+            for chunk in iter(lambda: process.stderr.read(8192), b''):
+                if len(stderr_buffer) < 8192:
+                    stderr_buffer.extend(chunk[:8192 - len(stderr_buffer)])
+        stderr_thread = threading.Thread(target=capture_stderr, daemon=True)
+        stderr_thread.start()
+    except BaseException:
+        if process is not None:
+            try:
+                os.killpg(process.pid, 15)
+                process.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    os.killpg(process.pid, 9)
+                except OSError:
+                    pass
+            if process.poll() is None:
+                raise store.Refusal('reviewer Herdr server cleanup is unproven')
+            try:
+                launcher._herdr_status(session)
+            except store.Refusal:
+                pass
+            else:
+                raise store.Refusal('reviewer Herdr server remains active after cleanup')
+        if stderr_thread is not None:
+            stderr_thread.join(.5)
+        raise
+    try:
+        for _ in range(100):
+            if process.poll() is not None:
+                stderr_thread.join(.2)
+                detail = stderr_buffer.decode('utf-8', errors='replace').strip()
+                raise store.Refusal(
+                    'reviewer Herdr server exited during startup'
+                    + (f'; server stderr: {detail}' if detail else ''))
+            try:
+                candidate = launcher._herdr_status(session)
+                candidate.update(launcher._prove_herdr_server(candidate, process))
+                candidate['server'] = server_identity(candidate)
+                candidate['server']['target'] = supervision.runtime_home_identity(home)
+                _prove_reviewer_startup(candidate)
+                endpoint = candidate
+                break
+            except store.Refusal:
+                time.sleep(.1)
+        if endpoint is None:
+            detail = stderr_buffer.decode('utf-8', errors='replace').strip()
+            raise store.Refusal(
+                'reviewer Herdr server did not complete startup'
+                + (f'; server stderr: {detail}' if detail else ''))
+        endpoint.update({'schema': 1, 'backend': 'herdr', 'review_run_id': run_id,
+                         'home': str(home), 'target': supervision.runtime_home_identity(home),
+                         'config_env': config_env, 'expected_process_argv': list(command)})
+        workspace = response(_reviewer_call(endpoint, 'workspace', 'create', '--cwd', str(cwd),
+                                            '--label', session, '--no-focus'))['workspace']
+        workspace_id = workspace['workspace_id']
+        tab_result = response(_reviewer_call(
+            endpoint, 'tab', 'create', '--workspace', workspace_id,
+            '--cwd', str(cwd), '--label', 'reviewer', '--no-focus'))
+        tab, pane = tab_result['tab'], tab_result['root_pane']
+        if (pane.get('workspace_id') != workspace_id or pane.get('tab_id') != tab.get('tab_id')):
+            raise store.Refusal('reviewer Herdr endpoint identity is inconsistent')
+        endpoint.update(workspace=workspace_id, tab=tab['tab_id'], pane=pane['pane_id'],
+                        terminal=pane['terminal_id'])
+        env_file = cwd / '.reviewer-env'
+        content = ''.join(f'{key}={shlex.quote(value)}\n' for key, value in sorted(env.items()))
+        fd = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(content)
+        endpoint['env_file'] = str(env_file)
+        script = f"set -a; . {shlex.quote(str(env_file))}; set +a; exec {shlex.join(command)}"
+        _reviewer_call(endpoint, 'pane', 'run', endpoint['pane'], script)
+        return endpoint
+    except BaseException:
+        try:
+            if endpoint is not None:
+                reviewer_close(home, endpoint)
+            else:
+                os.killpg(process.pid, 15)
+        except BaseException:
+            try:
+                os.killpg(process.pid, 9)
+            except ProcessLookupError:
+                pass
+        stderr_thread.join(.5)
+        raise
+
+
+def _reviewer_endpoint(endpoint):
+    if (not isinstance(endpoint, dict) or endpoint.get('backend') != 'herdr'
+            or not isinstance(endpoint.get('review_run_id'), str)
+            or not isinstance(endpoint.get('home'), str)
+            or not isinstance(endpoint.get('session'), str)):
+        raise store.Refusal('reviewer Herdr endpoint is malformed')
+    run_id = _reviewer_run_id(endpoint['review_run_id'])
+    if endpoint['session'] != f'agd-reviewer-{run_id.replace("-", "")}':
+        raise store.Refusal('reviewer Herdr session is not run-scoped')
+    return endpoint
+
+
+def reviewer_capture(home: Path, receipt: dict, lines: int = 120) -> str:
+    endpoint = _reviewer_endpoint(receipt)
+    if Path(endpoint['home']).resolve() != Path(home).resolve():
+        raise store.Refusal('reviewer Herdr endpoint home differs')
+    if type(lines) is not int or lines <= 0 or lines > 200:
+        raise store.Refusal('reviewer capture limit is invalid')
+    result = _reviewer_call(endpoint, 'pane', 'read', endpoint['pane'],
+                            '--source', 'recent-unwrapped', '--lines', str(lines))
+    return result.stdout[-8192:]
+
+def reviewer_inspect(home: Path, receipt: dict) -> dict:
+    from . import supervision
+    endpoint = _reviewer_endpoint(receipt)
+    if Path(endpoint['home']).resolve() != Path(home).resolve():
+        raise store.Refusal('reviewer Herdr endpoint home differs')
+    if os.path.lexists(home) and endpoint.get('target') != supervision.runtime_home_identity(home):
+        raise store.Refusal('reviewer Herdr endpoint target differs')
+    server = endpoint.get('server', {}).get('process')
+    if not isinstance(server, dict):
+        raise store.Refusal('reviewer Herdr server identity is missing')
+    try:
+        socket_paths = [endpoint['socket'],
+                        endpoint.get('client_socket', {}).get('path')
+                        or str(_reviewer_client_socket(endpoint))]
+    except (KeyError, TypeError, store.Refusal):
+        raise store.Refusal('reviewer Herdr socket identity is missing')
+    server_live = supervision.process_presence(server)
+    if not server_live:
+        if any(os.path.lexists(path) for path in socket_paths):
+            raise store.Refusal('reviewer Herdr server absence is unproven')
+        return {'presence': 'missing', 'backend': 'herdr', 'endpoint': endpoint}
+    result = _reviewer_call(endpoint, 'pane', 'get', endpoint['pane'], check=False)
+    if result.returncode:
+        try:
+            error = json.loads(result.stderr or result.stdout).get('error', {})
+        except (ValueError, AttributeError):
+            raise store.Refusal('reviewer Herdr pane state is unknown')
+        if error.get('code') == 'pane_not_found':
+            return {'presence': 'missing', 'backend': 'herdr', 'endpoint': endpoint}
+        raise store.Refusal('reviewer Herdr pane state is unknown')
+    pane = response(result)['pane']
+    expected = {key: endpoint[key] for key in ('pane', 'workspace', 'tab', 'terminal')}
+    names = {'pane': 'pane_id', 'workspace': 'workspace_id',
+             'tab': 'tab_id', 'terminal': 'terminal_id'}
+    if any(pane.get(names[key]) != value for key, value in expected.items()):
+        raise store.Refusal('reviewer Herdr endpoint identity differs')
+    process = response(_reviewer_call(
+        endpoint, 'pane', 'process-info', '--pane', endpoint['pane']))['process_info']
+    return {'presence': 'present', 'backend': 'herdr', 'endpoint': endpoint,
+            'process': process}
+
+
+def reviewer_close(home: Path, receipt: dict) -> None:
+    from . import supervision
+    endpoint = _reviewer_endpoint(receipt)
+    if Path(endpoint['home']).resolve() != Path(home).resolve():
+        raise store.Refusal('reviewer Herdr endpoint home differs')
+    identity_proved = bool(os.path.lexists(home)
+                           and endpoint.get('target') == supervision.runtime_home_identity(home))
+    if os.path.lexists(home) and not identity_proved:
+        raise store.Refusal('reviewer Herdr endpoint target differs')
+    try:
+        socket_paths = [endpoint['socket'],
+                        endpoint.get('client_socket', {}).get('path')
+                        or str(_reviewer_client_socket(endpoint))]
+    except (KeyError, TypeError, store.Refusal):
+        socket_paths = [endpoint.get('socket', '')]
+    try:
+        observed = reviewer_inspect(home, endpoint)
+    except store.Refusal:
+        server = endpoint.get('server', {}).get('process')
+        if (isinstance(server, dict) and supervision.process_presence(server)) or any(
+                os.path.lexists(path) for path in socket_paths):
+            raise
+        observed = {'presence': 'missing'}
+    if observed['presence'] == 'present':
+        _reviewer_call(endpoint, 'pane', 'close', endpoint['pane'])
+    server = endpoint.get('server', {}).get('process')
+    if not isinstance(server, dict) or not supervision.process_presence(server):
+        if any(os.path.lexists(path) for path in socket_paths):
+            raise store.Refusal('reviewer Herdr server absence is unproven')
+    else:
+        try:
+            os.killpg(server['pid'], 15)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 10
+        while supervision.process_presence(server) and time.monotonic() < deadline:
+            time.sleep(.05)
+        if supervision.process_presence(server):
+            try:
+                os.killpg(server['pid'], 9)
+            except ProcessLookupError:
+                pass
+        if supervision.process_presence(server) or any(os.path.lexists(path) for path in socket_paths):
+            raise store.Refusal('reviewer Herdr server remains active')
+    if identity_proved:
+        try:
+            Path(endpoint['env_file']).unlink()
+        except (KeyError, OSError):
+            pass

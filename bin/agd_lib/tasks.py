@@ -547,8 +547,22 @@ def _uninstall_slot(identity):
 
 
 def uninstall_inventory(home, *, expected=None):
-    from . import supervision, uninstall_state, worker_skills
+    from . import reviewer_workspaces, supervision, uninstall_state, worker_skills
     saved = {row['key']: row for row in expected or [] if row['kind'] == 'treehouse-slot'}
+    probe_rows = reviewer_workspaces.uninstall_inventory(home)
+    probes = {row['identity'].get('path'): row['identity']
+              for row in probe_rows if row.get('presence') == 'present'
+              and row.get('ownership') == 'owned' and row['identity'].get('path')}
+
+    def probe_owns_slot(slot, project):
+        identity = probes.get(slot.get('path'))
+        if not identity or slot.get('lease_id') != identity.get('lease_id') \
+                or slot.get('lease_holder') != identity.get('lease_holder') \
+                or slot.get('branch') != identity.get('branch') \
+                or identity.get('common_dir') != project.get('common_dir'):
+            return False
+        return store.git(Path(slot['path']), 'rev-parse', '--path-format=absolute',
+                         '--git-common-dir') == identity.get('common_dir')
     rows, grouped = {}, {}
     for path in sorted((home / 'data/tasks').glob('*/task.json')):
         task = uninstall_state.read_evidence(path)
@@ -616,6 +630,8 @@ def uninstall_inventory(home, *, expected=None):
                                          cwd=project['path']).stdout)
             for slot in slots:
                 key = 'treehouse:' + slot['path']
+                if probe_owns_slot(slot, project):
+                    continue
                 if slot['path'] in grouped or key in saved or key in rows:
                     continue
                 rows[key] = {

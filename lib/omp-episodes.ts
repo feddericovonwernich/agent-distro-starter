@@ -84,7 +84,7 @@ function finalProjection(messages: unknown[]): RecordValue | undefined {
     }
   }
   if (!candidate || candidate.stopReason !== 'stop' || Boolean(candidate.isError) ||
-      'errorMessage' in candidate || Boolean(candidate.error) ||
+      candidate.errorMessage !== undefined || Boolean(candidate.error) ||
       Boolean(candidate.errorDetails) || Boolean(candidate.truncated)) return;
   if (typeof candidate.timestamp !== 'number' || !Number.isFinite(candidate.timestamp)) return;
   const content = candidate.content;

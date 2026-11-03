@@ -3,12 +3,9 @@ from functools import partial
 import io
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tarfile
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -445,6 +442,12 @@ def reviewer_onboarding(tmp_path, monkeypatch):
     (home / 'data').mkdir(parents=True)
     (home / 'data/home.json').write_text('{"schema":1,"home_id":"123e4567-e89b-12d3-a456-426614174000"}')
     omp_runtime.agent_dir(home).mkdir(parents=True)
+    (home / 'data' / 'dependencies.json').write_text(json.dumps({
+        'schema': 1, 'omp': {'source': 'existing', 'path': '/bin/true',
+                             'version': 'omp/18.14.0',
+                             'capabilities': ['models-json', 'login']}}))
+    (home / 'data' / 'launcher.json').write_text(json.dumps({
+        'schema': 1, 'backend': 'tmux', 'herdr_session': 'agd-' + '0' * 32}))
     xdg = tmp_path / 'xdg'
     control = {'failure': None}
     def systemctl(argv):
@@ -481,7 +484,6 @@ def test_reviewer_onboarding_presets_and_customization(reviewer_onboarding, answ
     from agd_lib import reviewer, reviewer_timer
     home, xdg, _ = reviewer_onboarding
     before = reviewer.read_config(home)
-    before['limits']['max_model_calls'] = 7
     before['review_model'] = 'operator-selected-model'
     reviewer._private(reviewer.paths(home)['config'].parent)
     installer.store.atomic_json(reviewer.paths(home)['config'], before)
@@ -491,11 +493,10 @@ def test_reviewer_onboarding_presets_and_customization(reviewer_onboarding, answ
     config = reviewer.read_config(home)
     assert config['schedule'] == schedule
     assert config['review_model'] == 'operator-selected-model'
-    assert config['limits']['max_model_calls'] == 7
+    assert 'max_model_calls' not in config['limits']
     assert reviewer_timer._read_record(home)['schedule'] == schedule
     assert list(xdg.glob('systemd/user/*.timer'))
     assert not list(reviewer.paths(home)['receipts'].glob('*.json'))
-
 
 @pytest.mark.parametrize('invalid', [
     ['4', '25:61', 'UTC'], ['4', '03:45', '../invalid'], ['5', '1.5'], ['5', '-2'], ['not-a-choice'],
@@ -514,16 +515,11 @@ def test_reviewer_onboarding_corrects_invalid_input_without_partial_config(revie
     assert any('invalid' in message.lower() for message in errors)
 
 
-@pytest.mark.parametrize('failure', ['runtime', 'show', 'is-active'])
+@pytest.mark.parametrize('failure', ['show', 'is-active'])
 def test_reviewer_onboarding_retains_schedule_when_activation_unavailable(reviewer_onboarding, monkeypatch, failure):
-    from agd_lib import reviewer, reviewer_runner, reviewer_timer
+    from agd_lib import reviewer, reviewer_timer
     home, xdg, control = reviewer_onboarding
-    if failure == 'runtime':
-        def unavailable(*args, **kwargs):
-            raise installer.store.DependencyError('installed OMP package root is unavailable')
-        monkeypatch.setattr(reviewer_runner, 'assert_runtime_capability', unavailable)
-    else:
-        control['failure'] = failure
+    control['failure'] = failure
     values = iter(['y', '2'])
     messages = []
     got = installer.setup_reviewer(home, lambda _: next(values, None), messages.append)
@@ -537,6 +533,7 @@ def test_reviewer_onboarding_retains_schedule_when_activation_unavailable(review
     else:
         reviewer_timer.disable(home, xdg_config_home=xdg, command_runner=lambda _: None)
         assert reviewer_timer._read_record(home)['state'] == 'disabled'
+
 
 
 @pytest.mark.parametrize('state', ['enabled', 'failed', 'enabling', 'disabling'])
@@ -587,47 +584,3 @@ def test_reviewer_onboarding_cli_preserves_live_central_owner(reviewer_onboardin
     assert owner.read_bytes() == frozen
 
 
-def test_partial_reviewer_sdk_does_not_contact_registry_or_install(reviewer_onboarding, tmp_path, monkeypatch):
-    from agd_lib import reviewer
-    if shutil.which('bun') is None:
-        pytest.skip('native Bun runtime unavailable')
-    home, xdg, _ = reviewer_onboarding
-    requests = []
-    class Registry(BaseHTTPRequestHandler):
-        def do_GET(self):
-            requests.append(self.path)
-            self.send_response(404)
-            self.end_headers()
-        def log_message(self, *_args):
-            pass
-    server = ThreadingHTTPServer(('127.0.0.1', 0), Registry)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    sdk = tmp_path / 'partial-sdk'
-    (sdk / 'bin').mkdir(parents=True)
-    (sdk / 'package.json').write_text(json.dumps({
-        'name': '@oh-my-pi/pi-coding-agent', 'version': '18.14.0', 'type': 'module',
-        'bin': {'omp': 'bin/omp'}, 'exports': {'.': './stub.js', './*': './stub.js'},
-        'dependencies': {'@oh-my-pi/pi-ai': '9999.0.0', '@oh-my-pi/pi-agent-core': '9999.0.0'}}))
-    (sdk / 'stub.js').write_text('export const placeholder = true;\n')
-    (sdk / 'bin/omp').write_text('#!/usr/bin/env bun\n')
-    (sdk / 'bin/omp').chmod(0o755)
-    cache = tmp_path / 'bun-cache'
-    (sdk / 'bunfig.toml').write_text(
-        f'[install]\nregistry = "http://127.0.0.1:{server.server_port}"\n'
-        f'[install.cache]\ndir = "{cache}"\n')
-    frozen = {str(path.relative_to(sdk)): path.read_bytes() for path in sdk.rglob('*') if path.is_file()}
-    monkeypatch.setenv('PATH', f'{sdk / "bin"}:{os.environ["PATH"]}')
-    values = iter(['y', '2'])
-    try:
-        got = installer.setup_reviewer(home, lambda _: next(values, None), lambda _: None)
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-    assert got['state'] == 'configured'
-    assert reviewer.read_config(home)['schedule']['interval_hours'] == 6
-    assert requests == []
-    assert {str(path.relative_to(sdk)): path.read_bytes() for path in sdk.rglob('*') if path.is_file()} == frozen
-    assert not any(path.is_file() for path in cache.rglob('*'))
-    assert not list(xdg.glob('systemd/user/*.timer'))

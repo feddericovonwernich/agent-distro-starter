@@ -11,7 +11,7 @@ import pwd
 import uuid
 from pathlib import Path
 from urllib.request import urlopen
-from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr, relay, observability, reviewer, reviewer_runner, reviewer_timer, launcher, installer, omp_runtime, reviewer_episodes
+from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr, relay, observability, reviewer, reviewer_runner, reviewer_timer, launcher, installer, omp_runtime, reviewer_episodes, reviewer_workspaces
 
 
 def parser():
@@ -29,6 +29,7 @@ def parser():
     installer_setup = installer_command.add_parser('setup')
     installer_setup.add_argument('--backend', choices=('tmux', 'herdr'), required=True)
     installer_command.add_parser('shell')
+    installer_command.add_parser('langfuse')
     installer_command.add_parser('reviewer')
     omp = sub.add_parser('omp')
     omp.add_argument('omp_args', nargs=argparse.REMAINDER)
@@ -153,7 +154,28 @@ def parser():
     central.add_argument('omp_args', nargs=argparse.REMAINDER)
     reviewer_p = sub.add_parser('reviewer').add_subparsers(dest='reviewer_op', required=True)
     run_p = reviewer_p.add_parser('run'); run_p.add_argument('--timer', action='store_true'); run_p.add_argument('--retrospective-review-run', type=lambda value: str(uuid.UUID(value)), action='append', default=[])
+    execute_p = reviewer_p.add_parser('execute'); execute_p.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
+    bind_p = reviewer_p.add_parser('session-bind'); bind_p.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value))); bind_p.add_argument('--session-id', required=True); bind_p.add_argument('--session-file', required=True)
     reviewer_p.add_parser('status')
+    workspace = reviewer_p.add_parser('workspace').add_subparsers(dest='workspace_op', required=True)
+    workspace_create = workspace.add_parser('create')
+    workspace_create.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
+    workspace_create.add_argument('--project', required=True)
+    workspace_create.add_argument('--commit', required=True)
+    workspace_list = workspace.add_parser('list')
+    workspace_list.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
+    workspace_cleanup = workspace.add_parser('cleanup')
+    workspace_cleanup.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
+    workspace_cleanup.add_argument('--project', required=True)
+    workspace_cleanup.add_argument('--commit', required=True)
+    workspace_cleanup.add_argument('--instruction')
+    evidence = reviewer_p.add_parser('evidence').add_subparsers(dest='evidence_op', required=True)
+    evidence_add = evidence.add_parser('add')
+    evidence_add.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
+    evidence_add.add_argument('--file', required=True)
+    evidence_add.add_argument('--label', required=True)
+    evidence_list = evidence.add_parser('list')
+    evidence_list.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
     reports = reviewer_p.add_parser('reports').add_subparsers(dest='report_op', required=True)
     reports.add_parser('list'); reports.add_parser('show').add_argument('report_id')
     proposals = reviewer_p.add_parser('proposals').add_subparsers(dest='proposal_op', required=True)
@@ -234,10 +256,13 @@ def main(args):
         if not fresh:
             raise store.Refusal('fresh non-symlink launcher home required')
     reviewer_write = args.command == 'reviewer' and (
-        args.reviewer_op == 'episode' or args.reviewer_op == 'run' or args.reviewer_op == 'timer' and args.timer_op != 'status'
+        args.reviewer_op in ('execute', 'session-bind', 'episode')
+        or args.reviewer_op == 'run' or args.reviewer_op == 'timer' and args.timer_op != 'status'
+        or args.reviewer_op == 'workspace' and args.workspace_op in ('create', 'list', 'cleanup')
+        or args.reviewer_op == 'evidence' and args.evidence_op == 'add'
         or args.reviewer_op == 'proposals' and args.proposal_op == 'dispose')
     managed_loop = (args.command == 'worker' and args.operation == 'run'
-                    or args.command == 'reviewer' and args.reviewer_op == 'run')
+                    or args.command == 'reviewer' and args.reviewer_op in ('run', 'execute'))
     if (mutation or reviewer_write) and not managed_loop and not episode_write:
         with admission(home, initializing=args.command == 'init'):
             return _dispatch(args, home, fresh)
@@ -322,6 +347,9 @@ def _dispatch(args, home, fresh):
         def stream_url(url):
             with urlopen(url) as response:
                 yield from iter(lambda: response.read(1024 * 1024), b'')
+        def fetch_bytes(url):
+            with urlopen(url) as response:
+                yield from iter(lambda: response.read(1024 * 1024), b'')
         def ask(message):
             color = sys.stderr.isatty() and os.environ.get('TERM', 'dumb') != 'dumb' and 'NO_COLOR' not in os.environ
             label = f'\033[36m{message}\033[0m' if color else message
@@ -330,6 +358,10 @@ def _dispatch(args, home, fresh):
                 return input().strip()
             except EOFError:
                 return None
+        if args.installer_operation == 'langfuse':
+            return installer.setup_langfuse(
+                home, input_fn=ask, output=lambda message: print(message, file=sys.stderr),
+                fetch_bytes=fetch_bytes, run=store.run, which=shutil.which)
         if args.installer_operation == 'reviewer':
             installer.setup_reviewer(home, ask, lambda message: print(message, file=sys.stderr))
             return None
@@ -446,6 +478,10 @@ def _dispatch(args, home, fresh):
             return reviewer_episodes.register_source(home, request)
         return reviewer_episodes.record_completion(home, request)
     if args.command == 'reviewer':
+        if args.reviewer_op == 'execute':
+            return reviewer_runner.execute(home, args.review_run_id)
+        if args.reviewer_op == 'session-bind':
+            return reviewer_runner.bind_session(home, args.review_run_id, args.session_id, Path(args.session_file))
         if args.reviewer_op == 'run':
             if args.timer and args.retrospective_review_run: raise store.Refusal('timer runs cannot be retrospective')
             if args.timer: return reviewer_runner.launch_timer(home)
@@ -454,8 +490,23 @@ def _dispatch(args, home, fresh):
                 home, reviewer.enqueue_intent(
                     home, kind='retrospective' if selected else 'manual',
                     retrospective_review_run_ids=selected))
+        if args.reviewer_op == 'workspace':
+            if args.workspace_op == 'create':
+                return reviewer_workspaces.create(home, args.review_run_id, args.project, args.commit)
+            if args.workspace_op == 'list':
+                return reviewer_workspaces.list_workspaces(home, args.review_run_id)
+            return reviewer_workspaces.cleanup(
+                home, args.review_run_id, args.project, args.commit,
+                instruction=Path(args.instruction).absolute() if args.instruction else None)
         if args.reviewer_op == 'status':
             return {'timer': reviewer_timer._read_record(home), 'runs': len(list(reviewer.paths(home)['receipts'].glob('*.json')))}
+        if args.reviewer_op == 'evidence':
+            if args.evidence_op == 'add':
+                return reviewer.capture_evidence(home, args.review_run_id, Path(args.file).absolute(), args.label)
+            evidence = reviewer.read_evidence(home, args.review_run_id)
+            return [{'source_id': source_id, **{
+                key: value for key, value in source.items() if key != 'text'
+            }} for source_id, source in sorted(evidence['sources'].items())]
         if args.reviewer_op == 'reports':
             if args.report_op == 'list': return [reviewer._read_json(p) for p in sorted(reviewer.paths(home)['reports'].glob('*.json'))]
             return reviewer._read_json(reviewer.report_path(home, args.report_id))
@@ -489,6 +540,8 @@ def _dispatch(args, home, fresh):
 if __name__ == '__main__':
     try:
         result = main(parse_args())
+        if isinstance(result, int):
+            raise SystemExit(result)
         if result is not None:
             print(json.dumps(result, indent=2 if sys.stdout.isatty() else None))
     except (ValueError, store.Refusal, store.DependencyError) as error:

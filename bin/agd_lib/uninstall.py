@@ -12,10 +12,10 @@ from pathlib import Path
 from . import store, uninstall_state as state
 
 MODULES = (
-    'github', 'harnesses', 'herdr', 'installer', 'launcher', 'observability', 'omp_runtime',
-    'pr', 'projects', 'relay', 'relay_reviews', 'review_feedback', 'reviewer', 'reviewer_episodes', 'reviewer_runner',
-    'reviewer_timer', 'store', 'supervision', 'tasks', 'tmux', 'worker_skills', 'workers',
-    'uninstall_state', 'uninstall',
+    'github', 'harnesses', 'herdr', 'installer', 'langfuse_cli', 'launcher', 'observability', 'omp_runtime',
+    'pr', 'projects', 'relay', 'relay_reviews', 'review_feedback', 'reviewer', 'reviewer_episodes',
+    'reviewer_runner', 'reviewer_timer', 'reviewer_workspaces', 'store', 'supervision', 'tasks', 'tmux',
+    'uninstall', 'uninstall_state', 'worker_skills', 'workers',
 )
 FILES = ('bin/agd', *(f'bin/agd_lib/{name}.py' for name in MODULES),
          'bundled/observability/release-lock.json')
@@ -127,9 +127,11 @@ def _collect(home, previous=None):
     definitions = (
         (reviewer_timer, {'systemd-reviewer'}),
         (launcher, {'central', 'native-omp', 'backend-server', 'backend-workspace'}),
+        (observability, {'docker'}),
         (workers, {'worker', 'worker-endpoint'}),
-        (reviewer_runner, {'reviewer-run', 'reviewer-lease'}), (relay, {'relay'}),
-        (observability, {'docker'}), (worker_skills, {'worker-skills'}),
+        (worker_skills, {'worker-skills'}),
+        (reviewer_runner, {'reviewer-run', 'reviewer-lease', 'reviewer-backend', 'reviewer-probe'}),
+        (relay, {'relay'}),
         (tasks, {'treehouse-slot'}), (projects, {'checkout'}),
     )
     marker = (home / 'data/home.json').is_file()
@@ -144,7 +146,9 @@ def _collect(home, previous=None):
                                              and row['ownership'] == 'owned'), None)
             resources.extend(module.uninstall_inventory(home, **arguments))
         except (store.Refusal, store.DependencyError, OSError, ValueError, KeyError, TypeError) as error:
-            dependency = isinstance(error, store.DependencyError) or isinstance(error, FileNotFoundError)
+            dependency = (isinstance(error, store.DependencyError)
+                          or isinstance(error, FileNotFoundError)
+                          or isinstance(error.__cause__, FileNotFoundError))
             blockers.append({'code': 'inspection-dependency' if dependency else 'inspection-uncertain',
                              'source': module.__name__.rsplit('.', 1)[-1],
                              'reason': str(error) if isinstance(error, (store.Refusal, store.DependencyError))
@@ -326,6 +330,7 @@ def _run(home, operation, ask, report):
         report('2 / 3  Remove approved units, data and Git registrations')
         rows = operation['inventory']['resources']
         observability.uninstall_quiesce(home, rows, operation)
+        reviewer_runner.uninstall_remove(home, rows, operation)
         reviewer_timer.uninstall_remove(home, rows, operation)
         observability.uninstall_remove(home, rows, operation)
         worker_skills.uninstall_remove(home, rows, operation)

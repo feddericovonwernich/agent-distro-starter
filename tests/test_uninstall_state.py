@@ -382,32 +382,6 @@ def test_native_omp_handoff_is_owned_and_releases_admission(home):
         child.communicate(timeout=10)
 
 
-def test_retirement_prevents_private_reviewer_capability_child(home, tmp_path, monkeypatch):
-    from agd_lib import reviewer_runner
-    package = tmp_path / 'node_modules/@oh-my-pi/pi-coding-agent'
-    (package / 'bin').mkdir(parents=True)
-    executable = package / 'bin/omp'
-    executable.write_text('#!/bin/sh\nexit 0\n')
-    executable.chmod(0o755)
-    (package / 'package.json').write_text(json.dumps({
-        'name': '@oh-my-pi/pi-coding-agent', 'version': '18.14.0', 'bin': {'omp': 'bin/omp'}}))
-    binary = tmp_path / 'bun'
-    marker = home / 'probe-started'
-    capability = {f'{name}_url': executable.as_uri() for name in
-                  ('ai', 'core', 'sdk', 'registry', 'manager', 'session', 'telemetry', 'resolver')}
-    capability['omp_version'] = '18.14.0'
-    binary.write_text(
-        '#!/usr/bin/env python3\nimport pathlib\n'
-        f'pathlib.Path({str(marker)!r}).write_text("started")\n'
-        f'print({json.dumps(capability)!r})\n')
-    binary.chmod(0o755)
-    monkeypatch.setenv('PATH', str(tmp_path) + os.pathsep + os.environ['PATH'])
-    with uninstall_scope(home, preview(home)['resources']):
-        with pytest.raises(store.Refusal):
-            reviewer_runner.assert_runtime_capability(
-                int((time.time() + 10) * 1000), home=home, omp_binary=str(executable))
-        assert not marker.exists()
-
 
 def test_cancelled_preparation_releases_admission_without_executor(home):
     module = state()

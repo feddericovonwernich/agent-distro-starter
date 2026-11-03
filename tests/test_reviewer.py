@@ -1,10 +1,10 @@
 import hashlib
-import io
 import os
 import json
 import sys
 import time
 import uuid
+import resource
 from pathlib import Path
 
 import pytest
@@ -12,7 +12,7 @@ import pytest
 from support import command, lab
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
-from agd_lib import observability, reviewer, reviewer_episodes, reviewer_runner, store, supervision, tasks, worker_skills, workers
+from agd_lib import observability, reviewer, reviewer_episodes, store, supervision, tasks, worker_skills, workers
 
 
 def ended_worker(home, task_id, incarnation, rows, status=1):
@@ -928,41 +928,6 @@ def test_reviewer_environment_sanitizes_ambient_identity_and_otel(monkeypatch):
         assert not any(key.startswith('OTEL_') for key in env)
 
 
-def test_broker_only_exposes_frozen_packet_and_persists_report():
-    with lab() as (home, _):
-        run, selected = produced_run(home)
-        requests = [
-            {'id': str(uuid.uuid4()), 'op': 'packet', 'args': {}},
-            {'id': str(uuid.uuid4()), 'op': 'reviewer_excerpt', 'args': {'source_id': 'outside'}},
-            {'id': str(uuid.uuid4()), 'op': 'reviewer_search', 'args': {'query': 'failure'}},
-            {'id': str(uuid.uuid4()), 'op': 'reviewer_submit', 'args': {'report': build_report(selected)}},
-            {'id': str(uuid.uuid4()), 'op': 'result', 'args': {}},
-        ]
-        output = io.StringIO()
-        reviewer_runner.serve_broker(home, run['review_run_id'],
-                                     io.StringIO(''.join(json.dumps(row) + '\n' for row in requests)), output)
-        responses = [json.loads(row) for row in output.getvalue().splitlines()]
-        assert json.loads(responses[0]['value'])['packet_id'] == selected['packet_id']
-        assert responses[1]['ok'] is False
-        assert responses[2]['ok'] is True
-        assert json.loads(responses[3]['value'])['reportId'] == responses[4]['value']['reportId']
-        assert reviewer.report_path(home, responses[4]['value']['reportId']).is_file()
-        assert reviewer._receipt(home, run['review_run_id'])['dispatch_state'] == 'report-committed'
-
-
-def test_broker_refuses_symlinked_config_manifest_before_consuming_request_budget():
-    with lab() as (home, _):
-        run, _ = produced_run(home)
-        config = reviewer.read_config(home); config['limits']['max_input_bytes'] += 1
-        outside = home / 'attacker-config.json'; outside.write_text(json.dumps(config))
-        manifest = reviewer.paths(home)['manifests'] / f"{run['config_snapshot_ref']}.json"
-        manifest.unlink(); manifest.symlink_to(outside)
-        request = {'id': str(uuid.uuid4()), 'op': 'packet', 'args': {}}
-        with pytest.raises(store.Refusal):
-            reviewer_runner.serve_broker(home, run['review_run_id'], io.StringIO(json.dumps(request) + '\n'), io.StringIO())
-        receipt = reviewer._receipt(home, run['review_run_id'])
-        assert receipt['counters'].get('input_bytes', 0) == 0 and not receipt.get('broker_replies')
-
 
 def test_retrospective_rejects_mismatched_receipt_and_session_symlink(tmp_path):
     with lab() as (home, _):
@@ -981,20 +946,6 @@ def test_retrospective_rejects_mismatched_receipt_and_session_symlink(tmp_path):
             packet(home, retrospective=(run['review_run_id'],))
 
 
-def test_broker_replay_charges_input_once_and_keeps_receipt_dispatchable():
-    with lab() as (home, _):
-        run, _ = produced_run(home); request_id = str(uuid.uuid4())
-        assert reviewer_runner._replay_or_reserve_input(home, run['review_run_id'], request_id, 'packet', {}, 'abc', 5) == 'abc'
-        assert reviewer_runner._replay_or_reserve_input(home, run['review_run_id'], request_id, 'packet', {}, 'abc', 5) == 'abc'
-        assert reviewer._receipt(home, run['review_run_id'])['counters']['input_bytes'] == len('abc'.encode())
-        with pytest.raises(store.Refusal, match='cumulative'):
-            reviewer_runner._replay_or_reserve_input(home, run['review_run_id'], str(uuid.uuid4()), 'search', {}, 'abc', 5)
-        requests = [{'id': str(uuid.uuid4()), 'op': 'reserve', 'args': {}}, {'id': str(uuid.uuid4()), 'op': 'settle', 'args': {}}]
-        output = io.StringIO()
-        reviewer_runner.serve_broker(home, run['review_run_id'], io.StringIO(''.join(json.dumps(row) + '\n' for row in requests)), output)
-        receipt = reviewer._receipt(home, run['review_run_id'])
-        assert receipt['dispatch_state'] == 'begun'
-        assert receipt['counters']['model_calls'] == 1 and receipt['counters']['provider_inflight'] == 0
 
 
 def test_past_deadline_refuses_packet_before_publish():
@@ -1053,3 +1004,407 @@ def test_publish_immutable_refuses_symlink_swapped_before_no_follow_open(monkeyp
         with pytest.raises(store.Refusal):
             reviewer.publish_immutable(path, {'packet': 'new'})
         assert outside.read_bytes() == b'{"packet":"new"}'
+def test_schema1_config_preserves_values_and_drops_only_old_model_limit():
+    with lab() as (home, _):
+        path = reviewer.paths(home)['config']
+        current = reviewer.read_config(home)
+        legacy = {
+            'schema': 1, 'schedule': {
+                'mode': 'interval', 'timezone': None, 'calendar': None,
+                'interval_hours': 17,
+            }, 'review_model': 'private/reviewer',
+            'limits': {**current['limits'], 'max_model_calls': 7},
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        before = json.dumps(legacy, sort_keys=True, separators=(',', ':')).encode() + b'\n'
+        path.write_bytes(before)
+        normalized = reviewer.read_config(home)
+        assert normalized['schema'] == 2
+        assert normalized['schedule'] == legacy['schedule']
+        assert normalized['review_model'] == legacy['review_model']
+        assert normalized['limits'] == current['limits']
+        assert path.read_bytes() == before
+
+
+def test_native_receipt_does_not_fabricate_provider_counters():
+    with lab() as (home, _):
+        intent = reviewer.enqueue_intent(home, kind='manual')
+        started = time.time()
+        run = reviewer.reserve_run(
+            home, intent, config_snapshot=reviewer.read_config(home),
+            instruction_snapshot=b'fixture', started_at=started,
+            deadline_epoch_ms=int((started + 60) * 1000))
+        receipt = reviewer._receipt(home, run['review_run_id'])
+        assert receipt.get('execution') == 'native-cli'
+        assert receipt.get('backend') is None
+        assert 'counters' not in receipt
+
+
+def test_historical_receipt_and_report_bytes_remain_unchanged_after_config_migration():
+    with lab() as (home, _):
+        config_path = reviewer.paths(home)['config']
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy = {
+            **reviewer.DEFAULT_CONFIG, 'schema': 1,
+            'limits': {**reviewer.DEFAULT_LIMITS, 'max_model_calls': 20},
+        }
+        config_path.write_text(json.dumps(legacy, sort_keys=True) + '\n')
+        run_id = '11111111-1111-4111-8111-111111111111'
+        receipt_path = reviewer.paths(home)['receipts'] / f'{run_id}.json'
+        report_path = reviewer.paths(home)['reports'] / ('a' * 64 + '.json')
+        historical_receipt = {
+            'schema': 1, 'review_run_id': run_id, 'dispatch_state': 'final',
+            'outcome': 'exited', 'counters': {'model_calls': 1, 'provider_inflight': 0},
+        }
+        historical_report = {'schema': 1, 'summary': 'old', 'findings': []}
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(json.dumps(historical_receipt, sort_keys=True) + '\n')
+        report_path.write_text(json.dumps(historical_report, sort_keys=True) + '\n')
+        receipt_before, report_before = receipt_path.read_bytes(), report_path.read_bytes()
+        assert reviewer.read_config(home)['schema'] == 2
+        assert reviewer._receipt(home, run_id) == historical_receipt
+        assert reviewer._read_json(report_path) == historical_report
+        assert receipt_path.read_bytes() == receipt_before
+        assert report_path.read_bytes() == report_before
+
+
+def _evidence_source(evidence, source_id):
+    sources = evidence.get('sources', evidence)
+    if isinstance(sources, dict):
+        return sources[source_id]
+    return next(row for row in sources if row['source_id'] == source_id)
+
+
+def _run_with_artifact(home, text='printf investigation\n'):
+    run, selected = produced_run(home)
+    runtime = reviewer.paths(home)['runtime'] / run['review_run_id']
+    runtime.mkdir(parents=True, exist_ok=True)
+    artifact = runtime / 'investigation.txt'
+    artifact.write_text(text)
+    return run, selected, runtime, artifact
+
+
+def _retry_run_with_packet(home, selected):
+    intent = reviewer.enqueue_intent(home, kind='manual')
+    config = reviewer.read_config(home)
+    started = time.time()
+    run = reviewer.reserve_run(
+        home, intent, config_snapshot=config,
+        instruction_snapshot=reviewer.INSTRUCTION_FILE.read_bytes(),
+        started_at=started,
+        deadline_epoch_ms=int((started + config['limits']['max_runtime_seconds']) * 1000))
+    reviewer.begin_run(home, run, selected, model='fixture/model', observed_omp_version='fixture')
+    return run
+
+
+def test_report_cites_captured_investigation_source():
+    with lab() as (home, _):
+        run, selected, _, artifact = _run_with_artifact(home)
+        text = artifact.read_text()
+        captured = reviewer.capture_evidence(home, run['review_run_id'], artifact, 'shell investigation')
+        source_id = captured['source_id']
+        source = _evidence_source(reviewer.read_evidence(home, run['review_run_id']), source_id)
+        assert source['text'] == text
+        assert source['text_sha256'] == hashlib.sha256(text.encode()).hexdigest()
+
+        report = build_report(selected)
+        report['findings'][0]['citations'] = [source_id]
+        submitted = reviewer.submit_report(home, run['review_run_id'], str(uuid.uuid4()), report)
+        stored = reviewer._read_json(reviewer.report_path(home, submitted['report_id']))
+        assert stored['report']['findings'][0]['citations'] == [source_id]
+
+
+def test_cross_run_or_modified_evidence_is_refused():
+    with lab() as (home, _):
+        run, selected, runtime, artifact = _run_with_artifact(home)
+        reviewer.capture_evidence(home, run['review_run_id'], artifact, 'investigation')
+        reviewer.close_run(home, run['review_run_id'], 'failed', error_code='fixture')
+        other_run = _retry_run_with_packet(home, selected)
+        with pytest.raises(store.Refusal):
+            reviewer.capture_evidence(home, other_run['review_run_id'], artifact, 'foreign artifact')
+
+        stored_path = next((home / 'data' / 'reviewer' / 'evidence' / run['review_run_id']).glob('*.json'))
+        stored = json.loads(stored_path.read_text())
+        stored['text'] = 'tampered'
+        stored_path.write_text(json.dumps(stored))
+        with pytest.raises(store.Refusal):
+            reviewer.read_evidence(home, run['review_run_id'])
+
+
+def test_symlink_special_file_and_known_secret_paths_refused():
+    with lab() as (home, _):
+        run, _, runtime, _ = _run_with_artifact(home)
+        outside = home / 'outside.txt'
+        outside.write_text('not a credential')
+        symlink = runtime / 'linked.txt'
+        symlink.symlink_to(outside)
+        with pytest.raises(store.Refusal):
+            reviewer.capture_evidence(home, run['review_run_id'], symlink, 'linked')
+
+        special = runtime / 'pipe'
+        os.mkfifo(special)
+        pid = os.fork()
+        if pid == 0:
+            try:
+                reviewer.capture_evidence(home, run['review_run_id'], special, 'special')
+            except store.Refusal:
+                os._exit(0)
+            except BaseException:
+                os._exit(2)
+            os._exit(1)
+        status = None
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            waited, candidate = os.waitpid(pid, os.WNOHANG)
+            if waited == pid:
+                status = candidate
+                break
+            time.sleep(0.01)
+        if status is None:
+            os.kill(pid, 15)
+            _, status = os.waitpid(pid, 0)
+        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+
+        credentials = runtime / 'credentials.json'
+        credentials.write_text('{"api_key":"do-not-capture"}')
+        with pytest.raises(store.Refusal):
+            reviewer.capture_evidence(home, run['review_run_id'], credentials, 'credentials')
+
+
+def test_supplementary_capture_budget_is_cumulative():
+    with lab() as (home, _):
+        run, _, runtime, _ = _run_with_artifact(home)
+        seed_path = reviewer.paths(home)['packets'] / f"{run['packet_id']}.json"
+        seed_bytes = seed_path.stat().st_size
+        remaining = reviewer.DEFAULT_LIMITS['max_input_bytes'] - seed_bytes
+        assert remaining > 1
+
+        first = runtime / 'first.txt'
+        second = runtime / 'second.txt'
+        first.write_text('a' * remaining)
+        second.write_text('b')
+        captured = reviewer.capture_evidence(home, run['review_run_id'], first, 'first')
+        duplicate = reviewer.capture_evidence(home, run['review_run_id'], first, 'first')
+        assert duplicate['source_id'] == captured['source_id']
+        with pytest.raises(store.Refusal):
+            reviewer.capture_evidence(home, run['review_run_id'], second, 'second')
+        evidence = reviewer.read_evidence(home, run['review_run_id'])
+        assert set(evidence['sources']) == {captured['source_id']}
+
+
+def test_late_investigation_does_not_advance_unselected_episode_coverage():
+    with lab() as (home, _):
+        ended_worker(home, 'first', str(uuid.uuid4()), [message('first')])
+        ended_worker(home, 'second', str(uuid.uuid4()), [message('second')])
+        config = reviewer.read_config(home)
+        config['limits']['max_candidates'] = 1
+        cutoff = time.time() + 10
+        selected = reviewer.select_packet(home, cutoff=cutoff, config_snapshot=config)
+        assert len(selected['episodes']) == 1
+        run = _retry_run_with_packet(home, selected)
+        reviewer.mark_material_reviewed(home, selected['coverage']['followup_id'])
+        baseline = reviewer.select_packet(home, cutoff=time.time() + 20, config_snapshot=config)
+
+        runtime = reviewer.paths(home)['runtime'] / run['review_run_id']
+        runtime.mkdir(parents=True, exist_ok=True)
+        artifact = runtime / 'late.txt'
+        artifact.write_text('late investigation')
+        reviewer.capture_evidence(home, run['review_run_id'], artifact, 'late')
+        after = reviewer.select_packet(home, cutoff=time.time() + 30, config_snapshot=config)
+        assert [row['task_id'] for row in after['episodes']] == [row['task_id'] for row in baseline['episodes']]
+        assert after['coverage']['followup_id'] == baseline['coverage']['followup_id']
+
+
+def test_failed_review_leaves_seed_retryable():
+    with lab() as (home, _):
+        run, selected, _, artifact = _run_with_artifact(home)
+        reviewer.capture_evidence(home, run['review_run_id'], artifact, 'failed-run supplement')
+        before = {(row['source_id'], row['excerpt_id']) for row in selected['excerpts']}
+        reviewer.close_run(home, run['review_run_id'], 'failed', error_code='fixture')
+        retry = reviewer.select_packet(home, cutoff=time.time() + 1, config_snapshot=reviewer.read_config(home))
+        assert {(row['source_id'], row['excerpt_id']) for row in retry['excerpts']} == before
+
+
+def test_failed_run_supplement_is_not_automatically_reused():
+    with lab() as (home, _):
+        run, selected, _, artifact = _run_with_artifact(home)
+        captured = reviewer.capture_evidence(home, run['review_run_id'], artifact, 'failed supplement')
+        reviewer.close_run(home, run['review_run_id'], 'failed', error_code='fixture')
+        retry = _retry_run_with_packet(home, selected)
+        report = build_report(selected)
+        report['findings'][0]['citations'].append(captured['source_id'])
+        with pytest.raises(store.Refusal):
+            reviewer.submit_report(home, retry['review_run_id'], str(uuid.uuid4()), report)
+
+
+def test_deliberate_recapture_has_new_run_scope_without_seed_consumption():
+    with lab() as (home, _):
+        first, selected, _, artifact = _run_with_artifact(home, 'retained failed output')
+        old = reviewer.capture_evidence(home, first['review_run_id'], artifact, 'failed output')
+        reviewer.close_run(home, first['review_run_id'], 'failed', error_code='fixture')
+        second = _retry_run_with_packet(home, selected)
+        second_runtime = reviewer.paths(home)['runtime'] / second['review_run_id']
+        second_runtime.mkdir(parents=True, exist_ok=True)
+        recaptured_path = second_runtime / 'recaptured.txt'
+        recaptured_path.write_bytes(artifact.read_bytes())
+        new = reviewer.capture_evidence(home, second['review_run_id'], recaptured_path, 'recaptured failed output')
+        assert new['source_id'] != old['source_id']
+        assert new['text_sha256'] == old['text_sha256']
+        old_source = _evidence_source(reviewer.read_evidence(home, first['review_run_id']), old['source_id'])
+        new_source = _evidence_source(reviewer.read_evidence(home, second['review_run_id']), new['source_id'])
+        assert old_source['origin']['run_id'] == first['review_run_id']
+        assert new_source['origin']['run_id'] == second['review_run_id']
+        assert old_source['text_sha256'] == new_source['text_sha256'] == old['text_sha256']
+        assert reviewer.material_state(home, selected['coverage']['followup_id'])['state'] == 'pending'
+
+
+def test_duplicate_capture_same_origin_bytes_keeps_first_label():
+    with lab() as (home, _):
+        run, _, _, artifact = _run_with_artifact(home, 'same-origin bytes')
+        first = reviewer.capture_evidence(home, run['review_run_id'], artifact, 'first label')
+        second = reviewer.capture_evidence(home, run['review_run_id'], artifact, 'changed label')
+        assert second['source_id'] == first['source_id']
+        assert second['label'] == 'first label'
+        evidence = reviewer.read_evidence(home, run['review_run_id'])
+        assert list(evidence['sources']) == [first['source_id']]
+
+
+def test_dangling_evidence_root_refuses_read_submit_and_recovery(monkeypatch):
+    with lab() as (home, _):
+        run, selected, _, artifact = _run_with_artifact(home)
+        reviewer.capture_evidence(home, run['review_run_id'], artifact, 'dangling-root fixture')
+        report = build_report(selected)
+        original_apply = reviewer._apply_prepared_locked
+        def crash_apply(*args, **kwargs):
+            raise RuntimeError('fixture crash')
+        monkeypatch.setattr(reviewer, '_apply_prepared_locked', crash_apply)
+        with pytest.raises(RuntimeError):
+            reviewer.submit_report(home, run['review_run_id'], str(uuid.uuid4()), report)
+        monkeypatch.setattr(reviewer, '_apply_prepared_locked', original_apply)
+
+        evidence_root = reviewer.paths(home)['evidence'] / run['review_run_id']
+        next(evidence_root.glob('*.json')).unlink()
+        evidence_root.rmdir()
+        evidence_root.symlink_to(home / 'missing-evidence-root', target_is_directory=True)
+        with pytest.raises(store.Refusal):
+            reviewer.read_evidence(home, run['review_run_id'])
+        with pytest.raises(store.Refusal):
+            reviewer.submit_report(home, run['review_run_id'], str(uuid.uuid4()), report)
+        with pytest.raises(store.Refusal):
+            reviewer.recover_submissions(home, run['review_run_id'])
+
+
+def test_oversized_sparse_artifact_is_refused_under_bounded_memory():
+    with lab() as (home, _):
+        run, _, runtime, _ = _run_with_artifact(home)
+        artifact = runtime / 'oversized-sparse.bin'
+        with artifact.open('wb') as stream:
+            stream.truncate(reviewer.DEFAULT_LIMITS['max_input_bytes'] * 8192)
+        pid = os.fork()
+        if pid == 0:
+            try:
+                _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+                limit = 256 * 1024 * 1024
+                if hard != resource.RLIM_INFINITY:
+                    limit = min(limit, hard)
+                resource.setrlimit(resource.RLIMIT_AS, (limit, hard))
+                reviewer.capture_evidence(home, run['review_run_id'], artifact, 'oversized sparse')
+            except store.Refusal:
+                os._exit(0)
+            except BaseException:
+                os._exit(2)
+            os._exit(1)
+        _, status = os.waitpid(pid, 0)
+        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+
+
+def test_parent_symlink_swap_never_captures_external_artifact(monkeypatch):
+    with lab() as (home, _):
+        run, _, runtime, _ = _run_with_artifact(home)
+        parent = runtime / 'nested'
+        parent.mkdir()
+        artifact = parent / 'output.txt'
+        artifact.write_text('owned artifact')
+        external = home / 'external-artifacts'
+        external.mkdir()
+        (external / 'output.txt').write_text('external artifact')
+        moved = runtime / 'nested-owned'
+        original_open = reviewer.os.open
+        swapped = [False]
+
+        def swap_parent(pathname, flags, mode=0o777, **kwargs):
+            candidate = Path(pathname)
+            final_open = candidate == artifact or (
+                candidate.name == artifact.name and kwargs.get('dir_fd') is not None)
+            if final_open and not swapped[0]:
+                parent.rename(moved)
+                parent.symlink_to(external, target_is_directory=True)
+                swapped[0] = True
+            return original_open(pathname, flags, mode, **kwargs)
+
+        monkeypatch.setattr(reviewer.os, 'open', swap_parent)
+        try:
+            captured = reviewer.capture_evidence(home, run['review_run_id'], artifact, 'parent swap')
+        except store.Refusal:
+            captured = None
+        assert swapped[0]
+        if captured is not None:
+            source = _evidence_source(reviewer.read_evidence(home, run['review_run_id']),
+                                      captured['source_id'])
+            assert source['text'] == 'owned artifact'
+
+
+def test_oversized_sparse_artifact_refuses_before_reading_full_file():
+    with lab() as (home, _):
+        run, _, runtime, _ = _run_with_artifact(home)
+        artifact = runtime / 'oversized-sparse.txt'
+        with artifact.open('wb') as stream:
+            stream.truncate(8 * 1024 * 1024)
+
+        def rchar():
+            values = Path('/proc/self/io').read_text().splitlines()
+            return int(next(line.split(':', 1)[1] for line in values if line.startswith('rchar:')))
+
+        before = rchar()
+        with pytest.raises(store.Refusal):
+            reviewer.capture_evidence(home, run['review_run_id'], artifact, 'oversized sparse')
+        assert rchar() - before < reviewer.DEFAULT_LIMITS['max_input_bytes'] * 4
+
+
+def test_runtime_ancestor_swap_never_captures_external_artifact(monkeypatch):
+    with lab() as (home, _):
+        run, _, runtime, _ = _run_with_artifact(home, 'owned artifact')
+        run_root = runtime
+        ancestor = runtime.parent
+        external_runtime = home / 'external-runtime'
+        external_run = external_runtime / run['review_run_id']
+        external_run.mkdir(parents=True)
+        (external_run / 'output.txt').write_text('external artifact')
+        artifact = run_root / 'output.txt'
+        artifact.write_text('owned artifact')
+        moved_ancestor = ancestor.parent / 'runtime-owned'
+        original_open = reviewer.os.open
+        swapped = [False]
+
+        def swap_runtime(pathname, flags, mode=0o777, **kwargs):
+            candidate = Path(pathname)
+            opens_run_root = candidate == run_root or (
+                candidate.name == run['review_run_id'] and kwargs.get('dir_fd') is not None)
+            if opens_run_root and not swapped[0]:
+                ancestor.rename(moved_ancestor)
+                ancestor.symlink_to(external_runtime, target_is_directory=True)
+                swapped[0] = True
+            return original_open(pathname, flags, mode, **kwargs)
+
+        monkeypatch.setattr(reviewer.os, 'open', swap_runtime)
+        try:
+            captured = reviewer.capture_evidence(
+                home, run['review_run_id'], artifact, 'runtime ancestor swap')
+        except store.Refusal:
+            captured = None
+        assert swapped[0]
+        if captured is not None:
+            source = _evidence_source(
+                reviewer.read_evidence(home, run['review_run_id']), captured['source_id'])
+            assert source['text'] == 'owned artifact'

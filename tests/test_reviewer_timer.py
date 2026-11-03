@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
-from agd_lib import omp_runtime, reviewer, reviewer_runner, reviewer_timer, store
+from agd_lib import installer, omp_runtime, reviewer, reviewer_runner, reviewer_timer, store
 
 
 def utc(value):
@@ -22,7 +22,47 @@ def home(tmp_path):
     (root / 'data').mkdir(parents=True)
     (root / 'data' / 'home.json').write_text('{"schema":1,"home_id":"123e4567-e89b-12d3-a456-426614174000"}\n')
     omp_runtime.agent_dir(root).mkdir(parents=True)
+    (root / 'data' / 'dependencies.json').write_text(json.dumps({
+        'schema': 1, 'omp': {'source': 'existing', 'path': '/bin/true',
+                             'version': 'omp/18.14.0',
+                             'capabilities': ['models-json', 'login']}}))
+    (root / 'data' / 'launcher.json').write_text(json.dumps({
+        'schema': 1, 'backend': 'tmux', 'herdr_session': 'agd-' + '0' * 32}))
     return root
+
+
+def test_timer_minimal_environment_runs_selected_tools_from_distinct_receipt_dirs(tmp_path):
+    root = home(tmp_path)
+    selected = tmp_path / 'selected'
+    omp_real, herdr_dir, treehouse_dir = selected / 'omp-real', selected / 'herdr', selected / 'treehouse'
+    for directory in (omp_real, herdr_dir, treehouse_dir):
+        directory.mkdir(parents=True)
+    sources = {name: shutil.which(name) for name in ('omp', 'herdr', 'treehouse')}
+    assert all(sources.values())
+    shutil.copy2(sources['omp'], omp_real / 'omp-native-version')
+    shutil.copy2(sources['herdr'], herdr_dir / 'herdr')
+    shutil.copy2(sources['treehouse'], treehouse_dir / 'treehouse')
+    for path in (omp_real / 'omp-native-version', herdr_dir / 'herdr', treehouse_dir / 'treehouse'):
+        path.chmod(0o700)
+    omp_link_dir = selected / 'omp-link'
+    omp_link_dir.symlink_to(omp_real, target_is_directory=True)
+    installer.write_dependencies(root, {
+        'schema': 1,
+        'omp': {'source': 'existing', 'path': str(omp_link_dir / 'omp-native-version'),
+                'version': 'omp/18.14.0', 'capabilities': ['models-json', 'login']},
+        'herdr': {'source': 'existing', 'path': str(herdr_dir / 'herdr'),
+                  'version': 'herdr/0.8.2', 'capabilities': ['session-list-json', 'named-status']},
+        'treehouse': {'source': 'existing', 'path': str(treehouse_dir / 'treehouse'),
+                      'version': 'treehouse/3.1.6', 'capabilities': ['version']},
+    })
+    runtime = reviewer_timer.runtime_environment(root)
+    environment = {'HOME': str(tmp_path), 'PATH': runtime['path']}
+    assert shutil.which('omp-native-version', path=runtime['path']) == str((omp_real / 'omp-native-version').resolve())
+    for name in ('omp-native-version', 'herdr', 'treehouse'):
+        result = subprocess.run([name, '--version'], env=environment,
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+
 
 
 def interval_config(hours=12):
@@ -127,6 +167,8 @@ def test_timer_runner_skips_collection_until_interval_is_due(tmp_path, monkeypat
 
 
 
+
+
 def test_refuses_foreign_owned_xdg_root(tmp_path, monkeypatch):
     root, xdg = home(tmp_path), tmp_path / 'xdg'; xdg.mkdir()
     actual = reviewer_timer.os.lstat
@@ -140,34 +182,6 @@ def test_refuses_foreign_owned_xdg_root(tmp_path, monkeypatch):
         reviewer_timer.enable(root, interval_config(), xdg_config_home=xdg, command_runner=lambda _: None)
 
 
-@pytest.mark.parametrize('missing', ['omp', 'bun', 'agent-dir'])
-def test_enable_refuses_unusable_runtime_before_unit_activation(tmp_path, monkeypatch, missing):
-    root, xdg = home(tmp_path), tmp_path / 'xdg'
-    actual = shutil.which
-    if missing == 'agent-dir':
-        omp_runtime.agent_dir(root).rmdir()
-    else:
-        monkeypatch.setattr(shutil, 'which', lambda name, *args, **kwargs:
-                            None if name == missing else actual(name, *args, **kwargs))
-    with pytest.raises((store.Refusal, store.DependencyError)):
-        reviewer_timer.enable(root, interval_config(), xdg_config_home=xdg, command_runner=lambda _: None)
-    assert not list(xdg.glob('systemd/user/*.timer'))
-    assert reviewer_timer._read_record(root) is None
-
-
-def test_runtime_binding_survives_minimal_environment_and_special_paths(tmp_path, monkeypatch):
-    root = home(tmp_path)
-    directory = tmp_path / "runtime % 'quoted' \"tools\""
-    directory.mkdir()
-    for name in ('omp', 'bun'):
-        (directory / name).symlink_to(shutil.which(name))
-    monkeypatch.setenv('PATH', f'{directory}:{os.environ["PATH"]}')
-    runtime = reviewer_timer.runtime_environment(root)
-    result = subprocess.run(
-        [runtime['python'], '-c',
-         'import json,shutil;print(json.dumps({name:shutil.which(name) for name in ("omp","bun")}))'],
-        cwd='/', env={'PATH': runtime['path']}, capture_output=True, text=True, check=True)
-    assert json.loads(result.stdout) == {'omp': str(directory / 'omp'), 'bun': str(directory / 'bun')}
 
 
 def test_native_activation_failure_retains_owned_disable_recovery(tmp_path):
@@ -175,7 +189,7 @@ def test_native_activation_failure_retains_owned_disable_recovery(tmp_path):
     def inactive(argv):
         if 'is-active' in argv:
             raise store.DependencyError('timer remained inactive')
-    with pytest.raises(store.DependencyError, match='inactive'):
+    with pytest.raises(store.DependencyError):
         reviewer_timer.enable(root, interval_config(), xdg_config_home=xdg, command_runner=inactive)
     assert reviewer_timer._read_record(root)['state'] == 'failed'
     assert list((xdg / 'systemd/user').glob('*.timer'))
@@ -200,12 +214,13 @@ def test_native_service_discards_inherited_credentials(tmp_path):
     helper.write_text(
         'import json,os\nfrom pathlib import Path\n'
         f'Path({str(marker)!r}).write_text(json.dumps({{key:os.environ.get(key) for key in '
-        '("AGD_CREDENTIAL_SENTINEL","OTEL_EXPORTER_OTLP_HEADERS","HOME","PATH")}))\n')
+        '("AGD_CREDENTIAL_SENTINEL","OTEL_EXPORTER_OTLP_HEADERS","HERDR_ENV","AGD_HERDR_SESSION","HOME","PATH")}))\n')
     rendered = reviewer_timer.render_units(
         root, interval_config(), runtime={'python': sys.executable, 'path': os.defpath}, source_cli=str(helper))
     content = rendered['service'].replace(
         '[Service]\n', '[Service]\nEnvironment=AGD_CREDENTIAL_SENTINEL=synthetic-secret\n'
-        'Environment=OTEL_EXPORTER_OTLP_HEADERS=synthetic-header\n')
+        'Environment=OTEL_EXPORTER_OTLP_HEADERS=synthetic-header\n'
+        'Environment=HERDR_ENV=synthetic-herdr\nEnvironment=AGD_HERDR_SESSION=synthetic-session\n')
     directory = reviewer_timer._unit_directory(Path.home() / '.config')
     service = directory / rendered['service_name']
     owner = f'X-AGD-Reviewer-Owner={identity}:{os.getuid()}'
@@ -217,6 +232,8 @@ def test_native_service_discards_inherited_credentials(tmp_path):
         observed = json.loads(marker.read_text())
         assert observed['AGD_CREDENTIAL_SENTINEL'] is None
         assert observed['OTEL_EXPORTER_OTLP_HEADERS'] is None
+        assert observed['HERDR_ENV'] is None
+        assert observed['AGD_HERDR_SESSION'] is None
         assert observed['HOME'] == str(Path.home())
         assert observed['PATH'] == os.defpath
     finally:

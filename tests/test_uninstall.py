@@ -309,6 +309,31 @@ def test_work_changed_after_approval_requires_refreshed_discard(tmp_path):
     assert len(set(re.findall(r'Type (DISCARD [0-9a-f]{16}): ', stderr))) == 2
 
 
+def test_uninstall_removes_materialized_worker_skills_before_task_slot():
+    from support import command, lab, uninstall_scope
+    from agd_lib import tasks, uninstall, worker_skills
+    with lab() as (home, _):
+        brief = home / 'skill-uninstall.md'
+        brief.write_text('Inspect the unchanged fixture.\n')
+        task = command(home, 'task', 'create', 'skill-uninstall', '--project', 'sample',
+                       '--brief', str(brief), '--kind', 'scout')
+        worktree = Path(task['worktree'])
+        generated = worktree / '.omp' / 'skills' / 'ponytail' / 'SKILL.md'
+        assert generated.is_file()
+        resources = uninstall.inventory(home)['resources']
+        skill = next(row for row in resources
+                     if row['kind'] == 'worker-skills'
+                     and row['identity']['task_id'] == task['id'])
+        slot = next(row for row in resources
+                    if row['kind'] == 'treehouse-slot'
+                    and row['identity']['task_id'] == task['id'])
+        with uninstall_scope(home, [skill, slot]) as operation:
+            worker_skills.uninstall_remove(home, [skill, slot], operation)
+            assert not generated.exists()
+            tasks.uninstall_remove(home, [skill, slot], operation)
+        assert not worktree.exists()
+
+
 def test_unrecorded_foreign_native_lease_is_not_a_plain_git_checkout():
     from support import lab
     from agd_lib import store, uninstall
@@ -321,9 +346,47 @@ def test_unrecorded_foreign_native_lease_is_not_a_plain_git_checkout():
         foreign.write_text('must survive')
         preview = uninstall.inventory(home)
         assert preview['outcome'] == 'blocked'
+        foreign_rows = [row for row in preview['resources']
+                        if row['kind'] == 'treehouse-slot'
+                        and row.get('identity', {}).get('path') == allocated['path']]
+        assert len(foreign_rows) == 1 and foreign_rows[0]['ownership'] == 'unknown'
         assert foreign.read_text() == 'must survive'
         rows = json.loads(store.run(['treehouse', '--root', str(root), 'status', '--json'], cwd=project).stdout)
         assert next(row for row in rows if row['path'] == allocated['path'])['lease_id'] == allocated['lease_id']
+
+
+def test_uninstall_inventories_probe_work_loss_before_removal(monkeypatch):
+    from support import lab
+    from agd_lib import reviewer_workspaces, uninstall
+    from test_projects import run
+    from test_reviewer import produced_run
+    with lab() as (home, project):
+        private_home = home.parent / 'probe-user-home'
+        private_config = home.parent / 'probe-user-config'
+        private_home.mkdir(mode=0o700)
+        private_config.mkdir(mode=0o700)
+        monkeypatch.setenv('HOME', str(private_home))
+        monkeypatch.setenv('XDG_CONFIG_HOME', str(private_config))
+        monkeypatch.setenv('TREEHOUSE_ROOT', str(home / 'data' / 'treehouse'))
+        commit = run(['git', 'rev-parse', 'HEAD'], cwd=project).stdout.strip()
+        (project / 'later.txt').write_text('second existing commit\n')
+        run(['git', 'add', 'later.txt'], cwd=project)
+        run(['git', 'commit', '-m', 'second fixture commit'], cwd=project)
+        review_run, _ = produced_run(home)
+        result = reviewer_workspaces.create(
+            home, review_run['review_run_id'], 'sample', commit)
+        inventory = uninstall.inventory(home)
+        probes = [row for row in inventory['resources']
+                  if row['kind'] in {'reviewer-probe', 'reviewer-workspace'}
+                  and row['identity'].get('path') == result['path']]
+        assert len(probes) == 1
+        assert not any(row['kind'] == 'treehouse-slot'
+                       and row.get('identity', {}).get('path') == result['path']
+                       for row in inventory['resources'])
+        probe = probes[0]
+        assert probe['work_loss']
+        assert any(item.get('path') == result['path'] for item in inventory['work_loss'])
+        assert inventory['outcome'] in ('ready', 'blocked')
 
 
 def test_linked_home_uses_native_git_removal(tmp_path):
@@ -476,3 +539,50 @@ def test_partial_recovery_revalidates_home_inode_at_deletion(tmp_path, monkeypat
                            lambda _message: None)
         assert replacement and snapshot(home) == replacement[0]
         assert (moved / 'data/home.json').is_file()
+
+
+def test_uninstall_retains_external_cli_and_node(tmp_path):
+    from agd_lib import langfuse_cli
+
+    home = fixture_home(tmp_path)
+    external = tmp_path / 'shared'
+    package = external / 'node_modules/@langfuse/cli'
+    (package / 'bin').mkdir(parents=True)
+    (package / 'bin').chmod(0o755)
+    package.chmod(0o755)
+    package.parent.chmod(0o755)
+    (package / 'package.json').write_text(json.dumps({
+        'name': '@langfuse/cli', 'version': langfuse_cli.VERSION,
+        'bin': {'langfuse': 'bin/langfuse'}, 'dependencies': {},
+    }))
+    (package / 'package.json').chmod(0o644)
+    entry = package / 'bin/langfuse'
+    entry.write_text('#!/usr/bin/env node\nconsole.log("langfuse")\n')
+    entry.chmod(0o755)
+    node = external / 'bin/node'
+    node.parent.mkdir(parents=True)
+    node.write_text('#!/bin/sh\n')
+    node.chmod(0o755)
+
+    managed = home / 'data/langfuse-cli'
+    launcher = managed / 'bin/langfuse'
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text(langfuse_cli._launcher(node, entry))
+    launcher.chmod(0o700)
+    (managed / 'installation.json').write_text(json.dumps({
+        'schema': 1, 'source': 'external', 'owned': False, 'version': langfuse_cli.VERSION,
+        'package': str(package), 'entry': str(entry), 'node': str(node),
+        'launcher': str(launcher), 'assets': langfuse_cli._asset_map(package),
+    }))
+    external_before = snapshot(external)
+
+    code, stdout, stderr = terminal(
+        [home / 'bin/agd', '--home', '.', 'uninstall'],
+        cwd=home, home=home, timeout=60)
+
+    assert code == 0, (stdout, stderr)
+    assert json.loads(stdout)['outcome'] == 'uninstalled'
+    assert not home.exists()
+    assert snapshot(external) == external_before
+
+
