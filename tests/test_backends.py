@@ -457,7 +457,7 @@ def test_tmux_reviewer_close_retains_replaced_home_environment(tmp_path, monkeyp
                 return SimpleNamespace(returncode=0, stdout=str(process.pid), stderr='')
             if args[0] == 'list-panes':
                 return SimpleNamespace(returncode=0 if state['pane'] else 1,
-                                       stdout='%1 0 0\n' if state['pane'] else '', stderr='')
+                                       stdout=f'%1 {process.pid} 0\n' if state['pane'] else '', stderr='')
             if args[0] == 'show-options':
                 return SimpleNamespace(returncode=0, stdout='token\n', stderr='')
             if args[0] == 'kill-pane':
@@ -531,6 +531,7 @@ def test_tmux_reviewer_close_disposes_created_server_but_preserves_shared_server
             'schema': 1, 'backend': 'tmux', 'review_run_id': str(uuid.uuid4()),
             'home': str(home), 'prefix': tmux.prefix(home), 'session': 'agd',
             'pane': '%1', 'token': 'token', 'target': target,
+            'server_created': created,
             'server': {
                 'target': target, 'process': process_identity,
                 'socket': {'path': str(socket_path), 'device': socket_stat.st_dev,
@@ -550,7 +551,7 @@ def test_tmux_reviewer_close_disposes_created_server_but_preserves_shared_server
                 if '-a' in args:
                     return SimpleNamespace(returncode=0, stdout='%0\n', stderr='')
                 return SimpleNamespace(returncode=0 if state['pane'] else 1,
-                                       stdout='%1 0 0\n' if state['pane'] else '', stderr='')
+                                       stdout=f'%1 {process.pid} 0\n' if state['pane'] else '', stderr='')
             if args[0] == 'show-options':
                 token = 'anchor' if '%0' in args else 'token'
                 return SimpleNamespace(returncode=0, stdout=token + '\n', stderr='')
@@ -584,6 +585,219 @@ def test_tmux_reviewer_close_disposes_created_server_but_preserves_shared_server
             server_socket.close()
         socket_path.unlink(missing_ok=True)
 
+
+
+@pytest.mark.parametrize('foreign_record', [False, True], ids=['matching-record', 'foreign-record'])
+def test_tmux_reviewer_created_server_record_is_retired_for_consecutive_runs(
+        tmp_path, monkeypatch, foreign_record):
+    import socket
+    import uuid
+    from types import SimpleNamespace
+    from agd_lib import supervision, tmux
+
+    home = tmp_path / 'review-home'
+    (home / 'data').mkdir(parents=True)
+    (home / 'state').mkdir()
+    (home / 'data' / 'home.json').write_text(json.dumps({
+        'schema': 1, 'home_id': str(uuid.uuid4())}))
+    socket_path = tmp_path / 'tmux.sock'
+    server = {'process': None, 'socket': None, 'anchor_token': '', 'pane': None,
+              'pane_alive': False, 'next_pane': 1}
+
+    def start_server():
+        server_socket = socket.socket(socket.AF_UNIX)
+        server_socket.bind(str(socket_path))
+        process = subprocess.Popen(['/bin/sleep', '30'], start_new_session=True)
+        server.update(process=process, socket=server_socket, pane_alive=False,
+                      anchor_token='', pane=None)
+
+    def fake_run(argv, *args, **kwargs):
+        if 'has-session' in argv:
+            return SimpleNamespace(returncode=1, stdout='', stderr='')
+        if 'new-session' in argv:
+            start_server()
+            return SimpleNamespace(returncode=0, stdout='%0\n', stderr='')
+        if 'new-window' in argv:
+            server['pane'] = f"%{server['next_pane']}"
+            server['next_pane'] += 1
+            server['pane_alive'] = True
+            return SimpleNamespace(returncode=0, stdout=server['pane'] + '\n', stderr='')
+        if 'set-option' in argv and '@agd_anchor_owner' in argv:
+            server['anchor_token'] = argv[-1]
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        if 'display-message' in argv:
+            if argv[-1] == '#{pid}':
+                return SimpleNamespace(returncode=0, stdout=str(server['process'].pid), stderr='')
+            if argv[-1] == '#{socket_path}':
+                return SimpleNamespace(returncode=0, stdout=str(socket_path), stderr='')
+        raise AssertionError(argv)
+
+    def fake_call(_endpoint, *args, **_kwargs):
+        if args[0] == 'set-option' and '@agd_reviewer_owner' in args:
+            server['reviewer_token'] = args[-1]
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        if args[0] == 'display-message':
+            return SimpleNamespace(returncode=0, stdout=str(server['process'].pid), stderr='')
+        if args[0] == 'list-panes':
+            if '-a' in args:
+                return SimpleNamespace(returncode=0, stdout='%0\n', stderr='')
+            if not server['pane_alive']:
+                return SimpleNamespace(returncode=1, stdout='', stderr='')
+            return SimpleNamespace(returncode=0, stdout=f"{server['pane']} {server['process'].pid} 0\n", stderr='')
+        if args[0] == 'show-options':
+            target = args[args.index('-t') + 1]
+            if target == '%0':
+                value = server['anchor_token']
+            else:
+                value = server['reviewer_token']
+            return SimpleNamespace(returncode=0, stdout=value + '\n', stderr='')
+        if args[0] == 'kill-pane':
+            target = args[args.index('-t') + 1]
+            if target == '%0':
+                process = server['process']
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=5)
+                server['socket'].close()
+                socket_path.unlink(missing_ok=True)
+            else:
+                server['pane_alive'] = False
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        raise AssertionError(args)
+
+    monkeypatch.setattr(tmux.store, 'run', fake_run)
+    monkeypatch.setattr(tmux, 'call', fake_call)
+    try:
+        first = tmux.reviewer_create(
+            home, str(uuid.uuid4()), ['/bin/sh', '-c', 'sleep 30'],
+            cwd=home, env={'HOME': str(home)})
+        tmux.reviewer_close(home, first)
+        second = tmux.reviewer_create(
+            home, str(uuid.uuid4()), ['/bin/sh', '-c', 'sleep 30'],
+            cwd=home, env={'HOME': str(home)})
+        record = home / 'state' / 'tmux-server.json'
+        if foreign_record:
+            value = json.loads(record.read_text())
+            value['target'] = dict(value['target'], home_id=str(uuid.uuid4()))
+            record.write_text(json.dumps(value))
+            saved = record.read_bytes()
+            with pytest.raises(Refusal):
+                tmux.reviewer_close(home, second)
+            assert record.read_bytes() == saved
+        else:
+            tmux.reviewer_close(home, second)
+            assert not record.exists()
+    finally:
+        process = server['process']
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        server_socket = server['socket']
+        if server_socket is not None and server_socket.fileno() != -1:
+            server_socket.close()
+        socket_path.unlink(missing_ok=True)
+
+
+def test_tmux_reviewer_preserves_preexisting_agd_server_across_runs(
+        tmp_path, monkeypatch):
+    import socket
+    import uuid
+    from types import SimpleNamespace
+    from agd_lib import tmux
+
+    home = tmp_path / 'review-home'
+    (home / 'data').mkdir(parents=True)
+    (home / 'state').mkdir()
+    (home / 'data' / 'home.json').write_text(json.dumps({
+        'schema': 1, 'home_id': str(uuid.uuid4())}))
+    socket_path = tmp_path / 'tmux.sock'
+    server = {'process': None, 'socket': None, 'initialized': False,
+              'anchor_token': '', 'pane': None, 'pane_alive': False,
+              'next_pane': 1}
+
+    def start_server():
+        server_socket = socket.socket(socket.AF_UNIX)
+        server_socket.bind(str(socket_path))
+        process = subprocess.Popen(['/bin/sleep', '30'], start_new_session=True)
+        server.update(process=process, socket=server_socket, initialized=True,
+                      anchor_token='', pane=None, pane_alive=False)
+
+    def fake_run(argv, *args, **kwargs):
+        if 'has-session' in argv:
+            return SimpleNamespace(returncode=0 if server['initialized'] else 1,
+                                   stdout='', stderr='')
+        if 'new-session' in argv:
+            start_server()
+            return SimpleNamespace(returncode=0, stdout='%0\n', stderr='')
+        if 'new-window' in argv:
+            server['pane'] = f"%{server['next_pane']}"
+            server['next_pane'] += 1
+            server['pane_alive'] = True
+            return SimpleNamespace(returncode=0, stdout=server['pane'] + '\n', stderr='')
+        if 'set-option' in argv and '@agd_anchor_owner' in argv:
+            server['anchor_token'] = argv[-1]
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        if 'display-message' in argv:
+            if argv[-1] == '#{pid}':
+                return SimpleNamespace(returncode=0, stdout=str(server['process'].pid), stderr='')
+            if argv[-1] == '#{socket_path}':
+                return SimpleNamespace(returncode=0, stdout=str(socket_path), stderr='')
+        raise AssertionError(argv)
+
+    def fake_call(_endpoint, *args, **_kwargs):
+        if args[0] == 'set-option' and '@agd_reviewer_owner' in args:
+            server['reviewer_token'] = args[-1]
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        if args[0] == 'display-message':
+            return SimpleNamespace(returncode=0, stdout=str(server['process'].pid), stderr='')
+        if args[0] == 'list-panes':
+            if '-a' in args:
+                return SimpleNamespace(returncode=0, stdout='%0\n%9\n', stderr='')
+            if not server['pane_alive']:
+                return SimpleNamespace(returncode=1, stdout='', stderr='')
+            return SimpleNamespace(returncode=0, stdout=f"{server['pane']} {server['process'].pid} 0\n", stderr='')
+        if args[0] == 'show-options':
+            target = args[args.index('-t') + 1]
+            value = server['anchor_token'] if target == '%0' else server['reviewer_token']
+            return SimpleNamespace(returncode=0, stdout=value + '\n', stderr='')
+        if args[0] == 'kill-pane':
+            target = args[args.index('-t') + 1]
+            assert target != '%0'
+            server['pane_alive'] = False
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        raise AssertionError(args)
+
+    monkeypatch.setattr(tmux.store, 'run', fake_run)
+    monkeypatch.setattr(tmux, 'call', fake_call)
+    try:
+        tmux._ensure_server(home)
+        record = home / 'state' / 'tmux-server.json'
+        saved = record.read_bytes()
+        pid = server['process'].pid
+        first = tmux.reviewer_create(
+            home, str(uuid.uuid4()), ['/bin/sh', '-c', 'sleep 30'],
+            cwd=home, env={'HOME': str(home)})
+        tmux.reviewer_close(home, first)
+        assert server['process'].poll() is None
+        assert socket_path.exists()
+        assert record.read_bytes() == saved
+        second = tmux.reviewer_create(
+            home, str(uuid.uuid4()), ['/bin/sh', '-c', 'sleep 30'],
+            cwd=home, env={'HOME': str(home)})
+        tmux.reviewer_close(home, second)
+        assert server['process'].poll() is None
+        assert server['process'].pid == pid
+        assert socket_path.exists()
+        assert record.read_bytes() == saved
+    finally:
+        process = server['process']
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        server_socket = server['socket']
+        if server_socket is not None and server_socket.fileno() != -1:
+            server_socket.close()
+        socket_path.unlink(missing_ok=True)
 
 
 @pytest.mark.parametrize('session', ['default', 'focused'])

@@ -18,7 +18,8 @@ def call(endpoint, *args, check=True):
 
 
 def create(home: Path, task_id: str, incarnation: str, cwd: Path, argv: list[str]) -> dict:
-    cmd, session, server = prefix(home), 'agd', _ensure_server(home)
+    server, _ = _ensure_server(home)
+    cmd, session = prefix(home), 'agd'
     server_pid = str(server['process']['pid'])
     token = str(uuid.uuid4())
     receipt = home/'state'/'tasks'/task_id/'endpoint.json'
@@ -120,7 +121,8 @@ def create_central(home: Path, launch_id: str, endpoint_token: str, managed_argv
             or not all(isinstance(arg, str) for arg in expected_omp_argv)
             or not all(isinstance(key, str) and isinstance(value, str) for key, value in launch_env.items())):
         raise store.Refusal('tmux central command is malformed')
-    cmd, session, server = prefix(home), 'agd', _ensure_server(home)
+    server, _ = _ensure_server(home)
+    cmd, session = prefix(home), 'agd'
     server_pid = str(server['process']['pid'])
     command = shlex.join(['exec', 'env', *[f'{key}={value}' for key, value in sorted(launch_env.items())], *managed_argv])
     window, pane, tty = store.run([*cmd, 'new-window', '-d', '-P', '-F', '#{window_id} #{pane_id} #{pane_tty}', '-t', session,
@@ -205,7 +207,7 @@ def _ensure_server(home):
     previous = uninstall_state.read_evidence(path, private=True) if os.path.lexists(path) else None
     if previous and not _uninstall_server(home, previous):
         raise store.Refusal('previous tmux server is absent; evidence retained')
-    cmd, anchor = prefix(home), None
+    cmd, anchor, created = prefix(home), None, False
     if store.run([*cmd, 'has-session', '-t', 'agd'], check=False).returncode:
         pane = store.run([*cmd, 'new-session', '-d', '-P', '-F', '#{pane_id}', '-s', 'agd',
                           '-n', 'anchor', '-c', str(home)], timeout=10).stdout.strip()
@@ -214,6 +216,7 @@ def _ensure_server(home):
         token = uuid.uuid4().hex
         store.run([*cmd, 'set-option', '-p', '-t', pane, '@agd_anchor_owner', token])
         anchor = {'pane': pane, 'token_sha256': hashlib.sha256(token.encode()).hexdigest()}
+        created = True
     current = _server_evidence(home)
     if previous:
         if (previous['target'] != current['target'] or previous['socket'] != current['socket']
@@ -223,7 +226,7 @@ def _ensure_server(home):
     else:
         current['anchor'] = anchor
     store.atomic_json(path, current)
-    return current
+    return current, created
 
 
 def _uninstall_server(home, server):
@@ -319,7 +322,7 @@ def reviewer_create(home: Path, review_run_id: str, command: list[str], *, cwd: 
     if not isinstance(env, Mapping) or not all(isinstance(key, str) and key.isidentifier() and isinstance(value, str)
                                                for key, value in env.items()):
         raise store.Refusal('reviewer environment is malformed')
-    server = _ensure_server(home)
+    server, created = _ensure_server(home)
     token = uuid.uuid4().hex
     pane = None
     env_file = cwd / '.reviewer-env'
@@ -336,6 +339,7 @@ def reviewer_create(home: Path, review_run_id: str, command: list[str], *, cwd: 
         endpoint = {'schema': 1, 'backend': 'tmux', 'review_run_id': run_id,
                     'home': str(home), 'prefix': prefix(home), 'session': 'agd',
                     'pane': pane, 'token': token, 'server': server,
+                    'server_created': created,
                     'target': supervision.runtime_home_identity(home),
                     'expected_process_argv': list(command), 'env_file': str(env_file)}
         call(endpoint, 'set-option', '-p', '-t', pane, '@agd_reviewer_owner', token)
@@ -408,13 +412,29 @@ def _reviewer_anchor_owned(endpoint):
     return True
 
 
+def _reviewer_retire_server_record(endpoint, server):
+    from . import uninstall_state
+    home = Path(endpoint['home'])
+    _reviewer_target(home, endpoint)
+    path = home / 'state' / 'tmux-server.json'
+    if not os.path.lexists(path):
+        return
+    evidence = uninstall_state.read_evidence(path, private=True)
+    if evidence != server:
+        raise store.Refusal('tmux server evidence differs')
+    path.unlink()
+
+
 def _reviewer_dispose_server(endpoint):
     server = endpoint.get('server')
     if not isinstance(server, dict):
         raise store.Refusal('reviewer tmux server identity is malformed')
+    if endpoint.get('server_created') is not True:
+        return
     if 'anchor' not in server or server['anchor'] is None:
         return
     if not _reviewer_server_live(endpoint):
+        _reviewer_retire_server_record(endpoint, server)
         return
     _reviewer_anchor_owned(endpoint)
     call(endpoint, 'kill-pane', '-t', server['anchor']['pane'])
@@ -427,8 +447,7 @@ def _reviewer_dispose_server(endpoint):
     socket_path = server['socket']['path']
     if os.path.lexists(socket_path):
         raise store.Refusal('reviewer tmux server socket remains')
-
-
+    _reviewer_retire_server_record(endpoint, server)
 
 def _reviewer_owned(endpoint):
     if not _reviewer_server_live(endpoint):
