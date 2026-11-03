@@ -539,3 +539,67 @@ def test_docker_absence_can_be_verified_after_home_removal(monkeypatch):
             shutil.rmtree(root)
             assert all(row['presence'] == 'absent' for row in
                        observability.uninstall_inventory(root, expected=resources))
+
+
+def test_optional_cli_damage_does_not_block_native_review_environment(monkeypatch):
+    from agd_lib import langfuse_cli
+
+    with lab() as (home, _):
+        receipt = langfuse_cli._paths(home)['receipt']
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text(json.dumps({'schema': 1, 'secret_key': 'not-a-valid-receipt'}))
+        monkeypatch.setenv('LANGFUSE_HOST', 'https://outside.invalid')
+        monkeypatch.setenv('LANGFUSE_SECRET_KEY', 'outside-secret')
+
+        environment, generation, warning = observability.reviewer_environment(
+            home, '00000000-0000-4000-8000-000000000003')
+
+    assert environment['AGD_HOME'] == str(home)
+    assert generation == '0'
+    assert warning is None
+    assert not any(key.startswith('LANGFUSE_') for key in environment)
+
+
+def test_local_query_env_does_not_start_docker(monkeypatch):
+    with lab() as (home, _):
+        rendered = observability.render_stack(home)
+        observability._save_state(home, 'enabled', 'healthy', rendered)
+        config = observability.read_config(home)
+        secrets = observability._read_secrets(home)
+        calls = []
+
+        def forbidden(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError('local query context must not invoke Docker')
+
+        monkeypatch.setattr(observability.subprocess, 'run', forbidden)
+        context = observability.langfuse_query_context(home)
+
+    assert context['base_url'] == f"http://127.0.0.1:{config['ports']['web_port']}"
+    assert context['project_id'] == config['project_id'] == secrets['project_id']
+    assert context['public_key'] == secrets['public_key']
+    assert context['secret_key'] == secrets['secret_key']
+    assert calls == []
+
+
+def test_langfuse_keys_absent_from_status_receipts_and_errors():
+    from agd_lib import langfuse_cli
+
+    known_secret = 'sk-local-status-secret'
+    with lab() as (home, _):
+        rendered = observability.render_stack(home)
+        observability._save_state(home, 'enabled', 'stopped', rendered)
+        status = observability.read_status(home)
+        receipt = langfuse_cli._paths(home)['receipt']
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(json.dumps({'schema': 1, 'secret_key': known_secret}))
+        environment, availability = langfuse_cli.reviewer_environment(
+            home, {'LANGFUSE_SECRET_KEY': known_secret})
+        with pytest.raises(store.Refusal) as raised:
+            langfuse_cli.read_installation(home)
+
+    assert known_secret not in json.dumps(availability, sort_keys=True)
+    assert not any(key.startswith('LANGFUSE_') for key in environment)
+    assert known_secret not in json.dumps(status, sort_keys=True)
+    assert known_secret not in str(raised.value)
+

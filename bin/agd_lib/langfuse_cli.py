@@ -198,6 +198,44 @@ def _safe_reason(error):
     return reason[:160] or type(error).__name__
 
 
+
+def reviewer_environment(home, inherited):
+    """Return a credential-free base env plus optional local query settings."""
+    environment = {key: value for key, value in dict(inherited).items()
+                   if not key.startswith('LANGFUSE_')}
+    unavailable = {'available': False, 'reason': None}
+    try:
+        from . import observability
+        context = observability.langfuse_query_context(home)
+    except (OSError, ValueError, TypeError, store.Refusal):
+        context = None
+    if context is None:
+        unavailable['reason'] = 'local Langfuse query is unavailable'
+        return environment, unavailable
+
+    def private_run(argv, **kwargs):
+        options = dict(kwargs)
+        options['env'] = environment
+        return store.run(argv, **options)
+
+    try:
+        validate_installation(home, run=private_run)
+    except (OSError, ValueError, TypeError, store.Refusal, store.DependencyError) as error:
+        unavailable['reason'] = _safe_reason(error)
+        return environment, unavailable
+    host = context['base_url']
+    launcher = str(_paths(home)['bin'])
+    environment['PATH'] = launcher + (os.pathsep + environment['PATH'] if environment.get('PATH') else '')
+    environment.update(
+        LANGFUSE_HOST=host,
+        LANGFUSE_BASE_URL=host,
+        LANGFUSE_PROJECT_ID=context['project_id'],
+        LANGFUSE_PUBLIC_KEY=context['public_key'],
+        LANGFUSE_SECRET_KEY=context['secret_key'],
+        LANGFUSE_API_VERSION='auto',
+    )
+    return environment, {'available': True, 'reason': None}
+
 def _chunks(value):
     value = value() if callable(value) else value
     if isinstance(value, bytes):
@@ -304,9 +342,12 @@ def _candidate(which):
         return None
     if not value:
         return None
-    path = Path(value)
+    try:
+        path = Path(value).resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise store.Refusal('Langfuse command path is unavailable') from error
     _regular(path, executable=True)
-    return path.resolve()
+    return path
 
 
 def _write_receipt(path, value):

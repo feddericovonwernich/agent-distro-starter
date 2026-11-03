@@ -137,6 +137,36 @@ def read_status(home):
     return value
 
 
+def langfuse_query_context(home):
+    home = _home(home)
+    try:
+        config = read_config(home)
+        status = read_status(home)
+        if config.get('mode') != 'enabled' or status.get('runtime') != 'healthy':
+            return None
+        ports = config.get('ports')
+        web_port = ports.get('web_port') if isinstance(ports, dict) else None
+        if type(web_port) is not int or not 1 <= web_port <= 65535:
+            return None
+        project_id = config.get('project_id')
+        secrets = _read_secrets(home)
+        if (not isinstance(project_id, str) or not project_id
+                or secrets.get('project_id') != project_id):
+            return None
+        values = {key: secrets.get(key) for key in ('public_key', 'secret_key')}
+        if any(not isinstance(value, str) or not value for value in values.values()):
+            return None
+        _existing_private_directory(home, 'data', 'observability')
+        return {
+            'base_url': f'http://127.0.0.1:{web_port}',
+            'project_id': project_id,
+            'public_key': values['public_key'],
+            'secret_key': values['secret_key'],
+        }
+    except (OSError, ValueError, TypeError, KeyError, store.Refusal):
+        return None
+
+
 def worker_binding_locked(home, task_id, incarnation):
     home = _home(home)
     task_id = store.validate_id(task_id)
@@ -259,6 +289,11 @@ def reviewer_environment(home, review_run_id):
         home, {key: value for key, value in os.environ.items()
                if not key.startswith('OTEL_') and key not in {'AGD_TASK_ID', 'AGD_INCARNATION', 'AGD_MANAGED_CENTRAL', 'AGD_OWNER'}})
     env['AGD_HOME'] = str(home)
+    try:
+        from . import langfuse_cli
+        env, _ = langfuse_cli.reviewer_environment(home, env)
+    except (OSError, ValueError, TypeError, store.Refusal, store.DependencyError):
+        env = {key: value for key, value in env.items() if not key.startswith('LANGFUSE_')}
     if config['mode'] == 'disabled':
         return env, config['generation'], None
     allocation, project_id = config.get('ports'), config.get('project_id')

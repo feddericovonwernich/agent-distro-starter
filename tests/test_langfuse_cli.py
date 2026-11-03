@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import sys
 
 import pytest
+from support import lab
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'bin'))
@@ -84,12 +86,17 @@ def test_langfuse_reuses_external_official_cli_without_ownership(tmp_path, monke
         path.write_text(body)
         path.chmod(0o755 if name.startswith('bin/') else 0o644)
     executable = package / 'bin/langfuse'
+    command = external / 'node_modules/.bin/langfuse'
+    command.parent.mkdir()
+    command.symlink_to('../@langfuse/cli/bin/langfuse')
     node, _npm = _node_tools(tmp_path)
+    archive = _archive(_package_files())
+    monkeypatch.setattr(cli, 'ARCHIVE_SHA256', hashlib.sha256(archive).hexdigest(), raising=False)
     calls = []
 
     def which(name):
         calls.append(('which', name))
-        return str(executable) if name == 'langfuse' else str(node) if name == 'node' else None
+        return str(command) if name == 'langfuse' else str(node) if name == 'node' else None
 
     def run(argv, **kwargs):
         calls.append(('run', [str(item) for item in argv]))
@@ -101,16 +108,8 @@ def test_langfuse_reuses_external_official_cli_without_ownership(tmp_path, monke
             return _result('{"commands": {}}\n')
         raise AssertionError(argv)
 
-    # The fixture is trusted only when its package bytes are explicitly recorded
-    # as the verified archive contents; the implementation must still revalidate.
-    assets = {
-        str(path.relative_to(package)): hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in package.rglob('*') if path.is_file()
-    }
-    monkeypatch.setattr(cli, 'PINNED_ASSET_HASHES', assets, raising=False)
     result = cli.ensure_installed(
-        tmp_path, run=run, which=which,
-        fetch_bytes=lambda _url: iter([b'not-needed-for-external']),
+        tmp_path, run=run, which=which, fetch_bytes=lambda _url: iter([archive]),
     )
 
     assert result['source'] == 'external'
@@ -118,7 +117,45 @@ def test_langfuse_reuses_external_official_cli_without_ownership(tmp_path, monke
     launcher = tmp_path / 'data/langfuse-cli/bin/langfuse'
     assert launcher.is_file() and os.access(launcher, os.X_OK)
     assert json.loads((tmp_path / 'data/langfuse-cli/installation.json').read_text())['owned'] is False
+    assert command.is_symlink()
     assert executable.read_bytes() == (package / 'bin/langfuse').read_bytes()
+
+
+def test_langfuse_tampered_external_assets_are_not_executed_or_reused(tmp_path, monkeypatch):
+    cli = _cli()
+    external = tmp_path / 'shared'
+    package = external / 'node_modules/@langfuse/cli'
+    (package / 'bin').mkdir(parents=True)
+    archive_files = _package_files()
+    archive = _archive(archive_files)
+    for name, body in archive_files.items():
+        path = package / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+        path.chmod(0o755 if name.startswith('bin/') else 0o644)
+    executable = package / 'bin/langfuse'
+    executable.write_text('#!/usr/bin/env node\nconsole.log("tampered")\n')
+    command = external / 'node_modules/.bin/langfuse'
+    command.parent.mkdir()
+    command.symlink_to('../@langfuse/cli/bin/langfuse')
+    node, _npm = _node_tools(tmp_path)
+    monkeypatch.setattr(cli, 'ARCHIVE_SHA256', hashlib.sha256(archive).hexdigest(), raising=False)
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append([str(item) for item in argv])
+        return _result('22.19.0\n')
+
+    with pytest.raises(Refusal):
+        cli.ensure_installed(
+            tmp_path, run=run,
+            which=lambda name: str(command) if name == 'langfuse' else str(node) if name == 'node' else None,
+            fetch_bytes=lambda _url: iter([archive]),
+        )
+
+    assert not any(row[0] == str(executable) for row in calls)
+    assert executable.read_text() == '#!/usr/bin/env node\nconsole.log("tampered")\n'
+    assert not (tmp_path / 'data/langfuse-cli/installation.json').exists()
 
 
 def test_langfuse_verified_private_install_is_atomic(tmp_path, monkeypatch):
@@ -420,3 +457,96 @@ def test_root_owned_group_writable_node_or_npm_is_rejected(tmp_path, monkeypatch
         )
     assert calls == []
     assert not (tmp_path / 'data/langfuse-cli/bin/langfuse').exists()
+@pytest.mark.parametrize(('runtime', 'available'), [('healthy', True), ('stopped', False)])
+def test_reviewer_langfuse_env_uses_only_owned_local_project(tmp_path, monkeypatch, runtime, available):
+    cli = _cli()
+    from agd_lib import observability
+
+    with lab() as (home, _):
+        rendered = observability.render_stack(home)
+        observability._save_state(home, 'enabled', runtime, rendered)
+        config = observability.read_config(home)
+        secret = observability._read_secrets(home)
+        host = f"http://127.0.0.1:{config['ports']['web_port']}"
+
+        external = tmp_path / 'shared'
+        package = external / 'node_modules/@langfuse/cli'
+        package_files = _package_files()
+        (package / 'bin').mkdir(parents=True)
+        (package / 'bin').chmod(0o755)
+        package.chmod(0o755)
+        package.parent.chmod(0o755)
+        for name, body in package_files.items():
+            path = package / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body)
+            path.chmod(0o755 if name.startswith('bin/') else 0o644)
+        executable = package / 'bin/langfuse'
+        node, _npm = _node_tools(tmp_path)
+        archive = _archive(package_files)
+        monkeypatch.setattr(cli, 'ARCHIVE_SHA256', hashlib.sha256(archive).hexdigest(), raising=False)
+
+        def run(argv, **kwargs):
+            if argv[0] == str(node) and argv[1:2] == ['-p']:
+                return _result('22.19.0\n')
+            if str(argv[0]) == str(executable) and argv[1:] == ['--version']:
+                return _result('1.2.4\n')
+            if str(argv[0]) == str(executable) and argv[1:] == ['api', 'schema', '--json']:
+                return _result('{"commands": {}}\n')
+            raise AssertionError(argv)
+
+        cli.ensure_installed(
+            home, run=run,
+            which=lambda name: str(executable) if name == 'langfuse' else str(node) if name == 'node' else None,
+            fetch_bytes=lambda _url: iter([archive]),
+        )
+        original_validate = cli.validate_installation
+        monkeypatch.setattr(
+            cli, 'validate_installation',
+            lambda target, **_kwargs: original_validate(target, run=run))
+
+        inherited = {
+            'PATH': '/usr/bin',
+            'LANGFUSE_HOST': 'https://cloud.invalid',
+            'LANGFUSE_BASE_URL': 'https://cloud.invalid',
+            'LANGFUSE_PUBLIC_KEY': 'ambient-public',
+            'LANGFUSE_SECRET_KEY': 'ambient-secret',
+            'LANGFUSE_PROJECT_ID': 'ambient-project',
+        }
+        environment, status = cli.reviewer_environment(home, inherited)
+
+    if available:
+        assert status == {'available': True, 'reason': None}
+        assert environment['LANGFUSE_HOST'] == host
+        assert environment['LANGFUSE_BASE_URL'] == host
+        assert environment['LANGFUSE_PROJECT_ID'] == secret['project_id']
+        assert environment['LANGFUSE_PUBLIC_KEY'] == secret['public_key']
+        assert environment['LANGFUSE_SECRET_KEY'] == secret['secret_key']
+        assert environment['LANGFUSE_API_VERSION'] == 'auto'
+        assert environment['PATH'].split(':', 1)[0] == str(home / 'data/langfuse-cli/bin')
+    else:
+        assert status['available'] is False
+        assert status['reason']
+        assert not any(key.startswith('LANGFUSE_') for key in environment)
+        assert environment['PATH'] == '/usr/bin'
+
+
+def test_ambient_cloud_keys_removed_when_query_unavailable(monkeypatch):
+    cli = _cli()
+    inherited = {
+        'LANGFUSE_HOST': 'https://cloud.invalid',
+        'LANGFUSE_BASE_URL': 'https://cloud.invalid',
+        'LANGFUSE_PUBLIC_KEY': 'ambient-public',
+        'LANGFUSE_SECRET_KEY': 'ambient-secret',
+        'LANGFUSE_PROJECT_ID': 'ambient-project',
+    }
+    with lab() as (home, _):
+        environment, status = cli.reviewer_environment(home, inherited)
+
+    assert not any(key.startswith('LANGFUSE_') for key in environment)
+    assert status['available'] is False
+    assert status['reason']
+
+
+
+

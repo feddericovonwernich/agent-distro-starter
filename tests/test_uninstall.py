@@ -476,3 +476,48 @@ def test_partial_recovery_revalidates_home_inode_at_deletion(tmp_path, monkeypat
                            lambda _message: None)
         assert replacement and snapshot(home) == replacement[0]
         assert (moved / 'data/home.json').is_file()
+
+
+def test_uninstall_retains_external_cli_and_node(tmp_path):
+    from agd_lib import langfuse_cli
+
+    home = fixture_home(tmp_path)
+    external = tmp_path / 'shared'
+    package = external / 'node_modules/@langfuse/cli'
+    (package / 'bin').mkdir(parents=True)
+    (package / 'bin').chmod(0o755)
+    package.chmod(0o755)
+    package.parent.chmod(0o755)
+    (package / 'package.json').write_text(json.dumps({
+        'name': '@langfuse/cli', 'version': langfuse_cli.VERSION,
+        'bin': {'langfuse': 'bin/langfuse'}, 'dependencies': {},
+    }))
+    (package / 'package.json').chmod(0o644)
+    entry = package / 'bin/langfuse'
+    entry.write_text('#!/usr/bin/env node\nconsole.log("langfuse")\n')
+    entry.chmod(0o755)
+    node = external / 'bin/node'
+    node.parent.mkdir(parents=True)
+    node.write_text('#!/bin/sh\n')
+    node.chmod(0o755)
+
+    managed = home / 'data/langfuse-cli'
+    launcher = managed / 'bin/langfuse'
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text(langfuse_cli._launcher(node, entry))
+    launcher.chmod(0o700)
+    (managed / 'installation.json').write_text(json.dumps({
+        'schema': 1, 'source': 'external', 'owned': False, 'version': langfuse_cli.VERSION,
+        'package': str(package), 'entry': str(entry), 'node': str(node),
+        'launcher': str(launcher), 'assets': langfuse_cli._asset_map(package),
+    }))
+    external_before = snapshot(external)
+
+    code, stdout, stderr = terminal(
+        [home / 'bin/agd', '--home', '.', 'uninstall'],
+        cwd=home, home=home, timeout=60)
+
+    assert code == 0, (stdout, stderr)
+    assert json.loads(stdout)['outcome'] == 'uninstalled'
+    assert not home.exists()
+    assert snapshot(external) == external_before
