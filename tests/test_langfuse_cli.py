@@ -3,9 +3,12 @@ import io
 import json
 import os
 import tarfile
+import sys
+import threading
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-import sys
 
 import pytest
 from support import lab
@@ -58,6 +61,69 @@ def _node_tools(tmp_path):
         path.chmod(0o755)
     return node, npm
 
+
+@contextmanager
+def _query_loopback(web_port, collector_port, project_id):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append((self.path, self.headers.get('Authorization')))
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            payload = {'data': [{'id': project_id}]} if self.path.endswith('/projects') else {}
+            self.wfile.write(json.dumps(payload).encode())
+
+        def log_message(self, *_args):
+            pass
+
+    servers = [
+        ThreadingHTTPServer(('127.0.0.1', web_port), Handler),
+        ThreadingHTTPServer(('127.0.0.1', collector_port), Handler),
+    ]
+    threads = [threading.Thread(target=server.serve_forever, daemon=True)
+               for server in servers]
+    for thread in threads:
+        thread.start()
+    try:
+        yield requests
+    finally:
+        for server in servers:
+            server.shutdown()
+        for thread in threads:
+            thread.join(timeout=2)
+        for server in servers:
+            server.server_close()
+
+
+def _query_ownership(home_id, project, web_port):
+    container = {
+        'Config': {'Labels': {
+            'agd.home_id': home_id,
+            'com.docker.compose.project': project,
+            'com.docker.compose.service': 'langfuse-web',
+        }},
+        'State': {'Running': True},
+        'NetworkSettings': {'Ports': {
+            '3000/tcp': [{'HostIp': '127.0.0.1', 'HostPort': str(web_port)}],
+        }},
+    }
+
+    def inspect(argv):
+        if argv[:3] in (
+                ['docker', 'network', 'inspect'],
+                ['docker', 'volume', 'inspect']):
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps([{'Labels': {'agd.home_id': home_id}}]),
+                stderr='')
+        if argv[:3] == ['docker', 'ps', '-aq']:
+            return SimpleNamespace(returncode=0, stdout='web-container\n', stderr='')
+        if argv[:3] == ['docker', 'container', 'inspect']:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([container]), stderr='')
+        raise AssertionError(argv)
+
+    return inspect
 
 def test_langfuse_opt_out_has_no_probes_or_writes(tmp_path):
     cli = _cli()
@@ -472,6 +538,10 @@ def test_reviewer_langfuse_env_uses_only_owned_local_project(tmp_path, monkeypat
         config = observability.read_config(home)
         secret = observability._read_secrets(home)
         host = f"http://127.0.0.1:{config['ports']['web_port']}"
+        monkeypatch.setattr(
+            observability, '_ownership_command',
+            _query_ownership(rendered['home_id'], rendered['project'],
+                             rendered['web_port']))
 
         external = tmp_path / 'shared'
         package = external / 'node_modules/@langfuse/cli'
@@ -517,7 +587,10 @@ def test_reviewer_langfuse_env_uses_only_owned_local_project(tmp_path, monkeypat
             'LANGFUSE_SECRET_KEY': 'ambient-secret',
             'LANGFUSE_PROJECT_ID': 'ambient-project',
         }
-        environment, status = cli.reviewer_environment(home, inherited)
+        with _query_loopback(config['ports']['web_port'],
+                             config['ports']['collector_health_port'],
+                             secret['project_id']) as requests:
+            environment, status = cli.reviewer_environment(home, inherited)
 
     if available:
         assert status == {'available': True, 'reason': None}
@@ -528,11 +601,16 @@ def test_reviewer_langfuse_env_uses_only_owned_local_project(tmp_path, monkeypat
         assert environment['LANGFUSE_SECRET_KEY'] == secret['secret_key']
         assert environment['LANGFUSE_API_VERSION'] == 'auto'
         assert environment['PATH'].split(':', 1)[0] == str(home / 'data/langfuse-cli/bin')
+        assert requests
+        assert all(auth is None for _path, auth in requests[:-1])
+        assert requests[-1][0].endswith('/projects')
+        assert requests[-1][1].startswith('Basic ')
     else:
         assert status['available'] is False
         assert status['reason']
         assert not any(key.startswith('LANGFUSE_') for key in environment)
         assert environment['PATH'] == '/usr/bin'
+        assert requests == []
 
 
 def test_ambient_cloud_keys_removed_when_query_unavailable(monkeypatch):
@@ -554,3 +632,46 @@ def test_ambient_cloud_keys_removed_when_query_unavailable(monkeypatch):
 
 
 
+def test_reviewer_environment_drops_keys_when_healthy_record_is_stale(monkeypatch):
+    cli = _cli()
+    from agd_lib import observability
+
+    with lab() as (home, _):
+        rendered = observability.render_stack(home)
+        observability._save_state(home, 'enabled', 'healthy', rendered)
+        home_id = rendered['home_id']
+        container = {
+            'Config': {'Labels': {
+                'agd.home_id': home_id,
+                'com.docker.compose.project': rendered['project'],
+                'com.docker.compose.service': 'langfuse-web',
+            }},
+            'State': {'Running': True},
+            'NetworkSettings': {'Ports': {
+                '3000/tcp': [{'HostIp': '127.0.0.1',
+                              'HostPort': str(rendered['web_port'])}],
+            }},
+        }
+
+        def inspect(argv):
+            if argv[:3] in (
+                    ['docker', 'network', 'inspect'],
+                    ['docker', 'volume', 'inspect']):
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps([{'Labels': {'agd.home_id': home_id}}]),
+                    stderr='')
+            if argv[:3] == ['docker', 'ps', '-aq']:
+                return SimpleNamespace(returncode=0, stdout='web-container\n', stderr='')
+            if argv[:3] == ['docker', 'container', 'inspect']:
+                return SimpleNamespace(returncode=0, stdout=json.dumps([container]), stderr='')
+            raise AssertionError(argv)
+
+        monkeypatch.setattr(observability, '_ownership_command', inspect)
+        monkeypatch.setattr(cli, 'validate_installation', lambda *_a, **_k: None)
+        environment, status = cli.reviewer_environment(
+            home, {'PATH': '/usr/bin', 'LANGFUSE_SECRET_KEY': 'ambient-secret'})
+
+    assert status['available'] is False
+    assert status['reason']
+    assert not any(key.startswith('LANGFUSE_') for key in environment)

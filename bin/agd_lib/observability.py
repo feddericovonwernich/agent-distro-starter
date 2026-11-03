@@ -16,6 +16,11 @@ from pathlib import Path
 from . import omp_runtime, store
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
 def paths(home):
     return _paths(_home(home))
 
@@ -144,9 +149,14 @@ def langfuse_query_context(home):
         status = read_status(home)
         if config.get('mode') != 'enabled' or status.get('runtime') != 'healthy':
             return None
+        if (not isinstance(config.get('project'), str)
+                or config.get('home_id') != _home_id(home)):
+            return None
         ports = config.get('ports')
         web_port = ports.get('web_port') if isinstance(ports, dict) else None
-        if type(web_port) is not int or not 1 <= web_port <= 65535:
+        collector_port = ports.get('collector_health_port') if isinstance(ports, dict) else None
+        if (type(web_port) is not int or not 1 <= web_port <= 65535
+                or type(collector_port) is not int or not 1 <= collector_port <= 65535):
             return None
         project_id = config.get('project_id')
         secrets = _read_secrets(home)
@@ -156,14 +166,37 @@ def langfuse_query_context(home):
         values = {key: secrets.get(key) for key in ('public_key', 'secret_key')}
         if any(not isinstance(value, str) or not value for value in values.values()):
             return None
-        _existing_private_directory(home, 'data', 'observability')
+        containers = _require_owned_resources({
+            'project': config['project'], 'home_id': config['home_id']})
+        web = next((
+            value for value in containers
+            if value.get('Config', {}).get('Labels', {}).get(
+                'com.docker.compose.project') == config['project']
+            and value.get('Config', {}).get('Labels', {}).get(
+                'com.docker.compose.service') == 'langfuse-web'
+            and value.get('State', {}).get('Running') is True
+        ), None)
+        bindings = (web or {}).get('NetworkSettings', {}).get('Ports', {}).get('3000/tcp')
+        if not isinstance(bindings, list) or not any(
+                isinstance(binding, dict)
+                and binding.get('HostIp') == '127.0.0.1'
+                and str(binding.get('HostPort')) == str(web_port)
+                for binding in bindings):
+            return None
+        rendered = dict(ports)
+        rendered['project'] = config['project']
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _NoRedirect())
+        if not _ready(rendered, secrets, opener=opener):
+            return None
         return {
             'base_url': f'http://127.0.0.1:{web_port}',
             'project_id': project_id,
             'public_key': values['public_key'],
             'secret_key': values['secret_key'],
         }
-    except (OSError, ValueError, TypeError, KeyError, store.Refusal):
+    except (OSError, ValueError, TypeError, KeyError, urllib.error.URLError,
+            store.Refusal, store.DependencyError):
         return None
 
 
@@ -783,7 +816,7 @@ def _compose(rendered, *command):
 def _require_owned_resources(rendered):
     home_id = rendered.get('home_id')
     if not home_id:
-        return
+        return []
     names = [('network', rendered['project'] + '_network'),
              *[('volume', rendered['project'] + suffix) for suffix in ('_postgres', '_clickhouse', '_redis', '_minio')]]
     for kind, name in names:
@@ -800,6 +833,7 @@ def _require_owned_resources(rendered):
                                      f'label=com.docker.compose.project={rendered["project"]}'])
     if containers.returncode:
         raise store.Refusal('observability container ownership is uncertain')
+    owned_containers = []
     for container_id in containers.stdout.split():
         inspected = _ownership_command(['docker', 'container', 'inspect', container_id])
         try:
@@ -808,6 +842,9 @@ def _require_owned_resources(rendered):
             raise store.Refusal('observability container ownership is uncertain')
         if value.get('Config', {}).get('Labels', {}).get('agd.home_id') != home_id:
             raise store.Refusal('observability resource belongs to another home')
+        owned_containers.append(value)
+    return owned_containers
+
 
 def _ownership_command(command):
     try:
@@ -818,12 +855,13 @@ def _ownership_command(command):
         raise store.Refusal('observability ownership inspection is unavailable') from error
 
 
-def _ready(rendered, value):
-    with urllib.request.urlopen(
+def _ready(rendered, value, opener=None):
+    open_url = urllib.request.urlopen if opener is None else opener.open
+    with open_url(
             f"http://127.0.0.1:{rendered['collector_health_port']}/", timeout=3) as collector:
         if collector.status != 200:
             return False
-    with urllib.request.urlopen(
+    with open_url(
             f"http://127.0.0.1:{rendered['web_port']}/api/public/health", timeout=3) as response:
         if response.status != 200:
             return False
@@ -831,8 +869,11 @@ def _ready(rendered, value):
     request = urllib.request.Request(
         f"http://127.0.0.1:{rendered['web_port']}/api/public/projects",
         headers={'Authorization': 'Basic ' + auth})
-    with urllib.request.urlopen(request, timeout=5) as project_response:
-        payload = json.loads(project_response.read())
+    with open_url(request, timeout=5) as project_response:
+        payload = project_response.read(1024 * 1024 + 1)
+    if len(payload) > 1024 * 1024:
+        return False
+    payload = json.loads(payload)
     projects = payload.get('data', payload) if isinstance(payload, dict) else payload
     return isinstance(projects, list) and any(
         isinstance(project, dict) and project.get('id') == value['project_id'] for project in projects)

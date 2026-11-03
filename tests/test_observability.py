@@ -3,6 +3,9 @@ import os
 import socket
 import subprocess
 import sys
+import threading
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -561,20 +564,16 @@ def test_local_query_env_does_not_start_docker(monkeypatch):
         observability._save_state(home, 'enabled', 'healthy', rendered)
         config = observability.read_config(home)
         secrets = observability._read_secrets(home)
-        calls = []
-
-        def forbidden(*args, **kwargs):
-            calls.append((args, kwargs))
-            raise AssertionError('local query context must not invoke Docker')
-
-        monkeypatch.setattr(observability.subprocess, 'run', forbidden)
-        context = observability.langfuse_query_context(home)
+        monkeypatch.setattr(
+            observability, '_ownership_command',
+            _owned_query_probe(home, rendered))
+        with _loopback_probe(config['ports']['web_port'], secrets['project_id'],
+                             config['ports']['collector_health_port']):
+            context = observability.langfuse_query_context(home)
 
     assert context['base_url'] == f"http://127.0.0.1:{config['ports']['web_port']}"
     assert context['project_id'] == config['project_id'] == secrets['project_id']
-    assert context['public_key'] == secrets['public_key']
-    assert context['secret_key'] == secrets['secret_key']
-    assert calls == []
+    assert all(context[key] == secrets[key] for key in ('public_key', 'secret_key'))
 
 
 def test_langfuse_keys_absent_from_status_receipts_and_errors():
@@ -601,3 +600,121 @@ def test_langfuse_keys_absent_from_status_receipts_and_errors():
     assert known_secret not in json.dumps(status, sort_keys=True)
     assert known_secret not in str(raised.value)
 
+@contextmanager
+def _loopback_probe(port, project_id, collector_port=None):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append((self.path, self.headers.get('Authorization')))
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            payload = {'data': [{'id': project_id}]} if self.path.endswith('/projects') else {}
+            self.wfile.write(json.dumps(payload).encode())
+
+        def log_message(self, *_args):
+            pass
+
+    servers = [ThreadingHTTPServer(('127.0.0.1', port), Handler)]
+    if collector_port is not None:
+        servers.append(ThreadingHTTPServer(('127.0.0.1', collector_port), Handler))
+    threads = [threading.Thread(target=server.serve_forever, daemon=True) for server in servers]
+    for thread in threads:
+        thread.start()
+    try:
+        yield requests
+    finally:
+        for server in servers:
+            server.shutdown()
+        for thread in threads:
+            thread.join(timeout=2)
+        for server in servers:
+            server.server_close()
+
+
+def _owned_query_probe(home, rendered, *, home_id=None, service='langfuse-web',
+                       running=True, published_port=None):
+    from types import SimpleNamespace
+
+    home_id = home_id or rendered['home_id']
+    container = {
+        'Config': {'Labels': {
+            'agd.home_id': home_id,
+            'com.docker.compose.project': rendered['project'],
+            'com.docker.compose.service': service,
+        }},
+        'State': {'Running': running},
+        'NetworkSettings': {'Ports': {
+            '3000/tcp': [{'HostIp': '127.0.0.1',
+                          'HostPort': str(published_port or rendered['web_port'])}],
+        }},
+    }
+
+    def inspect(argv):
+        if argv[:3] in (
+                ['docker', 'network', 'inspect'],
+                ['docker', 'volume', 'inspect']):
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{
+                'Labels': {'agd.home_id': home_id},
+            }]), stderr='')
+        if argv[:3] == ['docker', 'ps', '-aq']:
+            return SimpleNamespace(returncode=0, stdout='web-container\n', stderr='')
+        if argv[:3] == ['docker', 'container', 'inspect']:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([container]), stderr='')
+        raise AssertionError(argv)
+
+    return inspect
+
+
+def test_query_context_requires_owned_live_loopback_binding(monkeypatch):
+    with lab() as (home, _):
+        rendered = observability.render_stack(home)
+        observability._save_state(home, 'enabled', 'healthy', rendered)
+        secrets = observability._read_secrets(home)
+        monkeypatch.setattr(
+            observability, '_ownership_command',
+            _owned_query_probe(home, rendered))
+        with _loopback_probe(rendered['web_port'], secrets['project_id'],
+                             rendered['collector_health_port']) as requests:
+            context = observability.langfuse_query_context(home)
+
+    assert context is not None
+    assert context['base_url'] == f"http://127.0.0.1:{rendered['web_port']}"
+    assert context['project_id'] == secrets['project_id']
+    assert all(context[key] == secrets[key] for key in ('public_key', 'secret_key'))
+    assert requests
+    assert all(auth is None for _path, auth in requests[:-1])
+    assert requests[-1][0].endswith('/projects')
+    assert requests[-1][1].startswith('Basic ')
+
+
+def test_query_context_fails_closed_when_owned_stack_is_unreachable(monkeypatch):
+    with lab() as (home, _):
+        rendered = observability.render_stack(home)
+        observability._save_state(home, 'enabled', 'healthy', rendered)
+        monkeypatch.setattr(
+            observability, '_ownership_command',
+            _owned_query_probe(home, rendered))
+        assert observability.langfuse_query_context(home) is None
+
+
+def test_query_context_refuses_foreign_listener_before_contact(monkeypatch):
+    with lab() as (home, _):
+        rendered = observability.render_stack(home)
+        observability._save_state(home, 'enabled', 'healthy', rendered)
+        project_id = observability._read_secrets(home)['project_id']
+        cases = (
+            {'home_id': 'foreign-home'},
+            {'running': False},
+            {'published_port': rendered['web_port'] + 1},
+        )
+        for case in cases:
+            monkeypatch.setattr(
+                observability, '_ownership_command',
+                _owned_query_probe(home, rendered, **case))
+            with _loopback_probe(rendered['web_port'], project_id,
+                                 rendered['collector_health_port']) as requests:
+                context = observability.langfuse_query_context(home)
+            assert context is None
+            assert requests == []
