@@ -4,6 +4,7 @@ import json
 import sys
 import time
 import uuid
+import resource
 from pathlib import Path
 
 import pytest
@@ -1143,8 +1144,27 @@ def test_symlink_special_file_and_known_secret_paths_refused():
 
         special = runtime / 'pipe'
         os.mkfifo(special)
-        with pytest.raises(store.Refusal):
-            reviewer.capture_evidence(home, run['review_run_id'], special, 'special')
+        pid = os.fork()
+        if pid == 0:
+            try:
+                reviewer.capture_evidence(home, run['review_run_id'], special, 'special')
+            except store.Refusal:
+                os._exit(0)
+            except BaseException:
+                os._exit(2)
+            os._exit(1)
+        status = None
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            waited, candidate = os.waitpid(pid, os.WNOHANG)
+            if waited == pid:
+                status = candidate
+                break
+            time.sleep(0.01)
+        if status is None:
+            os.kill(pid, 15)
+            _, status = os.waitpid(pid, 0)
+        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
 
         credentials = runtime / 'credentials.json'
         credentials.write_text('{"api_key":"do-not-capture"}')
@@ -1156,12 +1176,14 @@ def test_supplementary_capture_budget_is_cumulative():
     with lab() as (home, _):
         run, _, runtime, _ = _run_with_artifact(home)
         seed_path = reviewer.paths(home)['packets'] / f"{run['packet_id']}.json"
-        assert seed_path.stat().st_size < reviewer.DEFAULT_LIMITS['max_input_bytes'] // 2
+        seed_bytes = seed_path.stat().st_size
+        remaining = reviewer.DEFAULT_LIMITS['max_input_bytes'] - seed_bytes
+        assert remaining > 1
 
         first = runtime / 'first.txt'
         second = runtime / 'second.txt'
-        first.write_text('a' * 130000)
-        second.write_text('b' * 130000)
+        first.write_text('a' * remaining)
+        second.write_text('b')
         captured = reviewer.capture_evidence(home, run['review_run_id'], first, 'first')
         duplicate = reviewer.capture_evidence(home, run['review_run_id'], first, 'first')
         assert duplicate['source_id'] == captured['source_id']
@@ -1235,3 +1257,99 @@ def test_deliberate_recapture_has_new_run_scope_without_seed_consumption():
         assert new_source['origin']['run_id'] == second['review_run_id']
         assert old_source['text_sha256'] == new_source['text_sha256'] == old['text_sha256']
         assert reviewer.material_state(home, selected['coverage']['followup_id'])['state'] == 'pending'
+
+
+def test_duplicate_capture_same_origin_bytes_keeps_first_label():
+    with lab() as (home, _):
+        run, _, _, artifact = _run_with_artifact(home, 'same-origin bytes')
+        first = reviewer.capture_evidence(home, run['review_run_id'], artifact, 'first label')
+        second = reviewer.capture_evidence(home, run['review_run_id'], artifact, 'changed label')
+        assert second['source_id'] == first['source_id']
+        assert second['label'] == 'first label'
+        evidence = reviewer.read_evidence(home, run['review_run_id'])
+        assert list(evidence['sources']) == [first['source_id']]
+
+
+def test_dangling_evidence_root_refuses_read_submit_and_recovery(monkeypatch):
+    with lab() as (home, _):
+        run, selected, _, artifact = _run_with_artifact(home)
+        reviewer.capture_evidence(home, run['review_run_id'], artifact, 'dangling-root fixture')
+        report = build_report(selected)
+        original_apply = reviewer._apply_prepared_locked
+        def crash_apply(*args, **kwargs):
+            raise RuntimeError('fixture crash')
+        monkeypatch.setattr(reviewer, '_apply_prepared_locked', crash_apply)
+        with pytest.raises(RuntimeError):
+            reviewer.submit_report(home, run['review_run_id'], str(uuid.uuid4()), report)
+        monkeypatch.setattr(reviewer, '_apply_prepared_locked', original_apply)
+
+        evidence_root = reviewer.paths(home)['evidence'] / run['review_run_id']
+        next(evidence_root.glob('*.json')).unlink()
+        evidence_root.rmdir()
+        evidence_root.symlink_to(home / 'missing-evidence-root', target_is_directory=True)
+        with pytest.raises(store.Refusal):
+            reviewer.read_evidence(home, run['review_run_id'])
+        with pytest.raises(store.Refusal):
+            reviewer.submit_report(home, run['review_run_id'], str(uuid.uuid4()), report)
+        with pytest.raises(store.Refusal):
+            reviewer.recover_submissions(home, run['review_run_id'])
+
+
+def test_oversized_sparse_artifact_is_refused_under_bounded_memory():
+    with lab() as (home, _):
+        run, _, runtime, _ = _run_with_artifact(home)
+        artifact = runtime / 'oversized-sparse.bin'
+        with artifact.open('wb') as stream:
+            stream.truncate(reviewer.DEFAULT_LIMITS['max_input_bytes'] * 8192)
+        pid = os.fork()
+        if pid == 0:
+            try:
+                _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+                limit = 256 * 1024 * 1024
+                if hard != resource.RLIM_INFINITY:
+                    limit = min(limit, hard)
+                resource.setrlimit(resource.RLIMIT_AS, (limit, hard))
+                reviewer.capture_evidence(home, run['review_run_id'], artifact, 'oversized sparse')
+            except store.Refusal:
+                os._exit(0)
+            except BaseException:
+                os._exit(2)
+            os._exit(1)
+        _, status = os.waitpid(pid, 0)
+        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+
+
+def test_parent_symlink_swap_never_captures_external_artifact(monkeypatch):
+    with lab() as (home, _):
+        run, _, runtime, _ = _run_with_artifact(home)
+        parent = runtime / 'nested'
+        parent.mkdir()
+        artifact = parent / 'output.txt'
+        artifact.write_text('owned artifact')
+        external = home / 'external-artifacts'
+        external.mkdir()
+        (external / 'output.txt').write_text('external artifact')
+        moved = runtime / 'nested-owned'
+        original_open = reviewer.os.open
+        swapped = [False]
+
+        def swap_parent(pathname, flags, mode=0o777, **kwargs):
+            candidate = Path(pathname)
+            final_open = candidate == artifact or (
+                candidate.name == artifact.name and kwargs.get('dir_fd') is not None)
+            if final_open and not swapped[0]:
+                parent.rename(moved)
+                parent.symlink_to(external, target_is_directory=True)
+                swapped[0] = True
+            return original_open(pathname, flags, mode, **kwargs)
+
+        monkeypatch.setattr(reviewer.os, 'open', swap_parent)
+        try:
+            captured = reviewer.capture_evidence(home, run['review_run_id'], artifact, 'parent swap')
+        except store.Refusal:
+            captured = None
+        assert swapped[0]
+        if captured is not None:
+            source = _evidence_source(reviewer.read_evidence(home, run['review_run_id']),
+                                      captured['source_id'])
+            assert source['text'] == 'owned artifact'

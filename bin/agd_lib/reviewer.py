@@ -1,3 +1,4 @@
+import codecs
 import contextlib
 import fcntl
 import hashlib
@@ -172,9 +173,9 @@ _EVIDENCE_SECRET_TEXT = re.compile(
     r'\s*[:=]\s*["\']?[^,\s}"\']+')
 
 
-def _evidence_identity(review_run_id, origin, label, text_sha256):
+def _evidence_identity(review_run_id, origin, text_sha256):
     return {'review_run_id': review_run_id, 'origin': origin,
-            'label': label, 'text_sha256': text_sha256}
+            'text_sha256': text_sha256}
 
 
 def _evidence_integrity(record):
@@ -184,10 +185,10 @@ def _evidence_integrity(record):
 def _evidence_records(home, review_run_id):
     _receipt(home, review_run_id)
     root = paths(home)['evidence'] / review_run_id
-    if not root.exists():
-        return {}
-    if root.is_symlink() or not root.is_dir():
+    if os.path.lexists(root) and (root.is_symlink() or not root.is_dir()):
         raise store.Refusal('evidence directory is unsafe')
+    if not os.path.lexists(root):
+        return {}
     records = {}
     try:
         children = sorted(root.iterdir())
@@ -215,7 +216,7 @@ def _evidence_records(home, review_run_id):
                 or record.get('text_sha256') != hashlib.sha256(record['text'].encode()).hexdigest()
                 or record.get('bytes') != len(record['text'].encode())):
             raise store.Refusal('invalid supplementary evidence')
-        if _digest(_evidence_identity(review_run_id, record['origin'], record['label'],
+        if _digest(_evidence_identity(review_run_id, record['origin'],
                                       record['text_sha256'])) != source_id:
             raise store.Refusal('modified supplementary evidence')
         records[source_id] = record
@@ -231,7 +232,7 @@ def read_evidence(home, review_run_id):
             'sources': _evidence_records(home, review_run_id)}
 
 
-def _owned_artifact_bytes(home, review_run_id, path):
+def _artifact_path(home, review_run_id, path):
     root = paths(home)['runtime'] / review_run_id
     path = Path(path)
     try:
@@ -240,33 +241,95 @@ def _owned_artifact_bytes(home, review_run_id, path):
         raise store.Refusal('supplementary artifact is outside run') from error
     if not relative.parts or any(part in ('', '.', '..') for part in relative.parts):
         raise store.Refusal('supplementary artifact path')
-    current = path
-    while True:
-        try:
-            identity = os.lstat(current)
-        except OSError as error:
-            raise store.Refusal('supplementary artifact is unavailable') from error
-        if current == path:
-            if (not stat.S_ISREG(identity.st_mode) or identity.st_uid != os.getuid()
-                    or identity.st_nlink != 1):
-                raise store.Refusal('supplementary artifact is not owned')
-        elif stat.S_ISLNK(identity.st_mode) or not stat.S_ISDIR(identity.st_mode):
-            raise store.Refusal('supplementary artifact path is unsafe')
-        if current == root:
-            break
-        current = current.parent
     if (_EVIDENCE_SECRET_NAME.search(path.name)
             or path.name.lower() in {'.env', 'credentials', 'credentials.json', 'secrets.json',
                                      'token', 'token.txt', 'password', 'id_rsa', 'id_dsa'}):
         raise store.Refusal('supplementary artifact is credential-bearing')
+    return root, relative
+
+
+def _open_owned_artifact(home, review_run_id, path):
+    root, relative = _artifact_path(home, review_run_id, path)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, 'O_NOFOLLOW', 0)
+    file_flags = (os.O_RDONLY | os.O_NONBLOCK
+                  | getattr(os, 'O_NOFOLLOW', 0))
+    current_fd = None
+    final_fd = None
     try:
-        body = _read_regular_bytes(path, require_current_uid=True)
-        text = body.decode('utf-8')
-    except (OSError, UnicodeDecodeError, ValueError) as error:
-        raise store.Refusal('supplementary artifact is not UTF-8') from error
-    if _EVIDENCE_SECRET_TEXT.search(text):
-        raise store.Refusal('supplementary artifact is credential-bearing')
-    return relative.as_posix(), body, text
+        current_fd = os.open(root, directory_flags)
+        root_stat = os.fstat(current_fd)
+        if not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != os.getuid():
+            raise store.Refusal('supplementary artifact root is not owned')
+        for part in relative.parts[:-1]:
+            next_fd = os.open(part, directory_flags, dir_fd=current_fd)
+            identity = os.fstat(next_fd)
+            if not stat.S_ISDIR(identity.st_mode) or identity.st_uid != os.getuid():
+                os.close(next_fd)
+                raise store.Refusal('supplementary artifact parent is unsafe')
+            os.close(current_fd)
+            current_fd = next_fd
+        final_fd = os.open(relative.parts[-1], file_flags, dir_fd=current_fd)
+        identity = os.fstat(final_fd)
+        if (not stat.S_ISREG(identity.st_mode) or identity.st_uid != os.getuid()
+                or identity.st_nlink != 1):
+            raise store.Refusal('supplementary artifact is not owned')
+        os.close(current_fd)
+        current_fd = None
+        return final_fd, relative
+    except (OSError, ValueError) as error:
+        if isinstance(error, store.Refusal):
+            raise
+        raise store.Refusal('supplementary artifact is unavailable') from error
+    finally:
+        if current_fd is not None:
+            os.close(current_fd)
+        if final_fd is not None and current_fd is not None:
+            os.close(final_fd)
+
+
+def _read_owned_artifact(home, review_run_id, path, max_bytes):
+    fd, relative = _open_owned_artifact(home, review_run_id, path)
+    stream = None
+    try:
+        stream = os.fdopen(fd, 'rb')
+        initial = os.fstat(stream.fileno())
+        decoder = codecs.getincrementaldecoder('utf-8')()
+        digest = hashlib.sha256()
+        chunks = []
+        total = 0
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            digest.update(chunk)
+            if total <= max_bytes:
+                chunks.append(chunk)
+            else:
+                chunks.clear()
+            try:
+                decoder.decode(chunk, final=False)
+            except UnicodeDecodeError as error:
+                raise store.Refusal('supplementary artifact is not UTF-8') from error
+        try:
+            decoder.decode(b'', final=True)
+        except UnicodeDecodeError as error:
+            raise store.Refusal('supplementary artifact is not UTF-8') from error
+        final = os.fstat(stream.fileno())
+        if (initial.st_dev != final.st_dev or initial.st_ino != final.st_ino
+                or initial.st_size != final.st_size or total != final.st_size
+                or not stat.S_ISREG(final.st_mode) or final.st_uid != os.getuid()
+                or final.st_nlink != 1):
+            raise store.Refusal('supplementary artifact changed during capture')
+    except OSError as error:
+        raise store.Refusal('supplementary artifact is unavailable') from error
+    finally:
+        if stream is None:
+            os.close(fd)
+        elif not stream.closed:
+            stream.close()
+    body = b''.join(chunks) if total <= max_bytes else None
+    return relative.as_posix(), body, digest.hexdigest(), total
 
 
 def capture_evidence(home, review_run_id, path, label):
@@ -278,25 +341,11 @@ def capture_evidence(home, review_run_id, path, label):
         raise store.Refusal('supplementary evidence label')
     if _EVIDENCE_SECRET_TEXT.search(label):
         raise store.Refusal('supplementary evidence label is credential-bearing')
-    receipt = _receipt(home, review_run_id)
-    if receipt.get('dispatch_state') not in ('begun', 'report-committed'):
-        raise store.Refusal('review run is not active')
-    origin_path, body, text = _owned_artifact_bytes(home, review_run_id, path)
-    origin = {'run_id': review_run_id, 'path': origin_path}
-    text_sha256 = hashlib.sha256(body).hexdigest()
-    source_id = _digest(_evidence_identity(review_run_id, origin, label.strip(), text_sha256))
-    record = {'schema': 1, 'source_id': source_id, 'review_run_id': review_run_id,
-              'origin': origin, 'label': label.strip(), 'captured_at': time.time(),
-              'bytes': len(body), 'text': text, 'text_sha256': text_sha256}
-    record['integrity_sha256'] = _evidence_integrity(record)
     root = store.home(home)
     with store.lock(root):
         receipt = _receipt(root, review_run_id)
         if receipt.get('dispatch_state') not in ('begun', 'report-committed'):
             raise store.Refusal('review run is not active')
-        existing = _evidence_records(root, review_run_id).get(source_id)
-        if existing is not None:
-            return existing
         try:
             config = validate_config(_read_json(paths(root)['manifests'] / f"{receipt['config_snapshot_ref']}.json"))
             packet_id = receipt.get('packet_id')
@@ -304,9 +353,30 @@ def capture_evidence(home, review_run_id, path, label):
             seed_bytes = len(_read_regular_bytes(paths(root)['packets'] / f'{packet_id}.json'))
         except (OSError, ValueError, json.JSONDecodeError, store.Refusal) as error:
             raise store.Refusal('reviewer seed is unavailable') from error
-        used = seed_bytes + sum(item['bytes'] for item in _evidence_records(root, review_run_id).values())
-        if used + len(body) > config['limits']['max_input_bytes']:
+        records = _evidence_records(root, review_run_id)
+        used = seed_bytes + sum(item['bytes'] for item in records.values())
+        remaining = max(0, config['limits']['max_input_bytes'] - used)
+        origin_path, body, text_sha256, total = _read_owned_artifact(
+            root, review_run_id, path, remaining)
+        origin = {'run_id': review_run_id, 'path': origin_path}
+        source_id = _digest(_evidence_identity(review_run_id, origin, text_sha256))
+        existing = records.get(source_id)
+        if existing is not None:
+            return existing
+        if body is None:
             raise store.Refusal('cumulative reviewer input exceeds limit')
+        try:
+            text = body.decode('utf-8')
+        except UnicodeDecodeError as error:
+            raise store.Refusal('supplementary artifact is not UTF-8') from error
+        if _EVIDENCE_SECRET_TEXT.search(text):
+            raise store.Refusal('supplementary artifact is credential-bearing')
+        if used + total > config['limits']['max_input_bytes']:
+            raise store.Refusal('cumulative reviewer input exceeds limit')
+        record = {'schema': 1, 'source_id': source_id, 'review_run_id': review_run_id,
+                  'origin': origin, 'label': label.strip(), 'captured_at': time.time(),
+                  'bytes': total, 'text': text, 'text_sha256': text_sha256}
+        record['integrity_sha256'] = _evidence_integrity(record)
         publish_immutable(paths(root)['evidence'] / review_run_id / f'{source_id}.json', record)
     return record
 

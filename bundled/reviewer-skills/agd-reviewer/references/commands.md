@@ -9,8 +9,8 @@ The native reviewer receives a private run directory as its working directory. R
 3. For useful command or query output, deliberately write a bounded UTF-8 artifact under the `evidence.artifact_root` named by the request. Capture it after writing:
 
 ```sh
-agd --home "$AGD_HOME" reviewer evidence add "$AGD_REVIEW_RUN_ID" \
-  --file "$AGD_REVIEW_RUN_ID/relative-artifact-path" --label "what this proves"
+$AGD_CLI --home "$AGD_HOME" reviewer evidence add "$AGD_REVIEW_RUN_ID" \
+  --file "$PWD/relative-artifact-path" --label "what this proves"
 ```
 
 The CLI accepts only regular UTF-8 files owned by this run. Do not pass shell command strings to an AGD executor, capture arbitrary live source or credential paths, print secrets, install a Langfuse client, override endpoints, or claim arbitrary text was redacted. Use official Langfuse CLI read/query operations only when available; native evidence is the fallback and missing or delayed data is a limitation, not a negative finding.
