@@ -54,7 +54,7 @@ export default function reviewerExtension(api: ReviewerAPI) {
   api.on('before_agent_start', event => ({
     systemPrompt: [
       ...(event.systemPrompt ?? []).filter(part => !part.startsWith(marker)),
-      marker + `Review run ${runId ?? 'unbound'}. Use only admitted execution evidence, preserve the reserved reviewer role, and keep recommendations inert; cite observed native tool results.`,
+      marker + `Review run ${runId ?? 'unbound'}. Use only admitted execution evidence, preserve the reserved reviewer role, and keep recommendations inert; cite observed native tool results. For additional investigation, write bounded command or query output into request.json's evidence.artifact_root, then deliberately capture it with the native reviewer evidence CLI; never pass shell commands to an AGD executor, print credentials, install tools, contact foreign endpoints, or apply remediation.`,
     ],
   }));
 }

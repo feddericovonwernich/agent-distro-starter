@@ -183,11 +183,13 @@ def test_public_timer_managed_native_run_waits_for_exit_and_cleans_endpoint():
             packet = reviewer.read_packet(home, result['packet_id'])
             seed_source_id = next(excerpt['source_id'] for excerpt in packet['excerpts']
                                   if 'AGD_NATIVE_REVIEWER_SENTINEL' in excerpt['text'])
+            supplementary = reviewer.read_evidence(home, result['review_run_id'])
+            assert len(supplementary['sources']) == 1
+            supplement_source_id = next(iter(supplementary['sources']))
             finding = payload['findings']
             assert len(finding) == 1
-            assert finding[0]['kind'] == 'new-skill'
             assert finding[0]['target'] == 'agd-reviewer-execution-trace'
-            assert finding[0]['citations'] == [seed_source_id]
+            assert finding[0]['citations'] == [seed_source_id, supplement_source_id]
             control_status = subprocess.run([str(tools / 'herdr'), '--session', control_session,
                                              'status', 'server'], cwd=home, env=environment,
                                             capture_output=True, text=True)

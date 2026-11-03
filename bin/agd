@@ -157,6 +157,13 @@ def parser():
     execute_p = reviewer_p.add_parser('execute'); execute_p.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
     bind_p = reviewer_p.add_parser('session-bind'); bind_p.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value))); bind_p.add_argument('--session-id', required=True); bind_p.add_argument('--session-file', required=True)
     reviewer_p.add_parser('status')
+    evidence = reviewer_p.add_parser('evidence').add_subparsers(dest='evidence_op', required=True)
+    evidence_add = evidence.add_parser('add')
+    evidence_add.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
+    evidence_add.add_argument('--file', required=True)
+    evidence_add.add_argument('--label', required=True)
+    evidence_list = evidence.add_parser('list')
+    evidence_list.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
     reports = reviewer_p.add_parser('reports').add_subparsers(dest='report_op', required=True)
     reports.add_parser('list'); reports.add_parser('show').add_argument('report_id')
     proposals = reviewer_p.add_parser('proposals').add_subparsers(dest='proposal_op', required=True)
@@ -239,6 +246,7 @@ def main(args):
     reviewer_write = args.command == 'reviewer' and (
         args.reviewer_op in ('execute', 'session-bind', 'episode')
         or args.reviewer_op == 'run' or args.reviewer_op == 'timer' and args.timer_op != 'status'
+        or args.reviewer_op == 'evidence' and args.evidence_op == 'add'
         or args.reviewer_op == 'proposals' and args.proposal_op == 'dispose')
     managed_loop = (args.command == 'worker' and args.operation == 'run'
                     or args.command == 'reviewer' and args.reviewer_op in ('run', 'execute'))
@@ -471,6 +479,13 @@ def _dispatch(args, home, fresh):
                     retrospective_review_run_ids=selected))
         if args.reviewer_op == 'status':
             return {'timer': reviewer_timer._read_record(home), 'runs': len(list(reviewer.paths(home)['receipts'].glob('*.json')))}
+        if args.reviewer_op == 'evidence':
+            if args.evidence_op == 'add':
+                return reviewer.capture_evidence(home, args.review_run_id, Path(args.file).absolute(), args.label)
+            evidence = reviewer.read_evidence(home, args.review_run_id)
+            return [{'source_id': source_id, **{
+                key: value for key, value in source.items() if key != 'text'
+            }} for source_id, source in sorted(evidence['sources'].items())]
         if args.reviewer_op == 'reports':
             if args.report_op == 'list': return [reviewer._read_json(p) for p in sorted(reviewer.paths(home)['reports'].glob('*.json'))]
             return reviewer._read_json(reviewer.report_path(home, args.report_id))

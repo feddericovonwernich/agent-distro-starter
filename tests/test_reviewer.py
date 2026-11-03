@@ -1066,3 +1066,172 @@ def test_historical_receipt_and_report_bytes_remain_unchanged_after_config_migra
         assert reviewer._read_json(report_path) == historical_report
         assert receipt_path.read_bytes() == receipt_before
         assert report_path.read_bytes() == report_before
+
+
+def _evidence_source(evidence, source_id):
+    sources = evidence.get('sources', evidence)
+    if isinstance(sources, dict):
+        return sources[source_id]
+    return next(row for row in sources if row['source_id'] == source_id)
+
+
+def _run_with_artifact(home, text='printf investigation\n'):
+    run, selected = produced_run(home)
+    runtime = reviewer.paths(home)['runtime'] / run['review_run_id']
+    runtime.mkdir(parents=True, exist_ok=True)
+    artifact = runtime / 'investigation.txt'
+    artifact.write_text(text)
+    return run, selected, runtime, artifact
+
+
+def _retry_run_with_packet(home, selected):
+    intent = reviewer.enqueue_intent(home, kind='manual')
+    config = reviewer.read_config(home)
+    started = time.time()
+    run = reviewer.reserve_run(
+        home, intent, config_snapshot=config,
+        instruction_snapshot=reviewer.INSTRUCTION_FILE.read_bytes(),
+        started_at=started,
+        deadline_epoch_ms=int((started + config['limits']['max_runtime_seconds']) * 1000))
+    reviewer.begin_run(home, run, selected, model='fixture/model', observed_omp_version='fixture')
+    return run
+
+
+def test_report_cites_captured_investigation_source():
+    with lab() as (home, _):
+        run, selected, _, artifact = _run_with_artifact(home)
+        text = artifact.read_text()
+        captured = reviewer.capture_evidence(home, run['review_run_id'], artifact, 'shell investigation')
+        source_id = captured['source_id']
+        source = _evidence_source(reviewer.read_evidence(home, run['review_run_id']), source_id)
+        assert source['text'] == text
+        assert source['text_sha256'] == hashlib.sha256(text.encode()).hexdigest()
+
+        report = build_report(selected)
+        report['findings'][0]['citations'] = [source_id]
+        submitted = reviewer.submit_report(home, run['review_run_id'], str(uuid.uuid4()), report)
+        stored = reviewer._read_json(reviewer.report_path(home, submitted['report_id']))
+        assert stored['report']['findings'][0]['citations'] == [source_id]
+
+
+def test_cross_run_or_modified_evidence_is_refused():
+    with lab() as (home, _):
+        run, selected, runtime, artifact = _run_with_artifact(home)
+        reviewer.capture_evidence(home, run['review_run_id'], artifact, 'investigation')
+        reviewer.close_run(home, run['review_run_id'], 'failed', error_code='fixture')
+        other_run = _retry_run_with_packet(home, selected)
+        with pytest.raises(store.Refusal):
+            reviewer.capture_evidence(home, other_run['review_run_id'], artifact, 'foreign artifact')
+
+        stored_path = next((home / 'data' / 'reviewer' / 'evidence' / run['review_run_id']).glob('*.json'))
+        stored = json.loads(stored_path.read_text())
+        stored['text'] = 'tampered'
+        stored_path.write_text(json.dumps(stored))
+        with pytest.raises(store.Refusal):
+            reviewer.read_evidence(home, run['review_run_id'])
+
+
+def test_symlink_special_file_and_known_secret_paths_refused():
+    with lab() as (home, _):
+        run, _, runtime, _ = _run_with_artifact(home)
+        outside = home / 'outside.txt'
+        outside.write_text('not a credential')
+        symlink = runtime / 'linked.txt'
+        symlink.symlink_to(outside)
+        with pytest.raises(store.Refusal):
+            reviewer.capture_evidence(home, run['review_run_id'], symlink, 'linked')
+
+        special = runtime / 'pipe'
+        os.mkfifo(special)
+        with pytest.raises(store.Refusal):
+            reviewer.capture_evidence(home, run['review_run_id'], special, 'special')
+
+        credentials = runtime / 'credentials.json'
+        credentials.write_text('{"api_key":"do-not-capture"}')
+        with pytest.raises(store.Refusal):
+            reviewer.capture_evidence(home, run['review_run_id'], credentials, 'credentials')
+
+
+def test_supplementary_capture_budget_is_cumulative():
+    with lab() as (home, _):
+        run, _, runtime, _ = _run_with_artifact(home)
+        seed_path = reviewer.paths(home)['packets'] / f"{run['packet_id']}.json"
+        assert seed_path.stat().st_size < reviewer.DEFAULT_LIMITS['max_input_bytes'] // 2
+
+        first = runtime / 'first.txt'
+        second = runtime / 'second.txt'
+        first.write_text('a' * 130000)
+        second.write_text('b' * 130000)
+        captured = reviewer.capture_evidence(home, run['review_run_id'], first, 'first')
+        duplicate = reviewer.capture_evidence(home, run['review_run_id'], first, 'first')
+        assert duplicate['source_id'] == captured['source_id']
+        with pytest.raises(store.Refusal):
+            reviewer.capture_evidence(home, run['review_run_id'], second, 'second')
+        evidence = reviewer.read_evidence(home, run['review_run_id'])
+        assert set(evidence['sources']) == {captured['source_id']}
+
+
+def test_late_investigation_does_not_advance_unselected_episode_coverage():
+    with lab() as (home, _):
+        ended_worker(home, 'first', str(uuid.uuid4()), [message('first')])
+        ended_worker(home, 'second', str(uuid.uuid4()), [message('second')])
+        config = reviewer.read_config(home)
+        config['limits']['max_candidates'] = 1
+        cutoff = time.time() + 10
+        selected = reviewer.select_packet(home, cutoff=cutoff, config_snapshot=config)
+        assert len(selected['episodes']) == 1
+        run = _retry_run_with_packet(home, selected)
+        reviewer.mark_material_reviewed(home, selected['coverage']['followup_id'])
+        baseline = reviewer.select_packet(home, cutoff=time.time() + 20, config_snapshot=config)
+
+        runtime = reviewer.paths(home)['runtime'] / run['review_run_id']
+        runtime.mkdir(parents=True, exist_ok=True)
+        artifact = runtime / 'late.txt'
+        artifact.write_text('late investigation')
+        reviewer.capture_evidence(home, run['review_run_id'], artifact, 'late')
+        after = reviewer.select_packet(home, cutoff=time.time() + 30, config_snapshot=config)
+        assert [row['task_id'] for row in after['episodes']] == [row['task_id'] for row in baseline['episodes']]
+        assert after['coverage']['followup_id'] == baseline['coverage']['followup_id']
+
+
+def test_failed_review_leaves_seed_retryable():
+    with lab() as (home, _):
+        run, selected, _, artifact = _run_with_artifact(home)
+        reviewer.capture_evidence(home, run['review_run_id'], artifact, 'failed-run supplement')
+        before = {(row['source_id'], row['excerpt_id']) for row in selected['excerpts']}
+        reviewer.close_run(home, run['review_run_id'], 'failed', error_code='fixture')
+        retry = reviewer.select_packet(home, cutoff=time.time() + 1, config_snapshot=reviewer.read_config(home))
+        assert {(row['source_id'], row['excerpt_id']) for row in retry['excerpts']} == before
+
+
+def test_failed_run_supplement_is_not_automatically_reused():
+    with lab() as (home, _):
+        run, selected, _, artifact = _run_with_artifact(home)
+        captured = reviewer.capture_evidence(home, run['review_run_id'], artifact, 'failed supplement')
+        reviewer.close_run(home, run['review_run_id'], 'failed', error_code='fixture')
+        retry = _retry_run_with_packet(home, selected)
+        report = build_report(selected)
+        report['findings'][0]['citations'].append(captured['source_id'])
+        with pytest.raises(store.Refusal):
+            reviewer.submit_report(home, retry['review_run_id'], str(uuid.uuid4()), report)
+
+
+def test_deliberate_recapture_has_new_run_scope_without_seed_consumption():
+    with lab() as (home, _):
+        first, selected, _, artifact = _run_with_artifact(home, 'retained failed output')
+        old = reviewer.capture_evidence(home, first['review_run_id'], artifact, 'failed output')
+        reviewer.close_run(home, first['review_run_id'], 'failed', error_code='fixture')
+        second = _retry_run_with_packet(home, selected)
+        second_runtime = reviewer.paths(home)['runtime'] / second['review_run_id']
+        second_runtime.mkdir(parents=True, exist_ok=True)
+        recaptured_path = second_runtime / 'recaptured.txt'
+        recaptured_path.write_bytes(artifact.read_bytes())
+        new = reviewer.capture_evidence(home, second['review_run_id'], recaptured_path, 'recaptured failed output')
+        assert new['source_id'] != old['source_id']
+        assert new['text_sha256'] == old['text_sha256']
+        old_source = _evidence_source(reviewer.read_evidence(home, first['review_run_id']), old['source_id'])
+        new_source = _evidence_source(reviewer.read_evidence(home, second['review_run_id']), new['source_id'])
+        assert old_source['origin']['run_id'] == first['review_run_id']
+        assert new_source['origin']['run_id'] == second['review_run_id']
+        assert old_source['text_sha256'] == new_source['text_sha256'] == old['text_sha256']
+        assert reviewer.material_state(home, selected['coverage']['followup_id'])['state'] == 'pending'

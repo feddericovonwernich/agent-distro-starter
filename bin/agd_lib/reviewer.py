@@ -21,8 +21,9 @@ DEFAULT_CONFIG = {'schema': 2, 'schedule': {'mode': 'calendar', 'timezone': 'UTC
 
 def paths(home):
     root = store.home(home); data, state = root / 'data' / 'reviewer', root / 'state' / 'reviewer'
-    return {'config': data / 'config.json', 'packets': data / 'packets', 'reports': data / 'reports', 'proposals': data / 'proposals',
-            'revisions': data / 'revisions', 'manifests': data / 'manifests', 'triage': data / 'triage', 'intents': state / 'intents',
+    return {'config': data / 'config.json', 'packets': data / 'packets', 'evidence': data / 'evidence',
+            'reports': data / 'reports', 'proposals': data / 'proposals', 'revisions': data / 'revisions',
+            'manifests': data / 'manifests', 'triage': data / 'triage', 'intents': state / 'intents',
             'receipts': state / 'receipts', 'prepared': state / 'prepared',
             'pending': state / 'pending', 'checkpoints': state / 'checkpoints',
             'followups': state / 'followups', 'candidates': state / 'candidates',
@@ -161,6 +162,153 @@ def _read_regular_bytes(path, *, require_current_uid=False):
 
 def _read_json(path):
     return json.loads(_read_regular_bytes(path))
+
+
+_EVIDENCE_SECRET_NAME = re.compile(
+    r'(?i)(^|[._-])(credentials?|secrets?|tokens?|passwords?|id_rsa|id_dsa|'
+    r'private[_-]?key|known_hosts|\.env)([._-]|$)')
+_EVIDENCE_SECRET_TEXT = re.compile(
+    r'(?i)\b(api[_-]?key|secret(?:[_-]?key)?|token|password|authorization)'
+    r'\s*[:=]\s*["\']?[^,\s}"\']+')
+
+
+def _evidence_identity(review_run_id, origin, label, text_sha256):
+    return {'review_run_id': review_run_id, 'origin': origin,
+            'label': label, 'text_sha256': text_sha256}
+
+
+def _evidence_integrity(record):
+    return _digest({key: value for key, value in record.items() if key != 'integrity_sha256'})
+
+
+def _evidence_records(home, review_run_id):
+    _receipt(home, review_run_id)
+    root = paths(home)['evidence'] / review_run_id
+    if not root.exists():
+        return {}
+    if root.is_symlink() or not root.is_dir():
+        raise store.Refusal('evidence directory is unsafe')
+    records = {}
+    try:
+        children = sorted(root.iterdir())
+    except OSError as error:
+        raise store.Refusal('evidence directory is unavailable') from error
+    for path in children:
+        if path.suffix != '.json' or path.is_symlink() or not path.is_file():
+            raise store.Refusal('evidence directory is unsafe')
+        source_id = path.stem
+        _hex_id(source_id)
+        try:
+            record = json.loads(_read_regular_bytes(path, require_current_uid=True))
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            raise store.Refusal('invalid supplementary evidence') from error
+        if (not isinstance(record, dict) or record.get('schema') != 1
+                or record.get('source_id') != source_id
+                or record.get('review_run_id') != review_run_id
+                or not isinstance(record.get('captured_at'), (int, float))
+                or not isinstance(record.get('integrity_sha256'), str)
+                or record.get('integrity_sha256') != _evidence_integrity(record)
+                or not isinstance(record.get('origin'), dict)
+                or not isinstance(record.get('label'), str)
+                or not isinstance(record.get('text'), str)
+                or not isinstance(record.get('text_sha256'), str)
+                or record.get('text_sha256') != hashlib.sha256(record['text'].encode()).hexdigest()
+                or record.get('bytes') != len(record['text'].encode())):
+            raise store.Refusal('invalid supplementary evidence')
+        if _digest(_evidence_identity(review_run_id, record['origin'], record['label'],
+                                      record['text_sha256'])) != source_id:
+            raise store.Refusal('modified supplementary evidence')
+        records[source_id] = record
+    return records
+
+
+def read_evidence(home, review_run_id):
+    try:
+        review_run_id = str(uuid.UUID(str(review_run_id)))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise store.Refusal('review run ID') from error
+    return {'schema': 1, 'review_run_id': review_run_id,
+            'sources': _evidence_records(home, review_run_id)}
+
+
+def _owned_artifact_bytes(home, review_run_id, path):
+    root = paths(home)['runtime'] / review_run_id
+    path = Path(path)
+    try:
+        relative = path.relative_to(root)
+    except ValueError as error:
+        raise store.Refusal('supplementary artifact is outside run') from error
+    if not relative.parts or any(part in ('', '.', '..') for part in relative.parts):
+        raise store.Refusal('supplementary artifact path')
+    current = path
+    while True:
+        try:
+            identity = os.lstat(current)
+        except OSError as error:
+            raise store.Refusal('supplementary artifact is unavailable') from error
+        if current == path:
+            if (not stat.S_ISREG(identity.st_mode) or identity.st_uid != os.getuid()
+                    or identity.st_nlink != 1):
+                raise store.Refusal('supplementary artifact is not owned')
+        elif stat.S_ISLNK(identity.st_mode) or not stat.S_ISDIR(identity.st_mode):
+            raise store.Refusal('supplementary artifact path is unsafe')
+        if current == root:
+            break
+        current = current.parent
+    if (_EVIDENCE_SECRET_NAME.search(path.name)
+            or path.name.lower() in {'.env', 'credentials', 'credentials.json', 'secrets.json',
+                                     'token', 'token.txt', 'password', 'id_rsa', 'id_dsa'}):
+        raise store.Refusal('supplementary artifact is credential-bearing')
+    try:
+        body = _read_regular_bytes(path, require_current_uid=True)
+        text = body.decode('utf-8')
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        raise store.Refusal('supplementary artifact is not UTF-8') from error
+    if _EVIDENCE_SECRET_TEXT.search(text):
+        raise store.Refusal('supplementary artifact is credential-bearing')
+    return relative.as_posix(), body, text
+
+
+def capture_evidence(home, review_run_id, path, label):
+    try:
+        review_run_id = str(uuid.UUID(str(review_run_id)))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise store.Refusal('review run ID') from error
+    if not isinstance(label, str) or not label.strip() or len(label) > 256:
+        raise store.Refusal('supplementary evidence label')
+    if _EVIDENCE_SECRET_TEXT.search(label):
+        raise store.Refusal('supplementary evidence label is credential-bearing')
+    receipt = _receipt(home, review_run_id)
+    if receipt.get('dispatch_state') not in ('begun', 'report-committed'):
+        raise store.Refusal('review run is not active')
+    origin_path, body, text = _owned_artifact_bytes(home, review_run_id, path)
+    origin = {'run_id': review_run_id, 'path': origin_path}
+    text_sha256 = hashlib.sha256(body).hexdigest()
+    source_id = _digest(_evidence_identity(review_run_id, origin, label.strip(), text_sha256))
+    record = {'schema': 1, 'source_id': source_id, 'review_run_id': review_run_id,
+              'origin': origin, 'label': label.strip(), 'captured_at': time.time(),
+              'bytes': len(body), 'text': text, 'text_sha256': text_sha256}
+    record['integrity_sha256'] = _evidence_integrity(record)
+    root = store.home(home)
+    with store.lock(root):
+        receipt = _receipt(root, review_run_id)
+        if receipt.get('dispatch_state') not in ('begun', 'report-committed'):
+            raise store.Refusal('review run is not active')
+        existing = _evidence_records(root, review_run_id).get(source_id)
+        if existing is not None:
+            return existing
+        try:
+            config = validate_config(_read_json(paths(root)['manifests'] / f"{receipt['config_snapshot_ref']}.json"))
+            packet_id = receipt.get('packet_id')
+            _hex_id(packet_id)
+            seed_bytes = len(_read_regular_bytes(paths(root)['packets'] / f'{packet_id}.json'))
+        except (OSError, ValueError, json.JSONDecodeError, store.Refusal) as error:
+            raise store.Refusal('reviewer seed is unavailable') from error
+        used = seed_bytes + sum(item['bytes'] for item in _evidence_records(root, review_run_id).values())
+        if used + len(body) > config['limits']['max_input_bytes']:
+            raise store.Refusal('cumulative reviewer input exceeds limit')
+        publish_immutable(paths(root)['evidence'] / review_run_id / f'{source_id}.json', record)
+    return record
 
 
 def deadline_remaining_seconds(deadline_epoch_ms):
@@ -913,12 +1061,18 @@ def _receipt(home, review_run_id):
     except (OSError, ValueError, json.JSONDecodeError) as error: raise store.Refusal('unknown reviewer run') from error
 
 
-def _validate_report(home, receipt, packet, report):
+def _validate_report(home, receipt, packet, report, supplementary=None):
     if not isinstance(report, dict) or set(report) != {'schema', 'summary', 'findings'} or report['schema'] != 1 or not isinstance(report['summary'], str) or not isinstance(report['findings'], list):
         raise store.Refusal('report schema')
     config = _read_json(paths(home)['manifests'] / f"{receipt['config_snapshot_ref']}.json")
     if len(_json_bytes(report)) > config['limits']['max_output_bytes']: raise store.Refusal('report exceeds output limit')
     admitted = {source['source_id'] for source in packet['sources'] if any(excerpt['source_id'] == source['source_id'] for excerpt in packet['excerpts'])}
+    if supplementary is not None:
+        if (not isinstance(supplementary, dict)
+                or supplementary.get('review_run_id') != receipt.get('review_run_id')
+                or not isinstance(supplementary.get('sources'), dict)):
+            raise store.Refusal('supplementary evidence')
+        admitted.update(supplementary['sources'])
     inventory = {row['id']: row['catalog_sha256'] for row in packet.get('catalog', [])}
     required = {'kind', 'target', 'finding', 'applicability', 'citations', 'counterexamples', 'uncertainty', 'resolution', 'validation', 'validation_limits'}
     for finding in report['findings']:
@@ -980,7 +1134,8 @@ def submit_report(home, review_run_id, request_id, report):
         return receipt['report_results'][request_id]
     if receipt.get('dispatch_state') not in ('begun', 'report-committed'): raise store.Refusal('reviewer receipt cannot accept a report')
     packet = read_packet(home, receipt.get('packet_id'))
-    report = _validate_report(home, receipt, packet, report)
+    supplementary = read_evidence(home, receipt['review_run_id'])
+    report = _validate_report(home, receipt, packet, report, supplementary=supplementary)
     report_id = _digest({'review_run_id': receipt['review_run_id'], 'request_id': request_id, 'report': report})
     result = {'report_id': report_id, 'proposal_ids': []}
     with store.lock(store.home(home)):
@@ -1020,6 +1175,10 @@ def recover_submissions(home, review_run_id):
         for path in paths(home)['prepared'].glob(f"{receipt['review_run_id']}-*.json"):
             prepared = _read_json(path)
             if prepared['request_id'] not in receipt.get('report_requests', {}):
+                packet = read_packet(home, receipt.get('packet_id'))
+                _validate_report(
+                    home, receipt, packet, prepared['record']['report'],
+                    supplementary=read_evidence(home, receipt['review_run_id']))
                 receipt = _receipt(home, review_run_id)
                 _apply_prepared_locked(home, receipt, prepared)
     return _receipt(home, review_run_id)

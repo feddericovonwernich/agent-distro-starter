@@ -53,7 +53,9 @@ def _native_request(home, review_run_id):
             or request.get('packet_id') != receipt.get('packet_id')
             or request.get('config_snapshot_ref') != receipt.get('config_snapshot_ref')
             or request.get('instruction_snapshot_ref') != receipt.get('instruction_snapshot_ref')
-            or request.get('report_path') != str(runtime / 'report-draft.json')):
+            or request.get('report_path') != str(runtime / 'report-draft.json')
+            or (request.get('evidence') is not None
+                and request.get('evidence') != {'artifact_root': str(runtime), 'capture_run_id': canonical_id})):
         raise store.Refusal('reviewer request scope is invalid')
     try:
         reviewer._hex_id(request['packet_id'])
@@ -225,7 +227,8 @@ def execute(home: Path, review_run_id: str) -> int:
     inherited = {key: value for key, value in os.environ.items() if not key.startswith('LANGFUSE_')}
     env, _, _ = observability.reviewer_environment(home, review_run_id)
     env.update({key: value for key, value in inherited.items() if key not in env})
-    env.update(AGD_HOME=str(store.home(home)), AGD_REVIEW_RUN_ID=review_run_id)
+    env.update(AGD_HOME=str(store.home(home)), AGD_REVIEW_RUN_ID=review_run_id,
+               AGD_CLI=str(Path(__file__).resolve().parents[2] / 'bin' / 'agd'))
     started = time.time()
     process = None
     stdout_stream = stderr_stream = None
@@ -525,6 +528,7 @@ def _prepare_native_request(home, run, packet, config, *, langfuse_query=None):
         'config_snapshot_ref': run['config_snapshot_ref'],
         'instruction_snapshot_ref': run['instruction_snapshot_ref'],
         'report_path': str(runtime / 'report-draft.json'),
+        'evidence': {'artifact_root': str(runtime), 'capture_run_id': run['review_run_id']},
         'allowed_scope': {'source_ids': sorted(source['source_id'] for source in packet['sources'])},
     }
     if isinstance(langfuse_query, dict):

@@ -6,7 +6,7 @@ import type { ServerResponse } from 'node:http';
 const SENTINEL = 'AGD_NATIVE_REVIEWER_SENTINEL';
 const SHELL_MARKER = 'AGD_NATIVE_REVIEWER_SHELL';
 
-function reportFor(evidence: string, shell: string, sourceId: string): string {
+function reportFor(evidence: string, shell: string, sourceId: string, supplementId: string): string {
   return JSON.stringify({
     schema: 1,
     summary: `Native process evidence: ${evidence.slice(0, 160)}; shell: ${shell.slice(0, 160)}`,
@@ -15,7 +15,7 @@ function reportFor(evidence: string, shell: string, sourceId: string): string {
       target: 'agd-reviewer-execution-trace',
       finding: `The native run read the reserved reviewer contract and observed ${SENTINEL} plus ${SHELL_MARKER}.`,
       applicability: 'native reviewer execution traces',
-      citations: [sourceId],
+      citations: [sourceId, supplementId],
       counterexamples: [],
       uncertainty: 'The deterministic local provider proves tool/result plumbing, not model judgement.',
       resolution: 'Add an AGD-authored process-trace review checklist covering tool evidence and bounded report handoff.',
@@ -91,6 +91,17 @@ function sourceId(messages: unknown[]): string | undefined {
 }
 
 
+function supplementaryId(messages: unknown[]): string | undefined {
+  const result = resultText(toolResult(messages, 'capture-evidence')?.content);
+  try {
+    const value = JSON.parse(result) as { source_id?: unknown };
+    return typeof value.source_id === 'string' ? value.source_id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+
 function sse(res: ServerResponse, payload: object) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
   res.write('data: [DONE]\n\n');
@@ -151,6 +162,7 @@ export default async function fixture(pi: {
     const catalogResult = toolResult(messages, 'read-catalog');
     const bashResult = toolResult(messages, 'shell-diagnostic');
     const writeResult = toolResult(messages, 'write-report');
+    const captureResult = toolResult(messages, 'capture-evidence');
     if (hasToolCall(messages, 'read', 'request.json')
       && (!requestResult || toolErrors.has('read-request')
         || !resultText(requestResult.content).includes('review_run_id'))) {
@@ -175,7 +187,12 @@ export default async function fixture(pi: {
       res.writeHead(502).end('bash diagnostic failed or lacked marker');
       return;
     }
-    if (hasToolCall(messages, 'write')
+    if (hasToolCall(messages, 'bash', 'reviewer evidence add')
+      && (!captureResult || toolErrors.has('capture-evidence') || !supplementaryId(messages))) {
+      res.writeHead(502).end('supplementary evidence capture failed');
+      return;
+    }
+    if (hasToolCall(messages, 'write', 'report-draft.json')
       && (!writeResult || toolErrors.has('write-report') || !resultText(writeResult.content).trim())) {
       res.writeHead(502).end('report write failed');
       return;
@@ -209,16 +226,32 @@ export default async function fixture(pi: {
             command: `printf '${SHELL_MARKER}\\n'`,
           }) } }] },
         finish_reason: 'tool_calls' }] });
-    } else if (!hasToolCall(messages, 'write')) {
+    } else if (!hasToolCall(messages, 'write', 'investigation.txt')) {
+      send({ id, object: 'chat.completion.chunk', choices: [{ index: 0,
+        delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'write-evidence', type: 'function',
+          function: { name: 'write', arguments: JSON.stringify({
+            path: 'investigation.txt',
+            content: JSON.stringify({ shell: SHELL_MARKER, purpose: 'bounded native investigation artifact' }) + '\n',
+          }) } }] },
+        finish_reason: 'tool_calls' }] });
+    } else if (!hasToolCall(messages, 'bash', 'reviewer evidence add')) {
+      send({ id, object: 'chat.completion.chunk', choices: [{ index: 0,
+        delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'capture-evidence', type: 'function',
+          function: { name: 'bash', arguments: JSON.stringify({
+            command: '"$AGD_CLI" --home "$AGD_HOME" reviewer evidence add "$AGD_REVIEW_RUN_ID" --file "$PWD/investigation.txt" --label "native shell investigation"',
+          }) } }] },
+        finish_reason: 'tool_calls' }] });
+    } else if (!hasToolCall(messages, 'write', 'report-draft.json')) {
       const source = sourceId(messages);
-      if (!source || !packetText.includes(SENTINEL)) {
-        res.writeHead(502).end('fixture did not receive packet evidence');
+      const supplement = supplementaryId(messages);
+      if (!source || !supplement || !packetText.includes(SENTINEL)) {
+        res.writeHead(502).end('fixture did not receive packet and supplementary evidence');
         return;
       }
       send({ id, object: 'chat.completion.chunk', choices: [{ index: 0,
         delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'write-report', type: 'function',
           function: { name: 'write', arguments: JSON.stringify({
-            path: 'report-draft.json', content: reportFor(packetText, SHELL_MARKER, source),
+            path: 'report-draft.json', content: reportFor(packetText, SHELL_MARKER, source, supplement),
           }) } }] },
         finish_reason: 'tool_calls' }] });
     } else {
@@ -227,7 +260,7 @@ export default async function fixture(pi: {
         return;
       }
       send({ id, object: 'chat.completion.chunk', choices: [{ index: 0,
-        delta: { role: 'assistant', content: 'Native skill, file, shell, and report-write evidence was verified.' },
+        delta: { role: 'assistant', content: 'Native skill, file, shell, supplementary evidence, and report-write evidence was verified.' },
         finish_reason: 'stop' }] });
     }
   });
