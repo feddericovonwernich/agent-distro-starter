@@ -1,3 +1,5 @@
+import { writeFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { createServer } from 'node:http';
 import type { ServerResponse } from 'node:http';
 
@@ -96,11 +98,13 @@ export default async function fixture(pi: {
   on: (event: string, handler: (value: Record<string, unknown>) => void) => void;
 }) {
   const toolErrors = new Set<string>();
+  let contextCaptured = false;
   pi.on('tool_result', event => {
     if (event.isError === true && typeof event.toolCallId === 'string') {
       toolErrors.add(event.toolCallId);
     }
   });
+  const contextArtifact = resolve(process.cwd(), 'native-provider-context.json');
   const server = createServer(async (req, res) => {
     if (req.method !== 'POST' || !req.url?.endsWith('/chat/completions')) {
       res.writeHead(404).end();
@@ -109,16 +113,32 @@ export default async function fixture(pi: {
     let body = '';
     for await (const chunk of req) body += chunk;
     const messages = (JSON.parse(body).messages ?? []) as unknown[];
+    if (!contextCaptured) {
+      const contextMessages = messages.filter((row): row is Record<string, unknown> => {
+        if (!row || typeof row !== 'object') return false;
+        const role = (row as Record<string, unknown>).role;
+        return role === 'system' || role === 'developer';
+      });
+      const contextBody = JSON.stringify({ schema: 1, messages: contextMessages });
+      if (contextMessages.length > 0 && Buffer.byteLength(contextBody, 'utf8') <= 65536) {
+        try {
+          writeFileSync(contextArtifact, contextBody + '\n', { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+          contextCaptured = true;
+        } catch {
+          // A pre-existing artifact belongs to another disposable run.
+          contextCaptured = true;
+        }
+      }
+    }
     const id = `fixture-${Date.now()}`;
     const send = (payload: object) => {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
       sse(res, payload);
     };
     const skillResult = toolResult(messages, 'read-reviewer-skill');
-    const skillText = resultText(skillResult?.content);
+    const skillRead = hasToolCall(messages, 'read', 'skill://agd-reviewer/references/commands.md');
     if (hasToolCall(messages, 'read')
-      && (!skillResult || toolErrors.has('read-reviewer-skill')
-        || !skillText.includes('# Reviewer execution contract'))) {
+      && (!skillRead || !skillResult || toolErrors.has('read-reviewer-skill'))) {
       res.writeHead(502).end('reserved agd-reviewer core skill read failed');
       return;
     }

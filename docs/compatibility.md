@@ -70,6 +70,8 @@ The native episode lifecycle smoke passed with the official importable OMP SDK a
 
 This is lifecycle evidence only: it makes no paid-model quality, backend process-recovery, model-authentication, or telemetry-delivery claim. Native capture remains available regardless of telemetry opt-in. Existing live sessions are supported by reloading through the official harness command (`/reload` where provided) and obtaining a subsequent proved response; no historical boundary is fabricated and no agent is stopped. Scoped, title-independent material deduplication, retained-only finalization, direct taskless central episodes, linked-decision context, and selection-time-frozen citations are described in [operations](operations.md#background-reviewer).
 
+Task 1's standalone child component has separate controller-owned native acceptance: explicit and default native runs used OMP 18.14.0, a loopback local-only provider, native skill/session binding, real file/shell/report tools, true child exit, and owned process-group absence proof. Missing-context and bad-binding fatal probes exited by self-signal before assistant/tool/report activity. This validates the private B1 component only; the public reviewer coordinator and historical compatibility rows remain pending B2 cutover.
+
 The following is the acceptance matrix for the bounded reviewer. “Executable coverage” identifies the named fake-child, Python, CLI, or build proof; it is not a substitute for a real native OMP acceptance where that is required.
 
 | # | Approved criterion / concrete scenario | Status | Evidence |
