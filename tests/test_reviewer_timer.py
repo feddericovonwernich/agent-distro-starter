@@ -30,6 +30,13 @@ def home(tmp_path):
     return root
 
 
+def test_runtime_environment_exposes_only_timer_launch_contract(tmp_path):
+    runtime = reviewer_timer.runtime_environment(home(tmp_path))
+    assert set(runtime) == {'python', 'path'}
+    assert Path(runtime['python']).is_absolute()
+    assert runtime['path']
+
+
 def interval_config(hours=12):
     return {'schedule': {'mode': 'interval', 'timezone': None, 'calendar': None, 'interval_hours': hours},
             'limits': dict(reviewer.DEFAULT_LIMITS)}
@@ -132,6 +139,8 @@ def test_timer_runner_skips_collection_until_interval_is_due(tmp_path, monkeypat
 
 
 
+
+
 def test_refuses_foreign_owned_xdg_root(tmp_path, monkeypatch):
     root, xdg = home(tmp_path), tmp_path / 'xdg'; xdg.mkdir()
     actual = reviewer_timer.os.lstat
@@ -177,12 +186,13 @@ def test_native_service_discards_inherited_credentials(tmp_path):
     helper.write_text(
         'import json,os\nfrom pathlib import Path\n'
         f'Path({str(marker)!r}).write_text(json.dumps({{key:os.environ.get(key) for key in '
-        '("AGD_CREDENTIAL_SENTINEL","OTEL_EXPORTER_OTLP_HEADERS","HOME","PATH")}))\n')
+        '("AGD_CREDENTIAL_SENTINEL","OTEL_EXPORTER_OTLP_HEADERS","HERDR_ENV","AGD_HERDR_SESSION","HOME","PATH")}))\n')
     rendered = reviewer_timer.render_units(
         root, interval_config(), runtime={'python': sys.executable, 'path': os.defpath}, source_cli=str(helper))
     content = rendered['service'].replace(
         '[Service]\n', '[Service]\nEnvironment=AGD_CREDENTIAL_SENTINEL=synthetic-secret\n'
-        'Environment=OTEL_EXPORTER_OTLP_HEADERS=synthetic-header\n')
+        'Environment=OTEL_EXPORTER_OTLP_HEADERS=synthetic-header\n'
+        'Environment=HERDR_ENV=synthetic-herdr\nEnvironment=AGD_HERDR_SESSION=synthetic-session\n')
     directory = reviewer_timer._unit_directory(Path.home() / '.config')
     service = directory / rendered['service_name']
     owner = f'X-AGD-Reviewer-Owner={identity}:{os.getuid()}'
@@ -194,6 +204,8 @@ def test_native_service_discards_inherited_credentials(tmp_path):
         observed = json.loads(marker.read_text())
         assert observed['AGD_CREDENTIAL_SENTINEL'] is None
         assert observed['OTEL_EXPORTER_OTLP_HEADERS'] is None
+        assert observed['HERDR_ENV'] is None
+        assert observed['AGD_HERDR_SESSION'] is None
         assert observed['HOME'] == str(Path.home())
         assert observed['PATH'] == os.defpath
     finally:

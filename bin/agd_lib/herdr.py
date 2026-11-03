@@ -554,6 +554,10 @@ def reviewer_close(home: Path, receipt: dict) -> None:
     endpoint = _reviewer_endpoint(receipt)
     if Path(endpoint['home']).resolve() != Path(home).resolve():
         raise store.Refusal('reviewer Herdr endpoint home differs')
+    identity_proved = bool(os.path.lexists(home)
+                           and endpoint.get('target') == supervision.runtime_home_identity(home))
+    if os.path.lexists(home) and not identity_proved:
+        raise store.Refusal('reviewer Herdr endpoint target differs')
     try:
         socket_paths = [endpoint['socket'],
                         endpoint.get('client_socket', {}).get('path')
@@ -589,7 +593,8 @@ def reviewer_close(home: Path, receipt: dict) -> None:
                 pass
         if supervision.process_presence(server) or any(os.path.lexists(path) for path in socket_paths):
             raise store.Refusal('reviewer Herdr server remains active')
-    try:
-        Path(endpoint['env_file']).unlink()
-    except (KeyError, OSError):
-        pass
+    if identity_proved:
+        try:
+            Path(endpoint['env_file']).unlink()
+        except (KeyError, OSError):
+            pass

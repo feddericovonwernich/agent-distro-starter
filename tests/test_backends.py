@@ -381,3 +381,92 @@ def test_removed_home_herdr_reviewer_absence_requires_both_sockets(tmp_path):
             process.wait(timeout=5)
 
 
+def test_reviewer_close_retains_replaced_home_environment(tmp_path):
+    import uuid
+    from agd_lib import herdr, supervision
+    home = tmp_path / 'review-home'
+    home.mkdir()
+    (home / 'data').mkdir()
+    old_id = str(uuid.uuid4())
+    (home / 'data' / 'home.json').write_text(json.dumps({'schema': 1, 'home_id': old_id}))
+    target = supervision.runtime_home_identity(home)
+    process = subprocess.Popen(['/bin/sleep', '30'])
+    try:
+        process_identity = supervision.process_identity(process.pid)
+        process.terminate()
+        process.wait(timeout=5)
+        run_id = str(uuid.uuid4())
+        replacement = tmp_path / 'replacement'
+        home.rename(replacement)
+        home.mkdir()
+        (home / 'data').mkdir()
+        (home / 'data' / 'home.json').write_text(
+            json.dumps({'schema': 1, 'home_id': str(uuid.uuid4())}))
+        env_file = home / 'reviewer.env'
+        env_file.write_text('foreign replacement environment\n')
+        endpoint = {
+            'backend': 'herdr',
+            'review_run_id': run_id,
+            'home': str(home),
+            'session': f"agd-reviewer-{run_id.replace('-', '')}",
+            'target': target,
+            'server': {'process': process_identity},
+            'socket': str(tmp_path / 'reviewer.sock'),
+            'client_socket': {'path': str(tmp_path / 'reviewer-client.sock')},
+            'env_file': str(env_file),
+        }
+        with pytest.raises(Refusal):
+            herdr.reviewer_close(home, endpoint)
+        assert env_file.exists()
+        assert env_file.read_text() == 'foreign replacement environment\n'
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+@pytest.mark.parametrize('session', ['default', 'focused'])
+def test_reviewer_endpoint_rejects_default_or_focused_session(session):
+    import uuid
+    from agd_lib import herdr
+    run_id = str(uuid.uuid4())
+    with pytest.raises(Refusal):
+        herdr._reviewer_endpoint({
+            'backend': 'herdr',
+            'review_run_id': run_id,
+            'home': '/tmp/owned-reviewer-home',
+            'session': session,
+        })
+
+
+
+def test_managed_reviewer_herdr_endpoint_is_run_scoped_and_absent_after_close(tmp_path):
+    import shutil
+    import uuid
+    from agd_lib import herdr
+    if shutil.which('herdr') is None:
+        pytest.skip('Herdr executable unavailable')
+    home = tmp_path / 'home'
+    command(home, 'init', '--backend', 'tmux')
+    cwd = home / 'review-runtime'
+    cwd.mkdir()
+    run_id = str(uuid.uuid4())
+    endpoint = herdr.reviewer_create(
+        home, run_id, ['/bin/sh', '-c', 'printf managed-reviewer; sleep 30'],
+        cwd=cwd, env={'HOME': str(home), 'PATH': '/usr/bin:/bin'})
+    try:
+        assert endpoint['session'] == f"agd-reviewer-{run_id.replace('-', '')}"
+        assert herdr.reviewer_inspect(home, endpoint)['presence'] == 'present'
+        with pytest.raises(Refusal):
+            herdr.reviewer_create(
+                home, run_id, ['/bin/sh', '-c', 'printf collision; sleep 30'],
+                cwd=cwd, env={'HOME': str(home), 'PATH': '/usr/bin:/bin'})
+        assert herdr.reviewer_inspect(home, endpoint)['presence'] == 'present'
+        foreign = dict(endpoint, target={'canonical_home': str(home), 'home_id': str(uuid.uuid4())})
+        with pytest.raises(Refusal):
+            herdr.reviewer_inspect(home, foreign)
+        assert herdr.reviewer_inspect(home, endpoint)['presence'] == 'present'
+    finally:
+        herdr.reviewer_close(home, endpoint)
+    assert herdr.reviewer_inspect(home, endpoint)['presence'] == 'missing'
+

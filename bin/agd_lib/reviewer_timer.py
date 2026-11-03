@@ -34,7 +34,7 @@ def runtime_environment(home):
         raise store.DependencyError('reviewer native OMP agent directory is unavailable')
     try:
         executable = str(Path(omp_runtime.executable(home)).resolve(strict=True))
-        backend = launcher.resolve_backend(home, None)
+        launcher.resolve_backend(home, None)
     except (OSError, store.Refusal, store.DependencyError, KeyError, TypeError) as error:
         raise store.DependencyError('reviewer native runtime is unavailable') from error
     skill = Path(__file__).resolve().parents[2] / 'bundled' / 'reviewer-skills' / 'agd-reviewer'
@@ -44,8 +44,7 @@ def runtime_environment(home):
     path = os.pathsep.join(dict.fromkeys([parent, *os.defpath.split(os.pathsep)]))
     if shutil.which(Path(executable).name, path=path) != executable:
         raise store.DependencyError('reviewer runtime search path changed executable identity')
-    return {'python': str(Path(sys.executable).resolve()), 'path': path,
-            'omp': executable, 'backend': backend, 'skill': str(skill)}
+    return {'python': str(Path(sys.executable).resolve()), 'path': path}
 
 
 def _native_run(argv):
