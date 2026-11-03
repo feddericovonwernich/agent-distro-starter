@@ -28,22 +28,31 @@ def validate_schedule(schedule):
 
 
 def runtime_environment(home):
-    from . import launcher
+    from . import installer, launcher
     directory = omp_runtime.agent_dir(home)
     if directory.is_symlink() or not directory.is_dir():
         raise store.DependencyError('reviewer native OMP agent directory is unavailable')
     try:
-        executable = str(Path(omp_runtime.executable(home)).resolve(strict=True))
+        executable = Path(omp_runtime.executable(home)).resolve(strict=True)
+        dependencies = installer.read_dependencies(home)
+        selected = [('omp', executable)]
+        for name in ('herdr', 'treehouse'):
+            entry = dependencies.get(name)
+            if entry is None:
+                continue
+            selected.append((name, Path(entry['path']).resolve(strict=True)))
         launcher.resolve_backend(home, None)
     except (OSError, store.Refusal, store.DependencyError, KeyError, TypeError) as error:
         raise store.DependencyError('reviewer native runtime is unavailable') from error
     skill = Path(__file__).resolve().parents[2] / 'bundled' / 'reviewer-skills' / 'agd-reviewer'
     if not (skill / 'SKILL.md').is_file() or not (skill / 'references' / 'commands.md').is_file():
         raise store.DependencyError('reviewer skill is unavailable')
-    parent = str(Path(executable).parent)
-    path = os.pathsep.join(dict.fromkeys([parent, *os.defpath.split(os.pathsep)]))
-    if shutil.which(Path(executable).name, path=path) != executable:
-        raise store.DependencyError('reviewer runtime search path changed executable identity')
+    parents = [str(path.parent) for _, path in selected]
+    path = os.pathsep.join(dict.fromkeys([*parents, *os.defpath.split(os.pathsep)]))
+    for name, selected_executable in selected:
+        lookup = selected_executable.name if name == 'omp' else name
+        if shutil.which(lookup, path=path) != str(selected_executable):
+            raise store.DependencyError(f'reviewer runtime search path changed {name} identity')
     return {'python': str(Path(sys.executable).resolve()), 'path': path}
 
 

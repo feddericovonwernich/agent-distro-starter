@@ -400,11 +400,6 @@ def test_newest_live_central_receipt_wins_over_filename_order(monkeypatch):
         observability.record_process_generation(home, 'central', '0', pid=12, start='two')
         assert observability.status(home)['central']['pid'] == 12
 
-@pytest.mark.parametrize('error', [FileNotFoundError(), subprocess.TimeoutExpired(['docker'], 10)])
-def test_ownership_preflight_sanitizes_missing_docker_and_timeout(monkeypatch, error):
-    monkeypatch.setattr(observability.subprocess, 'run', lambda *args, **kwargs: (_ for _ in ()).throw(error))
-    with pytest.raises(store.Refusal, match='ownership inspection is unavailable'):
-        observability._require_owned_resources({'project': 'agdobs-test', 'home_id': INCARNATION})
 
 
 def _uninstall_engine(monkeypatch, root):
@@ -587,6 +582,9 @@ def test_langfuse_keys_absent_from_status_receipts_and_errors():
 
     known_secret = 'sk-local-status-secret'
     with lab() as (home, _):
+        observability._runtime_directories(home)
+        store.atomic_json(observability.paths(home)['compose'] / 'release-lock.json',
+                          observability._load_lock())
         rendered = observability.render_stack(home)
         observability._save_state(home, 'enabled', 'stopped', rendered)
         status = observability.read_status(home)

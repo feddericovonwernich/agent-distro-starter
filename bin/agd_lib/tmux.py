@@ -2,6 +2,7 @@ from collections.abc import Mapping
 import hashlib
 import os
 import shlex
+import stat
 import uuid
 from pathlib import Path
 from . import store, supervision
@@ -363,10 +364,76 @@ def _reviewer_endpoint(receipt):
     return receipt
 
 
+def _reviewer_target(home, endpoint):
+    if os.path.lexists(home) and endpoint.get('target') != supervision.runtime_home_identity(home):
+        raise store.Refusal('reviewer tmux endpoint target differs')
+
+
+def _reviewer_server_live(endpoint):
+    server = endpoint.get('server', {})
+    process = server.get('process') if isinstance(server, dict) else None
+    socket = server.get('socket') if isinstance(server, dict) else None
+    socket_path = socket.get('path') if isinstance(socket, dict) else None
+    if not isinstance(process, dict) or not isinstance(socket_path, str):
+        raise store.Refusal('reviewer tmux server identity is incomplete')
+    if not supervision.process_presence(process):
+        if os.path.lexists(socket_path):
+            raise store.Refusal('reviewer tmux server absence is unproven')
+        return False
+    path = Path(socket_path)
+    try:
+        identity = path.lstat()
+    except OSError as error:
+        raise store.Refusal('reviewer tmux server socket is unavailable') from error
+    if (not stat.S_ISSOCK(identity.st_mode) or identity.st_uid != os.getuid()
+            or identity.st_dev != socket.get('device') or identity.st_ino != socket.get('inode')):
+        raise store.Refusal('reviewer tmux server socket identity differs')
+    return True
+
+
+def _reviewer_anchor_owned(endpoint):
+    anchor = endpoint.get('server', {}).get('anchor')
+    if not isinstance(anchor, dict) or not isinstance(anchor.get('pane'), str):
+        raise store.Refusal('reviewer tmux server anchor is malformed')
+    if not isinstance(anchor.get('token_sha256'), str):
+        raise store.Refusal('reviewer tmux server anchor is malformed')
+    panes = call(endpoint, 'list-panes', '-a', '-F', '#{pane_id}', check=False)
+    if panes.returncode or panes.stdout.splitlines() != [anchor['pane']]:
+        raise store.Refusal('reviewer tmux server has unexpected panes')
+    token = call(endpoint, 'show-options', '-p', '-v', '-t', anchor['pane'],
+                 '@agd_anchor_owner', check=False)
+    if (token.returncode
+            or hashlib.sha256(token.stdout.strip().encode()).hexdigest() != anchor['token_sha256']):
+        raise store.Refusal('reviewer tmux server anchor differs')
+    return True
+
+
+def _reviewer_dispose_server(endpoint):
+    server = endpoint.get('server')
+    if not isinstance(server, dict):
+        raise store.Refusal('reviewer tmux server identity is malformed')
+    if 'anchor' not in server or server['anchor'] is None:
+        return
+    if not _reviewer_server_live(endpoint):
+        return
+    _reviewer_anchor_owned(endpoint)
+    call(endpoint, 'kill-pane', '-t', server['anchor']['pane'])
+    process = server['process']
+    deadline = __import__('time').monotonic() + 10
+    while supervision.process_presence(process):
+        if __import__('time').monotonic() >= deadline:
+            raise store.Refusal('reviewer tmux server remains active')
+        __import__('time').sleep(.05)
+    socket_path = server['socket']['path']
+    if os.path.lexists(socket_path):
+        raise store.Refusal('reviewer tmux server socket remains')
+
+
+
 def _reviewer_owned(endpoint):
-    server = endpoint.get('server', {}).get('process')
-    if not isinstance(server, dict) or not supervision.process_presence(server):
-        raise store.Refusal('reviewer tmux server is missing or replaced')
+    if not _reviewer_server_live(endpoint):
+        return False
+    server = endpoint['server']['process']
     result = call(endpoint, 'display-message', '-p', '#{pid}', check=False)
     if result.returncode or result.stdout.strip() != str(server['pid']):
         raise store.Refusal('reviewer tmux server is missing or replaced')
@@ -387,6 +454,7 @@ def reviewer_capture(home: Path, receipt: dict, lines: int = 120) -> str:
     endpoint = _reviewer_endpoint(receipt)
     if Path(endpoint['home']).resolve() != Path(home).resolve():
         raise store.Refusal('reviewer tmux endpoint home differs')
+    _reviewer_target(home, endpoint)
     if type(lines) is not int or lines <= 0 or lines > 200:
         raise store.Refusal('reviewer capture limit is invalid')
     if not _reviewer_owned(endpoint):
@@ -398,6 +466,7 @@ def reviewer_inspect(home: Path, receipt: dict) -> dict:
     endpoint = _reviewer_endpoint(receipt)
     if Path(endpoint['home']).resolve() != Path(home).resolve():
         raise store.Refusal('reviewer tmux endpoint home differs')
+    _reviewer_target(home, endpoint)
     if not _reviewer_owned(endpoint):
         return {'presence': 'missing', 'backend': 'tmux', 'endpoint': endpoint}
     pane = call(endpoint, 'list-panes', '-F', '#{pane_id} #{pane_pid} #{pane_dead}',
@@ -411,6 +480,9 @@ def reviewer_inspect(home: Path, receipt: dict) -> dict:
 
 def reviewer_close(home: Path, receipt: dict) -> None:
     endpoint = _reviewer_endpoint(receipt)
+    if Path(endpoint['home']).resolve() != Path(home).resolve():
+        raise store.Refusal('reviewer tmux endpoint home differs')
+    _reviewer_target(home, endpoint)
     observed = reviewer_inspect(home, endpoint)
     if observed['presence'] == 'present':
         call(endpoint, 'kill-pane', '-t', endpoint['pane'])
@@ -425,6 +497,7 @@ def reviewer_close(home: Path, receipt: dict) -> None:
         if __import__('time').monotonic() >= deadline:
             raise store.Refusal('reviewer tmux pane remains active')
         __import__('time').sleep(.05)
+    _reviewer_dispose_server(endpoint)
     try:
         Path(endpoint['env_file']).unlink()
     except (KeyError, OSError):

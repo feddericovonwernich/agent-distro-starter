@@ -13,6 +13,7 @@ from support import lab
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'bin'))
+from agd_lib import store
 from agd_lib.store import Refusal
 
 
@@ -463,6 +464,9 @@ def test_reviewer_langfuse_env_uses_only_owned_local_project(tmp_path, monkeypat
     from agd_lib import observability
 
     with lab() as (home, _):
+        observability._runtime_directories(home)
+        store.atomic_json(observability.paths(home)['compose'] / 'release-lock.json',
+                          observability._load_lock())
         rendered = observability.render_stack(home)
         observability._save_state(home, 'enabled', runtime, rendered)
         config = observability.read_config(home)

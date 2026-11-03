@@ -8,8 +8,10 @@ from urllib.parse import unquote, urlparse
 
 def capability(home):
     from agd_lib import omp_runtime, store
-
-    entry = Path(omp_runtime.executable(home)).resolve(strict=True)
+    discovered = shutil.which('omp')
+    if not discovered:
+        raise store.DependencyError('installed OMP executable is unavailable')
+    entry = Path(discovered).resolve(strict=True)
     root = next((parent for parent in (entry.parent, *entry.parents)
                  if (parent / 'package.json').is_file()
                  and not (parent / 'package.json').is_symlink()
@@ -17,6 +19,13 @@ def capability(home):
                  == '@oh-my-pi/pi-coding-agent'), None)
     if root is None:
         raise store.DependencyError('installed OMP package root is unavailable')
+    installation_root = next(
+        (parent for parent in (root.parent, *root.parents)
+         if parent.name == 'node_modules'
+         and (parent / '@oh-my-pi/pi-coding-agent').resolve(strict=True) == root),
+        None)
+    if installation_root is None:
+        raise store.DependencyError('installed OMP installation root is unavailable')
     manifest = json.loads((root / 'package.json').read_text())
     declared = (root / manifest['bin']['omp']).resolve(strict=True)
     if declared != entry or not manifest.get('version'):
@@ -42,6 +51,7 @@ console.log(JSON.stringify({ai_url:import.meta.resolve(modules.ai),core_url:impo
     for key in expected - {'omp_version'}:
         parsed = urlparse(value[key])
         location = Path(unquote(parsed.path)).resolve(strict=True)
-        if parsed.scheme != 'file' or root not in location.parents:
+        if (parsed.scheme != 'file' or not location.is_file()
+                or not location.is_relative_to(installation_root)):
             raise store.DependencyError('native OMP test capability escaped package root')
     return value

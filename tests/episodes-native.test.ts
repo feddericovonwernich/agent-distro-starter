@@ -114,15 +114,17 @@ function fixture(repo: string, role: 'worker' | 'central'): Fixture {
     const value = JSON.parse(readFileSync(path, 'utf8')) as Fixture | Fixture[];
     return Array.isArray(value) ? value.find(row => row.role === role)! : value;
   }
-  generatedRoot = mkdtempSync(join(tmpdir(), `agd-native-episodes-${role}-`));
+  generatedRoot = process.env.AGD_NATIVE_EPISODES_ROOT ??
+    mkdtempSync(join(tmpdir(), `agd-native-episodes-${role}-`));
   const setup = `
-import json, os, sys, time, uuid
+import json, os, sys, time
 from pathlib import Path
 from support import run
 from native_omp_capability import capability
 from agd_lib import tasks, store, supervision, observability
 root=Path(sys.argv[1]); repo=Path(sys.argv[2]); owner=int(sys.argv[3]); role=sys.argv[4]; home=root/'distro'
-def agd(*args): return json.loads(run([repo/'bin/agd','--home',home,*args]).stdout)
+env=dict(os.environ,TREEHOUSE_ROOT=str(home/'data/treehouse'))
+def agd(*args): return json.loads(run([repo/'bin/agd','--home',home,*args],env=env).stdout)
 agd('init','--backend','tmux'); (home/'native-probe.txt').write_text('Native episode fixture.')
 if role == 'worker':
  brief=home/'brief.md'; brief.write_text('Native episode fixture.')
@@ -130,7 +132,7 @@ if role == 'worker':
  (seed/'value.txt').write_text('base\\n'); run(['git','add','.'],cwd=seed); run(['git','commit','-m','initial'],cwd=seed)
  run(['git','clone','--bare',seed,root/'origin.git']); agd('project','add','sample','--source',str(root/'origin.git'))
  task=agd('task','create','native','--project','sample','--brief',str(brief),'--kind','scout','--skill-mode','none')
- task.update(executor='worker',phase='running',incarnation=str(uuid.uuid4()),worker_alive=True)
+ task.update(executor='worker',phase='running',incarnation=os.environ['AGD_INCARNATION'],worker_alive=True)
  binding=observability.worker_binding(home,task['id'],task['incarnation']); task['observability']={'session_dir':binding['session_dir']}; tasks.save(home,task)
  runner=supervision.process_identity(owner); runner.pop('state',None); child=dict(runner); runner.update(incarnation=task['incarnation'],phase='spawned',child_pid=owner,child_start=runner['start'],child=child)
  store.atomic_json(home/'state/tasks'/task['id']/'runner.json',runner)
@@ -138,7 +140,9 @@ if role == 'worker':
  session_dir=binding['session_dir']; extension='lib/omp-worker.ts'
 else:
  task=None; session_dir=str(home/'data/observability/central/omp'); Path(session_dir).mkdir(parents=True,exist_ok=True); extension='.omp/extensions/agd-primary.ts'
- observability.record_process_generation(home,'central','1',pid=owner,start=supervision.process_start(owner))
+ owner_identity=supervision.process_identity(owner); owner_start=owner_identity['start']; token=os.environ['AGD_ENDPOINT_TOKEN']
+ store.atomic_json(home/'state/owner.json',dict(owner_pid=owner,owner_start=owner_start,watcher_pid=owner,watcher_start=owner_start,heartbeat=time.time(),token=token))
+ observability.record_process_generation(home,'central','1',pid=owner,start=owner_start)
 capability=capability(home)
 print(json.dumps({'home':str(home),'task':task,'session_dir':session_dir,'role':role,'extension':extension,'capability':capability}))
 `;
@@ -157,6 +161,8 @@ async function nativeProbe(role: 'worker' | 'central') {
   const agentDir = join(isolated, 'agent');
   mkdirSync(agentDir, { recursive: true });
   process.env.AGD_HOME = data.home;
+  process.env.AGD_CLI = join(repo, 'bin', 'agd');
+  process.env.TREEHOUSE_ROOT = join(data.home, 'data', 'treehouse');
   process.env.AGD_MANAGED_CENTRAL = role === 'central' ? '1' : '';
   process.env.OPENAI_API_KEY = 'provider-free-episode-probe';
   process.env.OMP_TELEMETRY_ENABLED = 'false';
@@ -283,7 +289,8 @@ async function nativeProbe(role: 'worker' | 'central') {
     model: modelRegistry.find('openai', 'gpt-4o-mini'), modelRegistry, sessionManager: manager,
     rules: [], contextFiles: [], noContextFiles: true, disableExtensionDiscovery: true,
     toolNames: ['read'], enableMCP: false, enableLsp: false, enableIrc: false,
-    extensions: [extensionWithStaleGate],
+    skipPythonPreflight: true, spawns: '', autoTitle: false,
+    systemPrompt: ['NATIVE-POLICY'], extensions: [extensionWithStaleGate],
   });
   let mode: 'final' | 'wait' | 'error' | 'abort' | 'hold' = 'final';
   let waitTurn = 0;
@@ -301,7 +308,7 @@ async function nativeProbe(role: 'worker' | 'central') {
       : mode === 'final' ? [{ type: 'text', text: 'Native final episode.' }] : [];
     const stopReason = mode === 'error' ? 'error' : mode === 'abort' ? 'aborted' : 'stop';
     const message = { role: 'assistant', content, api: model.api, provider: model.provider, model: model.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-      stopReason, timestamp: Date.now() };
+      stopReason, errorMessage: undefined, timestamp: Date.now() };
     const fail = (reason: 'error' | 'aborted') => {
       const error = { ...message, stopReason: reason, errorMessage: 'Scripted provider failure.' };
       stream.push({ type: 'error', reason, error });
@@ -687,20 +694,45 @@ async function nativeProbe(role: 'worker' | 'central') {
 }
 
 if (process.env.AGD_NATIVE_EPISODES_CHECK === '1') {
-  const worker = await nativeProbe('worker');
-  const central = await nativeProbe('central');
-  console.log(JSON.stringify({ worker, central }));
+  const role = process.env.AGD_NATIVE_EPISODES_ROLE as 'worker' | 'central';
+  const result = await nativeProbe(role);
+  console.log(JSON.stringify(result));
 } else {
   test('native episode capture keeps markers out of provider context and records only finals', async () => {
-    const child = Bun.spawn([process.execPath, '--no-env-file', import.meta.path], {
-      env: { ...process.env, AGD_NATIVE_EPISODES_CHECK: '1' }, stdout: 'pipe', stderr: 'pipe',
-      signal: AbortSignal.timeout(180000),
+    const repo = resolve(import.meta.dir, '..');
+    const roles = ['worker', 'central'] as const;
+    const children = roles.map(role => {
+      const root = mkdtempSync(join(tmpdir(), `agd-native-episodes-${role}-`));
+      const env = { ...process.env, AGD_NATIVE_EPISODES_CHECK: '1',
+        AGD_NATIVE_EPISODES_ROLE: role, AGD_NATIVE_EPISODES_ROOT: root,
+        AGD_HOME: join(root, 'distro'), AGD_CLI: join(repo, 'bin', 'agd'),
+        TREEHOUSE_ROOT: join(root, 'distro', 'data', 'treehouse') };
+      delete env.AGD_TASK_ID;
+      delete env.AGD_INCARNATION;
+      delete env.AGD_MANAGED_CENTRAL;
+      delete env.AGD_OWNER;
+      delete env.AGD_ENDPOINT_TOKEN;
+      if (role === 'worker') {
+        env.AGD_TASK_ID = 'native';
+        env.AGD_INCARNATION = randomUUID();
+      } else {
+        env.AGD_MANAGED_CENTRAL = '1';
+        env.AGD_ENDPOINT_TOKEN = randomUUID();
+        env.AGD_OWNER = env.AGD_ENDPOINT_TOKEN;
+      }
+      return { role, root, child: Bun.spawn([process.execPath, '--no-env-file', import.meta.path], {
+        env, stdout: 'pipe', stderr: 'pipe', signal: AbortSignal.timeout(180000),
+      }) };
     });
-    const [stdout, stderr, exit] = await Promise.all([
-      new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
-    ]);
-    expect(exit, stderr).toBe(0);
-    const evidence = JSON.parse(stdout);
+    const settled = await Promise.all(children.map(async ({ role, root, child }) => {
+      const [stdout, stderr, exit] = await Promise.all([
+        new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+      ]);
+      rmSync(root, { recursive: true, force: true });
+      expect(exit, stderr).toBe(0);
+      return [role, JSON.parse(stdout)] as const;
+    }));
+    const evidence = Object.fromEntries(settled) as Record<'worker' | 'central', Record<string, unknown>>;
     for (const result of [evidence.worker, evidence.central]) {
       expect(result.markerHidden).toBe(true);
       expect(result.gapsRejected).toBe(true);

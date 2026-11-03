@@ -1,5 +1,6 @@
 import os
 import json
+import shutil
 import subprocess
 import sys
 import uuid
@@ -9,7 +10,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
-from agd_lib import omp_runtime, reviewer, reviewer_runner, reviewer_timer, store
+from agd_lib import installer, omp_runtime, reviewer, reviewer_runner, reviewer_timer, store
 
 
 def utc(value):
@@ -30,11 +31,38 @@ def home(tmp_path):
     return root
 
 
-def test_runtime_environment_exposes_only_timer_launch_contract(tmp_path):
-    runtime = reviewer_timer.runtime_environment(home(tmp_path))
-    assert set(runtime) == {'python', 'path'}
-    assert Path(runtime['python']).is_absolute()
-    assert runtime['path']
+def test_timer_minimal_environment_runs_selected_tools_from_distinct_receipt_dirs(tmp_path):
+    root = home(tmp_path)
+    selected = tmp_path / 'selected'
+    omp_real, herdr_dir, treehouse_dir = selected / 'omp-real', selected / 'herdr', selected / 'treehouse'
+    for directory in (omp_real, herdr_dir, treehouse_dir):
+        directory.mkdir(parents=True)
+    sources = {name: shutil.which(name) for name in ('omp', 'herdr', 'treehouse')}
+    assert all(sources.values())
+    shutil.copy2(sources['omp'], omp_real / 'omp-native-version')
+    shutil.copy2(sources['herdr'], herdr_dir / 'herdr')
+    shutil.copy2(sources['treehouse'], treehouse_dir / 'treehouse')
+    for path in (omp_real / 'omp-native-version', herdr_dir / 'herdr', treehouse_dir / 'treehouse'):
+        path.chmod(0o700)
+    omp_link_dir = selected / 'omp-link'
+    omp_link_dir.symlink_to(omp_real, target_is_directory=True)
+    installer.write_dependencies(root, {
+        'schema': 1,
+        'omp': {'source': 'existing', 'path': str(omp_link_dir / 'omp-native-version'),
+                'version': 'omp/18.14.0', 'capabilities': ['models-json', 'login']},
+        'herdr': {'source': 'existing', 'path': str(herdr_dir / 'herdr'),
+                  'version': 'herdr/0.8.2', 'capabilities': ['session-list-json', 'named-status']},
+        'treehouse': {'source': 'existing', 'path': str(treehouse_dir / 'treehouse'),
+                      'version': 'treehouse/3.1.6', 'capabilities': ['version']},
+    })
+    runtime = reviewer_timer.runtime_environment(root)
+    environment = {'HOME': str(tmp_path), 'PATH': runtime['path']}
+    assert shutil.which('omp-native-version', path=runtime['path']) == str((omp_real / 'omp-native-version').resolve())
+    for name in ('omp-native-version', 'herdr', 'treehouse'):
+        result = subprocess.run([name, '--version'], env=environment,
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+
 
 
 def interval_config(hours=12):
