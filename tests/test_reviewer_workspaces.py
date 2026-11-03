@@ -196,34 +196,64 @@ def test_same_run_project_commit_does_not_allocate_twice(workspace_lab):
                 if row.get('lease_holder') == first['lease_holder']]) == 1
 
 
-def test_foreign_or_ambiguous_lease_is_refused(workspace_lab):
-    home, project, commit, run_id, _ = workspace_lab
-    from agd_lib import reviewer, store
+def test_foreign_or_ambiguous_lease_is_refused_by_receipt_consumer(workspace_lab):
+    home, project, commit, run_id, selected = workspace_lab
+    from agd_lib import store
     workspaces = _workspace_module()
-    reviewer.close_run(home, run_id, 'failed', error_code='fixture')
+    original = workspaces.create(home, run_id, 'sample', commit)
     root = home / 'data' / 'treehouse'
     base = json.loads((home / 'data' / 'projects' / 'sample.json').read_text())['base']
     include = home / 'empty-include'
     include.write_text('')
-    foreign = []
-    for holder in ('foreign-owner', 'ambiguous-owner', 'ambiguous-owner'):
-        foreign.append(json.loads(store.run([
+
+    def allocate(holder):
+        return json.loads(store.run([
             'treehouse', '--root', str(root), 'get', '--lease', '--json', '--no-fetch',
             '--lease-holder', holder, '--base', base, '--include-file', str(include)],
-            cwd=project).stdout))
-    instruction = home / 'operator-instruction.txt'
-    instruction.write_text(
-        f'Close and inspect exact reviewer cleanup {run_id} sample {commit}.\\n')
-    try:
-        outcome = workspaces.cleanup(home, run_id, 'sample', commit, instruction=instruction)
-    except store.Refusal:
-        outcome = {'outcome': 'refused'}
-    assert outcome['outcome'] in ('retained', 'refused')
-    rows = _status(home, project)
-    for allocation in foreign:
-        row = next(row for row in rows if row.get('lease_id') == allocation['lease_id'])
-        assert row['lease_holder'] in {'foreign-owner', 'ambiguous-owner'}
+            cwd=project).stdout)
 
+    foreign = allocate('foreign-owner')
+    receipt_path = workspaces._receipt_path(home, run_id, 'sample', commit)
+    record = workspaces._record(receipt_path)
+    record['lease_id'] = foreign['lease_id']
+    workspaces._write(receipt_path, record)
+    with pytest.raises(store.Refusal, match='lease identity changed'):
+        workspaces.list_workspaces(home, run_id)
+    assert _row(home, project, original['lease_id'])['lease_holder'] == original['lease_holder']
+    assert _row(home, project, foreign['lease_id'])['lease_holder'] == 'foreign-owner'
+
+    from test_reviewer import _retry_run_with_packet
+    ambiguous_run = _retry_run_with_packet(home, selected)
+    ambiguous_id = ambiguous_run['review_run_id']
+    probe = workspaces.create(home, ambiguous_id, 'sample', commit)
+    ambiguous = [allocate('ambiguous-owner'), allocate('ambiguous-owner')]
+    receipt_path = workspaces._receipt_path(home, ambiguous_id, 'sample', commit)
+    record = workspaces._record(receipt_path)
+    record['lease_holder'] = 'ambiguous-owner'
+    workspaces._write(receipt_path, record)
+    with pytest.raises(store.Refusal, match='ambiguous probe lease holder'):
+        workspaces.list_workspaces(home, ambiguous_id)
+    assert all(_row(home, project, item['lease_id'])['lease_holder'] == 'ambiguous-owner'
+               for item in ambiguous)
+    assert _row(home, project, probe['lease_id'])['lease_holder'] == probe['lease_holder']
+
+
+def test_returned_receipt_is_durable_for_public_list(workspace_lab):
+    home, project, commit, run_id, _ = workspace_lab
+    workspaces = _workspace_module()
+    result = workspaces.create(home, run_id, 'sample', commit)
+    record = workspaces._records(home, run_id)[0]
+    workspaces._return(home, project, record)
+    listed = workspaces.list_workspaces(home, run_id)
+    assert len(listed) == 1
+    item = listed[0]
+    assert {item[key] for key in ('review_run_id', 'project', 'commit',
+                                  'lease_id', 'lease_holder')} == {
+        run_id, 'sample', commit, result['lease_id'], result['lease_holder']}
+    assert item['state'] == 'returned'
+    assert item['exposure'] == 'exposed'
+    assert 'path' not in item
+    assert not any(row.get('lease_id') == result['lease_id'] for row in _status(home, project))
 
 def test_dirty_or_committed_probe_is_retained(workspace_lab):
     home, project, commit, run_id, selected = workspace_lab

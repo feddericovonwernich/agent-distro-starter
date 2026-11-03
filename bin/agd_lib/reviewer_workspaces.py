@@ -367,6 +367,7 @@ def _return(home, project, record):
         raise store.Refusal('returned probe lease remains present')
     _delete_base_ref(home, project, record)
     record['state'] = 'returned'
+    _write(_receipt_path(home, record['review_run_id'], record['project'], record['commit']), record)
 
 
 def cleanup(home: Path, review_run_id: str, project_id: str, commit: str, *, instruction: Path | None = None) -> dict:
