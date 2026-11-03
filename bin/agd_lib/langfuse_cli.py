@@ -44,6 +44,21 @@ def _regular(path, *, executable=False):
         raise store.Refusal('Langfuse launcher is not executable')
     return path
 
+def _runtime_executable(path):
+    path = Path(path)
+    try:
+        mode = path.lstat()
+    except FileNotFoundError as error:
+        raise store.Refusal(f'Langfuse runtime path is unavailable: {path.name}') from error
+    if (not stat.S_ISREG(mode.st_mode) or mode.st_uid not in {os.getuid(), 0}
+            or mode.st_nlink != 1):
+        raise store.Refusal('Langfuse runtime ownership is unproven')
+    if mode.st_mode & 0o022:
+        raise store.Refusal('Langfuse runtime is writable by another user')
+    if not mode.st_mode & 0o111:
+        raise store.Refusal('Langfuse runtime is not executable')
+    return path
+
 
 def _directory(path):
     path = Path(path)
@@ -250,7 +265,7 @@ def _validate_candidate(package, node, run, assets):
     actual = _asset_map(package)
     if actual != assets:
         raise store.Refusal('Langfuse package assets differ from the verified archive')
-    _regular(node, executable=True)
+    _runtime_executable(node)
     node_version = _node_version(run, node)
     _probe(entry, run)
     return metadata, entry, node_version, actual
@@ -263,7 +278,7 @@ def validate_installation(home, *, run=store.run):
     paths = _paths(home)
     package = _directory(receipt['package'])
     entry = _regular(receipt['entry'], executable=True)
-    node = _regular(receipt['node'], executable=True)
+    node = _runtime_executable(receipt['node'])
     launcher = _regular(receipt['launcher'], executable=True)
     if launcher != paths['launcher'] or package != Path(receipt['package']) or entry != Path(receipt['entry']):
         raise store.Refusal('Langfuse installation path changed')
@@ -320,6 +335,7 @@ def ensure_installed(home, *, run=store.run, which=shutil.which, fetch_bytes):
         node = Path(node_name).resolve() if node_name else None
         if node is None:
             raise store.Refusal('existing Node.js 20+ is required; install it separately and retry')
+        _runtime_executable(node)
         candidate_error = None
         try:
             candidate = _candidate(which)
@@ -360,7 +376,7 @@ def ensure_installed(home, *, run=store.run, which=shutil.which, fetch_bytes):
         archive_path = temporary / 'archive.tgz'
         archive_path.write_bytes(archive)
         npm = Path(npm_name).resolve()
-        _regular(npm, executable=True)
+        _runtime_executable(npm)
         run([str(npm), 'install', '--global', '--prefix', str(runtime), '--ignore-scripts',
              '--no-audit', '--no-fund', str(archive_path)])
         package = next((path for path in runtime.rglob('package.json')

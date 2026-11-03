@@ -338,3 +338,81 @@ def test_other_version_is_retained_and_pinned_copy_is_installed(tmp_path, monkey
     assert result['source'] == 'managed'
     assert legacy_entry.read_bytes() == legacy['bin/langfuse'].encode()
     assert (tmp_path / 'data/langfuse-cli/runtime').is_dir()
+
+def test_root_owned_node_and_npm_are_accepted_when_read_only(tmp_path, monkeypatch):
+    cli = _cli()
+    node, npm = _node_tools(tmp_path)
+    real_lstat = Path.lstat
+
+    def root_owned_lstat(path):
+        result = real_lstat(path)
+        if path in {node, npm}:
+            fields = list(result)
+            fields[4] = 0
+            return os.stat_result(fields)
+        return result
+
+    monkeypatch.setattr(Path, 'lstat', root_owned_lstat)
+    archive = _archive(_package_files())
+    monkeypatch.setattr(cli, 'ARCHIVE_SHA256', hashlib.sha256(archive).hexdigest(), raising=False)
+
+    def which(name):
+        return str(node) if name == 'node' else str(npm) if name == 'npm' else None
+
+    def run(argv, **kwargs):
+        argv = [str(item) for item in argv]
+        if argv[0] == str(node):
+            return _result('22.19.0\n')
+        if argv[0] == str(npm):
+            prefix = Path(argv[argv.index('--prefix') + 1])
+            for name, body in _package_files().items():
+                path = prefix / 'lib/node_modules/@langfuse/cli' / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(body)
+                path.chmod(0o755 if name.startswith('bin/') else 0o644)
+            return _result()
+        if argv[-1:] == ['--version']:
+            return _result('1.2.4\n')
+        if argv[-3:] == ['api', 'schema', '--json']:
+            return _result('{"commands": {}}\n')
+        raise AssertionError(argv)
+
+    result = cli.ensure_installed(
+        tmp_path, run=run, which=which, fetch_bytes=lambda _url: iter([archive]),
+    )
+    assert result['source'] == 'managed'
+
+
+def test_root_owned_group_writable_node_or_npm_is_rejected(tmp_path, monkeypatch):
+    cli = _cli()
+    node, npm = _node_tools(tmp_path)
+    npm.chmod(0o775)
+    real_lstat = Path.lstat
+
+    def root_owned_lstat(path):
+        result = real_lstat(path)
+        if path in {node, npm}:
+            fields = list(result)
+            fields[4] = 0
+            return os.stat_result(fields)
+        return result
+
+    monkeypatch.setattr(Path, 'lstat', root_owned_lstat)
+    archive = _archive(_package_files())
+    monkeypatch.setattr(cli, 'ARCHIVE_SHA256', hashlib.sha256(archive).hexdigest(), raising=False)
+
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(list(argv))
+        return _result('22.19.0\n')
+
+    with pytest.raises(Refusal):
+        cli.ensure_installed(
+            tmp_path,
+            run=run,
+            which=lambda name: str(node) if name == 'node' else str(npm) if name == 'npm' else None,
+            fetch_bytes=lambda _url: iter([archive]),
+        )
+    assert calls == []
+    assert not (tmp_path / 'data/langfuse-cli/bin/langfuse').exists()
