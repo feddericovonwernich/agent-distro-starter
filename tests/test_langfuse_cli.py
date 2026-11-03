@@ -342,11 +342,15 @@ def test_other_version_is_retained_and_pinned_copy_is_installed(tmp_path, monkey
 def test_root_owned_node_and_npm_are_accepted_when_read_only(tmp_path, monkeypatch):
     cli = _cli()
     node, npm = _node_tools(tmp_path)
+    node_alias = tmp_path / 'node-alias'
+    npm_alias = tmp_path / 'npm-alias'
+    os.link(node, node_alias)
+    os.link(npm, npm_alias)
     real_lstat = Path.lstat
 
     def root_owned_lstat(path):
         result = real_lstat(path)
-        if path in {node, npm}:
+        if path in {node, npm, node_alias, npm_alias}:
             fields = list(result)
             fields[4] = 0
             return os.stat_result(fields)
@@ -357,13 +361,13 @@ def test_root_owned_node_and_npm_are_accepted_when_read_only(tmp_path, monkeypat
     monkeypatch.setattr(cli, 'ARCHIVE_SHA256', hashlib.sha256(archive).hexdigest(), raising=False)
 
     def which(name):
-        return str(node) if name == 'node' else str(npm) if name == 'npm' else None
+        return str(node_alias) if name == 'node' else str(npm_alias) if name == 'npm' else None
 
     def run(argv, **kwargs):
         argv = [str(item) for item in argv]
-        if argv[0] == str(node):
+        if argv[0] == str(node_alias):
             return _result('22.19.0\n')
-        if argv[0] == str(npm):
+        if argv[0] == str(npm_alias):
             prefix = Path(argv[argv.index('--prefix') + 1])
             for name, body in _package_files().items():
                 path = prefix / 'lib/node_modules/@langfuse/cli' / name

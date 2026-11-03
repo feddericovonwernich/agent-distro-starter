@@ -50,8 +50,7 @@ def _runtime_executable(path):
         mode = path.lstat()
     except FileNotFoundError as error:
         raise store.Refusal(f'Langfuse runtime path is unavailable: {path.name}') from error
-    if (not stat.S_ISREG(mode.st_mode) or mode.st_uid not in {os.getuid(), 0}
-            or mode.st_nlink != 1):
+    if not stat.S_ISREG(mode.st_mode) or mode.st_uid not in {os.getuid(), 0}:
         raise store.Refusal('Langfuse runtime ownership is unproven')
     if mode.st_mode & 0o022:
         raise store.Refusal('Langfuse runtime is writable by another user')
