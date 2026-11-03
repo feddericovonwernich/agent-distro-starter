@@ -1353,3 +1353,58 @@ def test_parent_symlink_swap_never_captures_external_artifact(monkeypatch):
             source = _evidence_source(reviewer.read_evidence(home, run['review_run_id']),
                                       captured['source_id'])
             assert source['text'] == 'owned artifact'
+
+
+def test_oversized_sparse_artifact_refuses_before_reading_full_file():
+    with lab() as (home, _):
+        run, _, runtime, _ = _run_with_artifact(home)
+        artifact = runtime / 'oversized-sparse.txt'
+        with artifact.open('wb') as stream:
+            stream.truncate(8 * 1024 * 1024)
+
+        def rchar():
+            values = Path('/proc/self/io').read_text().splitlines()
+            return int(next(line.split(':', 1)[1] for line in values if line.startswith('rchar:')))
+
+        before = rchar()
+        with pytest.raises(store.Refusal):
+            reviewer.capture_evidence(home, run['review_run_id'], artifact, 'oversized sparse')
+        assert rchar() - before < reviewer.DEFAULT_LIMITS['max_input_bytes'] * 4
+
+
+def test_runtime_ancestor_swap_never_captures_external_artifact(monkeypatch):
+    with lab() as (home, _):
+        run, _, runtime, _ = _run_with_artifact(home, 'owned artifact')
+        run_root = runtime
+        ancestor = runtime.parent
+        external_runtime = home / 'external-runtime'
+        external_run = external_runtime / run['review_run_id']
+        external_run.mkdir(parents=True)
+        (external_run / 'output.txt').write_text('external artifact')
+        artifact = run_root / 'output.txt'
+        artifact.write_text('owned artifact')
+        moved_ancestor = ancestor.parent / 'runtime-owned'
+        original_open = reviewer.os.open
+        swapped = [False]
+
+        def swap_runtime(pathname, flags, mode=0o777, **kwargs):
+            candidate = Path(pathname)
+            opens_run_root = candidate == run_root or (
+                candidate.name == run['review_run_id'] and kwargs.get('dir_fd') is not None)
+            if opens_run_root and not swapped[0]:
+                ancestor.rename(moved_ancestor)
+                ancestor.symlink_to(external_runtime, target_is_directory=True)
+                swapped[0] = True
+            return original_open(pathname, flags, mode, **kwargs)
+
+        monkeypatch.setattr(reviewer.os, 'open', swap_runtime)
+        try:
+            captured = reviewer.capture_evidence(
+                home, run['review_run_id'], artifact, 'runtime ancestor swap')
+        except store.Refusal:
+            captured = None
+        assert swapped[0]
+        if captured is not None:
+            source = _evidence_source(
+                reviewer.read_evidence(home, run['review_run_id']), captured['source_id'])
+            assert source['text'] == 'owned artifact'

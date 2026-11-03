@@ -1,4 +1,3 @@
-import codecs
 import contextlib
 import fcntl
 import hashlib
@@ -250,17 +249,20 @@ def _artifact_path(home, review_run_id, path):
 
 def _open_owned_artifact(home, review_run_id, path):
     root, relative = _artifact_path(home, review_run_id, path)
+    home_root = store.home(home)
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, 'O_NOFOLLOW', 0)
     file_flags = (os.O_RDONLY | os.O_NONBLOCK
                   | getattr(os, 'O_NOFOLLOW', 0))
-    current_fd = None
-    final_fd = None
+    home_fd = current_fd = final_fd = None
     try:
-        current_fd = os.open(root, directory_flags)
-        root_stat = os.fstat(current_fd)
-        if not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != os.getuid():
-            raise store.Refusal('supplementary artifact root is not owned')
-        for part in relative.parts[:-1]:
+        home_fd = os.open(home_root, directory_flags)
+        home_stat = os.fstat(home_fd)
+        if not stat.S_ISDIR(home_stat.st_mode) or home_stat.st_uid != os.getuid():
+            raise store.Refusal('supplementary artifact home is not owned')
+        current_fd = home_fd
+        home_fd = None
+        components = root.relative_to(home_root).parts + relative.parts
+        for part in components[:-1]:
             next_fd = os.open(part, directory_flags, dir_fd=current_fd)
             identity = os.fstat(next_fd)
             if not stat.S_ISDIR(identity.st_mode) or identity.st_uid != os.getuid():
@@ -268,59 +270,50 @@ def _open_owned_artifact(home, review_run_id, path):
                 raise store.Refusal('supplementary artifact parent is unsafe')
             os.close(current_fd)
             current_fd = next_fd
-        final_fd = os.open(relative.parts[-1], file_flags, dir_fd=current_fd)
+        final_fd = os.open(components[-1], file_flags, dir_fd=current_fd)
         identity = os.fstat(final_fd)
         if (not stat.S_ISREG(identity.st_mode) or identity.st_uid != os.getuid()
                 or identity.st_nlink != 1):
             raise store.Refusal('supplementary artifact is not owned')
         os.close(current_fd)
         current_fd = None
-        return final_fd, relative
+        return final_fd, relative, identity
     except (OSError, ValueError) as error:
         if isinstance(error, store.Refusal):
             raise
         raise store.Refusal('supplementary artifact is unavailable') from error
     finally:
+        if home_fd is not None:
+            os.close(home_fd)
         if current_fd is not None:
             os.close(current_fd)
         if final_fd is not None and current_fd is not None:
             os.close(final_fd)
 
 
-def _read_owned_artifact(home, review_run_id, path, max_bytes):
-    fd, relative = _open_owned_artifact(home, review_run_id, path)
+def _read_owned_artifact(home, review_run_id, path, max_bytes, duplicate_sizes):
+    fd, relative, initial = _open_owned_artifact(home, review_run_id, path)
+    if initial.st_size > max_bytes:
+        if initial.st_size not in duplicate_sizes:
+            os.close(fd)
+            raise store.Refusal('cumulative reviewer input exceeds limit')
+        max_bytes = initial.st_size
     stream = None
     try:
         stream = os.fdopen(fd, 'rb')
-        initial = os.fstat(stream.fileno())
-        decoder = codecs.getincrementaldecoder('utf-8')()
-        digest = hashlib.sha256()
-        chunks = []
-        total = 0
-        while True:
-            chunk = stream.read(65536)
-            if not chunk:
-                break
-            total += len(chunk)
-            digest.update(chunk)
-            if total <= max_bytes:
-                chunks.append(chunk)
-            else:
-                chunks.clear()
-            try:
-                decoder.decode(chunk, final=False)
-            except UnicodeDecodeError as error:
-                raise store.Refusal('supplementary artifact is not UTF-8') from error
-        try:
-            decoder.decode(b'', final=True)
-        except UnicodeDecodeError as error:
-            raise store.Refusal('supplementary artifact is not UTF-8') from error
+        body = stream.read(max_bytes + 1)
         final = os.fstat(stream.fileno())
         if (initial.st_dev != final.st_dev or initial.st_ino != final.st_ino
-                or initial.st_size != final.st_size or total != final.st_size
+                or initial.st_size != final.st_size or len(body) != final.st_size
                 or not stat.S_ISREG(final.st_mode) or final.st_uid != os.getuid()
                 or final.st_nlink != 1):
             raise store.Refusal('supplementary artifact changed during capture')
+        if len(body) > max_bytes:
+            raise store.Refusal('cumulative reviewer input exceeds limit')
+        try:
+            text = body.decode('utf-8')
+        except UnicodeDecodeError as error:
+            raise store.Refusal('supplementary artifact is not UTF-8') from error
     except OSError as error:
         raise store.Refusal('supplementary artifact is unavailable') from error
     finally:
@@ -328,8 +321,8 @@ def _read_owned_artifact(home, review_run_id, path, max_bytes):
             os.close(fd)
         elif not stream.closed:
             stream.close()
-    body = b''.join(chunks) if total <= max_bytes else None
-    return relative.as_posix(), body, digest.hexdigest(), total
+    text_sha256 = hashlib.sha256(body).hexdigest()
+    return relative.as_posix(), body, text, text_sha256
 
 
 def capture_evidence(home, review_run_id, path, label):
@@ -356,19 +349,18 @@ def capture_evidence(home, review_run_id, path, label):
         records = _evidence_records(root, review_run_id)
         used = seed_bytes + sum(item['bytes'] for item in records.values())
         remaining = max(0, config['limits']['max_input_bytes'] - used)
-        origin_path, body, text_sha256, total = _read_owned_artifact(
-            root, review_run_id, path, remaining)
+        _, relative = _artifact_path(root, review_run_id, path)
+        origin_path = relative.as_posix()
         origin = {'run_id': review_run_id, 'path': origin_path}
+        duplicate_sizes = {
+            item['bytes'] for item in records.values() if item['origin'] == origin}
+        origin_path, body, text, text_sha256 = _read_owned_artifact(
+            root, review_run_id, path, remaining, duplicate_sizes)
         source_id = _digest(_evidence_identity(review_run_id, origin, text_sha256))
         existing = records.get(source_id)
         if existing is not None:
             return existing
-        if body is None:
-            raise store.Refusal('cumulative reviewer input exceeds limit')
-        try:
-            text = body.decode('utf-8')
-        except UnicodeDecodeError as error:
-            raise store.Refusal('supplementary artifact is not UTF-8') from error
+        total = len(body)
         if _EVIDENCE_SECRET_TEXT.search(text):
             raise store.Refusal('supplementary artifact is credential-bearing')
         if used + total > config['limits']['max_input_bytes']:
