@@ -11,7 +11,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import observability, omp_runtime, reviewer, store
+from . import observability, omp_runtime, reviewer, reviewer_workspaces, store
 
 UNINSTALL_TIMEOUT = 15.0
 
@@ -384,15 +384,22 @@ def _lifecycle_proved_absent(receipt, exit_record):
             return False
     return _process_group_present(child) is False
 
+def _finalize_with_workspace_disclosure(home, review_run_id, outcome):
+    probes = reviewer_workspaces.list_workspaces(home, review_run_id)
+    result = reviewer.finalize_run(home, review_run_id, outcome)
+    result['probe_workspaces'] = probes
+    return result
+
+
 def _collect_native_result(home, review_run_id):
     receipt = reviewer._receipt(home, review_run_id)
     if receipt.get('dispatch_state') == 'final':
-        return receipt
+        return _finalize_with_workspace_disclosure(home, review_run_id, receipt.get('outcome', 'exited'))
     receipt = reviewer.recover_submissions(home, review_run_id)
     if receipt.get('dispatch_state') == 'final':
-        return receipt
+        return _finalize_with_workspace_disclosure(home, review_run_id, receipt.get('outcome', 'exited'))
     if receipt.get('dispatch_state') == 'report-committed':
-        return reviewer.finalize_run(home, review_run_id, 'exited')
+        return _finalize_with_workspace_disclosure(home, review_run_id, 'exited')
     runtime, request = _native_request(home, review_run_id)
     exit_bytes = _same_uid_file(runtime / 'exit.json', 8192)
     if exit_bytes is None:
@@ -444,7 +451,7 @@ def _collect_native_result(home, review_run_id):
         reviewer.submit_report(home, review_run_id, request_id, draft)
     except (store.Refusal, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return reviewer.close_run(home, review_run_id, 'failed', error_code='report', packet=packet)
-    return reviewer.finalize_run(home, review_run_id, 'exited')
+    return _finalize_with_workspace_disclosure(home, review_run_id, 'exited')
 
 
 def _native_session_header(raw: str) -> dict:
@@ -911,6 +918,8 @@ def uninstall_inventory(home, *, expected=None, service=None):
         saved = expected['reviewer-lease:legacy']
         live = any(supervision.process_presence(item) for item in saved['identity']['processes'])
         rows[saved['key']] = {**saved, 'presence': 'present' if live else 'absent', 'blockers': []}
+    for row in reviewer_workspaces.uninstall_inventory(home, expected=expected.values()):
+        rows[row['key']] = row
     return list(rows.values())
 
 
@@ -953,3 +962,8 @@ def uninstall_quiesce(home, resources, operation):
         if remaining['presence'] != 'absent':
             raise store.Refusal('reviewer remains active; run lock and receipts retained')
         uninstall_state.checkpoint(home, operation, phase='quiescing', completed=approved['key'])
+    reviewer_workspaces.uninstall_quiesce(home, resources, operation)
+
+
+def uninstall_remove(home, resources, operation):
+    reviewer_workspaces.uninstall_remove(home, resources, operation)

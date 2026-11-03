@@ -93,6 +93,14 @@ The following is the acceptance matrix for the bounded reviewer. “Executable c
 
 Observed reviewer scheduling and managed native evidence are recorded above. The compatibility matrix has real native acceptance for the standalone runtime, restricted tool inventory, telemetry-independent capture, and explicit timer lifecycle. The controller also proved per-run endpoint readiness/binding, truthful startup/timeout/crash receipts, process-group and endpoint absence, retry without redispatch, and owned uninstall with delayed home absence while preserving an unrelated central. No paid provider quality or user-live rollout claim is made.
 
+### Run-owned probe workspaces
+
+The public `reviewer workspace create|list|cleanup` commands use the registered project clone, an existing local commit, and the distro's Treehouse root. Each receipt persists intent before allocation, uses an intent-owned CAS base reference because Treehouse accepts branch bases, and binds the exact run, project, commit, Git common directory, branch, lease holder/ID, and path. The path is not disclosed until the exposed state is durable. Probes are execution-only and do not create task metadata, fetch, install dependencies, or run project code.
+
+The Task 4 native proof exercised the public create/list/cleanup flow, a real Python assertion and bounded artifact capture/report, and preserved stable/ready worktrees. The probe descriptor proof retained an exposed probe with a live directory-file-descriptor holder after cwd-based inspection alone would have missed it. The exact lease `837893bb8fb77da889dca5521a915c3c` remained preserved with the probe; the retained path is not a positive cleanup guarantee.
+
+On this host, strict process inspection also encounters a protected same-UID user-manager process whose `/proc` metadata is not readable. The actual strict retirement proof therefore correctly blocked on `probe-process-inspection` (and the managed-ancestor blocker), preserved the probe home and exact lease, and produced no approval prompts; it did not whitelist the PID/name, change privileges, or claim successful uninstall. Any active, detached, ambiguous, foreign, or uninspectable process keeps a probe retained/refused. Work-loss consent does not bypass this identity check, and no force cleanup or OS sandbox is provided.
+
 ### Scheduled reviewer installer onboarding
 
 The fifth installer stage has real PTY coverage for independent telemetry/reviewer choices, presets, custom time correction, cancellation/EOF, missing prerequisites, and shell handoff from a spaced parent path. Python checks exercise validated schema-2 config, preserved schedule/model/other limits, run lease, timer ownership/checkpoints, standalone executable readiness, partial native activation, and disable recovery. Systemctl effects are controlled in those regressions; enabled assertions are not paid-model readiness claims.

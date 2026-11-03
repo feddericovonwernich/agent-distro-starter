@@ -88,6 +88,15 @@ Reviewer evidence is bounded by a proved **final response**, not by the lifetime
 
 Investigation outputs may be deliberately captured as run-scoped supplementary evidence with `./bin/agd --home . reviewer evidence add RUN_ID --file PATH --label LABEL` and inspected as sanitized metadata with `reviewer evidence list RUN_ID`. The file must be a same-run owned regular UTF-8 artifact beneath the private run directory; symlinks, special files, hardlinks, known credential paths, and secret-bearing inputs are refused. Stored supplementary text shares the frozen seed packet's cumulative input-byte bound, while late investigation never widens seed eligibility or reviewed-material coverage. Failed or unknown runs' evidence is diagnostic-only until deliberately recaptured under a new run, which receives a new source ID and provenance. Reports may cite only frozen seed IDs and evidence captured for that run. Langfuse remains optional and query/read-only by policy; unavailable or delayed query data is an evidence limitation, not a negative finding, and no credentials are copied into requests or reports.
 
+For execution-only investigation of a registered project, allocate a run-owned probe from an existing local commit:
+
+```sh
+./bin/agd --home . reviewer workspace create RUN_ID --project PROJECT_ID --commit COMMIT
+./bin/agd --home . reviewer workspace list RUN_ID
+./bin/agd --home . reviewer workspace cleanup RUN_ID --project PROJECT_ID --commit COMMIT --instruction OPERATOR_INSTRUCTION
+```
+
+The receipt binds the run, project, commit, Git common directory, base reference, branch, lease holder, lease ID, and path. Allocation uses an intent-owned local CAS base reference and does not fetch, create task metadata, install dependencies, or run project code. A returned path is exposed only after its receipt is durable. Cleanup is conservative: dirty or committed work, exposed probes without the exact operator instruction, active or detached users, and incomplete process inspection are retained or refused. A protected same-UID process (for example, an uninspectable user-manager process) can therefore block clean probe cleanup and the whole uninstall; AGD does not whitelist names/PIDs, bypass this with force, or change privileges. `uninstall --dry-run` inventories probe work-loss before any removal.
 For an existing live OMP session, reload the installed extension through the official harness's supported command (`/reload` where that command is provided), then obtain a subsequent proved response; do not stop agents or invent historical boundaries. Direct central sessions are taskless reviewer episodes, while explicitly linked decisions remain contextual to their worker task. Packet citations and source hashes are frozen at selection time, so later native-session changes do not rewrite an earlier packet.
 
 

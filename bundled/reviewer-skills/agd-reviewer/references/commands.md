@@ -2,6 +2,18 @@
 
 The native reviewer receives a private run directory as its working directory. Read `request.json` first; it is the trusted scope that names the admitted packet and the run artifact root. Then read `packet.json` and `catalog.json`, whose bytes are frozen for this run, before using evidence files. Use ordinary native `read`, `bash`, and `write` tools; do not install packages, call external services, alter model/auth configuration, or apply proposals.
 
+## Registered probe workflow
+
+When a trace requires a real project checkout, use only a registered project and an existing local commit:
+
+```sh
+$AGD_CLI --home "$AGD_HOME" reviewer workspace create "$AGD_REVIEW_RUN_ID" \
+  --project PROJECT_ID --commit COMMIT
+$AGD_CLI --home "$AGD_HOME" reviewer workspace list "$AGD_REVIEW_RUN_ID"
+```
+
+The result is a run-owned Treehouse lease. Reconcile its lease ID, holder, path, branch, base, commit, and Git common directory before probing. Probes must not create task metadata, fetch, install dependencies, or execute project code in an unstable/active/ready worktree. Write bounded native output beneath the canonical runtime artifact root, capture it with `reviewer evidence add`, and cite that returned ID. A retained probe is not a cleanup authorization: cleanup requires a closed run, exact operator instruction, and fresh lease/process inspection; an active reviewer never self-authorizes cleanup. `workspace cleanup` never force-discards dirty or committed work. Unknown, detached, foreign, or uninspectable process users retain the lease; an absent OMP group is not containment proof. Whole-distro uninstall inventories probe work-loss first and may remain blocked by a protected same-UID process that cannot be inspected; do not whitelist a PID/name or bypass the check with privilege changes.
+
 ## Evidence workflow
 
 1. Read `request.json`, then the supplied packet and catalog, retaining admitted source IDs and catalog hashes shown by native read results.

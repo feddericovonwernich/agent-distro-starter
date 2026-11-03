@@ -346,9 +346,47 @@ def test_unrecorded_foreign_native_lease_is_not_a_plain_git_checkout():
         foreign.write_text('must survive')
         preview = uninstall.inventory(home)
         assert preview['outcome'] == 'blocked'
+        foreign_rows = [row for row in preview['resources']
+                        if row['kind'] == 'treehouse-slot'
+                        and row.get('identity', {}).get('path') == allocated['path']]
+        assert len(foreign_rows) == 1 and foreign_rows[0]['ownership'] == 'unknown'
         assert foreign.read_text() == 'must survive'
         rows = json.loads(store.run(['treehouse', '--root', str(root), 'status', '--json'], cwd=project).stdout)
         assert next(row for row in rows if row['path'] == allocated['path'])['lease_id'] == allocated['lease_id']
+
+
+def test_uninstall_inventories_probe_work_loss_before_removal(monkeypatch):
+    from support import lab
+    from agd_lib import reviewer_workspaces, uninstall
+    from test_projects import run
+    from test_reviewer import produced_run
+    with lab() as (home, project):
+        private_home = home.parent / 'probe-user-home'
+        private_config = home.parent / 'probe-user-config'
+        private_home.mkdir(mode=0o700)
+        private_config.mkdir(mode=0o700)
+        monkeypatch.setenv('HOME', str(private_home))
+        monkeypatch.setenv('XDG_CONFIG_HOME', str(private_config))
+        monkeypatch.setenv('TREEHOUSE_ROOT', str(home / 'data' / 'treehouse'))
+        commit = run(['git', 'rev-parse', 'HEAD'], cwd=project).stdout.strip()
+        (project / 'later.txt').write_text('second existing commit\n')
+        run(['git', 'add', 'later.txt'], cwd=project)
+        run(['git', 'commit', '-m', 'second fixture commit'], cwd=project)
+        review_run, _ = produced_run(home)
+        result = reviewer_workspaces.create(
+            home, review_run['review_run_id'], 'sample', commit)
+        inventory = uninstall.inventory(home)
+        probes = [row for row in inventory['resources']
+                  if row['kind'] in {'reviewer-probe', 'reviewer-workspace'}
+                  and row['identity'].get('path') == result['path']]
+        assert len(probes) == 1
+        assert not any(row['kind'] == 'treehouse-slot'
+                       and row.get('identity', {}).get('path') == result['path']
+                       for row in inventory['resources'])
+        probe = probes[0]
+        assert probe['work_loss']
+        assert any(item.get('path') == result['path'] for item in inventory['work_loss'])
+        assert inventory['outcome'] in ('ready', 'blocked')
 
 
 def test_linked_home_uses_native_git_removal(tmp_path):

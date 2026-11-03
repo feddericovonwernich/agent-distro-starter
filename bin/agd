@@ -11,7 +11,7 @@ import pwd
 import uuid
 from pathlib import Path
 from urllib.request import urlopen
-from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr, relay, observability, reviewer, reviewer_runner, reviewer_timer, launcher, installer, omp_runtime, reviewer_episodes
+from agd_lib import projects, store, tasks, workers, supervision, worker_skills, pr, relay, observability, reviewer, reviewer_runner, reviewer_timer, launcher, installer, omp_runtime, reviewer_episodes, reviewer_workspaces
 
 
 def parser():
@@ -157,6 +157,18 @@ def parser():
     execute_p = reviewer_p.add_parser('execute'); execute_p.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
     bind_p = reviewer_p.add_parser('session-bind'); bind_p.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value))); bind_p.add_argument('--session-id', required=True); bind_p.add_argument('--session-file', required=True)
     reviewer_p.add_parser('status')
+    workspace = reviewer_p.add_parser('workspace').add_subparsers(dest='workspace_op', required=True)
+    workspace_create = workspace.add_parser('create')
+    workspace_create.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
+    workspace_create.add_argument('--project', required=True)
+    workspace_create.add_argument('--commit', required=True)
+    workspace_list = workspace.add_parser('list')
+    workspace_list.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
+    workspace_cleanup = workspace.add_parser('cleanup')
+    workspace_cleanup.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
+    workspace_cleanup.add_argument('--project', required=True)
+    workspace_cleanup.add_argument('--commit', required=True)
+    workspace_cleanup.add_argument('--instruction')
     evidence = reviewer_p.add_parser('evidence').add_subparsers(dest='evidence_op', required=True)
     evidence_add = evidence.add_parser('add')
     evidence_add.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
@@ -246,6 +258,7 @@ def main(args):
     reviewer_write = args.command == 'reviewer' and (
         args.reviewer_op in ('execute', 'session-bind', 'episode')
         or args.reviewer_op == 'run' or args.reviewer_op == 'timer' and args.timer_op != 'status'
+        or args.reviewer_op == 'workspace' and args.workspace_op in ('create', 'list', 'cleanup')
         or args.reviewer_op == 'evidence' and args.evidence_op == 'add'
         or args.reviewer_op == 'proposals' and args.proposal_op == 'dispose')
     managed_loop = (args.command == 'worker' and args.operation == 'run'
@@ -477,6 +490,14 @@ def _dispatch(args, home, fresh):
                 home, reviewer.enqueue_intent(
                     home, kind='retrospective' if selected else 'manual',
                     retrospective_review_run_ids=selected))
+        if args.reviewer_op == 'workspace':
+            if args.workspace_op == 'create':
+                return reviewer_workspaces.create(home, args.review_run_id, args.project, args.commit)
+            if args.workspace_op == 'list':
+                return reviewer_workspaces.list_workspaces(home, args.review_run_id)
+            return reviewer_workspaces.cleanup(
+                home, args.review_run_id, args.project, args.commit,
+                instruction=Path(args.instruction).absolute() if args.instruction else None)
         if args.reviewer_op == 'status':
             return {'timer': reviewer_timer._read_record(home), 'runs': len(list(reviewer.paths(home)['receipts'].glob('*.json')))}
         if args.reviewer_op == 'evidence':

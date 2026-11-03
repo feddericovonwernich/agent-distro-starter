@@ -13,8 +13,9 @@ from . import store, uninstall_state as state
 
 MODULES = (
     'github', 'harnesses', 'herdr', 'installer', 'langfuse_cli', 'launcher', 'observability', 'omp_runtime',
-    'pr', 'projects', 'relay', 'relay_reviews', 'review_feedback', 'reviewer', 'reviewer_episodes', 'reviewer_runner',
-    'reviewer_timer', 'store', 'supervision', 'tasks', 'tmux', 'uninstall', 'uninstall_state', 'worker_skills', 'workers',
+    'pr', 'projects', 'relay', 'relay_reviews', 'review_feedback', 'reviewer', 'reviewer_episodes',
+    'reviewer_runner', 'reviewer_timer', 'reviewer_workspaces', 'store', 'supervision', 'tasks', 'tmux',
+    'uninstall', 'uninstall_state', 'worker_skills', 'workers',
 )
 FILES = ('bin/agd', *(f'bin/agd_lib/{name}.py' for name in MODULES),
          'bundled/observability/release-lock.json')
@@ -129,7 +130,7 @@ def _collect(home, previous=None):
         (observability, {'docker'}),
         (workers, {'worker', 'worker-endpoint'}),
         (worker_skills, {'worker-skills'}),
-        (reviewer_runner, {'reviewer-run', 'reviewer-lease', 'reviewer-backend'}),
+        (reviewer_runner, {'reviewer-run', 'reviewer-lease', 'reviewer-backend', 'reviewer-probe'}),
         (relay, {'relay'}),
         (tasks, {'treehouse-slot'}), (projects, {'checkout'}),
     )
@@ -329,6 +330,7 @@ def _run(home, operation, ask, report):
         report('2 / 3  Remove approved units, data and Git registrations')
         rows = operation['inventory']['resources']
         observability.uninstall_quiesce(home, rows, operation)
+        reviewer_runner.uninstall_remove(home, rows, operation)
         reviewer_timer.uninstall_remove(home, rows, operation)
         observability.uninstall_remove(home, rows, operation)
         worker_skills.uninstall_remove(home, rows, operation)

@@ -124,6 +124,20 @@ To run a manual review from the distro directory, use `./bin/agd --home . review
 
 After writing bounded command or query output into the active run directory, capture it with `reviewer evidence add RUN_ID --file PATH --label LABEL`; list operations return metadata without the stored text. Captures are immutable under `data/reviewer/evidence/RUN_ID/` and carry a run-scoped source ID, UTF-8 text SHA-256, relative origin, capture time, and integrity record. The cumulative bound is the stored frozen packet plus unique supplementary text, so a duplicate same-run capture is idempotent and does not consume the limit again. Capture refuses inactive or unknown runs, cross-run paths, symlinks, special files, hardlinks, known credential stores, and credential-bearing inputs. A failed/unknown run's supplement is not imported by retry; deliberate recapture under a new run has a new source ID and origin. Only that run's supplementary IDs may extend report citation admission; late investigation does not advance episode coverage or alter the frozen packet. Native evidence remains the fallback when optional Langfuse query data is missing or delayed.
 
+### Run-owned probe workspaces
+
+Use a registered project and an existing local commit for execution-only investigation:
+
+```sh
+./bin/agd --home . reviewer workspace create RUN_ID --project PROJECT_ID --commit COMMIT
+./bin/agd --home . reviewer workspace list RUN_ID
+./bin/agd --home . reviewer workspace cleanup RUN_ID --project PROJECT_ID --commit COMMIT --instruction OPERATOR_INSTRUCTION
+```
+
+The durable receipt records the exact run/project/commit, Git common directory, intent-owned CAS base reference and object ID, branch, lease holder/ID, and path. Allocation is not a task: it does not create task or worker metadata, fetch, install dependencies, or run project code, and it never uses stable, active, or ready worktrees. `list` reconciles the exact current lease before disclosing an exposed path. Write bounded output only beneath the run artifact root, then capture it with the evidence workflow above.
+
+`workspace cleanup` is not a force-delete operation. An exposed probe requires a closed run and an operator instruction naming that exact run, project, and commit. Dirty or committed work, changed/foreign/ambiguous leases, active or detached users, and unknown process identity are retained or refused; an absent OMP group is not containment proof. Uninstall inventories each owned probe and its work-loss before quiescing/removing it, and existing scoped work-loss consent never bypasses lease or process identity. The process scan aggregates cwd, open descriptors, mapped paths, and uninspectable same-UID processes. On hosts where a protected same-UID user-manager PID cannot be inspected, clean probe cleanup and whole uninstall may remain blocked; AGD does not whitelist a name/PID, weaken inspection, change privileges, or promise positive cleanup in that state.
+
 ### Native reviewer runtime and managed endpoints
 
 The public coordinator launches the installed standalone OMP executable through a dedicated managed Herdr or tmux endpoint named for the run. It validates the private request, materializes the frozen packet/catalog and reserved `agd-reviewer` skill runtime, proves endpoint readiness and native session binding, and persists bounded stdout/stderr/exit and process identities. Recovery promotes a report only after exit-zero, native binding, bounded report, and supervisor/child/owned-group plus endpoint absence proof. A failed or incomplete handoff remains retryable without redispatch; a timeout, startup, model, or endpoint failure is a truthful terminal receipt, not fabricated usage or provider state.
