@@ -8,4 +8,16 @@ Inspect the frozen catalog before choosing an existing-skill finding or a new wo
 
 Every finding must state citations, counterexamples considered (or `[]` with why), uncertainty, impact/applicability, resolution, and validation. Citations and counterexamples may use only frozen packet source IDs or supplementary source IDs captured for this run. Respect selected source IDs, cutoff, and coverage; do not infer omitted material. New drafts are inert: human triage and separate implementation are required.
 
-Return only JSON: `{"schema":1,"summary":"string","findings":[{"kind":"new-skill|existing-skill","target":"workflow-key-or-skill-id","finding":"string","applicability":"string","citations":["source-id"],"counterexamples":["source-id"],"uncertainty":"string","resolution":"draft|none","validation":"string","validation_limits":["string"],"new_skill":{"id":"string","draft":"frontmatter and body","triggers":["string"],"scope":"string","prerequisites":["string"]}}]}`.
+Return only a JSON report with exactly `schema`, `summary`, and `findings`: `{"schema":1,"summary":"Evidence-backed review summary","findings":[]}`. An empty findings list is valid. Each finding must use exactly one of the following shapes; replace example text and source IDs with admitted evidence.
+
+For an existing skill, set `target` to its exact catalog `id` and copy its exact `catalog_sha256` into `target_source_version`. The hash must be a field, not merely mentioned in prose. Do not include `new_skill`, even as an empty object or null.
+
+```json
+{"kind":"existing-skill","target":"catalog-skill-id","target_source_version":"exact catalog_sha256","finding":"Evidence-backed process observation","applicability":"Affected workflow","citations":["admitted-source-id"],"counterexamples":[],"uncertainty":"Evidence and coverage limitations","resolution":"draft","validation":"How to evaluate the proposed improvement","validation_limits":["Improvement not yet tested"]}
+```
+
+For a new skill, set `target` to the proposed workflow key and include `new_skill`. Do not include `target_source_version`, even as null. The draft needs YAML frontmatter with `name` and `description`, and at least one trigger.
+
+```json
+{"kind":"new-skill","target":"workflow-key","finding":"Evidence-backed workflow gap","applicability":"Affected workflow","citations":["admitted-source-id"],"counterexamples":[],"uncertainty":"Evidence and coverage limitations","resolution":"draft","validation":"How to evaluate the proposed workflow","validation_limits":["Draft not yet tested"],"new_skill":{"id":"workflow-key","draft":"---\nname: workflow-key\ndescription: When to use this workflow.\n---\nEvidence-backed workflow instructions.","triggers":["Relevant workflow condition"],"scope":"Workflow boundaries","prerequisites":[]}}
+```

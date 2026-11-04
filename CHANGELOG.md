@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Align native reviewer instructions and the reserved reviewer skill with the strict existing/new-skill finding formats; preserve frozen catalog hash binding and retain bounded, sanitized report rejection reasons instead of empty diagnostics.
 - Prevent generated ClickHouse telemetry passwords from being parsed as CLI options by prefixing new credentials without reducing their random entropy; preserve existing credentials unchanged across stack re-renders.
 - Fail closed local Langfuse credential admission on a persisted healthy record: a bounded read-only check now proves the current owned web container, project/service identity, loopback binding, and health/project readiness before credentials are returned. Stopped stacks, foreign listeners, mismatched ports, timeouts, and damaged state remain key-free without an implicit Docker restart.
 - Correct reviewer boundary documentation: normal native read/bash/write tools and local investigation remain trusted-model policy rather than an OS filesystem, secret, or detached-process sandbox; scheduled-review evidence covers only rendered minimal-environment oneshot execution, not real user-timer or cgroup activation.
