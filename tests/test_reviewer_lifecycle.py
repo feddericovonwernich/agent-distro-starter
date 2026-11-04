@@ -168,6 +168,68 @@ def test_missing_or_invalid_report_is_retryable(monkeypatch, mode):
         assert _packet_ids(home) == before
 
 
+@pytest.mark.parametrize('kind, mutation', [
+    ('existing-skill', None),
+    ('existing-skill', 'missing-version'),
+    ('existing-skill', 'stale-version'),
+    ('existing-skill', 'wrong-kind-field'),
+    ('new-skill', None),
+    ('new-skill', 'wrong-kind-field'),
+])
+def test_finding_variants_commit_or_retain_safe_rejection(monkeypatch, kind, mutation):
+    with lab() as (home, _):
+        run, packet = _reserved_reviewer_run(home)
+        before = _packet_ids(home)
+        skill = packet['catalog'][0]
+        finding = {
+            'kind': kind, 'target': skill['id'] if kind == 'existing-skill' else 'cli-review',
+            'finding': 'Distinguish CLI startup errors from behavioral failures.',
+            'applicability': 'Subprocess-based CLI checks.',
+            'citations': [packet['sources'][0]['source_id']], 'counterexamples': [],
+            'uncertainty': 'One incident; no recurrence established.',
+            'resolution': 'draft', 'validation': 'Compare startup and wrong-output failures.',
+            'validation_limits': ['No proposed change has been applied.'],
+        }
+        if kind == 'existing-skill':
+            finding['target_source_version'] = skill['catalog_sha256']
+        else:
+            finding['new_skill'] = {
+                'id': 'cli-review',
+                'draft': '---\nname: cli-review\ndescription: Inspect CLI check failures.\n---\nRead stderr before classifying a failure.',
+                'triggers': ['CLI check failure'], 'scope': 'CLI subprocess checks',
+                'prerequisites': [],
+            }
+        if mutation == 'missing-version':
+            del finding['target_source_version']
+        elif mutation == 'stale-version':
+            finding['target_source_version'] = '0' * 64
+        elif mutation == 'wrong-kind-field':
+            finding['new_skill' if kind == 'existing-skill' else 'target_source_version'] = {}
+        if mutation:
+            finding['finding'] += ' password=fixture-secret-not-for-diagnostics'
+        code, runtime = _run_child(home, monkeypatch, run, packet)
+        assert code == 0
+        (runtime / 'report-draft.json').write_text(json.dumps({
+            'schema': 1, 'summary': 'CLI process review', 'findings': [finding],
+        }))
+        result = _collect(home, run)
+        reports = list(reviewer.paths(home)['reports'].glob('*.json'))
+        proposals = list(reviewer.paths(home)['proposals'].glob('*.json'))
+        if mutation is None:
+            assert result['dispatch_state'] == 'final' and result['outcome'] == 'exited'
+            assert len(reports) == len(proposals) == 1
+            assert json.loads(reports[0].read_text())['report']['findings'][0]['kind'] == kind
+            assert _packet_ids(home)['sources'] == ()
+        else:
+            assert result['dispatch_state'] == 'final' and result['outcome'] == 'failed'
+            assert result['error']['code'] == 'report'
+            expected = 'frozen skill target' if kind == 'existing-skill' else 'new skill draft'
+            assert result['error']['message'] == expected
+            assert 'fixture-secret' not in json.dumps(result['error'])
+            assert reports == proposals == []
+            assert _packet_ids(home) == before
+
+
 def test_duplicate_execute_does_not_dispatch_again(monkeypatch):
     with lab() as (home, _):
         run, packet = _reserved_reviewer_run(home)

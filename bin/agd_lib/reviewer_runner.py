@@ -449,7 +449,10 @@ def _collect_native_result(home, review_run_id):
     request_id = _native_request_uuid(review_run_id)
     try:
         reviewer.submit_report(home, review_run_id, request_id, draft)
-    except (store.Refusal, ValueError, TypeError, KeyError, json.JSONDecodeError):
+    except store.Refusal as error:
+        return reviewer.close_run(home, review_run_id, 'failed', error_code='report',
+                                  diagnostic=str(error), packet=packet)
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
         return reviewer.close_run(home, review_run_id, 'failed', error_code='report', packet=packet)
     return _finalize_with_workspace_disclosure(home, review_run_id, 'exited')
 
