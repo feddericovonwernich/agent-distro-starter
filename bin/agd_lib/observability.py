@@ -961,7 +961,7 @@ def _secrets(home, allocation):
     value = {'schema': 1, 'home_id': _home_id(home), 'org_id': str(uuid.uuid4()),
              'project_id': str(uuid.uuid4()), 'public_key': 'pk-lf-' + secrets.token_urlsafe(24),
              'secret_key': 'sk-lf-' + secrets.token_urlsafe(32), 'postgres_password': secrets.token_urlsafe(24),
-             'clickhouse_password': secrets.token_urlsafe(24), 'redis_password': secrets.token_urlsafe(24),
+             'clickhouse_password': 'ch-' + secrets.token_urlsafe(24), 'redis_password': secrets.token_urlsafe(24),
              'minio_user': 'agd' + secrets.token_hex(6), 'minio_password': secrets.token_urlsafe(24),
              'salt': secrets.token_urlsafe(24), 'encryption_key': secrets.token_hex(32),
              'nextauth_secret': secrets.token_urlsafe(32), 'admin_password': secrets.token_urlsafe(24)}

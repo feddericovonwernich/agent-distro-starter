@@ -196,14 +196,21 @@ def test_rendered_minio_uses_the_pinned_compose_shell_contract():
     assert model['services']['minio']['command'][0] == '-c'
 
 
-def test_rendered_clickhouse_uses_pinned_user_contract():
+def test_clickhouse_password_is_cli_safe_and_stable_across_renders(monkeypatch):
+    monkeypatch.setattr(observability.secrets, 'token_urlsafe',
+                        lambda size: '-' + 'a' * (size * 4 // 3 - 1))
     with lab() as (home, _):
-        rendered = observability.render_stack(home)
-        model = json.loads(subprocess.check_output(
-            ['docker', 'compose', '-f', str(rendered['compose']), 'config', '--format', 'json'],
-            text=True, stderr=subprocess.DEVNULL))
+        observability.render_stack(home)
+        path = observability.paths(home)['secrets']
+        original = path.read_bytes()
+        assert not json.loads(original)['clickhouse_password'].startswith('-')
 
-    assert model['services']['clickhouse']['environment']['CLICKHOUSE_USER'] == 'clickhouse'
+        def unexpected_rotation(_size):
+            pytest.fail('rendering an existing stack must not regenerate credentials')
+
+        monkeypatch.setattr(observability.secrets, 'token_urlsafe', unexpected_rotation)
+        observability.render_stack(home)
+        assert path.read_bytes() == original
 
 
 def test_disable_unconfigured_home_is_idempotent():
