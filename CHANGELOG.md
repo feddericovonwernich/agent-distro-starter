@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Prevent generated ClickHouse telemetry passwords from being parsed as CLI options by prefixing new credentials without reducing their random entropy; preserve existing credentials unchanged across stack re-renders.
 - Fail closed local Langfuse credential admission on a persisted healthy record: a bounded read-only check now proves the current owned web container, project/service identity, loopback binding, and health/project readiness before credentials are returned. Stopped stacks, foreign listeners, mismatched ports, timeouts, and damaged state remain key-free without an implicit Docker restart.
 - Correct reviewer boundary documentation: normal native read/bash/write tools and local investigation remain trusted-model policy rather than an OS filesystem, secret, or detached-process sandbox; scheduled-review evidence covers only rendered minimal-environment oneshot execution, not real user-timer or cgroup activation.
 - Fix native final-response admission for the upstream healthy `errorMessage: undefined` shape while retaining rejection of explicit errors, truncation, waits and malformed boundaries. Timer readiness now exercises selected physical OMP identity with receipt-selected Herdr and Treehouse directories; tmux cleanup refuses replaced homes and preserves shared servers.
