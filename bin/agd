@@ -176,6 +176,34 @@ def parser():
     evidence_add.add_argument('--label', required=True)
     evidence_list = evidence.add_parser('list')
     evidence_list.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
+    inspect_p = reviewer_p.add_parser('inspect')
+    inspect_p.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
+    inspect_p.add_argument('--episode', required=True)
+    inspect_p.add_argument('--source', choices=('auto', 'native', 'langfuse'), default='auto')
+    inspect_p.add_argument('--record')
+    inspect_p.add_argument('--part', choices=('content', 'input', 'output'))
+    inspect_p.add_argument('--cursor')
+    reviewer_skills = reviewer_p.add_parser('skills').add_subparsers(dest='reviewer_skills_op', required=True)
+    for action in ('list', 'show'):
+        op = reviewer_skills.add_parser(action)
+        op.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
+        if action == 'show':
+            op.add_argument('skill_id')
+        op.add_argument('--cursor')
+    target = reviewer_p.add_parser('target').add_subparsers(dest='target_op', required=True)
+    target_inspect = target.add_parser('inspect')
+    target_inspect.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
+    target_inspect.add_argument('--scope', choices=('project', 'distro'), required=True)
+    target_inspect.add_argument('--project')
+    destination = target_inspect.add_mutually_exclusive_group(required=True)
+    destination.add_argument('--path')
+    destination.add_argument('--component')
+    target_inspect.add_argument('--operation', choices=('create', 'modify', 'remove'), default='modify')
+    target_inspect.add_argument('--surface', required=True)
+    target_inspect.add_argument('--basis-source', action='append', default=[])
+    target_inspect.add_argument('--authority-hint', choices=('external', 'unknown'))
+    target_inspect.add_argument('--authority-locator')
+    target_inspect.add_argument('--cursor')
     reports = reviewer_p.add_parser('reports').add_subparsers(dest='report_op', required=True)
     reports.add_parser('list'); reports.add_parser('show').add_argument('report_id')
     proposals = reviewer_p.add_parser('proposals').add_subparsers(dest='proposal_op', required=True)
@@ -256,7 +284,7 @@ def main(args):
         if not fresh:
             raise store.Refusal('fresh non-symlink launcher home required')
     reviewer_write = args.command == 'reviewer' and (
-        args.reviewer_op in ('execute', 'session-bind', 'episode')
+        args.reviewer_op in ('execute', 'session-bind', 'episode', 'inspect', 'skills', 'target')
         or args.reviewer_op == 'run' or args.reviewer_op == 'timer' and args.timer_op != 'status'
         or args.reviewer_op == 'workspace' and args.workspace_op in ('create', 'list', 'cleanup')
         or args.reviewer_op == 'evidence' and args.evidence_op == 'add'
@@ -500,6 +528,22 @@ def _dispatch(args, home, fresh):
                 instruction=Path(args.instruction).absolute() if args.instruction else None)
         if args.reviewer_op == 'status':
             return {'timer': reviewer_timer._read_record(home), 'runs': len(list(reviewer.paths(home)['receipts'].glob('*.json')))}
+        if args.reviewer_op == 'inspect':
+            from agd_lib import reviewer_inspection
+            return reviewer_inspection.inspect(home, args.review_run_id, args.episode, source=args.source,
+                                               record_id=args.record, part=args.part, cursor=args.cursor)
+        if args.reviewer_op == 'skills':
+            from agd_lib import reviewer_inspection
+            if args.reviewer_skills_op == 'list':
+                return reviewer_inspection.list_skills(home, args.review_run_id, cursor=args.cursor)
+            return reviewer_inspection.show_skill(home, args.review_run_id, args.skill_id, cursor=args.cursor)
+        if args.reviewer_op == 'target':
+            from agd_lib import reviewer_inspection
+            return reviewer_inspection.inspect_target(
+                home, args.review_run_id, scope=args.scope, project_id=args.project, path=args.path,
+                component=args.component, operation=args.operation, surface=args.surface,
+                basis_source_ids=tuple(args.basis_source), authority_hint=args.authority_hint,
+                authority_locator=args.authority_locator, cursor=args.cursor)
         if args.reviewer_op == 'evidence':
             if args.evidence_op == 'add':
                 return reviewer.capture_evidence(home, args.review_run_id, Path(args.file).absolute(), args.label)
@@ -539,11 +583,15 @@ def _dispatch(args, home, fresh):
 
 if __name__ == '__main__':
     try:
-        result = main(parse_args())
+        args = parse_args()
+        result = main(args)
         if isinstance(result, int):
             raise SystemExit(result)
         if result is not None:
-            print(json.dumps(result, indent=2 if sys.stdout.isatty() else None))
+            if args.command == 'reviewer' and args.reviewer_op in ('inspect', 'skills', 'target'):
+                print(json.dumps(result, indent=2, ensure_ascii=False))
+            else:
+                print(json.dumps(result, indent=2 if sys.stdout.isatty() else None))
     except (ValueError, store.Refusal, store.DependencyError) as error:
         print(str(error), file=sys.stderr)
         sys.exit(2 if isinstance(error, ValueError) else 4 if isinstance(error, store.DependencyError) else 3)

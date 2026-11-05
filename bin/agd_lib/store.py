@@ -87,8 +87,17 @@ def lock(root):
         yield
 
 
-def git(cwd, *args, check=True):
-    return run(['git', *args], cwd=cwd, check=check).stdout.strip()
+def git(cwd, *args, check=True, deadline_epoch_ms=None):
+    if deadline_epoch_ms is None:
+        return run(['git', *args], cwd=cwd, check=check).stdout.strip()
+    import time
+    remaining = deadline_epoch_ms / 1000 - time.time()
+    if remaining <= 0:
+        raise Refusal('deadline exceeded')
+    try:
+        return run(['git', *args], cwd=cwd, check=check, timeout=min(30, remaining)).stdout.strip()
+    except subprocess.TimeoutExpired as error:
+        raise Refusal('Git deadline exceeded') from error
 
 
 def clean(cwd):

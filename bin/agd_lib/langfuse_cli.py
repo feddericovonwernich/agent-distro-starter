@@ -7,6 +7,8 @@ import re
 import shlex
 import shutil
 import stat
+import subprocess
+import time
 import tarfile
 import tempfile
 import uuid
@@ -70,10 +72,12 @@ def _directory(path):
     return path.resolve()
 
 
-def _sha256(path):
+def _sha256(path, *, deadline_epoch_ms=None):
     digest = hashlib.sha256()
     with Path(path).open('rb') as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b''):
+            if deadline_epoch_ms is not None and time.time() * 1000 >= deadline_epoch_ms:
+                raise store.Refusal('reviewer deadline exceeded')
             digest.update(block)
     return digest.hexdigest()
 
@@ -165,15 +169,17 @@ def _metadata(package):
     return value, entry
 
 
-def _asset_map(package):
+def _asset_map(package, *, deadline_epoch_ms=None):
     package = Path(package).resolve()
     result = {}
     for path in package.rglob('*'):
+        if deadline_epoch_ms is not None and time.time() * 1000 >= deadline_epoch_ms:
+            raise store.Refusal('reviewer deadline exceeded')
         if path.is_symlink():
             raise store.Refusal('Langfuse package contains a redirected asset')
         if path.is_file():
             _regular(path)
-            result[str(path.relative_to(package))] = _sha256(path)
+            result[str(path.relative_to(package))] = _sha256(path, deadline_epoch_ms=deadline_epoch_ms)
     if 'package.json' not in result:
         raise store.Refusal('Langfuse package metadata is unavailable')
     return result
@@ -199,14 +205,15 @@ def _safe_reason(error):
 
 
 
-def reviewer_environment(home, inherited):
+def reviewer_environment(home, inherited, *, deadline_epoch_ms=None):
     """Return a credential-free base env plus optional local query settings."""
     environment = {key: value for key, value in dict(inherited).items()
                    if not key.startswith('LANGFUSE_')}
     unavailable = {'available': False, 'reason': None}
     try:
         from . import observability
-        context = observability.langfuse_query_context(home)
+        context = (observability.langfuse_query_context(home) if deadline_epoch_ms is None else
+                   observability.langfuse_query_context(home, deadline_epoch_ms=deadline_epoch_ms))
     except (OSError, ValueError, TypeError, store.Refusal):
         context = None
     if context is None:
@@ -216,10 +223,18 @@ def reviewer_environment(home, inherited):
     def private_run(argv, **kwargs):
         options = dict(kwargs)
         options['env'] = environment
-        return store.run(argv, **options)
+        if deadline_epoch_ms is not None:
+            remaining = deadline_epoch_ms / 1000 - time.time()
+            if remaining <= 0:
+                raise store.Refusal('reviewer deadline exceeded')
+            options['timeout'] = min(options.get('timeout', 30), remaining)
+        try:
+            return store.run(argv, **options)
+        except subprocess.TimeoutExpired as error:
+            raise store.Refusal('reviewer deadline exceeded') from error
 
     try:
-        validate_installation(home, run=private_run)
+        validate_installation(home, run=private_run, deadline_epoch_ms=deadline_epoch_ms)
     except (OSError, ValueError, TypeError, store.Refusal, store.DependencyError) as error:
         unavailable['reason'] = _safe_reason(error)
         return environment, unavailable
@@ -308,7 +323,7 @@ def _validate_candidate(package, node, run, assets):
     return metadata, entry, node_version, actual
 
 
-def validate_installation(home, *, run=store.run):
+def validate_installation(home, *, run=store.run, deadline_epoch_ms=None):
     receipt = read_installation(home)
     if receipt is None:
         raise store.Refusal('Langfuse CLI is not installed')
@@ -323,10 +338,10 @@ def validate_installation(home, *, run=store.run):
         runtime = _directory(receipt['runtime'])
         if runtime != paths['runtime'] or not package.is_relative_to(runtime):
             raise store.Refusal('Langfuse managed runtime path changed')
-    actual = _asset_map(package)
+    actual = _asset_map(package, deadline_epoch_ms=deadline_epoch_ms)
     if actual != receipt['assets']:
         raise store.Refusal('Langfuse package assets differ from receipt')
-    if _sha256(launcher) != hashlib.sha256(_launcher(node, entry).encode()).hexdigest():
+    if _sha256(launcher, deadline_epoch_ms=deadline_epoch_ms) != hashlib.sha256(_launcher(node, entry).encode()).hexdigest():
         raise store.Refusal('Langfuse launcher differs from receipt')
     _metadata(package)
     node_version = _node_version(run, node)

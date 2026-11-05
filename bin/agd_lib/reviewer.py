@@ -340,6 +340,12 @@ def _read_owned_artifact(home, review_run_id, path, max_bytes, duplicate_sizes):
 
 
 def capture_evidence(home, review_run_id, path, label):
+    from .uninstall_state import admission
+    with admission(home):
+        return _capture_evidence(home, review_run_id, path, label)
+
+
+def _capture_evidence(home, review_run_id, path, label):
     try:
         review_run_id = str(uuid.UUID(str(review_run_id)))
     except (ValueError, TypeError, AttributeError) as error:
@@ -351,17 +357,25 @@ def capture_evidence(home, review_run_id, path, label):
     root = store.home(home)
     with store.lock(root):
         receipt = _receipt(root, review_run_id)
-        if receipt.get('dispatch_state') not in ('begun', 'report-committed'):
+        schema2 = receipt.get('manifest_id') is not None
+        if (receipt.get('dispatch_state') != 'begun' if schema2 else
+                receipt.get('dispatch_state') not in ('begun', 'report-committed')):
             raise store.Refusal('review run is not active')
+        if schema2:
+            _check_deadline(receipt.get('deadline_epoch_ms'))
         try:
             config = validate_config(_read_json(paths(root)['manifests'] / f"{receipt['config_snapshot_ref']}.json"))
-            packet_id = receipt.get('packet_id')
-            _hex_id(packet_id)
-            seed_bytes = len(_read_regular_bytes(paths(root)['packets'] / f'{packet_id}.json'))
+            if schema2:
+                from . import reviewer_inspection
+                seed_bytes = reviewer_inspection._input_used_locked(root, receipt)
+            else:
+                packet_id = receipt.get('packet_id')
+                _hex_id(packet_id)
+                seed_bytes = len(_read_regular_bytes(paths(root)['packets'] / f'{packet_id}.json'))
         except (OSError, ValueError, json.JSONDecodeError, store.Refusal) as error:
             raise store.Refusal('reviewer seed is unavailable') from error
         records = _evidence_records(root, review_run_id)
-        used = seed_bytes + sum(item['bytes'] for item in records.values())
+        used = seed_bytes if schema2 else seed_bytes + sum(item['bytes'] for item in records.values())
         remaining = max(0, config['limits']['max_input_bytes'] - used)
         _, relative = _artifact_path(root, review_run_id, path)
         origin_path = relative.as_posix()
@@ -714,15 +728,20 @@ def _completion_candidates(root, cutoff, coverage, deadline_epoch_ms=None):
                'task_dir': task_dir, 'event': event, 'jsonls': [native]}
 
 
-def _project_binding(home, task):
+def _project_binding(home, task, *, deadline_epoch_ms=None):
     project_id = store.validate_id(task['project'])
-    record = projects.read(home, project_id)
+    record = (projects.read(home, project_id) if deadline_epoch_ms is None else
+              projects.read(home, project_id, deadline_epoch_ms=deadline_epoch_ms))
     if record.get('id') != project_id:
         raise store.Refusal('project registry identity mismatch')
     revision = task.get('start')
     if not isinstance(revision, str) or not re.fullmatch(r'[0-9a-f]{40,64}', revision):
         raise store.Refusal('task start revision invalid')
-    if store.git(record['path'], 'rev-parse', '--verify', revision + '^{commit}') != revision:
+    resolved = (store.git(record['path'], 'rev-parse', '--verify', revision + '^{commit}')
+                if deadline_epoch_ms is None else
+                store.git(record['path'], 'rev-parse', '--verify', revision + '^{commit}',
+                          deadline_epoch_ms=deadline_epoch_ms))
+    if resolved != revision:
         raise store.Refusal('task start revision unavailable')
     identity = {key: record[key] for key in ('id', 'path', 'common_dir', 'source')}
     home_id = _read_json(home / 'data' / 'home.json')['home_id']
@@ -730,7 +749,7 @@ def _project_binding(home, task):
             'identity_sha256': _digest(identity), 'task_revision': revision}
 
 
-def _validate_project_binding(home, episode):
+def _validate_project_binding(home, episode, *, deadline_epoch_ms=None):
     """Revalidate the frozen worker project and revision before project retrieval."""
     root = store.home(home)
     task_id = store.validate_id(episode['task_id'])
@@ -738,7 +757,7 @@ def _validate_project_binding(home, episode):
     if directory is None:
         raise store.Refusal('selected task unavailable')
     task = _read_json(directory / 'task.json')
-    if task.get('id') != task_id or _project_binding(root, task) != episode.get('project_binding'):
+    if task.get('id') != task_id or _project_binding(root, task, deadline_epoch_ms=deadline_epoch_ms) != episode.get('project_binding'):
         raise store.Refusal('selected project identity changed')
     return episode['project_binding']
 

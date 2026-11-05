@@ -290,27 +290,50 @@ class _MetadataIndex:
                ORDER BY marker.seq LIMIT 1''', (binding_id, final_id)).fetchone()
         return row[0] if row else None
 
+    def window_time_conflict(self, binding_id, prompt_id, start, end):
+        row = self._connection.execute(
+            '''SELECT id FROM entries
+               WHERE at>=? AND at<=? AND id NOT IN (?, ?) AND
+                 ((type='custom_message' AND custom_type IN ('agd:episode-binding', 'agd:episode-gap'))
+                  OR (type='message' AND role='user'))
+               LIMIT 1''', (start, end, binding_id, prompt_id)).fetchone()
+        return row is not None
+
     def in_chain(self, ident):
         return self._connection.execute('SELECT 1 FROM selected_chain WHERE id=?', (ident,)).fetchone() is not None
 
 
-def read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_ms: int | None = None, *, completion: dict | None = None, skip_row=None, metadata_only=False) -> dict:
+def read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_ms: int | None = None, *,
+                completion: dict | None = None, skip_row=None, metadata_only=False,
+                content_range=None, reject_text=None) -> dict:
     index = None
     try:
         index = _MetadataIndex() if completion is not None else None
-        return _read_native(session_path, cutoff, budget, deadline_epoch_ms, completion=completion, skip_row=skip_row, metadata_only=metadata_only, _index=index)
+        return _read_native(session_path, cutoff, budget, deadline_epoch_ms, completion=completion,
+                            skip_row=skip_row, metadata_only=metadata_only, content_range=content_range,
+                            reject_text=reject_text, _index=index)
     finally:
         if index is not None:
             index.close()
 
 
-def _read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_ms: int | None = None, *, completion: dict | None = None, skip_row=None, metadata_only=False, _index=None) -> dict:
+def _read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_ms: int | None = None, *,
+                 completion: dict | None = None, skip_row=None, metadata_only=False,
+                 content_range=None, reject_text=None, _index=None) -> dict:
     if not isinstance(cutoff, (int, float)) or isinstance(cutoff, bool) or not math.isfinite(cutoff):
         raise store.Refusal('native cutoff is invalid')
+    if content_range is not None and (metadata_only or not isinstance(content_range, tuple) or
+            len(content_range) != 3 or not isinstance(content_range[0], str) or
+            type(content_range[1]) is not int or content_range[1] < 0 or
+            type(content_range[2]) is not int or not 0 < content_range[2] <= budget):
+        raise store.Refusal('native content range invalid')
     state = {'header': None, 'header_record': None, 'header_index': None,
              'index': _index if completion is not None else None,
              'rows': [], 'retained': 0, 'late': False,
              'limited': False, 'withheld': []}
+    # The input budget limits exposed content, not the size of an on-disk
+    # JSONL record needed to prove a metadata projection.
+    scan_budget = max(budget, Path(session_path).stat().st_size) if metadata_only or content_range else budget
 
     def withhold(reason, record, message_id=None):
         state['withheld'].append({'reason': reason, 'line_start': record['line_start'],
@@ -323,6 +346,29 @@ def _read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_
             state['rows'].append({'message_id': value['id'], 'parent_id': value.get('parentId'),
                                   'role': message.get('role'), 'unsupported': unsupported,
                                   'text_sha256': hashlib.sha256(text.encode()).hexdigest()})
+            return
+        if content_range is not None:
+            message_id, start, limit = content_range
+            if value['id'] != message_id:
+                return
+            if reject_text is not None and reject_text(text):
+                raise store.Refusal('native source contains credentials')
+            raw = text.encode()
+            if start > len(raw):
+                raise store.Refusal('native range outside source')
+            end = min(start + limit, len(raw))
+            while end > start:
+                try:
+                    chunk = raw[start:end].decode('utf-8')
+                    break
+                except UnicodeDecodeError as error:
+                    if error.reason != 'unexpected end of data':
+                        raise store.Refusal('native range splits UTF-8') from error
+                    end = start + error.start
+            else:
+                chunk = ''
+            state['rows'].append({'message_id': message_id, 'text': chunk, 'start': start,
+                                  'end': end, 'size': len(raw), 'text_sha256': hashlib.sha256(raw).hexdigest()})
             return
         row = {'message_id': value['id'], 'text': text,
                'line_start': record['line_start'], 'line_end': record['line_start'],
@@ -400,7 +446,7 @@ def _read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_
         if at > cutoff:
             state['late'] = True
 
-    digest, watermark = _scan(session_path, budget, deadline_epoch_ms, visit)
+    digest, watermark = _scan(session_path, scan_budget, deadline_epoch_ms, visit)
     header = state['header']
     header_record = state['header_record']
     if header is None or header_record is None or not isinstance(header, dict):
@@ -475,6 +521,25 @@ def _read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_
     result['boundary'] = {'interaction_id': interaction_id, 'entry_id': final_entry['id'],
                           'parent_id': final_entry.get('parentId'),
                           'closed_at': max(published, final_entry['_reader_epoch'])}
+    # The binding belongs to the immediately preceding proved user turn.
+    # Do not infer a start from the final message or an arbitrary time span.
+    current = bindings[0].get('parentId')
+    window_start, prompt_id = None, None
+    while current is not None:
+        entry = index._row(current)
+        if entry is None or not index.in_chain(current):
+            break
+        if (entry.get('type') == 'custom_message' and
+                entry.get('customType') in ('agd:episode-binding', 'agd:episode-gap')):
+            break
+        if entry.get('type') == 'message' and entry.get('_role') == 'user':
+            window_start = entry.get('_reader_epoch')
+            prompt_id = current
+            break
+        current = entry.get('parentId')
+    if (isinstance(window_start, (int, float)) and window_start <= result['boundary']['closed_at'] and
+            not index.window_time_conflict(bindings[0]['id'], prompt_id, window_start, result['boundary']['closed_at'])):
+        result['interaction_window'] = {'start': window_start, 'end': result['boundary']['closed_at']}
     def retain_proved(record):
         value = record.get('value')
         if (not isinstance(value, dict) or value.get('type') != 'message'
@@ -492,7 +557,7 @@ def _read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_
             retain(value, record, text)
 
     # Proof selects the branch first; unrelated or consumed rows cannot spend its text budget.
-    digest, watermark = _scan(session_path, budget, deadline_epoch_ms, retain_proved,
+    digest, watermark = _scan(session_path, scan_budget, deadline_epoch_ms, retain_proved,
                               stop_at=boundary_record['byte_end'])
     if watermark != boundary_record['byte_end']:
         raise store.Refusal('native source changed while selecting material')
