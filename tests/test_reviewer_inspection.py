@@ -2782,3 +2782,116 @@ def test_report_v2_coverage_native_resume_uses_only_successful_prior_ranges():
         changed_prefix = read_page(changed_run, changed_episode['episode_id'])
         assert changed_prefix['range']['start'] == 0
         assert changed_prefix['text'].startswith('changed version ')
+
+
+def test_r1_report_v2_coverage_same_request_uuid_in_distinct_runs_is_idempotent():
+    with lab() as (home, _):
+        native, _, _ = completed_session(home, texts=('observed final outcome',))
+        request = str(uuid.uuid4())
+        first_run, first_manifest = stage(home)
+        first_episode = first_manifest['episodes'][0]
+        eid, basis = first_episode['episode_id'], first_episode['basis']
+        metadata = inspection().inspect(home, first_run, eid, source='native')
+        screened = {'episode_id': eid, 'assessment': 'screened',
+                    'intent_sources': [metadata['source_id']], 'action_sources': [], 'outcome_sources': [],
+                    'limitations': []}
+        first_report = report_v2(screened)
+        first_result = reviewer.submit_report(home, first_run, request, first_report)
+        reviewer.finalize_run(home, first_run, 'exited')
+        progress = reviewer._episode_progress(home, eid, basis)
+        assert progress['screened'] and not progress['reflected'] and not progress['ranges']
+
+        second_run, second_manifest = stage(home, cutoff=201)
+        second_episode = second_manifest['episodes'][0]
+        assert second_run != first_run
+        assert second_episode['episode_id'] == eid and second_episode['basis'] == basis
+        reflected, _, _ = report_v2_inputs(home, second_run, second_manifest, native)
+        second_report = report_v2(reflected)
+        second_result = reviewer.submit_report(home, second_run, request, second_report)
+        assert second_result['report_id'] != first_result['report_id']
+        reviewer.finalize_run(home, second_run, 'exited')
+        completed = reviewer._episode_progress(home, eid, basis)
+        assert completed['screened'] and completed['reflected']
+        assert completed['ranges']
+        assert len(completed['submissions']) == len(set(completed['submissions'])) == 2
+
+        for run_id, report, result in ((first_run, first_report, first_result),
+                                       (second_run, second_report, second_result)):
+            reviewer.recover_submissions(home, run_id)
+            assert reviewer.submit_report(home, run_id, request, report) == result
+            reviewer.finalize_run(home, run_id, 'exited')
+            assert reviewer._episode_progress(home, eid, basis) == completed
+
+
+@pytest.mark.parametrize('overlap', ['first', 'second', 'none', 'multiple'])
+def test_r1_report_v2_destination_collision_selects_unique_evidence_lineage(overlap):
+    with lab() as (home, _):
+        hook = home / 'config' / 'hooks' / 'lineage.sh'
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text('first guard version\n')
+        native, _, _ = completed_session(home, texts=('distinct final evidence',))
+
+        first_run, first_manifest = stage(home)
+        first_row, first_prompt, _ = report_v2_inputs(home, first_run, first_manifest, native)
+        first_target = target(home, first_run, scope='distro', path='config/hooks/lineage.sh')
+        first_guard = record(home, first_run, first_target)['guard']['source_sha256']
+        first_report = report_v2(first_row, [report_v2_finding(first_row, first_target['target_ref'],
+                                                               first_prompt, 'distro')])
+        first_result = reviewer.submit_report(home, first_run, str(uuid.uuid4()), first_report)
+        reviewer.finalize_run(home, first_run, 'exited')
+
+        eid = first_row['episode_id']
+        second_run, second_manifest = stage(home, cutoff=201, detail=(eid,))
+        second_row, _, second_final = report_v2_inputs(home, second_run, second_manifest, native)
+        second_target = target(home, second_run, scope='distro', path='config/hooks/lineage.sh')
+        second_report = report_v2(second_row, [report_v2_finding(second_row, second_target['target_ref'],
+                                                                second_final, 'distro')])
+        second_result = reviewer.submit_report(home, second_run, str(uuid.uuid4()), second_report)
+        reviewer.finalize_run(home, second_run, 'exited')
+        first_id, second_id = first_result['proposal_ids'][0], second_result['proposal_ids'][0]
+        assert first_id != second_id
+        first_before, second_before = reviewer.read_proposal(home, first_id), reviewer.read_proposal(home, second_id)
+        assert first_before['fingerprint'] == second_before['fingerprint']
+        assert second_before['uncertain_distinct']
+        old_reports = {result['report_id']: reviewer.report_path(home, result['report_id']).read_bytes()
+                       for result in (first_result, second_result)}
+        old_revision_bytes = {row['revision_hash']: (reviewer.paths(home)['revisions'] /
+                               (row['revision_hash'] + '.json')).read_bytes()
+                              for proposal in (first_before, second_before) for row in proposal['revisions']}
+
+        hook.write_text('changed guard version\n')
+        third_run, third_manifest = stage(home, cutoff=202, detail=(eid,))
+        third_row, third_prompt, third_final = report_v2_inputs(home, third_run, third_manifest, native)
+        assert first_prompt != third_prompt and second_final != third_final
+        third_target = target(home, third_run, scope='distro', path='config/hooks/lineage.sh')
+        third_guard = record(home, third_run, third_target)['guard']['source_sha256']
+        assert third_guard != first_guard
+        if overlap == 'first':
+            citations = [third_prompt]
+        elif overlap == 'second':
+            citations = [third_final]
+        elif overlap == 'multiple':
+            citations = [third_prompt, third_final]
+        else:
+            citations = [capture(home, third_run, 'independent manual observation')]
+        finding = report_v2_finding(third_row, third_target['target_ref'], citations[0], 'distro')
+        finding['citations'] = citations
+        third_result = reviewer.submit_report(home, third_run, str(uuid.uuid4()), report_v2(third_row, [finding]))
+        reviewer.finalize_run(home, third_run, 'exited')
+        third_id = third_result['proposal_ids'][0]
+        if overlap in ('first', 'second'):
+            chosen, other = (first_id, second_id) if overlap == 'first' else (second_id, first_id)
+            assert third_id == chosen
+            revised = reviewer.read_proposal(home, chosen)
+            assert len(revised['revisions']) == 2
+            assert revised['revisions'][-1]['target']['guard']['source_sha256'] == third_guard
+            assert reviewer.read_proposal(home, other) == (second_before if overlap == 'first' else first_before)
+        else:
+            assert third_id not in (first_id, second_id)
+            assert reviewer.read_proposal(home, third_id)['uncertain_distinct']
+            assert reviewer.read_proposal(home, first_id) == first_before
+            assert reviewer.read_proposal(home, second_id) == second_before
+        for report_id, body in old_reports.items():
+            assert reviewer.report_path(home, report_id).read_bytes() == body
+        for revision_hash, body in old_revision_bytes.items():
+            assert (reviewer.paths(home)['revisions'] / (revision_hash + '.json')).read_bytes() == body

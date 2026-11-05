@@ -2142,9 +2142,10 @@ def _submit_report_v2(home, receipt, request_id, report):
                     descriptors = [overlap.get(ident, {'source_id': ident}) for ident in finding['citations']]
                     fingerprint = _finding_fingerprint(finding, target)
                     matches = [item for item in proposals if item.get('schema') == 2 and item['fingerprint'] == fingerprint]
-                    proposal = (matches[0] if len(matches) == 1 and any(
+                    overlapping = [item for item in matches if any(
                         _evidence_overlap(row.get('evidence_overlap', []), descriptors)
-                        for row in matches[0]['revisions']) else None)
+                        for row in item['revisions'])]
+                    proposal = overlapping[0] if len(overlapping) == 1 else None
                     if proposal is None:
                         proposal = {'schema': 2, 'proposal_id': str(uuid.uuid4()), 'fingerprint': fingerprint,
                                     'head_revision': None, 'revisions': [], 'uncertain_distinct': bool(matches)}
@@ -2317,7 +2318,7 @@ def _commit_v2_coverage_locked(home, receipt):
             episode = item['episode']
             state = _record_episode_progress(home, episode=episode, assessment=item['assessment'],
                                              limitations=item['limitations'], ranges=item['ranges'],
-                                             submission_id=prepared['request_id'])
+                                             submission_id=f"{receipt['review_run_id']}:{prepared['request_id']}")
             if episode.get('role') not in ('worker', 'central'):
                 continue
             scope = _source_scope(home, episode)
