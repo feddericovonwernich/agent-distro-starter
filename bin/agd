@@ -158,6 +158,12 @@ def parser():
     execute_p = reviewer_p.add_parser('execute'); execute_p.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
     bind_p = reviewer_p.add_parser('session-bind'); bind_p.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value))); bind_p.add_argument('--session-id', required=True); bind_p.add_argument('--session-file', required=True)
     reviewer_p.add_parser('status')
+    selection = reviewer_p.add_parser('selection').add_subparsers(dest='reviewer_selection_op', required=True)
+    disclosures = selection.add_parser('disclosures')
+    disclosures.add_argument('manifest_id')
+    disclosures.add_argument('--category', choices=('held', 'unavailable', 'withheld'), required=True)
+    disclosures.add_argument('--cursor', type=int, default=0)
+    disclosures.add_argument('--limit', type=int, default=20)
     workspace = reviewer_p.add_parser('workspace').add_subparsers(dest='workspace_op', required=True)
     workspace_create = workspace.add_parser('create')
     workspace_create.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
@@ -531,6 +537,9 @@ def _dispatch(args, home, fresh):
                 instruction=Path(args.instruction).absolute() if args.instruction else None)
         if args.reviewer_op == 'status':
             return {'timer': reviewer_timer._read_record(home), 'runs': len(list(reviewer.paths(home)['receipts'].glob('*.json')))}
+        if args.reviewer_op == 'selection':
+            return reviewer.read_selection_disclosures(
+                home, args.manifest_id, args.category, cursor=args.cursor, limit=args.limit)
         if args.reviewer_op == 'inspect':
             from agd_lib import reviewer_inspection
             return reviewer_inspection.inspect(home, args.review_run_id, args.episode, source=args.source,
@@ -591,7 +600,7 @@ if __name__ == '__main__':
         if isinstance(result, int):
             raise SystemExit(result)
         if result is not None:
-            if args.command == 'reviewer' and args.reviewer_op in ('inspect', 'skills', 'target'):
+            if args.command == 'reviewer' and args.reviewer_op in ('inspect', 'skills', 'target', 'selection'):
                 print(json.dumps(result, indent=2, ensure_ascii=False))
             else:
                 print(json.dumps(result, indent=2 if sys.stdout.isatty() else None))

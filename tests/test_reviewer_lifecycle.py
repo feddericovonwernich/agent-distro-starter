@@ -323,26 +323,127 @@ def test_manifest_manual_detail_intent_reopens_held_episode(monkeypatch):
             reviewer_runner.run_native_reviewer(home, intent)
 
 
-def test_manifest_cli_detail_repeated_manual_only(monkeypatch):
+def test_public_no_work_discloses_all_holds_and_incomplete_proof_and_detail_reopens(monkeypatch):
+    import time
+    import uuid
     from importlib.machinery import SourceFileLoader
     from importlib.util import module_from_spec, spec_from_loader
+    from support import command
+    from test_reviewer import completed_session
+    from test_reviewer_inspection import inspection, stage
 
     with lab() as (home, _):
-        loader = SourceFileLoader('agd_cli_detail', str(Path(__file__).resolve().parents[1] / 'bin' / 'agd'))
-        cli = module_from_spec(spec_from_loader('agd_cli_detail', loader))
+        for index in range(5):
+            completed_session(home, texts=(f'completed case {index}',), active='unfinished',
+                              cutoff=time.time() + 3600)
+        run_id, manifest = stage(home, cutoff=time.time() + 1)
+        assert len(manifest['episodes']) == 5
+        expected = {}
+        reviews = []
+        for index, episode in enumerate(manifest['episodes']):
+            source = inspection().inspect(home, run_id, episode['episode_id'], source='native')
+            reasons = [f'Outcome unavailable for held case {index}.']
+            if index == 4:
+                reasons += [f'Additional limitation {number}: ' + 'x' * 300 for number in range(4)]
+            expected[episode['episode_id']] = reasons
+            reviews.append({'episode_id': episode['episode_id'], 'assessment': 'limited',
+                            'intent_sources': [source['source_id']], 'action_sources': [],
+                            'outcome_sources': [], 'limitations': reasons})
+        reviewer.submit_report(home, run_id, str(uuid.uuid4()),
+                               {'schema': 2, 'summary': 'Limited evidence.',
+                                'episode_reviews': reviews, 'findings': []})
+        reviewer.finalize_run(home, run_id, 'exited')
+        _, incomplete, _ = completed_session(home, texts=('pending native proof',),
+                                              cutoff=time.time() + 3600)
+        incomplete.write_text('\n'.join(incomplete.read_text().splitlines()[:3]) + '\n')
+
+        result = command(home, 'reviewer', 'run')
+        assert result['state'] == 'no-work'
+        summary = result['selection']
+        assert summary['held_count'] == len(expected)
+        assert summary['coverage']['complete'] is False
+        assert summary['coverage']['unavailable_count'] > 0
+        assert not (reviewer.paths(home)['runtime'] / result['review_run_id']).exists()
+        assert not result.get('backend') and not result.get('endpoint') and not result.get('model')
+        assert len(json.dumps(result, ensure_ascii=False).encode()) <= 16384
+
+        def pages(category):
+            cursor, rows = 0, []
+            while cursor is not None:
+                page = command(home, 'reviewer', 'selection', 'disclosures', result['manifest_id'],
+                               '--category', category, '--limit', '2', '--cursor', str(cursor))
+                assert len(json.dumps(page, ensure_ascii=False).encode()) <= 16384
+                rows.extend(page['rows'])
+                cursor = page['next_cursor']
+            return rows
+
+        held = pages('held')
+        assert {row['episode_id']: row['limitations'] for row in held} == expected
+        unavailable = pages('unavailable')
+        assert any(row.get('reason') == 'native-proof-pending' for row in unavailable)
+        assert len(unavailable) == summary['coverage']['unavailable_count']
+
+        loader = SourceFileLoader('agd_cli_disclosure', str(Path(__file__).resolve().parents[1] / 'bin' / 'agd'))
+        cli = module_from_spec(spec_from_loader('agd_cli_disclosure', loader))
         loader.exec_module(cli)
-        first, second = 'a' * 64, 'b' * 64
-        monkeypatch.setattr(reviewer_runner, 'run_native_reviewer', lambda _home, intent: intent)
-        args = cli.parser().parse_args(['--home', str(home), 'reviewer', 'run',
-                                        '--detail-episode', first, '--detail-episode', second])
-        intent = cli.main(args)
-        assert intent['kind'] == 'manual'
-        assert intent['detail_episode_ids'] == [first, second]
-        assert intent['retrospective_review_run_ids'] == []
-        args = cli.parser().parse_args(['--home', str(home), 'reviewer', 'run',
-                                        '--timer', '--detail-episode', first])
-        with pytest.raises(store.Refusal):
-            cli.main(args)
+
+        def forbidden(*_args, **_kwargs):
+            pytest.fail('detail bypassed the fixture allocation stop')
+
+        monkeypatch.setattr(reviewer_runner, '_reviewer_backend', forbidden)
+        monkeypatch.setattr(reviewer_runner.omp_runtime, 'executable', forbidden)
+
+        def stop_before_allocation(*_args, **_kwargs):
+            raise RuntimeError('fixture stops before backend allocation')
+
+        monkeypatch.setattr(reviewer_runner.observability, 'reviewer_environment', stop_before_allocation)
+        chosen = held[-1]['episode_id']
+        detail = cli.main(cli.parser().parse_args(
+            ['--home', str(home), 'reviewer', 'run', '--detail-episode', chosen]))
+        reopened = reviewer.read_manifest(home, detail['manifest_id'])
+        assert chosen in {row['episode_id'] for row in reopened['episodes']}
+        assert detail['outcome'] == 'failed'
+        assert all(not reviewer._episode_progress(home, row['episode_id'], row['basis'])['reflected']
+                   for row in manifest['episodes'])
+
+
+def test_public_no_work_oversized_hold_has_complete_trusted_artifact_reference():
+    import time
+    import uuid
+    from support import command
+    from test_reviewer import completed_session
+    from test_reviewer_inspection import inspection, stage
+
+    with lab() as (home, _):
+        completed_session(home, texts=('bounded native result',), cutoff=time.time() + 3600)
+        run_id, manifest = stage(home, cutoff=time.time() + 1)
+        episode = manifest['episodes'][0]
+        source = inspection().inspect(home, run_id, episode['episode_id'], source='native')
+        reason = 'Unavailable: ' + 'é' * 12000
+        reviewer.submit_report(
+            home, run_id, str(uuid.uuid4()),
+            {'schema': 2, 'summary': 'Held.', 'findings': [],
+             'episode_reviews': [{'episode_id': episode['episode_id'], 'assessment': 'limited',
+                                  'intent_sources': [source['source_id']], 'action_sources': [],
+                                  'outcome_sources': [], 'limitations': [reason]}]})
+        reviewer.finalize_run(home, run_id, 'exited')
+        result = command(home, 'reviewer', 'run')
+        assert result['state'] == 'no-work' and result['selection']['held_count'] == 1
+        page = command(home, 'reviewer', 'selection', 'disclosures', result['manifest_id'],
+                       '--category', 'held', '--limit', '1')
+        assert len(json.dumps(page, ensure_ascii=False, indent=2).encode()) <= 16384
+        assert page['total'] == 1 and page['next_cursor'] is None
+        row = page['rows'][0]
+        assert row['episode_id'] == episode['episode_id']
+        reference = row['artifact_ref']
+        assert reference['category'] == 'held' and reference['index'] == 0
+        selected = reviewer.read_manifest(home, result['manifest_id'])
+        assert reference['detail_id'] == selected['details_id']
+        path = Path(reference['path'])
+        assert path.is_absolute() and path.parent == reviewer.paths(home)['selection_details']
+        details = json.loads(path.read_text())
+        assert reviewer._digest(details) == reference['detail_id']
+        assert details['held'][reference['index']]['limitations'] == [reason]
 
 
 def test_reviewer_session_binding_refuses_foreign_directory(tmp_path):

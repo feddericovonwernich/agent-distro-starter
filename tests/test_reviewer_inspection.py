@@ -2627,6 +2627,56 @@ def test_report_v2_historical_prepared_recovery_coexists_with_new_submission():
         assert (prepared_path.read_bytes(), old_report_path.read_bytes(), old_proposal_path.read_bytes()) == preserved
 
 
+def test_general_review_event_delivery_triage_preserves_historical_event_and_target():
+    with lab() as (home, _):
+        old_run, old_result = historical_final(home)
+        old_receipt = reviewer._receipt(home, old_run['review_run_id'])
+        old_event_path = home / 'state' / 'events' / f"{old_receipt['event_id']}.json"
+        old_event_bytes = old_event_path.read_bytes()
+        old_event = json.loads(old_event_bytes)
+        assert old_event['kind'] == 'background-skill-review'
+        assert old_event['details']['proposal_ids'] == old_result['proposal_ids']
+
+        hook = home / 'config' / 'hooks' / 'reviewed-tool.sh'
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text('printf original-tool\\n\n')
+        original = hook.read_bytes()
+        native, _, _ = completed_session(home, texts=('Tool result omitted the requested check.',))
+        run_id, manifest = stage(home)
+        row, _, citation = report_v2_inputs(home, run_id, manifest, native)
+        destination = target(home, run_id, scope='distro', path='config/hooks/reviewed-tool.sh')
+        submitted = reviewer.submit_report(
+            home, run_id, str(uuid.uuid4()),
+            report_v2(row, [report_v2_finding(row, destination['target_ref'], citation, 'distro')]))
+        finalized = reviewer.finalize_run(home, run_id, 'exited')
+        assert finalized['purpose'] == 'background-review'
+
+        events = command(home, 'events', 'list')
+        by_id = {event['id']: event for event in events}
+        event = by_id[finalized['event_id']]
+        assert by_id[old_receipt['event_id']] == old_event
+        assert event['kind'] == 'background-review'
+        assert event['details']['purpose'] == 'background-review'
+        assert event['details']['manifest_id'] == manifest['manifest_id']
+        assert event['details']['report_ids'] == [submitted['report_id']]
+        assert event['details']['proposal_ids'] == submitted['proposal_ids']
+        assert event['details']['targets'][0]['identity']['locator'] == 'config/hooks/reviewed-tool.sh'
+        assert event['details']['targets'][0]['identity']['kind'] == 'file'
+        assert event['details']['targets'][0]['surface'] == 'tooling'
+
+        proposal_id = submitted['proposal_ids'][0]
+        proposal = command(home, 'reviewer', 'proposals', 'show', proposal_id)
+        assert proposal['revisions'][0]['target']['identity']['locator'] == 'config/hooks/reviewed-tool.sh'
+        disposed = command(home, 'reviewer', 'proposals', 'dispose', proposal_id, '--status', 'accepted')
+        assert disposed['current'] == 'accepted'
+        assert hook.read_bytes() == original
+        assert old_event_path.read_bytes() == old_event_bytes
+        command(home, 'events', 'acknowledge', event['id'])
+        remaining = command(home, 'events', 'list')
+        assert old_receipt['event_id'] in {row['id'] for row in remaining}
+        assert event['id'] not in {row['id'] for row in remaining}
+
+
 def test_report_v2_coverage_noncontiguous_issued_ranges_leave_middle_gap():
     with lab() as (home, _):
         text = 'independent page evidence ' * 400

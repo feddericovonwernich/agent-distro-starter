@@ -450,9 +450,9 @@ def setup_reviewer(home, ask, report):
     from . import reviewer, reviewer_timer
     from .uninstall_state import admission
     with admission(home):
-        report('Optional scheduled skill reviews inspect completed worker evidence and may incur model-provider charges.')
-        report('Reports/proposals only: no automatic skill edits. Independent of Langfuse; limits are not a dollar budget.')
-        answer = ask('Enable scheduled skill reviews? [y/N] ')
+        report('Optional scheduled behavioral reviews inspect completed execution evidence and may incur model-provider charges.')
+        report('Reports and recommendations require human triage; no changes are applied automatically. Independent of Langfuse; limits are not a dollar budget.')
+        answer = ask('Enable scheduled behavioral reviews? [y/N] ')
         if answer is None or answer.lower() not in ('y', 'yes'):
             report('Scheduled reviewer: unchanged; not enabled by this installer.')
             return {'state': 'skipped'}

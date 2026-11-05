@@ -732,7 +732,23 @@ def run_native_reviewer(home, intent, *, omp_binary='omp'):
         if reviewer.deadline_remaining_seconds(run['deadline_epoch_ms']) <= 0:
             return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='timeout')
         if not manifest['episodes']:
-            return reviewer.close_run(home, run['review_run_id'], 'no-work')
+            receipt = reviewer.close_run(home, run['review_run_id'], 'no-work')
+            coverage = manifest['coverage']
+            selection = {'held_count': manifest['held_count'],
+                         'omitted_pending': manifest['omitted_pending'],
+                         'coverage': {key: coverage[key] for key in
+                                      ('complete', 'unavailable_count', 'withheld_count')},
+                         'disclosure_command': 'reviewer selection disclosures'}
+            result = {**receipt, 'selection': selection}
+            if len(json.dumps(result, indent=2).encode()) >= 16384:
+                result = {'schema': receipt['schema'], 'purpose': receipt['purpose'],
+                          'review_run_id': receipt['review_run_id'],
+                          'manifest_id': receipt['manifest_id'], 'report_schema': receipt['report_schema'],
+                          'dispatch_state': receipt['dispatch_state'], 'state': receipt['state'],
+                          'outcome': receipt['outcome'], 'closed_at': receipt['closed_at'],
+                          'receipt_ref': f"state/reviewer/receipts/{receipt['review_run_id']}.json",
+                          'selection': selection}
+            return result
         try:
             env, _, _ = observability.reviewer_environment(home, run['review_run_id'])
             query = observability.reviewer_query_status(home, env)

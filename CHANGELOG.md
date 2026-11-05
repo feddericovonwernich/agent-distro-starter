@@ -2,6 +2,7 @@
 
 ## Unreleased
 - Cut over new reviewer runs to metadata-first, bounded reflection with schema-2 episode assessments and general guarded project/distro recommendations. Retrieve scoped evidence and relevant targets on demand; preserve schema-1 history for reads, triage and already-prepared recovery. Recommendations remain inert, and semantic evaluation is unapproved and unperformed.
+- Disclose held/incomplete evidence in no-work results with bounded operator pages and verified full-reason artifact references; label new general-review notifications and installer opt-in accurately while preserving historical events and human-only triage.
 - Disable Treehouse background update checks only for managed reviewer workspace commands so the updater cannot recreate isolated data during cleanup; ordinary Treehouse and installer behavior are unchanged.
 - Prevent generated ClickHouse telemetry passwords from being parsed as CLI options by prefixing new credentials without reducing their random entropy; preserve existing credentials unchanged across stack re-renders.
 - Fail closed local Langfuse credential admission on a persisted healthy record: a bounded read-only check now proves the current owned web container, project/service identity, loopback binding, and health/project readiness before credentials are returned. Stopped stacks, foreign listeners, mismatched ports, timeouts, and damaged state remain key-free without an implicit Docker restart.

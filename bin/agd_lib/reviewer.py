@@ -912,16 +912,29 @@ def _read_selection_detail(home, detail_id, kind):
         raise store.Refusal('invalid selection details') from error
 
 
-def _selection_page(rows, cursor, limit, *, notices):
+def _selection_page(rows, cursor, limit, *, overflow=None):
     if type(cursor) is not int or cursor < 0 or cursor > len(rows) or type(limit) is not int or not 1 <= limit <= 20:
         raise store.Refusal('selection detail cursor invalid')
     result = {'rows': [], 'next_cursor': None, 'total': len(rows)}
     for index in range(cursor, min(cursor + limit, len(rows))):
-        result['rows'].append(_bounded_notice(rows[index]) if notices else rows[index])
+        result['rows'].append(rows[index])
         result['next_cursor'] = index + 1 if index + 1 < len(rows) else None
-        if len(json.dumps(result, ensure_ascii=False, indent=2).encode()) > 16384:
+        if len(json.dumps(result, ensure_ascii=False, indent=2).encode()) >= 16384:
             result['rows'].pop()
-            result['next_cursor'] = index
+            if not result['rows'] and overflow is not None:
+                source = rows[index]
+                reference = {**overflow, 'index': index}
+                summary = {'artifact_ref': reference}
+                if isinstance(source, dict):
+                    for key in ('episode_id', 'basis'):
+                        if key in source:
+                            summary[key] = source[key]
+                result['rows'].append(summary)
+                result['next_cursor'] = index + 1 if index + 1 < len(rows) else None
+                if len(json.dumps(result, ensure_ascii=False, indent=2).encode()) >= 16384:
+                    raise store.Refusal('selection detail reference exceeds limit')
+            else:
+                result['next_cursor'] = index
             break
     if cursor < len(rows) and not result['rows']:
         raise store.Refusal('selection detail row exceeds limit')
@@ -933,7 +946,12 @@ def read_selection_disclosures(home, manifest_id, category, *, cursor=0, limit=2
         raise store.Refusal('selection disclosure category invalid')
     manifest = read_manifest(home, manifest_id)
     details = _read_selection_detail(home, manifest['details_id'], 'disclosures')
-    return _selection_page(details[category], cursor, limit, notices=True)
+    reference = {'path': str((paths(home)['selection_details'] / f"{manifest['details_id']}.json").absolute()),
+                 'detail_id': manifest['details_id'], 'category': category}
+    if len(json.dumps(reference, ensure_ascii=False).encode()) > 8192:
+        reference['path'] = str(Path(reference['path']).relative_to(store.home(home)))
+        reference['path_base'] = 'home'
+    return _selection_page(details[category], cursor, limit, overflow=reference)
 
 
 def read_selection_locators(home, manifest_id, episode_id, *, cursor=0, limit=20):
@@ -945,7 +963,7 @@ def read_selection_locators(home, manifest_id, episode_id, *, cursor=0, limit=20
     details = _read_selection_detail(home, episode['locators_id'], 'locators')
     if details['episode_id'] != episode_id or details['basis'] != episode['basis']:
         raise store.Refusal('selection locator identity mismatch')
-    return _selection_page(details['locators'], cursor, limit, notices=False)
+    return _selection_page(details['locators'], cursor, limit)
 
 
 def _selection_schedule(home, actionable, requested):
@@ -1273,7 +1291,7 @@ def reserve_run(home, intent, *, config_snapshot, instruction_snapshot, started_
     publish_immutable(paths(home)['manifests'] / f'{config_ref}.json', config)
     publish_immutable(paths(home)['manifests'] / f'{instruction_ref}.json', {
         'text': instruction_snapshot.decode('utf-8'), 'raw_utf8_sha256': instruction_ref})
-    run = {'schema': 2, 'purpose': 'background-skill-review', 'review_run_id': run_id,
+    run = {'schema': 2, 'purpose': 'background-review', 'review_run_id': run_id,
            'intent': intent, 'config_snapshot_ref': config_ref,
            'instruction_snapshot_ref': instruction_ref, 'started_at': started_at,
            'deadline_epoch_ms': deadline_epoch_ms, 'execution': 'native-cli',
@@ -1862,14 +1880,15 @@ def _review_event(home, receipt):
     event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, _digest([receipt['review_run_id'], receipt.get('report_ids', []), proposal_ids])))
     pending, handled = store.home(home) / 'state' / 'events' / f'{event_id}.json', store.home(home) / 'state' / 'events-handled' / f'{event_id}.json'
     if not pending.exists() and not handled.exists():
-        details = {'purpose': 'background-skill-review', 'review_run_id': receipt['review_run_id'],
+        kind = 'background-review' if receipt.get('manifest_id') is not None else 'background-skill-review'
+        details = {'purpose': kind, 'review_run_id': receipt['review_run_id'],
                    'report_ids': receipt.get('report_ids', []), 'proposal_ids': proposal_ids,
                    'report_count': len(receipt.get('report_ids', [])), 'proposal_count': len(proposal_ids)}
         if receipt.get('manifest_id') is not None:
             details['manifest_id'] = receipt['manifest_id']
             details['targets'] = [target for report_id in receipt.get('report_ids', [])
                                   for target in _read_json(report_path(home, report_id)).get('targets', [])]
-        store.atomic_json(pending, {'schema': 1, 'id': event_id, 'kind': 'background-skill-review',
+        store.atomic_json(pending, {'schema': 1, 'id': event_id, 'kind': kind,
                                     'key': receipt['review_run_id'], 'observed_at': time.time(), 'details': details})
     return event_id
 

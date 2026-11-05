@@ -77,6 +77,14 @@ A limited review with no recommendations is valid; metadata alone is not reflect
 
 A screened row uses the same six keys with `assessment` set to `screened`; do not label metadata-only evidence reflected. Omit unseen episode rows rather than inventing assessments. A later detail request is explicit and respects retrospective/self-exclusion and scheduling policy.
 
-## Operator-only detail admission
+## Operator-only disclosure and detail admission
+
+A no-work result's `selection` summarizes held episodes and incomplete coverage. Operators can enumerate its immutable disclosure records:
+
+```sh
+bin/agd --home "$AGD_HOME" reviewer selection disclosures MANIFEST_ID --category held --limit 20 --cursor 0
+```
+
+Use `next_cursor` for subsequent pages and `unavailable` or `withheld` for the other categories. Oversized rows carry `artifact_ref`: read its `category` and zero-based `index` from the verified detail file to obtain every reason. Resolve `path_base: home` paths against the distro home. If the full no-work receipt exceeds the output bound, `receipt_ref` identifies its home-relative stored file; the bounded summary remains in the response.
 
 An operator may run `bin/agd --home "$AGD_HOME" reviewer run --detail-episode EPISODE_ID` to request further inspection in a new run; repeat `--detail-episode` for multiple episodes. Timers cannot request detail. This is not a reviewer command: the reviewer must not launch another reviewer.
