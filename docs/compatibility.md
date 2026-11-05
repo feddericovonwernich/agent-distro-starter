@@ -64,6 +64,14 @@ The private smoke home is under `/tmp`; raw transcripts and credentials are not 
 
 ## Background reviewer acceptance
 
+### Metadata-first behavioral design status
+
+The historical packet-based acceptance below does not validate the new interface or model judgment. Owner verification reports a successful standalone public reviewer smoke with schema-2 request/report, scoped reads, a non-skill target, proposal CLI, exit zero, and process/endpoint absence. Affected Python suites passed 297 assertions including a scripted OMP/Herdr scheduled/manual/crash/uninstall scenario; after the Treehouse updater cleanup fix, 11 workspace tests passed. Both documented report shapes also passed real submit/finalize and report-show with admitted IDs. These checks establish mechanics and shape, not the truth of illustrative claims or model judgment.
+
+The installed OMP 18.14.0 is a standalone ELF. With matching official package modules in a disposable test prefix, the native TypeScript episode suite passed: one test, 42 assertions. No product or global SDK dependency was added. An excessively long disposable config path was refused by Herdr at server startup due to its Unix socket path ceiling. tmux was unavailable for this feature's verification; these checks do not establish all environments or backend variants.
+
+Behavioral evaluation is unapproved and unperformed; all eight scenarios in [the evaluation checklist](../tests/reviewer-behavior-scenarios.md) are deferred. A scripted provider proves mechanics only. No behaviorally validated release readiness or token-saving claim is established.
+
 ### Incremental episode admission
 
 The native episode lifecycle smoke remains a development-harness check using the official importable OMP SDK and a scripted provider: it exercises real native recording, packet selection, final-response admission, retained-only finalization, taskless central episodes, scoped deduplication, and fresh-cutoff scans. The public reviewer runtime does not depend on that SDK; its managed coordinator uses the installed standalone OMP executable.
