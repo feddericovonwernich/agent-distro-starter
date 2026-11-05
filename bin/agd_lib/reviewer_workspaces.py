@@ -64,7 +64,8 @@ def _safe_env(home):
     cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     env = dict(os.environ)
     env.update(HOME=str(isolated), XDG_CONFIG_HOME=str(config), XDG_CACHE_HOME=str(cache),
-               TREEHOUSE_ROOT=str(root / 'data' / 'treehouse'), GIT_CONFIG_NOSYSTEM='1',
+               TREEHOUSE_ROOT=str(root / 'data' / 'treehouse'), TREEHOUSE_NO_UPDATE_CHECK='1',
+               GIT_CONFIG_NOSYSTEM='1',
                GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_COUNT='1',
                GIT_CONFIG_KEY_0='core.hooksPath', GIT_CONFIG_VALUE_0='/dev/null')
     return env

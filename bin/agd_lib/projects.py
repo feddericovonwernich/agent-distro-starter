@@ -9,7 +9,7 @@ def record(home, project_id):
     return home/'data'/'projects'/f'{store.validate_id(project_id)}.json'
 
 
-def read(home, project_id):
+def read(home, project_id, *, deadline_epoch_ms=None):
     path = record(home, project_id)
     if not path.is_file():
         raise store.Refusal(f'unknown project: {project_id}')
@@ -17,7 +17,11 @@ def read(home, project_id):
     clone = Path(data['path'])
     if clone.resolve() != (home/'projects'/project_id).resolve() or clone.is_symlink():
         raise store.Refusal('project clone identity changed')
-    if store.git(clone, 'rev-parse', '--path-format=absolute', '--git-common-dir') != data['common_dir']:
+    common = (store.git(clone, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+              if deadline_epoch_ms is None else
+              store.git(clone, 'rev-parse', '--path-format=absolute', '--git-common-dir',
+                        deadline_epoch_ms=deadline_epoch_ms))
+    if common != data['common_dir']:
         raise store.Refusal('project Git identity changed')
     return data
 

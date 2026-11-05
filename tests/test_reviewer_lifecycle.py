@@ -13,9 +13,10 @@ from support import lab
 
 
 def _reserved_reviewer_run(home, *, work=True, deadline=None):
-    from test_reviewer import ended_worker, message
+    from test_reviewer import completed_session
     if work:
-        ended_worker(home, 'native-reviewer', str(__import__('uuid').uuid4()), [message('evidence')])
+        completed_session(home, role='worker', task_id='native-reviewer', texts=('evidence',),
+                          cutoff=__import__('time').time() + 3600)
     intent = reviewer.enqueue_intent(home, kind='manual')
     config = reviewer.read_config(home)
     started = __import__('time').time()
@@ -24,33 +25,17 @@ def _reserved_reviewer_run(home, *, work=True, deadline=None):
         instruction_snapshot=reviewer.INSTRUCTION_FILE.read_bytes(),
         started_at=started,
         deadline_epoch_ms=int((started + (deadline or config['limits']['max_runtime_seconds'])) * 1000))
-    packet = reviewer.select_packet(home, cutoff=started + 1, config_snapshot=config) if work else None
-    if packet is not None:
-        with store.lock(home):
-            receipt = reviewer._receipt(home, run['review_run_id'])
-            receipt['packet_id'] = packet['packet_id']
-            store.atomic_json(reviewer.paths(home)['receipts'] / f"{run['review_run_id']}.json", receipt)
-    return run, packet
+    manifest = reviewer.select_manifest(home, cutoff=started + 1, config_snapshot=config) if work else None
+    return run, manifest
 
 
-def _write_native_request(home, run, packet):
-    runtime = reviewer.paths(home)['runtime'] / run['review_run_id']
-    runtime.mkdir(parents=True, exist_ok=True)
-    (runtime / 'request.json').write_text(json.dumps({
-        'schema': 1, 'review_run_id': run['review_run_id'],
-        'home': str(home.resolve()), 'cwd': str(runtime),
-        'packet_id': packet['packet_id'],
-        'config_snapshot_ref': run['config_snapshot_ref'],
-        'instruction_snapshot_ref': run['instruction_snapshot_ref'],
-        'report_path': str(runtime / 'report-draft.json'),
-        'allowed_scope': {'source_ids': sorted(source['source_id'] for source in packet['sources'])},
-    }))
-    return runtime
+def _write_native_request(home, run, manifest):
+    return reviewer_runner._prepare_native_request(home, run, manifest, reviewer.read_config(home))
 
 
-def _run_child(home, monkeypatch, run, packet, mode='success'):
+def _run_child(home, monkeypatch, run, manifest, mode='success'):
     fixture = _fake_omp(home)
-    runtime = _write_native_request(home, run, packet)
+    runtime = _write_native_request(home, run, manifest)
     monkeypatch.setenv('AGD_HOME', str(home))
     monkeypatch.setenv('AGD_CLI', str(Path(__file__).resolve().parents[1] / 'bin' / 'agd'))
     monkeypatch.setenv('AGD_FAKE_OMP_MODE', mode)
@@ -90,8 +75,8 @@ def _fake_omp(home):
         '                "session-bind", run_id, "--session-id", "fixture-session",\n'
         '                "--session-file", str(session_file)], check=True)\n'
         'if mode == "missing": sys.exit(0)\n'
-        'if mode == "invalid": (runtime / "report-draft.json").write_text("{\\"schema\\":1}")\n'
-        'else: (runtime / "report-draft.json").write_text(json.dumps({"schema":1,"summary":"fixture","findings":[]}))\n'
+        'if mode == "invalid": (runtime / "report-draft.json").write_text("{\\"schema\\":2}")\n'
+        'else: (runtime / "report-draft.json").write_text(json.dumps({"schema":2,"summary":"fixture","episode_reviews":[],"findings":[]}))\n'
         'if mode == "nonzero":\n'
         ' sys.stderr.write("fixture nonzero diagnostic\\\\n"); sys.exit(7)\n'
         'if mode == "timeout":\n'
@@ -104,18 +89,14 @@ def _fake_omp(home):
 
 
 
-def _packet_ids(home):
-    selected = reviewer.select_packet(
+def _pending_episode_ids(home):
+    selected = reviewer.select_manifest(
         home, cutoff=__import__('time').time() + 1,
         config_snapshot=reviewer.read_config(home))
-    return {
-        'sources': tuple(sorted(source['source_id'] for source in selected['sources'])),
-        'excerpts': tuple(sorted(excerpt['excerpt_id'] for excerpt in selected['excerpts'])),
-        'catalog': tuple(sorted((row['id'], row['catalog_sha256']) for row in selected.get('catalog', []))),
-    }
+    return tuple(sorted(row['episode_id'] for row in selected['episodes']))
 
-def _real_exit_proof(home, run, packet, *, keep_supervisor=False, keep_child=False):
-    runtime = _write_native_request(home, run, packet)
+def _real_exit_proof(home, run, manifest, *, keep_supervisor=False, keep_child=False):
+    runtime = _write_native_request(home, run, manifest)
     supervisor = os.fork()
     if supervisor == 0:
         child = subprocess.Popen(['sleep', '30'], start_new_session=True)
@@ -146,88 +127,28 @@ def _real_exit_proof(home, run, packet, *, keep_supervisor=False, keep_child=Fal
 def test_valid_report_then_nonzero_does_not_commit(monkeypatch):
     with lab() as (home, _):
         run, packet = _reserved_reviewer_run(home)
-        before = _packet_ids(home)
+        before = _pending_episode_ids(home)
         code, _ = _run_child(home, monkeypatch, run, packet, 'nonzero')
         result = _collect(home, run)
         assert code == 7 and result['dispatch_state'] == 'final'
         assert result['outcome'] in ('failed', 'unknown')
         assert not list(reviewer.paths(home)['reports'].glob('*.json'))
-        assert _packet_ids(home) == before
+        assert _pending_episode_ids(home) == before
 
 
 @pytest.mark.parametrize('mode', ('missing', 'invalid'))
 def test_missing_or_invalid_report_is_retryable(monkeypatch, mode):
     with lab() as (home, _):
         run, packet = _reserved_reviewer_run(home)
-        before = _packet_ids(home)
+        before = _pending_episode_ids(home)
         code, _ = _run_child(home, monkeypatch, run, packet, mode)
         result = _collect(home, run)
         assert code == 0 and result['dispatch_state'] == 'final'
         assert result['outcome'] in ('failed', 'unknown')
         assert not list(reviewer.paths(home)['reports'].glob('*.json'))
-        assert _packet_ids(home) == before
+        assert _pending_episode_ids(home) == before
 
 
-@pytest.mark.parametrize('kind, mutation', [
-    ('existing-skill', None),
-    ('existing-skill', 'missing-version'),
-    ('existing-skill', 'stale-version'),
-    ('existing-skill', 'wrong-kind-field'),
-    ('new-skill', None),
-    ('new-skill', 'wrong-kind-field'),
-])
-def test_finding_variants_commit_or_retain_safe_rejection(monkeypatch, kind, mutation):
-    with lab() as (home, _):
-        run, packet = _reserved_reviewer_run(home)
-        before = _packet_ids(home)
-        skill = packet['catalog'][0]
-        finding = {
-            'kind': kind, 'target': skill['id'] if kind == 'existing-skill' else 'cli-review',
-            'finding': 'Distinguish CLI startup errors from behavioral failures.',
-            'applicability': 'Subprocess-based CLI checks.',
-            'citations': [packet['sources'][0]['source_id']], 'counterexamples': [],
-            'uncertainty': 'One incident; no recurrence established.',
-            'resolution': 'draft', 'validation': 'Compare startup and wrong-output failures.',
-            'validation_limits': ['No proposed change has been applied.'],
-        }
-        if kind == 'existing-skill':
-            finding['target_source_version'] = skill['catalog_sha256']
-        else:
-            finding['new_skill'] = {
-                'id': 'cli-review',
-                'draft': '---\nname: cli-review\ndescription: Inspect CLI check failures.\n---\nRead stderr before classifying a failure.',
-                'triggers': ['CLI check failure'], 'scope': 'CLI subprocess checks',
-                'prerequisites': [],
-            }
-        if mutation == 'missing-version':
-            del finding['target_source_version']
-        elif mutation == 'stale-version':
-            finding['target_source_version'] = '0' * 64
-        elif mutation == 'wrong-kind-field':
-            finding['new_skill' if kind == 'existing-skill' else 'target_source_version'] = {}
-        if mutation:
-            finding['finding'] += ' password=fixture-secret-not-for-diagnostics'
-        code, runtime = _run_child(home, monkeypatch, run, packet)
-        assert code == 0
-        (runtime / 'report-draft.json').write_text(json.dumps({
-            'schema': 1, 'summary': 'CLI process review', 'findings': [finding],
-        }))
-        result = _collect(home, run)
-        reports = list(reviewer.paths(home)['reports'].glob('*.json'))
-        proposals = list(reviewer.paths(home)['proposals'].glob('*.json'))
-        if mutation is None:
-            assert result['dispatch_state'] == 'final' and result['outcome'] == 'exited'
-            assert len(reports) == len(proposals) == 1
-            assert json.loads(reports[0].read_text())['report']['findings'][0]['kind'] == kind
-            assert _packet_ids(home)['sources'] == ()
-        else:
-            assert result['dispatch_state'] == 'final' and result['outcome'] == 'failed'
-            assert result['error']['code'] == 'report'
-            expected = 'frozen skill target' if kind == 'existing-skill' else 'new skill draft'
-            assert result['error']['message'] == expected
-            assert 'fixture-secret' not in json.dumps(result['error'])
-            assert reports == proposals == []
-            assert _packet_ids(home) == before
 
 
 def test_duplicate_execute_does_not_dispatch_again(monkeypatch):
@@ -251,6 +172,280 @@ def test_no_work_allocates_no_endpoint(monkeypatch):
         assert not reviewer.paths(home)['runtime'].exists()
 
 
+def test_manifest_no_work_does_not_allocate_backend_model_or_auth(monkeypatch):
+    with lab() as (home, _):
+        def forbidden(*_args, **_kwargs):
+            pytest.fail('no-work allocated backend, model, or authentication')
+
+        monkeypatch.setattr(reviewer_runner, '_reviewer_backend', forbidden)
+        monkeypatch.setattr(reviewer_runner.observability, 'reviewer_environment', forbidden)
+        monkeypatch.setattr(reviewer_runner.omp_runtime, 'executable', forbidden)
+        result = reviewer_runner.run_native_reviewer(
+            home, reviewer.enqueue_intent(home, kind='manual'))
+        assert result['state'] == 'no-work'
+        assert not reviewer.paths(home)['runtime'].exists()
+
+
+@pytest.mark.parametrize('snapshot', ['instruction', 'config'])
+def test_manifest_request_refuses_different_reserved_snapshot(snapshot):
+    import time
+    from test_reviewer import ended_worker, message
+
+    with lab() as (home, _):
+        ended_worker(home, 'snapshot-race', str(__import__('uuid').uuid4()),
+                     [message('snapshot race evidence')])
+        config = reviewer.read_config(home)
+        now = time.time()
+        manifest = reviewer.select_manifest(home, cutoff=now + 1, config_snapshot=config)
+        assert manifest['episodes']
+        reserved_config = dict(config)
+        instruction = reviewer.INSTRUCTION_FILE.read_bytes()
+        if snapshot == 'instruction':
+            instruction += b'\nchanged after selection\n'
+        else:
+            reserved_config = {**config, 'limits': {**config['limits'],
+                               'max_candidates': config['limits']['max_candidates'] - 1}}
+        run = reviewer.reserve_run(
+            home, reviewer.enqueue_intent(home, kind='manual'),
+            config_snapshot=reserved_config, instruction_snapshot=instruction,
+            started_at=now, deadline_epoch_ms=int((now + 1800) * 1000))
+        with pytest.raises(store.Refusal):
+            reviewer_runner._prepare_native_request(home, run, manifest, reserved_config)
+        receipt = reviewer._receipt(home, run['review_run_id'])
+        assert receipt.get('manifest_id') is None
+        assert not (reviewer.paths(home)['runtime'] / run['review_run_id'] / 'request.json').exists()
+
+
+def test_manifest_request_exposes_only_metadata_and_sanitized_availability():
+    import time
+    from test_reviewer import ended_worker, message
+
+    with lab() as (home, _):
+        sentinel = 'PRIVATE_NATIVE_BODY_NOT_FOR_INITIAL_REQUEST'
+        ended_worker(home, 'metadata-only', str(__import__('uuid').uuid4()), [message(sentinel)])
+        config = reviewer.read_config(home)
+        now = time.time()
+        run = reviewer.reserve_run(
+            home, reviewer.enqueue_intent(home, kind='manual'), config_snapshot=config,
+            instruction_snapshot=reviewer.INSTRUCTION_FILE.read_bytes(),
+            started_at=now, deadline_epoch_ms=int((now + 1800) * 1000))
+        manifest = reviewer.select_manifest(home, cutoff=now + 1, config_snapshot=config)
+        assert manifest['episodes']
+        runtime = reviewer_runner._prepare_native_request(
+            home, run, manifest, config,
+            langfuse_query={'available': False, 'secret_key': 'private-secret',
+                            'public_key': 'private-public', 'base_url': 'private-host'})
+        request = json.loads((runtime / 'request.json').read_text())
+        selection = json.loads((runtime / 'selection-manifest.json').read_text())
+        receipt = reviewer._receipt(home, run['review_run_id'])
+        assert request['schema'] == 2
+        assert request['manifest_id'] == receipt['manifest_id'] == manifest['manifest_id']
+        assert request['report_schema'] == receipt['report_schema'] == 2
+        assert selection['manifest_id'] == manifest['manifest_id']
+        assert manifest['instruction_sha256'] == run['instruction_snapshot_ref']
+        assert manifest['config_snapshot_sha256'] == run['config_snapshot_ref']
+        assert reviewer_runner._native_request(home, run['review_run_id']) == (runtime, request)
+        assert len((runtime / 'selection-manifest.json').read_bytes()) <= 16384
+        exposed = (runtime / 'request.json').read_text() + (runtime / 'selection-manifest.json').read_text()
+        assert all(value not in exposed for value in (sentinel, 'private-secret', 'private-public', 'private-host'))
+        assert not (runtime / 'packet.json').exists()
+        assert not (runtime / 'catalog.json').exists()
+
+
+def test_manifest_screened_reflection_remains_actionable_before_backend(monkeypatch):
+    import time
+    import uuid
+    from test_reviewer import completed_session
+    from test_reviewer_inspection import inspection, stage
+
+    with lab() as (home, _):
+        completed_session(home)
+        run_id, manifest = stage(home)
+        episode = manifest['episodes'][0]
+        source = inspection().inspect(home, run_id, episode['episode_id'], source='native')
+        report = {'schema': 2, 'summary': 'Screened only.', 'findings': [],
+                  'episode_reviews': [{'episode_id': episode['episode_id'], 'assessment': 'screened',
+                                       'intent_sources': [source['source_id']], 'action_sources': [],
+                                       'outcome_sources': [], 'limitations': []}]}
+        reviewer.submit_report(home, run_id, str(uuid.uuid4()), report)
+        reviewer.finalize_run(home, run_id, 'exited')
+        selected = reviewer.select_manifest(home, cutoff=time.time() + 1,
+                                            config_snapshot=reviewer.read_config(home))
+        assert episode['episode_id'] in {row['episode_id'] for row in selected['episodes']}
+
+        class SelectionObserved(Exception):
+            pass
+
+        original = reviewer.select_manifest
+
+        def observe(*args, **kwargs):
+            result = original(*args, **kwargs)
+            assert episode['episode_id'] in {row['episode_id'] for row in result['episodes']}
+            raise SelectionObserved
+
+        monkeypatch.setattr(reviewer, 'select_manifest', observe)
+        with pytest.raises(SelectionObserved):
+            reviewer_runner.run_native_reviewer(home, reviewer.enqueue_intent(home, kind='manual'))
+
+
+def test_manifest_manual_detail_intent_reopens_held_episode(monkeypatch):
+    import uuid
+    from test_reviewer import completed_session
+    from test_reviewer_inspection import inspection, stage
+
+    with lab() as (home, _):
+        completed_session(home)
+        run_id, manifest = stage(home)
+        episode = manifest['episodes'][0]
+        source = inspection().inspect(home, run_id, episode['episode_id'], source='native')
+        report = {'schema': 2, 'summary': 'Limited.', 'findings': [],
+                  'episode_reviews': [{'episode_id': episode['episode_id'], 'assessment': 'limited',
+                                       'intent_sources': [source['source_id']], 'action_sources': [],
+                                       'outcome_sources': [], 'limitations': ['Outcome unavailable.']}]}
+        reviewer.submit_report(home, run_id, str(uuid.uuid4()), report)
+        reviewer.finalize_run(home, run_id, 'exited')
+        intent = reviewer.enqueue_intent(home, kind='manual', detail_episode_ids=(episode['episode_id'],))
+        assert intent['detail_episode_ids'] == [episode['episode_id']]
+
+        class SelectionObserved(Exception):
+            pass
+
+        original = reviewer.select_manifest
+
+        def observe(*args, **kwargs):
+            assert kwargs['detail_episode_ids'] == (episode['episode_id'],)
+            result = original(*args, **kwargs)
+            assert episode['episode_id'] in {row['episode_id'] for row in result['episodes']}
+            raise SelectionObserved
+
+        monkeypatch.setattr(reviewer, 'select_manifest', observe)
+        with pytest.raises(SelectionObserved):
+            reviewer_runner.run_native_reviewer(home, intent)
+
+
+def test_public_no_work_discloses_all_holds_and_incomplete_proof_and_detail_reopens(monkeypatch):
+    import time
+    import uuid
+    from importlib.machinery import SourceFileLoader
+    from importlib.util import module_from_spec, spec_from_loader
+    from support import command
+    from test_reviewer import completed_session
+    from test_reviewer_inspection import inspection, stage
+
+    with lab() as (home, _):
+        for index in range(5):
+            completed_session(home, texts=(f'completed case {index}',), active='unfinished',
+                              cutoff=time.time() + 3600)
+        run_id, manifest = stage(home, cutoff=time.time() + 1)
+        assert len(manifest['episodes']) == 5
+        expected = {}
+        reviews = []
+        for index, episode in enumerate(manifest['episodes']):
+            source = inspection().inspect(home, run_id, episode['episode_id'], source='native')
+            reasons = [f'Outcome unavailable for held case {index}.']
+            if index == 4:
+                reasons += [f'Additional limitation {number}: ' + 'x' * 300 for number in range(4)]
+            expected[episode['episode_id']] = reasons
+            reviews.append({'episode_id': episode['episode_id'], 'assessment': 'limited',
+                            'intent_sources': [source['source_id']], 'action_sources': [],
+                            'outcome_sources': [], 'limitations': reasons})
+        reviewer.submit_report(home, run_id, str(uuid.uuid4()),
+                               {'schema': 2, 'summary': 'Limited evidence.',
+                                'episode_reviews': reviews, 'findings': []})
+        reviewer.finalize_run(home, run_id, 'exited')
+        _, incomplete, _ = completed_session(home, texts=('pending native proof',),
+                                              cutoff=time.time() + 3600)
+        incomplete.write_text('\n'.join(incomplete.read_text().splitlines()[:3]) + '\n')
+
+        result = command(home, 'reviewer', 'run')
+        assert result['state'] == 'no-work'
+        summary = result['selection']
+        assert summary['held_count'] == len(expected)
+        assert summary['coverage']['complete'] is False
+        assert summary['coverage']['unavailable_count'] > 0
+        assert not (reviewer.paths(home)['runtime'] / result['review_run_id']).exists()
+        assert not result.get('backend') and not result.get('endpoint') and not result.get('model')
+        assert len(json.dumps(result, ensure_ascii=False).encode()) <= 16384
+
+        def pages(category):
+            cursor, rows = 0, []
+            while cursor is not None:
+                page = command(home, 'reviewer', 'selection', 'disclosures', result['manifest_id'],
+                               '--category', category, '--limit', '2', '--cursor', str(cursor))
+                assert len(json.dumps(page, ensure_ascii=False).encode()) <= 16384
+                rows.extend(page['rows'])
+                cursor = page['next_cursor']
+            return rows
+
+        held = pages('held')
+        assert {row['episode_id']: row['limitations'] for row in held} == expected
+        unavailable = pages('unavailable')
+        assert any(row.get('reason') == 'native-proof-pending' for row in unavailable)
+        assert len(unavailable) == summary['coverage']['unavailable_count']
+
+        loader = SourceFileLoader('agd_cli_disclosure', str(Path(__file__).resolve().parents[1] / 'bin' / 'agd'))
+        cli = module_from_spec(spec_from_loader('agd_cli_disclosure', loader))
+        loader.exec_module(cli)
+
+        def forbidden(*_args, **_kwargs):
+            pytest.fail('detail bypassed the fixture allocation stop')
+
+        monkeypatch.setattr(reviewer_runner, '_reviewer_backend', forbidden)
+        monkeypatch.setattr(reviewer_runner.omp_runtime, 'executable', forbidden)
+
+        def stop_before_allocation(*_args, **_kwargs):
+            raise RuntimeError('fixture stops before backend allocation')
+
+        monkeypatch.setattr(reviewer_runner.observability, 'reviewer_environment', stop_before_allocation)
+        chosen = held[-1]['episode_id']
+        detail = cli.main(cli.parser().parse_args(
+            ['--home', str(home), 'reviewer', 'run', '--detail-episode', chosen]))
+        reopened = reviewer.read_manifest(home, detail['manifest_id'])
+        assert chosen in {row['episode_id'] for row in reopened['episodes']}
+        assert detail['outcome'] == 'failed'
+        assert all(not reviewer._episode_progress(home, row['episode_id'], row['basis'])['reflected']
+                   for row in manifest['episodes'])
+
+
+def test_public_no_work_oversized_hold_has_complete_trusted_artifact_reference():
+    import time
+    import uuid
+    from support import command
+    from test_reviewer import completed_session
+    from test_reviewer_inspection import inspection, stage
+
+    with lab() as (home, _):
+        completed_session(home, texts=('bounded native result',), cutoff=time.time() + 3600)
+        run_id, manifest = stage(home, cutoff=time.time() + 1)
+        episode = manifest['episodes'][0]
+        source = inspection().inspect(home, run_id, episode['episode_id'], source='native')
+        reason = 'Unavailable: ' + 'é' * 12000
+        reviewer.submit_report(
+            home, run_id, str(uuid.uuid4()),
+            {'schema': 2, 'summary': 'Held.', 'findings': [],
+             'episode_reviews': [{'episode_id': episode['episode_id'], 'assessment': 'limited',
+                                  'intent_sources': [source['source_id']], 'action_sources': [],
+                                  'outcome_sources': [], 'limitations': [reason]}]})
+        reviewer.finalize_run(home, run_id, 'exited')
+        result = command(home, 'reviewer', 'run')
+        assert result['state'] == 'no-work' and result['selection']['held_count'] == 1
+        page = command(home, 'reviewer', 'selection', 'disclosures', result['manifest_id'],
+                       '--category', 'held', '--limit', '1')
+        assert len(json.dumps(page, ensure_ascii=False, indent=2).encode()) <= 16384
+        assert page['total'] == 1 and page['next_cursor'] is None
+        row = page['rows'][0]
+        assert row['episode_id'] == episode['episode_id']
+        reference = row['artifact_ref']
+        assert reference['category'] == 'held' and reference['index'] == 0
+        selected = reviewer.read_manifest(home, result['manifest_id'])
+        assert reference['detail_id'] == selected['details_id']
+        path = Path(reference['path'])
+        assert path.is_absolute() and path.parent == reviewer.paths(home)['selection_details']
+        details = json.loads(path.read_text())
+        assert reviewer._digest(details) == reference['detail_id']
+        assert details['held'][reference['index']]['limitations'] == [reason]
+
+
 def test_reviewer_session_binding_refuses_foreign_directory(tmp_path):
     with lab() as (home, _):
         run, _ = _reserved_reviewer_run(home)
@@ -263,13 +458,13 @@ def test_reviewer_session_binding_refuses_foreign_directory(tmp_path):
 def test_timeout_retains_diagnostics_and_unreviewed_seed(monkeypatch):
     with lab() as (home, _):
         run, packet = _reserved_reviewer_run(home, deadline=1)
-        before = _packet_ids(home)
+        before = _pending_episode_ids(home)
         code, runtime = _run_child(home, monkeypatch, run, packet, 'timeout')
         result = _collect(home, run)
         assert code != 0 and result['dispatch_state'] == 'final'
         assert result['outcome'] == 'unknown'
         assert 'fixture timeout diagnostic' in (runtime / 'stderr').read_text()
-        assert _packet_ids(home) == before
+        assert _pending_episode_ids(home) == before
 
 
 def test_crash_after_exit_recovers_report_without_redispatch(monkeypatch):
@@ -303,7 +498,7 @@ def test_missing_exit_proof_cannot_recover_success():
         run, packet = _reserved_reviewer_run(home)
         runtime = _write_native_request(home, run, packet)
         (runtime / 'report-draft.json').write_text(
-            json.dumps({'schema': 1, 'summary': 'unproved', 'findings': []}))
+            json.dumps({'schema': 2, 'summary': 'unproved', 'episode_reviews': [], 'findings': []}))
         result = reviewer_runner._collect_native_result(home, run['review_run_id'])
         assert result['dispatch_state'] == 'final'
         assert result['outcome'] in ('failed', 'unknown')
@@ -357,14 +552,12 @@ def test_reviewer_session_directory_does_not_bind_pending_id():
 
 
 def test_cli_reviewer_triage_preserves_foreign_owner_and_task_bytes():
-    from test_reviewer import produced_run, build_report
+    from reviewer_history_fixture import historical_final
     from agd_lib import worker_skills
     import os, json, uuid
     from support import command
     with lab() as (home, _):
-        run, packet = produced_run(home)
-        submitted = reviewer.submit_report(home, run['review_run_id'], str(uuid.uuid4()), build_report(packet))
-        reviewer.finalize_run(home, run['review_run_id'], 'exited')
+        run, submitted = historical_final(home)
         owner = home / 'state' / 'owner.json'; owner.write_text(json.dumps({'pid': os.getpid(), 'started': 'foreign', 'token': str(uuid.uuid4())}))
         task_bytes = {str(p.relative_to(home/'data'/'tasks')): p.read_bytes() for p in (home/'data'/'tasks').rglob('*') if p.is_file()}
         before = (owner.read_bytes(), task_bytes, worker_skills.catalog(home), worker_skills.resolve(home))
@@ -446,14 +639,14 @@ def test_manual_reviewer_records_identity_before_spawn_and_preserves_timeout(mon
             'import json, sys\nfrom pathlib import Path\n'
             f'sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "bin")!r})\n'
             'from agd_lib import reviewer, reviewer_runner\n'
-            'select = reviewer.select_packet\n'
+            'select = reviewer.select_manifest\n'
             'def paused(*args, **kwargs):\n'
-            ' packet = select(*args, **kwargs)\n'
-            ' assert packet["excerpts"]\n'
+            ' manifest = select(*args, **kwargs)\n'
+            ' assert manifest["episodes"]\n'
             ' print("collected", flush=True)\n'
             ' sys.stdin.read(1)\n'
-            ' return packet\n'
-            'reviewer.select_packet = paused\n'
+            ' return manifest\n'
+            'reviewer.select_manifest = paused\n'
             'home = Path(sys.argv[1])\n'
             'result = reviewer_runner.run_native_reviewer(home, reviewer.enqueue_intent(home, kind="manual"))\n'
             'print(json.dumps(result), flush=True)\n')

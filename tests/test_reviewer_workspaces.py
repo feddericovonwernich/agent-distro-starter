@@ -9,15 +9,34 @@ import pytest
 
 from support import lab
 from test_projects import run
-from test_reviewer import produced_run
+from test_reviewer import completed_session
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'bin'))
 
 
+def _workspace_run(home, manifest=None):
+    import time
+    from agd_lib import reviewer, reviewer_runner
+    config = reviewer.read_config(home)
+    now = time.time()
+    if manifest is None:
+        completed_session(home, role='worker', task_id='workspace-seed',
+                          cutoff=now + 3600, texts=('workspace evidence',))
+        manifest = reviewer.select_manifest(home, cutoff=now + 1, config_snapshot=config)
+    run = reviewer.reserve_run(home, reviewer.enqueue_intent(home, kind='manual'),
+                               config_snapshot=config,
+                               instruction_snapshot=reviewer.INSTRUCTION_FILE.read_bytes(),
+                               started_at=now, deadline_epoch_ms=int((now + 1800) * 1000))
+    reviewer_runner._prepare_native_request(home, run, manifest, config)
+    return reviewer_runner._begin_native_run(home, reviewer._receipt(home, run['review_run_id']),
+                                             manifest, model_selector='fixture/model',
+                                             omp_version='fixture'), manifest
+
 @pytest.fixture
 def workspace_lab(monkeypatch):
     """Use an owned registered clone, real review run, and scoped Treehouse pool."""
+    monkeypatch.setenv('TREEHOUSE_NO_UPDATE_CHECK', '1')
     treehouse = shutil.which('treehouse')
     if not treehouse:
         pytest.fail('Treehouse is required for reviewer workspace acceptance')
@@ -36,7 +55,7 @@ def workspace_lab(monkeypatch):
         private_config.mkdir(mode=0o700)
         monkeypatch.setenv('HOME', str(private_home))
         monkeypatch.setenv('XDG_CONFIG_HOME', str(private_config))
-        review_run, selected = produced_run(home)
+        review_run, selected = _workspace_run(home)
         try:
             yield home, project, initial, review_run['review_run_id'], selected
         finally:
@@ -222,8 +241,7 @@ def test_foreign_or_ambiguous_lease_is_refused_by_receipt_consumer(workspace_lab
     assert _row(home, project, original['lease_id'])['lease_holder'] == original['lease_holder']
     assert _row(home, project, foreign['lease_id'])['lease_holder'] == 'foreign-owner'
 
-    from test_reviewer import _retry_run_with_packet
-    ambiguous_run = _retry_run_with_packet(home, selected)
+    ambiguous_run, _ = _workspace_run(home, selected)
     ambiguous_id = ambiguous_run['review_run_id']
     probe = workspaces.create(home, ambiguous_id, 'sample', commit)
     ambiguous = [allocate('ambiguous-owner'), allocate('ambiguous-owner')]
@@ -268,8 +286,7 @@ def test_dirty_or_committed_probe_is_retained(workspace_lab):
     assert dirty_path.exists() and (dirty_path / 'local-note.txt').exists()
     assert _row(home, project, dirty['lease_id'])['lease_holder'] == dirty['lease_holder']
 
-    from test_reviewer import _retry_run_with_packet
-    committed_run = _retry_run_with_packet(home, selected)
+    committed_run, _ = _workspace_run(home, selected)
     committed_id = committed_run['review_run_id']
     committed = workspaces.create(home, committed_id, 'sample', commit)
     committed_path = Path(committed['path'])
@@ -295,8 +312,7 @@ def test_exposed_probe_is_retained_without_containment_proof(workspace_lab):
     assert _row(home, project, result['lease_id'])['lease_holder'] == result['lease_holder']
     _close_review(home, run_id)
 
-    from test_reviewer import _retry_run_with_packet
-    clean_run = _retry_run_with_packet(home, selected)
+    clean_run, _ = _workspace_run(home, selected)
     clean_id = clean_run['review_run_id']
     clean = workspaces.create(home, clean_id, 'sample', commit)
     _close_review(home, clean_id)

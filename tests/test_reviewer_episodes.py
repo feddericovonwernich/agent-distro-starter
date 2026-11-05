@@ -599,3 +599,29 @@ def test_non_object_managed_process_record_refuses_cleanly(tmp_path, monkeypatch
     with pytest.raises(store.Refusal):
         reviewer_episodes.register_source(
             home, {'role': 'central', 'session_id': 'central-session', 'session_file': str(session)})
+
+
+def test_metadata_only_semantic_projection_proves_branch_without_bodies(tmp_path):
+    path = tmp_path / 'native.jsonl'
+    user, binding, final, later = episode_entries()
+    value = completion(path, 'session')
+    binding['details']['source_id'] = value['source_id']
+    write_native(path, 'session', [user, binding, final, later])
+    first = reviewer_episodes.read_native(path, 300, 4096, completion=value, metadata_only=True)
+    assert first['status'] == 'ready'
+    assert first['boundary']['entry_id'] == final['id']
+    assert [row['message_id'] for row in first['projection']] == [user['id'], final['id']]
+    assert [row['text_sha256'] for row in first['projection']] == [
+        hashlib.sha256('héllo'.encode()).hexdigest(),
+        hashlib.sha256('final café'.encode()).hexdigest()]
+    assert all('text' not in row for row in first['projection'])
+    assert 'héllo' not in json.dumps(first, ensure_ascii=False)
+    assert 'final café' not in json.dumps(first, ensure_ascii=False)
+    assert 'unfinished' not in json.dumps(first, ensure_ascii=False)
+    write_native(path, 'session', [user, binding, final, later], title='different title')
+    titled = reviewer_episodes.read_native(path, 300, 4096, completion=value, metadata_only=True)
+    assert titled['projection'] == first['projection']
+    user['message']['content'] = 'changed'
+    write_native(path, 'session', [user, binding, final, later], title='different title')
+    changed = reviewer_episodes.read_native(path, 300, 4096, completion=value, metadata_only=True)
+    assert changed['projection'] != first['projection']

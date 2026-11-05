@@ -142,7 +142,7 @@ def read_status(home):
     return value
 
 
-def langfuse_query_context(home):
+def langfuse_query_context(home, *, deadline_epoch_ms=None):
     home = _home(home)
     try:
         config = read_config(home)
@@ -166,8 +166,9 @@ def langfuse_query_context(home):
         values = {key: secrets.get(key) for key in ('public_key', 'secret_key')}
         if any(not isinstance(value, str) or not value for value in values.values()):
             return None
-        containers = _require_owned_resources({
-            'project': config['project'], 'home_id': config['home_id']})
+        rendered_owner = {'project': config['project'], 'home_id': config['home_id']}
+        containers = (_require_owned_resources(rendered_owner) if deadline_epoch_ms is None else
+                      _require_owned_resources(rendered_owner, deadline_epoch_ms=deadline_epoch_ms))
         web = next((
             value for value in containers
             if value.get('Config', {}).get('Labels', {}).get(
@@ -187,7 +188,9 @@ def langfuse_query_context(home):
         rendered['project'] = config['project']
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}), _NoRedirect())
-        if not _ready(rendered, secrets, opener=opener):
+        ready = (_ready(rendered, secrets, opener=opener) if deadline_epoch_ms is None else
+                 _ready(rendered, secrets, opener=opener, deadline_epoch_ms=deadline_epoch_ms))
+        if not ready:
             return None
         return {
             'base_url': f'http://127.0.0.1:{web_port}',
@@ -813,14 +816,17 @@ def _compose(rendered, *command):
         raise store.Refusal(result['message'])
 
 
-def _require_owned_resources(rendered):
+def _require_owned_resources(rendered, *, deadline_epoch_ms=None):
     home_id = rendered.get('home_id')
     if not home_id:
         return []
     names = [('network', rendered['project'] + '_network'),
              *[('volume', rendered['project'] + suffix) for suffix in ('_postgres', '_clickhouse', '_redis', '_minio')]]
+    def inspect(command):
+        return (_ownership_command(command) if deadline_epoch_ms is None else
+                _ownership_command(command, deadline_epoch_ms=deadline_epoch_ms))
     for kind, name in names:
-        inspected = _ownership_command(['docker', kind, 'inspect', name])
+        inspected = inspect(['docker', kind, 'inspect', name])
         if inspected.returncode:
             continue
         try:
@@ -829,13 +835,13 @@ def _require_owned_resources(rendered):
             raise store.Refusal('observability ownership is uncertain')
         if value.get('Labels', {}).get('agd.home_id') != home_id:
             raise store.Refusal('observability resource belongs to another home')
-    containers = _ownership_command(['docker', 'ps', '-aq', '--filter',
-                                     f'label=com.docker.compose.project={rendered["project"]}'])
+    containers = inspect(['docker', 'ps', '-aq', '--filter',
+                          f'label=com.docker.compose.project={rendered["project"]}'])
     if containers.returncode:
         raise store.Refusal('observability container ownership is uncertain')
     owned_containers = []
     for container_id in containers.stdout.split():
-        inspected = _ownership_command(['docker', 'container', 'inspect', container_id])
+        inspected = inspect(['docker', 'container', 'inspect', container_id])
         try:
             value = json.loads(inspected.stdout)[0]
         except (IndexError, ValueError, TypeError):
@@ -846,30 +852,40 @@ def _require_owned_resources(rendered):
     return owned_containers
 
 
-def _ownership_command(command):
+def _ownership_command(command, *, deadline_epoch_ms=None):
     try:
-        return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+        return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              timeout=_deadline_timeout(10, deadline_epoch_ms))
     except FileNotFoundError as error:
         raise store.DependencyError('Docker is required to inspect retained observability resources') from error
     except (OSError, subprocess.TimeoutExpired) as error:
         raise store.Refusal('observability ownership inspection is unavailable') from error
 
 
-def _ready(rendered, value, opener=None):
+def _deadline_timeout(limit, deadline_epoch_ms):
+    if deadline_epoch_ms is None:
+        return limit
+    remaining = deadline_epoch_ms / 1000 - time.time()
+    if remaining <= 0:
+        raise store.Refusal('reviewer deadline exceeded')
+    return min(limit, remaining)
+
+
+def _ready(rendered, value, opener=None, *, deadline_epoch_ms=None):
     open_url = urllib.request.urlopen if opener is None else opener.open
     with open_url(
-            f"http://127.0.0.1:{rendered['collector_health_port']}/", timeout=3) as collector:
+            f"http://127.0.0.1:{rendered['collector_health_port']}/", timeout=_deadline_timeout(3, deadline_epoch_ms)) as collector:
         if collector.status != 200:
             return False
     with open_url(
-            f"http://127.0.0.1:{rendered['web_port']}/api/public/health", timeout=3) as response:
+            f"http://127.0.0.1:{rendered['web_port']}/api/public/health", timeout=_deadline_timeout(3, deadline_epoch_ms)) as response:
         if response.status != 200:
             return False
     auth = base64.b64encode(f"{value['public_key']}:{value['secret_key']}".encode()).decode()
     request = urllib.request.Request(
         f"http://127.0.0.1:{rendered['web_port']}/api/public/projects",
         headers={'Authorization': 'Basic ' + auth})
-    with open_url(request, timeout=5) as project_response:
+    with open_url(request, timeout=_deadline_timeout(5, deadline_epoch_ms)) as project_response:
         payload = project_response.read(1024 * 1024 + 1)
     if len(payload) > 1024 * 1024:
         return False

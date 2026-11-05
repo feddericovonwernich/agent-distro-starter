@@ -271,6 +271,10 @@ def test_live_central_with_old_generation_requires_restart():
 
 def test_exited_worker_receipt_is_not_reported_stale(monkeypatch):
     with lab() as (home, _):
+        # Generation bookkeeping needs no live services or host-port allocation.
+        observability._runtime_directories(home)
+        store.atomic_json(observability.paths(home)['compose'] / 'release-lock.json',
+                          observability._load_lock())
         monkeypatch.setattr(observability, '_process_gone', lambda *_: True)
         observability.record_process_generation(home, 'worker', '1', 'task-a', INCARNATION,
                                                 pid=123, start='old')
