@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -79,11 +80,22 @@ def require_owner(root, worker_scoped=False):
 
 
 @contextlib.contextmanager
-def lock(root):
+def lock(root, *, deadline_epoch_ms=None):
     path = root/'state'/'mutation.lock'
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with path.open('a+') as file:
-        fcntl.flock(file, fcntl.LOCK_EX)
+        if deadline_epoch_ms is None:
+            fcntl.flock(file, fcntl.LOCK_EX)
+        else:
+            while True:
+                remaining = deadline_epoch_ms / 1000 - time.time()
+                if remaining <= 0:
+                    raise Refusal('deadline exceeded waiting for mutation lock')
+                try:
+                    fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(min(0.02, remaining))
         yield
 
 

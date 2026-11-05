@@ -11,7 +11,7 @@ import pytest
 
 from support import command, lab
 from test_projects import run
-from test_reviewer import append_unfinished, completed_session, rewrite_title
+from test_reviewer import append_unfinished, completed_session, message, rewrite_title
 from test_langfuse_cli import _package_files
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
@@ -90,6 +90,10 @@ elif args == ['api', 'schema', '--json']:
 else:
     Path(os.environ['INSPECTION_CHILD_PID']).write_text(str(os.getpid()))
     mode = os.environ['INSPECTION_MODE']
+    if mode == 'barrier':
+        while not Path(os.environ['INSPECTION_RELEASE']).exists():
+            time.sleep(0.02)
+        mode = 'normal'
     if mode == 'timeout':
         time.sleep(60)
     elif mode == 'overflow':
@@ -1013,3 +1017,623 @@ def test_project_identity_validation_obeys_remaining_deadline_and_reaps_child(mo
             target(home, run_id, scope='project', project_id='sample', path='value.txt')
         assert time.monotonic() - started < 4
         assert_child_gone(pid_file)
+
+
+def _fixture_record(directory, value):
+    """Place attacker-controlled bytes without changing any native authority record."""
+    directory.mkdir(parents=True, exist_ok=True)
+    ident = reviewer._digest(value)
+    (directory / (ident + '.json')).write_text(json.dumps(value))
+    return ident
+
+
+@pytest.mark.parametrize('actually_present', [True, False])
+def test_r1_self_addressed_distro_absence_is_not_issued(actually_present):
+    with lab() as (home, _):
+        hook = home / 'config/hooks/proved-hook'
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text('owned original\n')
+        completed_session(home)
+        run_id, _ = stage(home)
+        issued = target(home, run_id, scope='distro', path='config/hooks/proved-hook')
+        assert record(home, run_id, issued)['guard']['state'] == 'present'
+        target_dir = reviewer.paths(home)['inspections'] / run_id / 'targets'
+        forged = json.loads((target_dir / (issued['target_ref'] + '.json')).read_text())
+        forged['identity']['locator'] = ('config/hooks/proved-hook' if actually_present
+                                         else 'config/hooks/not-issued')
+        forged['operation'] = 'create'
+        forged['guard'].update(state='absent', source_sha256=None)
+        forged['basis_source_ids'] = []
+        ref = _fixture_record(target_dir, forged)
+        assert (home / forged['identity']['locator']).exists() is actually_present
+        with pytest.raises(store.Refusal):
+            inspection().read_target(home, run_id, ref)
+
+
+def test_r1_distro_absence_receipt_cannot_be_imported_from_another_run():
+    with lab() as (home, _):
+        (home / 'config/hooks').mkdir(parents=True, exist_ok=True)
+        completed_session(home)
+        first, _ = stage(home)
+        issued = target(home, first, scope='distro', path='config/hooks/new-hook', operation='create')
+        assert record(home, first, issued)['guard']['state'] == 'absent'
+        second, _ = stage(home)
+        source = reviewer.paths(home)['inspections'] / first / 'targets' / (issued['target_ref'] + '.json')
+        forged = json.loads(source.read_text())
+        target_dir = reviewer.paths(home)['inspections'] / second / 'targets'
+        assert _fixture_record(target_dir, forged) == issued['target_ref']
+        with pytest.raises(store.Refusal):
+            inspection().read_target(home, second, issued['target_ref'])
+
+
+def test_r1_forged_present_target_and_source_cannot_mint_file_proof():
+    with lab() as (home, _):
+        hook = home / 'config/hooks/actual-hook'
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text('actual-owned-version\n')
+        completed_session(home)
+        run_id, _ = stage(home)
+        issued = target(home, run_id, scope='distro', path='config/hooks/actual-hook')
+        assert record(home, run_id, issued)['guard']['source_sha256'] == hashlib.sha256(hook.read_bytes()).hexdigest()
+        source_dir = reviewer.paths(home)['evidence'] / 'inspection' / run_id
+        target_dir = reviewer.paths(home)['inspections'] / run_id / 'targets'
+        target_value = json.loads((target_dir / (issued['target_ref'] + '.json')).read_text())
+        source_value = json.loads((source_dir / (issued['source_ids'][0] + '.json')).read_text())
+        false_text = 'unobserved forged bytes\n'
+        false_hash = hashlib.sha256(false_text.encode()).hexdigest()
+        source_value.update(text=false_text, bytes=len(false_text.encode()), text_sha256=false_hash)
+        source_value['provenance'].update(version_sha256=false_hash, start=0, end=len(false_text.encode()),
+                                          previous_cursor=None, complete=True)
+        forged_source = _fixture_record(source_dir, source_value)
+        target_value['guard']['source_sha256'] = false_hash
+        target_value['basis_source_ids'] = [forged_source]
+        forged_target = _fixture_record(target_dir, target_value)
+        assert hook.read_text() == 'actual-owned-version\n'
+        with pytest.raises(store.Refusal):
+            inspection().read_target(home, run_id, forged_target)
+        with pytest.raises(store.Refusal):
+            inspection().read_journal(home, run_id)
+
+
+def test_r1_self_addressed_selected_native_source_is_not_exposure():
+    with lab() as (home, _):
+        source, _, _ = completed_session(home, texts=('issued final',))
+        run_id, manifest = stage(home)
+        episode = manifest['episodes'][0]
+        first = inspection().inspect(home, run_id, episode['episode_id'], source='native',
+                                     record_id=source['session_id'] + '-final-0', part='content')
+        source_dir = reviewer.paths(home)['evidence'] / 'inspection' / run_id
+        forged = json.loads((source_dir / (first['source_id'] + '.json')).read_text())
+        # The prompt really exists in the selected branch, but no command exposed
+        # it. Content-addressing and a correct native hash cannot issue a receipt.
+        prompt = 'prompt'
+        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+        forged.update(text=prompt, bytes=len(prompt), text_sha256=prompt_hash)
+        forged['provenance'].update(record_id=source['session_id'] + '-prompt-0',
+                                    start=0, end=len(prompt), version_sha256=prompt_hash,
+                                    previous_cursor=None, complete=True)
+        _fixture_record(source_dir, forged)
+        with pytest.raises(store.Refusal):
+            inspection().read_journal(home, run_id)
+
+
+def test_r1_evidenced_url_userinfo_is_refused_before_target_receipt():
+    with lab() as (home, _):
+        completed_session(home)
+        run_id, _ = stage(home)
+        locator = 'https://alice:pass@example.org/tool'
+        basis = capture(home, run_id, 'Observed upstream locator: ' + locator)
+        assert locator in reviewer.read_evidence(home, run_id)['sources'][basis]['text']
+        before = inspection().read_journal(home, run_id)
+        with pytest.raises(store.Refusal):
+            target(home, run_id, scope='distro', component='upstream-tool',
+                   basis_source_ids=(basis,), authority_hint='external', authority_locator=locator)
+        after = inspection().read_journal(home, run_id)
+        assert before == after
+
+
+def _disclosed_source_ids(value):
+    result = set()
+    for item in _nested_dicts(value):
+        single = item.get('source_id')
+        if isinstance(single, str) and len(single) == 64:
+            result.add(single)
+        multiple = item.get('source_ids', [])
+        if isinstance(multiple, list):
+            result.update(source for source in multiple if isinstance(source, str) and len(source) == 64)
+    return result
+
+
+def _wide_native_metadata(home):
+    source, native, _ = completed_session(home, texts=('bounded final',))
+    rows = [json.loads(line) for line in native.read_text().splitlines()]
+    binding_index = next(i for i, row in enumerate(rows) if row.get('customType') == 'agd:episode-binding')
+    final_index = next(i for i, row in enumerate(rows) if row.get('id') == source['session_id'] + '-final-0')
+    parent = rows[binding_index]['id']
+    inserted = []
+    for number in range(12):
+        entry = message('action', when=11.01 + number / 1000, role='assistant')
+        entry['id'] = f'wide-{number:02d}-' + 'x' * 1600
+        entry['parentId'] = parent
+        parent = entry['id']
+        inserted.append(entry)
+    rows[final_index]['parentId'] = parent
+    rows[final_index:final_index] = inserted
+    native.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+    return source, {row['id'] for row in inserted}
+
+
+def test_r1_native_metadata_large_ids_page_without_undisclosed_exposure():
+    with lab() as (home, _):
+        _, expected = _wide_native_metadata(home)
+        run_id, manifest = stage(home)
+        episode = manifest['episodes'][0]
+        before = inspection().read_journal(home, run_id)
+        disclosed, seen, cursor = set(), set(), None
+        while True:
+            try:
+                response = inspection().inspect(home, run_id, episode['episode_id'],
+                                                source='native', cursor=cursor)
+            except store.Refusal:
+                # A refused response cannot claim exposure or spend the budget.
+                after = inspection().read_journal(home, run_id)
+                assert set(after['sources']) == set(before['sources']) | disclosed
+                raise
+            bounded(response)
+            disclosed.update(_disclosed_source_ids(response) &
+                             set(inspection().read_journal(home, run_id)['sources']))
+            seen.update(row['message_id'] for row in response['rows'] if 'message_id' in row)
+            cursor = response['next_cursor']
+            if cursor is None:
+                break
+        assert expected <= seen
+        after = inspection().read_journal(home, run_id)
+        assert set(after['sources']) == set(before['sources']) | disclosed
+
+
+def test_r1_skills_show_assignments_and_content_are_bounded_without_orphans():
+    with lab() as (home, _):
+        skill = next(row for row in worker_skills.catalog(home) if row['id'] == 'systematic-debugging')
+        source = Path(skill['source']) / 'SKILL.md'
+        source.write_text('---\nname: systematic-debugging\ndescription: Fixture\n---\n' + '\x00' * 2400)
+        for number in range(8):
+            task_id = f'stress-{number:02d}-' + 'q' * 37
+            completed_session(home, role='worker', task_id=task_id)
+        run_id, manifest = stage(home)
+        selected = {episode['task_id'] for episode in manifest['episodes'] if episode.get('task_id', '').startswith('stress-')}
+        assert len(selected) >= 2
+        before = inspection().read_journal(home, run_id)
+        sources, targets, assigned, cursor = set(), set(), set(), None
+        while True:
+            try:
+                page = inspection().show_skill(home, run_id, 'systematic-debugging', cursor=cursor)
+            except store.Refusal:
+                after = inspection().read_journal(home, run_id)
+                assert set(after['sources']) == set(before['sources']) | sources
+                assert set(after['targets']) == set(before['targets']) | targets
+                raise
+            bounded(page)
+            sources.update(_disclosed_source_ids(page) &
+                           set(inspection().read_journal(home, run_id)['sources']))
+            targets.add(page['target_ref'])
+            assigned.update(row['task_id'] for row in page.get('assigned', []))
+            cursor = page.get('next_cursor')
+            if cursor is None:
+                break
+        assert selected <= assigned
+        after = inspection().read_journal(home, run_id)
+        assert set(after['sources']) == set(before['sources']) | sources
+        assert set(after['targets']) == set(before['targets']) | targets
+
+
+def _nested_dicts(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _nested_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _nested_dicts(child)
+
+
+def test_r1_cli_discovers_and_reads_feedback_beyond_inline_locators():
+    with lab() as (home, _):
+        _, _, task = completed_session(home, role='worker', task_id='many-feedback')
+        directory = tasks.task_file(home, task['id']).parent
+        for number in range(6):
+            key = f'choice-{number}'
+            question = directory / f'question-{number}.txt'
+            answer = directory / f'answer-{number}.txt'
+            question.write_text(f'Question {number}?\n')
+            answer.write_text(f'PRIVATE_LINKED_ANSWER_{number}\n')
+            workers.event(home, task['id'], task['incarnation'], 'decision', key, question)
+            supervision.reconcile(home)
+            supervision.resolve(home, task['id'], key, answer)
+        expected_path = directory / 'decisions/choice-5.answer.json'
+        expected = hashlib.sha256(expected_path.read_bytes()).hexdigest()
+        run_id, manifest = stage(home, cutoff=time.time() + 100)
+        episode = next(e for e in manifest['episodes'] if e.get('task_id') == task['id'])
+        assert episode['locator_count'] > len(episode['locators'])
+        assert expected not in {row.get('sha256') for row in episode['locators']}
+        seen, cursor, visited = set(), None, set()
+        while True:
+            args = ['reviewer', 'inspect', run_id, '--episode', episode['episode_id'], '--source', 'native']
+            if cursor:
+                args.extend(['--cursor', cursor])
+            result = command(home, *args)
+            bounded(result)
+            seen.update(row['sha256'] for row in _nested_dicts(result)
+                        if row.get('kind') == 'feedback' and isinstance(row.get('sha256'), str))
+            cursor = result.get('next_cursor')
+            if cursor is None:
+                break
+            assert cursor not in visited
+            visited.add(cursor)
+        assert expected in seen
+        detail = command(home, 'reviewer', 'inspect', run_id, '--episode', episode['episode_id'],
+                         '--source', 'native', '--record', expected, '--part', 'content')
+        assert 'PRIVATE_LINKED_ANSWER_5' in json.dumps(detail)
+
+
+def test_r1_tool_only_capture_does_not_open_frozen_skill_catalog():
+    with lab() as (home, _):
+        completed_session(home)
+        run_id, manifest = stage(home)
+        catalog = reviewer.paths(home)['catalogs'] / (manifest['catalog_id'] + '.json')
+        unavailable = catalog.with_suffix('.unavailable')
+        assert catalog.is_file()
+        catalog.rename(unavailable)
+        try:
+            basis = capture(home, run_id, 'upstream vendor/tool contract observed')
+            result = target(home, run_id, scope='distro', component='tool', basis_source_ids=(basis,),
+                            authority_hint='external', authority_locator='vendor/tool')
+            assert record(home, run_id, result)['identity']['authority'] == {
+                'status': 'external', 'locator': 'vendor/tool'}
+        finally:
+            unavailable.rename(catalog)
+
+
+def test_r1_deadline_bounds_wait_for_mutation_lock():
+    with lab() as (home, _):
+        completed_session(home)
+        run_id, manifest = stage(home)
+        episode_id = manifest['episodes'][0]['episode_id']
+        bin_path = str(Path(__file__).resolve().parents[1] / 'bin')
+        holder_program = (
+            'import sys\nfrom pathlib import Path\n'
+            f'sys.path.insert(0, {bin_path!r})\nfrom agd_lib import store\n'
+            'with store.lock(Path(sys.argv[1])):\n'
+            ' print(\"locked\", flush=True)\n sys.stdin.read()\n')
+        set_deadline(home, run_id, 1.5)
+        holder = subprocess.Popen([sys.executable, '-c', holder_program, str(home)],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        worker = None
+        timed_out = False
+        try:
+            assert holder.stdout.readline().strip() == 'locked'
+            program = (
+                'import sys\nfrom pathlib import Path\n'
+                f'sys.path.insert(0, {bin_path!r})\n'
+                'from agd_lib import reviewer_inspection, store\n'
+                'try:\n'
+                ' reviewer_inspection.inspect(Path(sys.argv[1]), sys.argv[2], sys.argv[3], source=\"native\")\n'
+                'except store.Refusal:\n sys.exit(3)\n'
+                'sys.exit(0)\n')
+            worker = subprocess.Popen([sys.executable, '-c', program, str(home), run_id, episode_id],
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                worker.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+        finally:
+            holder.stdin.close()
+            holder.wait(timeout=5)
+            holder.stdout.close()
+            holder.stderr.close()
+            if worker is not None and worker.poll() is None:
+                worker.communicate(timeout=5)
+        assert not timed_out
+        assert worker.returncode == 3
+
+
+@pytest.mark.parametrize('reader', ['target', 'journal'])
+def test_r1_deadline_bounds_target_and_journal_git_revalidation(reader, monkeypatch):
+    with lab() as (home, _):
+        completed_session(home, role='worker', task_id='selected')
+        run_id, _ = stage(home)
+        issued = target(home, run_id, scope='project', project_id='sample', path='value.txt')
+        assert record(home, run_id, issued)['guard']['state'] == 'present'
+        tools = home / 'delayed-git-bin'
+        tools.mkdir(mode=0o700)
+        git = tools / 'git'
+        git.write_text('#!/usr/bin/python3\nimport os, sys, time\n'
+                       'open(os.environ[\"R1_GIT_PID\"], \"w\").write(str(os.getpid()))\n'
+                       'time.sleep(6)\nsys.exit(3)\n')
+        git.chmod(0o755)
+        pid_file = home / 'r1-git.pid'
+        monkeypatch.setenv('R1_GIT_PID', str(pid_file))
+        monkeypatch.setenv('PATH', str(tools) + os.pathsep + os.environ.get('PATH', '/usr/bin:/bin'))
+        set_deadline(home, run_id, 1.2)
+        started = time.monotonic()
+        with pytest.raises(store.Refusal):
+            if reader == 'target':
+                inspection().read_target(home, run_id, issued['target_ref'])
+            else:
+                inspection().read_journal(home, run_id)
+        elapsed = time.monotonic() - started
+        assert_child_gone(pid_file)
+        assert elapsed < 4
+
+
+def test_r1_slow_query_does_not_block_home_mutation_or_publish_after_close(monkeypatch):
+    with lab() as (home, _):
+        completed_session(home)
+        run_id, manifest = stage(home)
+        episode = manifest['episodes'][0]
+        pid_file = telemetry_fixture(home, monkeypatch, episode, mode='barrier')
+        release = home / 'release-query'
+        monkeypatch.setenv('INSPECTION_RELEASE', str(release))
+        before = inspection().read_journal(home, run_id)
+        bin_path = str(Path(__file__).resolve().parents[1] / 'bin')
+        query_program = (
+            'import sys\nfrom pathlib import Path\n'
+            f'sys.path.insert(0, {bin_path!r})\n'
+            'from agd_lib import observability, reviewer_inspection, store\n'
+            'observability.langfuse_query_context = lambda *a, **k: {'
+            '\"base_url\":\"http://127.0.0.1:9\", \"project_id\":\"synthetic-project\",'
+            '\"public_key\":\"pk_fixture\", \"secret_key\":\"sk_fixture\"}\n'
+            'try:\n'
+            ' reviewer_inspection.inspect(Path(sys.argv[1]), sys.argv[2], sys.argv[3], source=\"langfuse\")\n'
+            'except store.Refusal:\n sys.exit(3)\n'
+            'sys.exit(0)\n')
+        query = subprocess.Popen([sys.executable, '-c', query_program, str(home), run_id, episode['episode_id']],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=os.environ.copy())
+        mutator = closer = None
+        try:
+            deadline = time.monotonic() + 10
+            while not pid_file.exists() and time.monotonic() < deadline and query.poll() is None:
+                time.sleep(0.02)
+            assert pid_file.exists(), 'synthetic query never started'
+            mutate_program = (
+                'import sys\nfrom pathlib import Path\n'
+                f'sys.path.insert(0, {bin_path!r})\n'
+                'from agd_lib import reviewer\n'
+                'reviewer.enqueue_intent(Path(sys.argv[1]), kind=\"manual\")\n')
+            mutator = subprocess.Popen([sys.executable, '-c', mutate_program, str(home)],
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                _, stderr = mutator.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                pytest.fail('unrelated home mutation blocked by in-flight inspection')
+            assert mutator.returncode == 0, stderr
+            assert query.poll() is None
+            close_program = (
+                'import sys\nfrom pathlib import Path\n'
+                f'sys.path.insert(0, {bin_path!r})\n'
+                'from agd_lib import reviewer\n'
+                'reviewer.close_run(Path(sys.argv[1]), sys.argv[2], \"failed\")\n')
+            closer = subprocess.Popen([sys.executable, '-c', close_program, str(home), run_id],
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                _, stderr = closer.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                pytest.fail('closing the run blocked by in-flight inspection')
+            assert closer.returncode == 0, stderr
+            release.touch()
+            _, stderr = query.communicate(timeout=10)
+            assert query.returncode == 3, stderr
+            assert_child_gone(pid_file)
+            after = inspection().read_journal(home, run_id)
+            assert after['sources'] == before['sources']
+            assert after['targets'] == before['targets']
+            assert after['cursors'] == before['cursors']
+        finally:
+            release.touch()
+            for process in (query, mutator, closer):
+                if process is not None and process.poll() is None:
+                    try:
+                        process.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate(timeout=5)
+
+
+def test_r1_skill_catalog_metadata_pagination_has_only_disclosed_sources():
+    with lab() as (home, _):
+        directory = home / 'config/worker-skills'
+        directory.mkdir(parents=True, exist_ok=True)
+        names = set()
+        for number in range(45):
+            skill_id = f'long-{number:02d}-' + 'q' * 39
+            names.add(skill_id)
+            skill_dir = directory / skill_id
+            skill_dir.mkdir()
+            (skill_dir / 'SKILL.md').write_text(
+                f'---\nname: {skill_id}\ndescription: Local fixture\n---\nInspect the implicated behavior.\n')
+        completed_session(home)
+        run_id, _ = stage(home)
+        baseline = inspection().read_journal(home, run_id)
+        sources, seen, cursor = set(), set(), None
+        while True:
+            try:
+                page = inspection().list_skills(home, run_id, cursor=cursor)
+            except store.Refusal:
+                journal = inspection().read_journal(home, run_id)
+                assert set(journal['sources']) == set(baseline['sources']) | sources
+                raise
+            bounded(page)
+            sources.add(page['source_id'])
+            seen.update(row['id'] for row in page['rows'])
+            cursor = page['next_cursor']
+            if cursor is None:
+                break
+        assert names <= seen
+        journal = inspection().read_journal(home, run_id)
+        assert set(journal['sources']) == set(baseline['sources']) | sources
+
+
+def test_r1_retirement_quiesces_or_revalidates_inflight_capture(monkeypatch):
+    import select
+    with lab() as (home, _):
+        hook = home / 'config/hooks/retirement-hook'
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text('owned hook\n')
+        completed_session(home)
+        run_id, manifest = stage(home)
+        episode = manifest['episodes'][0]
+        pid_file = telemetry_fixture(home, monkeypatch, episode, mode='barrier')
+        release = home / 'release-before-retirement'
+        monkeypatch.setenv('INSPECTION_RELEASE', str(release))
+        root = Path(__file__).resolve().parents[1]
+        query_program = (
+            'import json, sys\nfrom pathlib import Path\n'
+            f"sys.path.insert(0, {str(root / 'bin')!r})\n"
+            'from agd_lib import observability, reviewer_inspection, store\n'
+            'observability.langfuse_query_context = lambda *a, **k: {'
+            '\"base_url\":\"http://127.0.0.1:9\", \"project_id\":\"synthetic-project\",'
+            '\"public_key\":\"pk_fixture\", \"secret_key\":\"sk_fixture\"}\n'
+            'try:\n'
+            ' value = reviewer_inspection.inspect(Path(sys.argv[1]), sys.argv[2], sys.argv[3], source=\"langfuse\")\n'
+            'except store.Refusal:\n sys.exit(3)\n'
+            'print(json.dumps(value))\n')
+        retirement_program = (
+            'import sys\nfrom pathlib import Path\n'
+            f"sys.path.insert(0, {str(root / 'tests')!r})\n"
+            f"sys.path.insert(0, {str(root / 'bin')!r})\n"
+            'from support import uninstall_scope\nfrom agd_lib import store\n'
+            'print(\"starting\", flush=True)\n'
+            'sys.stdin.read(1)\n'
+            'try:\n'
+            ' with uninstall_scope(Path(sys.argv[1]), []):\n'
+            '  print(\"entered\", flush=True)\n  sys.stdin.read()\n'
+            'except store.Refusal:\n print(\"busy\", flush=True)\n')
+        query = subprocess.Popen([sys.executable, '-c', query_program, str(home), run_id, episode['episode_id']],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=os.environ.copy())
+        retiring = None
+        try:
+            deadline = time.monotonic() + 10
+            while not pid_file.exists() and time.monotonic() < deadline and query.poll() is None:
+                time.sleep(0.02)
+            assert pid_file.exists(), 'synthetic query never started'
+            retiring = subprocess.Popen([sys.executable, '-c', retirement_program, str(home)],
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            assert retiring.stdout.readline().strip() == 'starting'
+            retiring.stdin.write('x')
+            retiring.stdin.flush()
+            early = ''
+            if select.select([retiring.stdout], [], [], 0.5)[0]:
+                early = retiring.stdout.readline().strip()
+            evidence_dir = reviewer.paths(home)['evidence'] / 'inspection' / run_id
+            before = {p.name for p in evidence_dir.glob('*.json')} if evidence_dir.exists() else set()
+            release.touch()
+            _, query_error = query.communicate(timeout=10)
+            assert_child_gone(pid_file)
+            if early == 'entered':
+                assert query.returncode == 3, query_error
+                after = {p.name for p in evidence_dir.glob('*.json')} if evidence_dir.exists() else set()
+                assert after == before
+            else:
+                assert query.returncode in (0, 3), query_error
+                if not early:
+                    assert select.select([retiring.stdout], [], [], 10)[0]
+                    early = retiring.stdout.readline().strip()
+                if early == 'busy':
+                    retiring.stdin.close()
+                    retiring.wait(timeout=10)
+                    retiring = subprocess.Popen([sys.executable, '-c', retirement_program, str(home)],
+                                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                                stderr=subprocess.PIPE, text=True)
+                    assert retiring.stdout.readline().strip() == 'starting'
+                    retiring.stdin.write('x')
+                    retiring.stdin.flush()
+                    assert select.select([retiring.stdout], [], [], 10)[0]
+                    early = retiring.stdout.readline().strip()
+                assert early == 'entered'
+            with pytest.raises(store.Refusal):
+                target(home, run_id, scope='distro', path='config/hooks/retirement-hook')
+        finally:
+            release.touch()
+            if query.poll() is None:
+                try:
+                    query.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    query.kill()
+                    query.communicate(timeout=5)
+            if retiring is not None:
+                if retiring.stdin and not retiring.stdin.closed:
+                    retiring.stdin.close()
+                if retiring.poll() is None:
+                    retiring.wait(timeout=10)
+
+
+def test_r1_copied_native_source_is_not_issued_in_another_run():
+    with lab() as (home, _):
+        source, _, _ = completed_session(home, texts=('shared episode output',))
+        first, manifest = stage(home)
+        episode = manifest['episodes'][0]
+        page = inspection().inspect(home, first, episode['episode_id'], source='native',
+                                    record_id=source['session_id'] + '-final-0', part='content')
+        first_dir = reviewer.paths(home)['evidence'] / 'inspection' / first
+        original = json.loads((first_dir / (page['source_id'] + '.json')).read_text())
+        second, second_manifest = stage(home)
+        assert any(item['episode_id'] == episode['episode_id'] for item in second_manifest['episodes'])
+        copied = json.loads(json.dumps(original))
+        copied['run_id'] = second
+        copied['manifest_id'] = second_manifest['manifest_id']
+        second_dir = reviewer.paths(home)['evidence'] / 'inspection' / second
+        _fixture_record(second_dir, copied)
+        with pytest.raises(store.Refusal):
+            inspection().read_journal(home, second)
+
+
+def _inspection_record_bytes(home, run_id):
+    roots = [reviewer.paths(home)['inspections'] / run_id,
+             reviewer.paths(home)['evidence'] / 'inspection' / run_id]
+    return {str(path.relative_to(home)): path.read_bytes()
+            for root in roots if root.exists()
+            for path in root.rglob('*.json') if path.is_file()}
+
+
+def test_r1_oversized_historical_skill_envelope_never_commits_an_undelivered_page():
+    with lab() as (home, _):
+        skill = next(row for row in worker_skills.catalog(home) if row['id'] == 'systematic-debugging')
+        (Path(skill['source']) / 'SKILL.md').write_text(
+            '---\nname: systematic-debugging\ndescription: Fixture\n---\n' + '\x00' * 2400)
+        completed_session(home, role='worker', task_id='catalog-owner')
+        run_id, manifest = stage(home)
+        catalog_path = reviewer.paths(home)['catalogs'] / (manifest['catalog_id'] + '.json')
+        catalog = json.loads(catalog_path.read_text())
+        assignment = next(row for row in catalog['assigned'] if row['task_id'] == 'catalog-owner')
+        snapshot = next(row for row in assignment['skills'] if row['id'] == 'systematic-debugging')
+        # Adversarial immutable input: distinct historical assignment records
+        # whose snapshots are no longer available. This exercises refusal or
+        # bounded disclosure, not an assumption that today’s selector emits it.
+        for number in range(130):
+            task_id = f'history-{number:03d}-' + 'q' * 32
+            catalog['assigned'].append({'task_id': task_id, 'skills': [snapshot], 'usage': 'unknown'})
+        assert len(json.dumps(catalog['assigned'], indent=2).encode()) > 16384
+        catalog_id = reviewer._digest(catalog)
+        reviewer.publish_immutable(reviewer.paths(home)['catalogs'] / (catalog_id + '.json'), catalog)
+        frozen = {key: value for key, value in manifest.items() if key != 'manifest_id'}
+        frozen['catalog_id'] = catalog_id
+        frozen['catalog_bytes'] = len(reviewer._json_bytes(catalog))
+        manifest_id = reviewer._digest(frozen)
+        reviewer.publish_immutable(reviewer.paths(home)['selections'] / (manifest_id + '.json'), frozen)
+        receipt_path = reviewer.paths(home)['receipts'] / (run_id + '.json')
+        receipt = json.loads(receipt_path.read_text())
+        receipt['manifest_id'] = manifest_id
+        store.atomic_json(receipt_path, receipt)
+        before = _inspection_record_bytes(home, run_id)
+        try:
+            response = inspection().show_skill(home, run_id, 'systematic-debugging')
+        except store.Refusal:
+            assert _inspection_record_bytes(home, run_id) == before
+            seed = len(json.dumps({**frozen, 'manifest_id': manifest_id}, indent=2,
+                                  ensure_ascii=False).encode()) + len(reviewer._json_bytes(catalog))
+            remaining = reviewer.read_config(home)['limits']['max_input_bytes'] - seed
+            assert remaining > 0
+            full = capture(home, run_id, 'z' * remaining)
+            assert reviewer.read_evidence(home, run_id)['sources'][full]['bytes'] == remaining
+        else:
+            bounded(response)
+            assert response.get('next_cursor') or response.get('limitations')

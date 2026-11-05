@@ -319,6 +319,7 @@ def _read_owned_artifact(home, review_run_id, path, max_bytes, duplicate_sizes):
         final = os.fstat(stream.fileno())
         if (initial.st_dev != final.st_dev or initial.st_ino != final.st_ino
                 or initial.st_size != final.st_size or len(body) != final.st_size
+                or initial.st_mtime_ns != final.st_mtime_ns or initial.st_ctime_ns != final.st_ctime_ns
                 or not stat.S_ISREG(final.st_mode) or final.st_uid != os.getuid()
                 or final.st_nlink != 1):
             raise store.Refusal('supplementary artifact changed during capture')
@@ -336,7 +337,55 @@ def _read_owned_artifact(home, review_run_id, path, max_bytes, duplicate_sizes):
         elif not stream.closed:
             stream.close()
     text_sha256 = hashlib.sha256(body).hexdigest()
-    return relative.as_posix(), body, text, text_sha256
+    return relative.as_posix(), body, text, text_sha256, initial
+
+
+def _capture_evidence_v2(root, run_id, path, label, initial_receipt):
+    from . import reviewer_inspection
+    deadline = initial_receipt.get('deadline_epoch_ms')
+    _check_deadline(deadline)
+    with store.lock(root, deadline_epoch_ms=deadline):
+        receipt = _receipt(root, run_id)
+        if (receipt.get('dispatch_state') != 'begun' or receipt.get('manifest_id') != initial_receipt['manifest_id']
+                or receipt.get('deadline_epoch_ms') != deadline):
+            raise store.Refusal('review run is not active')
+        _, config = reviewer_inspection._manifest_locked(root, receipt)
+        used = reviewer_inspection._input_used_locked(root, receipt)
+        records = _evidence_records(root, run_id)
+        _, relative = _artifact_path(root, run_id, path)
+        origin = {'run_id': run_id, 'path': relative.as_posix()}
+        duplicate_sizes = {item['bytes'] for item in records.values() if item['origin'] == origin}
+        remaining = max(0, config['limits']['max_input_bytes'] - used)
+    origin_path, body, text, text_sha256, initial = _read_owned_artifact(root, run_id, path, remaining, duplicate_sizes)
+    _check_deadline(deadline)
+    source_id = _digest(_evidence_identity(run_id, origin, text_sha256))
+    if _EVIDENCE_SECRET_TEXT.search(text):
+        raise store.Refusal('supplementary artifact is credential-bearing')
+    with store.lock(root, deadline_epoch_ms=deadline):
+        current = _receipt(root, run_id)
+        if (current.get('dispatch_state') != 'begun' or current.get('manifest_id') != receipt['manifest_id']
+                or current.get('deadline_epoch_ms') != deadline
+                or current.get('config_snapshot_ref') != receipt.get('config_snapshot_ref')
+                or current.get('instruction_snapshot_ref') != receipt.get('instruction_snapshot_ref')):
+            raise store.Refusal('review run changed during capture')
+        _check_deadline(deadline)
+        fd, _, final = _open_owned_artifact(root, run_id, path)
+        os.close(fd)
+        if ((initial.st_dev, initial.st_ino, initial.st_size, initial.st_mtime_ns, initial.st_ctime_ns) !=
+                (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns, final.st_ctime_ns)):
+            raise store.Refusal('supplementary artifact changed before publication')
+        records = _evidence_records(root, run_id)
+        if source_id in records:
+            return records[source_id]
+        _, config = reviewer_inspection._manifest_locked(root, current)
+        if reviewer_inspection._input_used_locked(root, current) + len(body) > config['limits']['max_input_bytes']:
+            raise store.Refusal('cumulative reviewer input exceeds limit')
+        record = {'schema': 1, 'source_id': source_id, 'review_run_id': run_id,
+                  'origin': {'run_id': run_id, 'path': origin_path}, 'label': label.strip(),
+                  'captured_at': time.time(), 'bytes': len(body), 'text': text, 'text_sha256': text_sha256}
+        record['integrity_sha256'] = _evidence_integrity(record)
+        publish_immutable(paths(root)['evidence'] / run_id / f'{source_id}.json', record)
+        return record
 
 
 def capture_evidence(home, review_run_id, path, label):
@@ -355,6 +404,9 @@ def _capture_evidence(home, review_run_id, path, label):
     if _EVIDENCE_SECRET_TEXT.search(label):
         raise store.Refusal('supplementary evidence label is credential-bearing')
     root = store.home(home)
+    initial_receipt = _receipt(root, review_run_id)
+    if initial_receipt.get('manifest_id') is not None:
+        return _capture_evidence_v2(root, review_run_id, path, label, initial_receipt)
     with store.lock(root):
         receipt = _receipt(root, review_run_id)
         schema2 = receipt.get('manifest_id') is not None
@@ -382,7 +434,7 @@ def _capture_evidence(home, review_run_id, path, label):
         origin = {'run_id': review_run_id, 'path': origin_path}
         duplicate_sizes = {
             item['bytes'] for item in records.values() if item['origin'] == origin}
-        origin_path, body, text, text_sha256 = _read_owned_artifact(
+        origin_path, body, text, text_sha256, _ = _read_owned_artifact(
             root, review_run_id, path, remaining, duplicate_sizes)
         source_id = _digest(_evidence_identity(review_run_id, origin, text_sha256))
         existing = records.get(source_id)
@@ -1224,6 +1276,7 @@ def select_manifest(home, *, cutoff, config_snapshot, retrospective_review_run_i
                      'home_id': _read_json(root / 'data' / 'home.json')['home_id'],
                      'cutoff': cutoff, 'config_snapshot_sha256': _digest(config),
                      'catalog_id': _digest(catalog_value) if catalog_value is not None else None,
+                     'catalog_bytes': len(_json_bytes(catalog_value)) if catalog_value is not None else 0,
                      'instruction_sha256': instruction_sha256, 'episodes': episodes,
                      'held': [_bounded_notice(item) for item in held[:3]], 'held_count': len(held),
                      'details_id': _digest(details), 'omitted_pending': len(actionable) - len(episodes),

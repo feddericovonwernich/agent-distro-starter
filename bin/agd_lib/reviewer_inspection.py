@@ -1,6 +1,7 @@
 """Run-scoped, immutable reviewer observations and target receipts."""
 import codecs
 import contextlib
+import contextvars
 import datetime
 import hashlib
 import json
@@ -20,6 +21,12 @@ from .uninstall_state import admission
 MAX_RESPONSE = 16384
 MAX_RAW = 262144
 PAGE_BYTES = 2000
+
+# A capture stages immutable records until its complete response is bounded.
+# The receipt is the native issuance authority; file hashes alone are not.
+_TRANSACTION = contextvars.ContextVar('reviewer_inspection_transaction', default=None)
+_VALIDATION_WATCHES = contextvars.ContextVar('reviewer_inspection_validation_watches', default=None)
+_CATEGORIES = ('sources', 'cursors', 'targets')
 
 
 def _sha(body):
@@ -75,33 +82,53 @@ def _category_dir(home, run_id, category):
 
 
 def _records(home, run_id, category):
+    tx = _TRANSACTION.get()
+    if tx is not None and tx['home'] == home and tx['run_id'] == run_id:
+        return {**tx['base'][category], **tx['staged'][category]}
     directory = _category_dir(home, run_id, category)
+    receipt = reviewer._receipt(home, run_id)
+    issuance = receipt.get('inspection_issuance')
+    if issuance is None:
+        expected = set()
+    else:
+        if (not isinstance(issuance, dict) or issuance.get('schema') != 1 or
+                issuance.get('manifest_id') != receipt.get('manifest_id') or
+                any(not isinstance(issuance.get(key), list) for key in _CATEGORIES)):
+            raise store.Refusal('inspection issuance invalid')
+        ids = issuance[category]
+        for ident in ids:
+            reviewer._hex_id(ident)
+        if len(ids) != len(set(ids)):
+            raise store.Refusal('inspection issuance invalid')
+        expected = set(ids)
     if not os.path.lexists(directory):
+        if expected:
+            raise store.Refusal('issued inspection records unavailable')
         return {}
     if directory.is_symlink() or not directory.is_dir():
         raise store.Refusal('inspection directory unsafe')
     result = {}
     for path in sorted(directory.iterdir()):
         reviewer._hex_id(path.stem)
-        if path.suffix != '.json' or path.is_symlink() or not path.is_file():
-            raise store.Refusal('inspection record unsafe')
+        if path.suffix != '.json' or path.is_symlink() or not path.is_file() or path.stem not in expected:
+            raise store.Refusal('inspection record not issued')
         value = _load(path)
         if not isinstance(value, dict) or reviewer._digest(value) != path.stem:
             raise store.Refusal('inspection record integrity mismatch')
         result[path.stem] = value
+    if set(result) != expected:
+        raise store.Refusal('issued inspection records unavailable')
     return result
 
 
 def _input_used_locked(home, receipt):
     manifest, _ = _manifest_locked(home, receipt)
     used = len(json.dumps(manifest, ensure_ascii=False, indent=2).encode())
-    catalog_id = manifest.get('catalog_id')
-    if catalog_id is not None:
-        reviewer._hex_id(catalog_id)
-        raw = reviewer._read_regular_bytes(reviewer.paths(home)['catalogs'] / (catalog_id + '.json'))
-        if reviewer._digest(json.loads(raw)) != catalog_id:
-            raise store.Refusal('catalog identity changed')
-        used += len(raw)
+    catalog_bytes = manifest.get('catalog_bytes')
+    if type(catalog_bytes) is not int or catalog_bytes < 0 or (
+            manifest.get('catalog_id') is None and catalog_bytes != 0):
+        raise store.Refusal('catalog input charge unavailable')
+    used += catalog_bytes
     used += sum(row['bytes'] for row in reviewer._evidence_records(home, receipt['review_run_id']).values())
     for row in _records(home, receipt['review_run_id'], 'sources').values():
         used += row['bytes']
@@ -110,31 +137,152 @@ def _input_used_locked(home, receipt):
     return used
 
 
+def _fingerprint(path, *, directory=False):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise store.Refusal('inspection input unavailable') from error
+    base = (info.st_dev, info.st_ino, info.st_mode, info.st_uid)
+    return base if directory else (*base, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _watch(home, path):
+    tx = _TRANSACTION.get()
+    watched = tx['watched'] if tx is not None else _VALIDATION_WATCHES.get()
+    if watched is None:
+        return
+    path = Path(path)
+    try:
+        parts = path.relative_to(home).parts
+    except ValueError as error:
+        raise store.Refusal('inspection input outside home') from error
+    current = home
+    for index, part in enumerate(parts):
+        current = current / part
+        directory = index < len(parts) - 1
+        key = (current, directory)
+        value = _fingerprint(current, directory=directory)
+        if key in watched and watched[key] != value:
+            raise store.Refusal('inspection input changed')
+        watched[key] = value
+        if value is None:
+            break
+
+
+def _watch_project_root(path):
+    tx = _TRANSACTION.get()
+    watched = tx['watched'] if tx is not None else _VALIDATION_WATCHES.get()
+    if watched is None:
+        return
+    for item in (path, path / '.git'):
+        key = (item, False)
+        value = _fingerprint(item)
+        if key in watched and watched[key] != value:
+            raise store.Refusal('project identity changed')
+        watched[key] = value
+
+
+def _check_watches(watched):
+    for (path, directory), fingerprint in watched.items():
+        if _fingerprint(path, directory=directory) != fingerprint:
+            raise store.Refusal('inspection input changed before publication')
+
+
+@contextlib.contextmanager
+def _validation_scope():
+    watched = {}
+    token = _VALIDATION_WATCHES.set(watched)
+    try:
+        yield watched
+    finally:
+        _VALIDATION_WATCHES.reset(token)
+
+
+def _active_receipt(home, run_id, deadline):
+    receipt = reviewer._receipt(home, run_id)
+    if receipt.get('dispatch_state') != 'begun' or receipt.get('review_run_id') != run_id:
+        raise store.Refusal('review run is not active')
+    if receipt.get('deadline_epoch_ms') != deadline:
+        raise store.Refusal('review run deadline changed')
+    reviewer._check_deadline(deadline)
+    return receipt
+
+
 @contextlib.contextmanager
 def _active(home, run_id):
     home = store.home(home)
     _root(home, run_id)
+    nested = _TRANSACTION.get()
+    if nested is not None:
+        if nested['home'] != home or nested['run_id'] != run_id:
+            raise store.Refusal('nested inspection scope mismatch')
+        yield home, nested['receipt'], nested['manifest'], nested['config']
+        return
     with admission(home):
-        with store.lock(home):
-            receipt = reviewer._receipt(home, run_id)
-            if receipt.get('dispatch_state') != 'begun' or receipt.get('review_run_id') != run_id:
-                raise store.Refusal('review run is not active')
-            reviewer._check_deadline(receipt.get('deadline_epoch_ms'))
+        deadline = reviewer._receipt(home, run_id).get('deadline_epoch_ms')
+        reviewer._check_deadline(deadline)
+        with store.lock(home, deadline_epoch_ms=deadline):
+            receipt = _active_receipt(home, run_id, deadline)
             manifest, config = _manifest_locked(home, receipt)
+            base = {category: _records(home, run_id, category) for category in _CATEGORIES}
+        tx = {'home': home, 'run_id': run_id, 'receipt': receipt, 'manifest': manifest,
+              'config': config, 'base': base, 'staged': {key: {} for key in _CATEGORIES}, 'watched': {}}
+        token = _TRANSACTION.set(tx)
+        try:
             yield home, receipt, manifest, config
+            with store.lock(home, deadline_epoch_ms=deadline):
+                current = _active_receipt(home, run_id, deadline)
+                if any(current.get(key) != receipt.get(key) for key in
+                       ('manifest_id', 'config_snapshot_ref', 'instruction_snapshot_ref')):
+                    raise store.Refusal('review run scope changed')
+                _manifest_locked(home, current)
+                for (path, directory), fingerprint in tx['watched'].items():
+                    if _fingerprint(path, directory=directory) != fingerprint:
+                        raise store.Refusal('inspection input changed before publication')
+                # Read the latest native receipt and journal while holding the lock.
+                _TRANSACTION.reset(token)
+                token = None
+                latest = {category: _records(home, run_id, category) for category in _CATEGORIES}
+                used = _input_used_locked(home, current)
+                for ident, value in tx['staged']['sources'].items():
+                    if ident not in latest['sources']:
+                        if any(row['text'] == value['text'] and row['provenance'] == value['provenance']
+                               for row in latest['sources'].values()):
+                            raise store.Refusal('concurrent inspection page already issued')
+                        used += value['bytes']
+                used += sum(len(reviewer._json_bytes(value)) for ident, value in tx['staged']['targets'].items()
+                            if ident not in latest['targets'])
+                if used > config['limits']['max_input_bytes']:
+                    raise store.Refusal('cumulative reviewer input exceeds limit')
+                issuance = current.get('inspection_issuance') or {
+                    'schema': 1, 'manifest_id': current['manifest_id'], **{key: [] for key in _CATEGORIES}}
+                for category in _CATEGORIES:
+                    for ident, value in tx['staged'][category].items():
+                        if ident not in latest[category]:
+                            reviewer.publish_immutable(_category_dir(home, run_id, category) / (ident + '.json'), value)
+                            issuance[category].append(ident)
+                current['inspection_issuance'] = issuance
+                store.atomic_json(reviewer.paths(home)['receipts'] / (run_id + '.json'), current)
+        finally:
+            if token is not None:
+                _TRANSACTION.reset(token)
 
 
 def _save(home, receipt, category, value, *, charge=0):
     ident = reviewer._digest(value)
-    path = _category_dir(home, receipt['review_run_id'], category) / (ident + '.json')
-    if path.exists():
-        if _load(path) != value:
+    tx = _TRANSACTION.get()
+    if tx is None or tx['home'] != home or tx['run_id'] != receipt['review_run_id']:
+        raise store.Refusal('inspection publication requires an active capture')
+    existing = _records(home, receipt['review_run_id'], category).get(ident)
+    if existing is not None:
+        if existing != value:
             raise store.Refusal('inspection immutable collision')
         return ident
-    _, config = _manifest_locked(home, receipt)
-    if _input_used_locked(home, receipt) + charge > config['limits']['max_input_bytes']:
+    if _input_used_locked(home, receipt) + charge > tx['config']['limits']['max_input_bytes']:
         raise store.Refusal('cumulative reviewer input exceeds limit')
-    reviewer.publish_immutable(path, value)
+    tx['staged'][category][ident] = value
     return ident
 
 
@@ -182,6 +330,22 @@ def _bounded(value):
     if len(json.dumps(value, ensure_ascii=False, indent=2).encode()) + 1 > MAX_RESPONSE:
         raise store.Refusal('inspection response exceeds limit')
     return value
+
+
+def _row_page(items, offset, envelope):
+    if offset > len(items):
+        raise store.Refusal('cursor outside metadata')
+    rows = []
+    for item in items[offset:offset + 20]:
+        candidate = [*rows, item]
+        try:
+            _bounded({**envelope, 'rows': candidate})
+        except store.Refusal:
+            if not rows:
+                raise store.Refusal('metadata row exceeds limit')
+            break
+        rows = candidate
+    return rows
 
 
 def _page_text(home, receipt, text, identity, cursor):
@@ -297,6 +461,7 @@ def _episode(manifest, episode_id):
 
 
 def _locators(home, manifest, episode):
+    _watch(home, reviewer.paths(home)['selection_details'] / (episode['locators_id'] + '.json'))
     result, cursor = [], 0
     while cursor is not None:
         page = reviewer.read_selection_locators(home, manifest['manifest_id'], episode['episode_id'], cursor=cursor)
@@ -329,9 +494,12 @@ def _native(home, receipt, manifest, episode):
     if not locator:
         raise store.Refusal('native source unavailable')
     path = _safe_home_file(home, locator['path'])
+    _watch(home, path)
     completion = locator.get('completion')
     if completion:
         paths = reviewer_episodes._episode_paths(home)
+        _watch(home, paths['sources'] / (locator['source_id'] + '.json'))
+        _watch(home, paths['completions'] / locator['source_id'] / (completion['interaction_id'] + '.json'))
         source = reviewer_episodes._read_private_json(paths['sources'] / (locator['source_id'] + '.json'))
         if (reviewer_episodes.source_fingerprint(source) != locator['source_id'] or
                 source.get('path') != locator['path']):
@@ -360,6 +528,7 @@ def _artifact(home, locator, *, offset, deadline):
     if scanned['size'] != locator['size'] or scanned['sha256'] != locator['sha256']:
         raise store.Refusal('native artifact changed')
     if locator.get('link_path'):
+        _watch(home, home / locator['link_path'])
         link = _safe_home_file(home, locator['link_path'])
         if _sha(reviewer._read_regular_bytes(link, require_current_uid=True)) != locator['link_sha256']:
             raise store.Refusal('feedback provenance changed')
@@ -486,11 +655,13 @@ def _telemetry_window(home, receipt, manifest, episode, meta):
     source_id = locator['source_id']
     source = reviewer_episodes._read_private_json(paths['sources'] / (source_id + '.json'))
     directory = paths['completions'] / source_id
+    _watch(home, directory)
     if directory.is_symlink() or not directory.is_dir():
         raise store.Refusal('telemetry completion set unavailable')
     _, config = _manifest_locked(home, receipt)
     native_path = _safe_home_file(home, locator['path'])
     for record_path in sorted(directory.glob('*.json')):
+        _watch(home, record_path)
         reviewer._check_deadline(receipt['deadline_epoch_ms'])
         if record_path.stem == episode['interaction_id']:
             continue
@@ -591,6 +762,8 @@ def inspect(home, run_id, episode_id, *, source='auto', record_id=None, part=Non
         locator, locators, path, completion, meta = _native(home, receipt, manifest, episode)
         limitation = None
         if source in ('auto', 'langfuse'):
+            tx = _TRANSACTION.get()
+            staged_before = {category: dict(tx['staged'][category]) for category in _CATEGORIES}
             try:
                 admitted = []
                 if record_id is not None:
@@ -630,19 +803,25 @@ def inspect(home, run_id, episode_id, *, source='auto', record_id=None, part=Non
             except store.Refusal as error:
                 if source == 'langfuse':
                     raise
+                tx['staged'] = staged_before
                 reviewer._check_deadline(receipt['deadline_epoch_ms'])
                 limitation = str(error)
         if record_id is None:
             identity = {'view': 'native-metadata', 'episode_id': episode_id, 'version_sha256': meta['material_sha256']}
             offset = _resume(home, receipt, cursor, identity)
-            rows = meta['projection'][offset:offset + 20]
+            artifacts = [{key: item[key] for key in ('kind', 'sha256', 'size') if key in item}
+                         for item in locators if item.get('kind') != 'native' and 'sha256' in item]
+            items = [*meta['projection'], *artifacts]
+            rows = _row_page(items, offset, {
+                'source': 'native', 'source_id': '0' * 64, 'next_cursor': '0' * 64,
+                'complete': False, 'limitations': [limitation] if limitation else []})
             next_offset = offset + len(rows)
             rendered = json.dumps(rows, ensure_ascii=False, sort_keys=True)
             source_id = _source(home, receipt, text=rendered, provenance={
                 **identity, 'start': offset, 'end': next_offset, 'previous_cursor': cursor,
-                'complete': next_offset == len(meta['projection'])})
+                'complete': next_offset == len(items)})
             next_cursor = _cursor(home, receipt, {**identity, 'offset': next_offset, 'previous_cursor': cursor,
-                                                  'source_id': source_id}) if next_offset < len(meta['projection']) else None
+                                                  'source_id': source_id}) if next_offset < len(items) else None
             return _bounded({'source': 'native', 'source_id': source_id, 'rows': rows, 'next_cursor': next_cursor,
                              'complete': next_cursor is None, 'limitations': [limitation] if limitation else []})
         artifact = next((item for item in locators if item.get('kind') != 'native' and item.get('sha256') == record_id), None)
@@ -699,6 +878,8 @@ def _git(project, *args, deadline=None):
 
 
 def _git_blob(project, oid, size, offset, deadline):
+    if deadline is None:
+        deadline = int((time.time() + 30) * 1000)
     try:
         process = subprocess.Popen(['git', '-C', str(project), 'cat-file', 'blob', oid],
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -710,7 +891,7 @@ def _git_blob(project, oid, size, offset, deadline):
         selector.register(process.stdout, selectors.EVENT_READ)
         def chunks():
             while selector.get_map():
-                remaining = 30 if deadline is None else reviewer.deadline_remaining_seconds(deadline)
+                remaining = reviewer.deadline_remaining_seconds(deadline)
                 if remaining <= 0:
                     raise store.Refusal('reviewer deadline exceeded')
                 events = selector.select(remaining)
@@ -722,7 +903,7 @@ def _git_blob(project, oid, size, offset, deadline):
                     break
                 yield raw
         scanned = _scan_source(chunks(), offset, deadline)
-        remaining = 30 if deadline is None else reviewer.deadline_remaining_seconds(deadline)
+        remaining = reviewer.deadline_remaining_seconds(deadline)
         if remaining <= 0 or process.wait(timeout=remaining) or scanned['size'] != size:
             raise store.Refusal('project blob changed')
         return scanned
@@ -743,6 +924,7 @@ def _project_file(home, binding, path, operation, *, offset=0, deadline=None):
     project = (projects.read(home, binding['project_id']) if deadline is None else
                projects.read(home, binding['project_id'], deadline_epoch_ms=deadline))
     root = Path(project['path'])
+    _watch_project_root(root)
     revision = binding['task_revision']
     # Each prefix must be an actual Git tree, not a symlink or gitlink.
     parts = path.parts
@@ -775,6 +957,7 @@ def _project_file(home, binding, path, operation, *, offset=0, deadline=None):
 
 
 def _distro_file(home, path, operation, *, offset=0, deadline=None):
+    _watch(home, home / path)
     directory = fd = None
     try:
         directory = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -868,7 +1051,7 @@ def inspect_target(home, run_id, *, scope, project_id=None, path=None, component
         if (authority_hint != 'external' or not isinstance(authority_locator, str) or
                 not 1 <= len(authority_locator) <= 256 or not authority_locator.isprintable() or
                 reviewer._EVIDENCE_SECRET_TEXT.search(authority_locator) or
-                re.search(r'://[^/\\s]*@', authority_locator)):
+                re.search(r'://[^/\s]*@', authority_locator)):
             raise store.Refusal('invalid authority locator')
     if component is not None and (not isinstance(component, str) or not 1 <= len(component) <= 256 or
                                   not component.isprintable() or reviewer._EVIDENCE_SECRET_TEXT.search(component)):
@@ -878,9 +1061,12 @@ def inspect_target(home, run_id, *, scope, project_id=None, path=None, component
         binding = None
         if scope == 'project':
             store.validate_id(project_id)
+            _watch(home, projects.record(home, project_id))
             episodes = [e for e in manifest['episodes'] if e.get('project_binding', {}).get('project_id') == project_id]
             if not episodes:
                 raise store.Refusal('project is not selected')
+            for episode in episodes:
+                _watch(home, home / 'data' / 'tasks' / store.validate_id(episode['task_id']) / 'task.json')
             bindings = [reviewer._validate_project_binding(home, e, deadline_epoch_ms=receipt['deadline_epoch_ms'])
                         for e in episodes]
             if any(b != bindings[0] for b in bindings):
@@ -941,7 +1127,7 @@ def inspect_target(home, run_id, *, scope, project_id=None, path=None, component
         return _bounded(result)
 
 
-def _validate_target_context(home, manifest, value):
+def _validate_target_context(home, manifest, value, *, deadline=None, live=True):
     try:
         identity, guard = value['identity'], value['guard']
         context, authority = identity['context'], identity['authority']
@@ -963,7 +1149,12 @@ def _validate_target_context(home, manifest, value):
                           if e.get('project_binding', {}).get('project_id') == context['project_id']]
             if not candidates:
                 raise ValueError('target project')
-            bindings = [reviewer._validate_project_binding(home, e) for e in candidates]
+            if live:
+                _watch(home, projects.record(home, context['project_id']))
+                for episode in candidates:
+                    _watch(home, home / 'data' / 'tasks' / store.validate_id(episode['task_id']) / 'task.json')
+            bindings = ([reviewer._validate_project_binding(home, e, deadline_epoch_ms=deadline) for e in candidates]
+                        if live else [e['project_binding'] for e in candidates])
             if any(b['identity_sha256'] != context['identity_sha256'] for b in bindings):
                 raise ValueError('target project identity')
         else:
@@ -978,14 +1169,19 @@ def _validate_target_context(home, manifest, value):
             if identity['scope'] == 'project':
                 if any(b['task_revision'] != guard['revision'] for b in bindings):
                     raise ValueError('target revision')
-                if guard['state'] == 'absent':
-                    _project_file(home, bindings[0], relative, 'create')
-                else:
-                    scanned, _ = _project_file(home, bindings[0], relative, 'modify')
+                if live and guard['state'] == 'absent':
+                    _project_file(home, bindings[0], relative, 'create', deadline=deadline)
+                elif live:
+                    scanned, _ = _project_file(home, bindings[0], relative, 'modify', deadline=deadline)
                     if scanned['sha256'] != guard['source_sha256']:
                         raise ValueError('project baseline changed')
             elif guard['revision'] is not None:
                 raise ValueError('distro revision')
+            elif live:
+                scanned = _distro_file(home, relative, 'create' if guard['state'] == 'absent' else 'modify',
+                                       deadline=deadline)
+                if scanned is not None and scanned['sha256'] != guard['source_sha256']:
+                    raise ValueError('distro baseline changed')
             if guard['state'] == 'present':
                 reviewer._hex_id(guard['source_sha256'])
             elif guard['source_sha256'] is not None:
@@ -1015,29 +1211,33 @@ def _validate_target_basis(value, rows):
 def read_target(home, run_id, target_ref):
     home = store.home(home)
     reviewer._hex_id(target_ref)
-    with store.lock(home):
-        receipt = reviewer._receipt(home, run_id)
-        manifest, _ = _manifest_locked(home, receipt)
-        value = _records(home, run_id, 'targets').get(target_ref)
-        if value is None:
-            raise store.Refusal('target not admitted')
-        _validate_target_context(home, manifest, value)
-        rows = _basis(home, receipt, value['basis_source_ids'])
-        _validate_target_basis(value, rows)
-        identity, guard = value['identity'], value['guard']
-        if identity['kind'] == 'file' and guard['state'] == 'present':
-            if not any(row.get('provenance', {}).get('view') == 'target-content' and
-                       row['provenance'].get('target_identity_sha256') == reviewer._digest(identity) and
-                       row['provenance'].get('version_sha256') == guard['source_sha256'] for row in rows):
-                raise store.Refusal('target capture proof invalid')
+    with admission(home):
+        deadline = reviewer._receipt(home, run_id).get('deadline_epoch_ms')
+        with store.lock(home, deadline_epoch_ms=deadline):
+            receipt = reviewer._receipt(home, run_id)
+            if receipt.get('deadline_epoch_ms') != deadline:
+                raise store.Refusal('review run deadline changed')
+            manifest, _ = _manifest_locked(home, receipt)
+            journal = _read_journal_locked(home, run_id)
+            value = journal['targets'].get(target_ref)
+            if value is None:
+                raise store.Refusal('target not admitted')
+        with _validation_scope() as watched:
+            _validate_target_context(home, manifest, value, deadline=deadline)
+            with store.lock(home, deadline_epoch_ms=deadline):
+                _check_watches(watched)
+                current = _read_journal_locked(home, run_id)
+                if current['targets'].get(target_ref) != value or current['manifest_id'] != receipt['manifest_id']:
+                    raise store.Refusal('target changed during validation')
         return {'target_ref': target_ref, **value}
 
 
 def _catalog(home, manifest):
     ident = manifest.get('catalog_id')
     reviewer._hex_id(ident)
+    _watch(home, reviewer.paths(home)['catalogs'] / (ident + '.json'))
     catalog = _load(reviewer.paths(home)['catalogs'] / (ident + '.json'))
-    if reviewer._digest(catalog) != ident:
+    if reviewer._digest(catalog) != ident or len(reviewer._json_bytes(catalog)) != manifest.get('catalog_bytes'):
         raise store.Refusal('skill catalog changed')
     return catalog
 
@@ -1047,7 +1247,7 @@ def list_skills(home, run_id, *, cursor=None):
         catalog = _catalog(home, manifest)
         identity = {'view': 'skills-list', 'version_sha256': manifest['catalog_id']}
         offset = _resume(home, receipt, cursor, identity)
-        rows = catalog['skills'][offset:offset + 20]
+        rows = _row_page(catalog['skills'], offset, {'source_id': '0' * 64, 'next_cursor': '0' * 64})
         end = offset + len(rows)
         text = json.dumps(rows, ensure_ascii=False, sort_keys=True)
         source_id = _source(home, receipt, text=text, provenance={
@@ -1061,7 +1261,7 @@ def list_skills(home, run_id, *, cursor=None):
 def show_skill(home, run_id, skill_id, *, cursor=None):
     with _active(home, run_id) as (home, receipt, manifest, config):
         catalog = _catalog(home, manifest)
-        frozen = next ( (row for row in catalog['skills'] if row['id'] == skill_id), None)
+        frozen = next((row for row in catalog['skills'] if row['id'] == skill_id), None)
         if frozen is None:
             raise store.Refusal('skill is not in selected catalog')
         current = next((row for row in worker_skills.catalog(home) if row['id'] == skill_id), None)
@@ -1072,39 +1272,103 @@ def show_skill(home, run_id, skill_id, *, cursor=None):
             relative = source.relative_to(home).as_posix()
         except ValueError as error:
             raise store.Refusal('skill target outside home') from error
+        identity = {'view': 'skill-show', 'skill_id': skill_id, 'version_sha256': manifest['catalog_id']}
+        offset = _resume(home, receipt, cursor, identity)
+        prior = _records(home, run_id, 'cursors').get(cursor) if cursor else None
+        content_cursor = prior.get('content_cursor') if prior else None
+        content_done = prior.get('content_done', False) if prior else False
+        if content_done:
+            target_ref = prior.get('target_ref')
+            saved = _records(home, run_id, 'targets').get(target_ref)
+            if saved is None:
+                raise store.Refusal('skill target unavailable')
+            result = {'target_ref': target_ref, 'identity': saved['identity'], 'guard': saved['guard'],
+                      'source_ids': [], 'next_cursor': None}
+        else:
+            result = inspect_target(home, run_id, scope='distro', path=relative, surface='skill',
+                                    operation='modify', cursor=content_cursor)
+        content_cursor = result['next_cursor']
+        content_done = content_cursor is None
         assigned = []
         limitations = []
         for assignment in catalog['assigned']:
+            reviewer._check_deadline(receipt['deadline_epoch_ms'])
             for item in assignment['skills']:
                 if item['id'] != skill_id:
                     continue
                 row = {'task_id': assignment['task_id'], 'snapshot_sha256': item['snapshot_sha256'],
                        'usage': 'unknown'}
                 try:
-                    task = _load(home / 'data' / 'tasks' / assignment['task_id'] / 'task.json')
+                    task_path = home / 'data' / 'tasks' / assignment['task_id'] / 'task.json'
+                    _watch(home, task_path)
+                    task = _load(task_path)
                     snapshot = next(s for s in worker_skills._manifest(home, task)['skills'] if s['id'] == skill_id)
-                    raw = reviewer._read_regular_bytes(Path(snapshot['snapshot']) / 'SKILL.md', require_current_uid=True)
+                    snapshot_path = Path(snapshot['snapshot']) / 'SKILL.md'
+                    _watch(home, snapshot_path)
+                    raw = reviewer._read_regular_bytes(snapshot_path, require_current_uid=True)
                     if _sha(raw) != item['snapshot_sha256']:
                         raise ValueError('snapshot changed')
                 except (OSError, ValueError, StopIteration, KeyError, store.Refusal):
-                    limitations.append('historical skill snapshot unavailable or changed')
+                    limitations = ['historical skill snapshot unavailable or changed']
                 assigned.append(row)
-    result = inspect_target(home, run_id, scope='distro', path=relative, surface='skill',
-                            operation='modify', cursor=cursor)
-    return _bounded({**result, 'catalog_sha256': frozen['sha256'], 'assigned': assigned,
-                     'limitations': limitations})
+        if offset > len(assigned):
+            raise store.Refusal('skill assignment cursor invalid')
+        envelope = {**result, 'catalog_sha256': frozen['sha256'], 'assigned': [],
+                    'limitations': limitations, 'source_id': '0' * 64, 'next_cursor': '0' * 64,
+                    'complete': False, 'source_ids': [*result['source_ids'], '0' * 64]}
+        rows = []
+        for row in assigned[offset:offset + 20]:
+            try:
+                _bounded({**envelope, 'assigned': [*rows, row]})
+            except store.Refusal:
+                if not rows and not result.get('text'):
+                    raise store.Refusal('skill assignment exceeds response limit')
+                break
+            rows.append(row)
+        end = offset + len(rows)
+        complete = content_done and end == len(assigned)
+        source_id = _source(home, receipt, text=json.dumps(rows, ensure_ascii=False, sort_keys=True),
+                            provenance={**identity, 'start': offset, 'end': end,
+                                        'previous_cursor': cursor, 'complete': complete})
+        token = None if complete else _cursor(home, receipt, {
+            **identity, 'offset': end, 'previous_cursor': cursor, 'source_id': source_id,
+            'content_cursor': content_cursor, 'content_done': content_done, 'target_ref': result['target_ref']})
+        return _bounded({**result, 'catalog_sha256': frozen['sha256'], 'assigned': rows,
+                         'limitations': limitations, 'source_id': source_id,
+                         'source_ids': [*result['source_ids'], source_id],
+                         'complete': complete, 'next_cursor': token})
 
 
 def read_journal(home, run_id):
-    """Read validated run-scoped exposure and target records."""
+    """Validate issued journal records and live target baselines outside the mutation lock."""
     home = store.home(home)
-    with store.lock(home):
-        return _read_journal_locked(home, run_id)
+    with admission(home):
+        deadline = reviewer._receipt(home, run_id).get('deadline_epoch_ms')
+        with store.lock(home, deadline_epoch_ms=deadline):
+            receipt = reviewer._receipt(home, run_id)
+            if receipt.get('deadline_epoch_ms') != deadline:
+                raise store.Refusal('review run deadline changed')
+            manifest, _ = _manifest_locked(home, receipt)
+            journal = _read_journal_locked(home, run_id)
+        with _validation_scope() as watched:
+            for target in journal['targets'].values():
+                _validate_target_context(home, manifest, target, deadline=deadline)
+            with store.lock(home, deadline_epoch_ms=deadline):
+                _check_watches(watched)
+                current = _read_journal_locked(home, run_id)
+                if current['journal_sha256'] != journal['journal_sha256']:
+                    raise store.Refusal('inspection journal changed during validation')
+        return journal
 
 
 def _read_journal_locked(home, run_id):
-    """Finalization caller must already hold the home mutation lock."""
+    """Read the issued, structurally checked snapshot while the caller holds the lock.
+
+    Native source provenance and live target baselines require independent validation
+    outside this lock before finalization; compare journal_sha256 on reacquisition.
+    """
     receipt = reviewer._receipt(home, run_id)
+    reviewer._check_deadline(receipt.get('deadline_epoch_ms'))
     manifest, _ = _manifest_locked(home, receipt)
     sources = _read_sources(home, receipt)
     cursors = _records(home, run_id, 'cursors')
@@ -1152,7 +1416,7 @@ def _read_journal_locked(home, run_id):
                 (previous is None and provenance.get('start') != 0)):
             raise store.Refusal('inspection page chain invalid')
     for target in targets.values():
-        _validate_target_context(home, manifest, target)
+        _validate_target_context(home, manifest, target, deadline=receipt.get('deadline_epoch_ms'), live=False)
         basis = _basis(home, receipt, target['basis_source_ids'])
         _validate_target_basis(target, basis)
         identity, guard = target['identity'], target['guard']
@@ -1160,7 +1424,7 @@ def _read_journal_locked(home, run_id):
             if not any(row.get('provenance', {}).get('view') == 'target-content' and
                        row['provenance'].get('target_identity_sha256') == reviewer._digest(identity) and
                        row['provenance'].get('version_sha256') == guard['source_sha256']
-                       for row in sources.values()):
+                       for row in basis):
                 raise store.Refusal('target capture proof invalid')
     value = {'schema': 1, 'run_id': run_id, 'manifest_id': receipt['manifest_id'],
              'sources': sources, 'cursors': cursors, 'targets': targets}
