@@ -1416,3 +1416,55 @@ def test_whole_fix_selected_assignment_acquisition_does_not_block_or_publish_sta
                 assert not manifest['coverage']['complete']
         else:
             assert isinstance(result.get('error'), store.Refusal)
+
+
+@pytest.mark.parametrize('expired', ['run', 'freshness'])
+def test_selection_expiring_during_publication_check_preserves_state(monkeypatch, expired):
+    from agd_lib import reviewer_inspection
+    with lab() as (home, _):
+        completed_session(home)
+        selection(home)
+        folders = reviewer.paths(home)
+        schedule = folders['progress'] / 'schedule.json'
+        before_schedule = schedule.read_bytes()
+
+        def publications():
+            return {str(path): path.read_bytes()
+                    for name in ('catalogs', 'selection_details', 'selections')
+                    for path in folders[name].glob('*.json')}
+
+        before = publications()
+        wall, monotonic = [time.time()], [time.monotonic()]
+        deadline = int((wall[0] + 30) * 1000)
+        checking = [False]
+        fingerprint = reviewer_inspection._fingerprint
+        check = reviewer_inspection._check_watches
+
+        def delayed_fingerprint(*args, **kwargs):
+            value = fingerprint(*args, **kwargs)
+            if checking[0]:
+                if expired == 'run':
+                    wall[0] += 60
+                else:
+                    monotonic[0] += 2
+            return value
+
+        def publication_check(*args, **kwargs):
+            checking[0] = True
+            try:
+                return check(*args, **kwargs)
+            finally:
+                checking[0] = False
+
+        with monkeypatch.context() as patch:
+            patch.setattr(time, 'time', lambda: wall[0])
+            patch.setattr(time, 'monotonic', lambda: monotonic[0])
+            patch.setattr(reviewer_inspection, '_fingerprint', delayed_fingerprint)
+            patch.setattr(reviewer_inspection, '_check_watches', publication_check)
+            with pytest.raises(store.Refusal):
+                reviewer.select_manifest(home, cutoff=201, config_snapshot=reviewer.read_config(home),
+                                         deadline_epoch_ms=deadline)
+        assert publications() == before
+        assert schedule.read_bytes() == before_schedule
+        with store.lock(home, deadline_epoch_ms=int((time.time() + 1) * 1000)):
+            assert schedule.read_bytes() == before_schedule

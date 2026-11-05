@@ -140,6 +140,8 @@ The cumulative input limit counts unique admitted manifest, catalog metadata, ta
 
 Selection propagates the frozen deadline to project Git, streamed regular-file artifact hashing and mutation-lock acquisition. Catalog and selected-assignment acquisition occur outside the global mutation lock; relevant snapshots and scheduling state are revalidated before publication, with stale inputs refused. These checks do not promise a kernel-hard deadline for local filesystem operations.
 
+Locked freshness validation checks the run deadline during traversal and has a cooperative one-second ceiling. Large or slow watch sets refuse before publishing a selection or advancing rotation, rather than extending the mutation-lock hold.
+
 ### Run-owned probe workspaces
 
 Use a registered project and an existing local commit for execution-only investigation:

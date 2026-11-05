@@ -21,6 +21,8 @@ from .uninstall_state import admission
 MAX_RESPONSE = 16384
 MAX_RAW = 262144
 PAGE_BYTES = 2000
+# ponytail: cap locked freshness scans at 1s; larger histories need a native change index.
+MAX_WATCH_SECONDS = 1.0
 
 # A capture stages immutable records until its complete response is bounded.
 # The receipt is the native issuance authority; file hashes alone are not.
@@ -182,10 +184,17 @@ def _watch_project_root(path):
         watched[key] = value
 
 
-def _check_watches(watched):
+def _check_watches(watched, *, deadline_epoch_ms=None):
+    reviewer._check_deadline(deadline_epoch_ms)
+    until = time.monotonic() + MAX_WATCH_SECONDS
     for (path, directory), fingerprint in watched.items():
-        if _fingerprint(path, directory=directory) != fingerprint:
+        current = _fingerprint(path, directory=directory)
+        reviewer._check_deadline(deadline_epoch_ms)
+        if time.monotonic() >= until:
+            raise store.Refusal('input freshness validation exceeded its one-second window')
+        if current != fingerprint:
             raise store.Refusal('inspection input changed before publication')
+    reviewer._check_deadline(deadline_epoch_ms)
 
 
 @contextlib.contextmanager
@@ -239,9 +248,7 @@ def _active(home, run_id):
                        ('manifest_id', 'config_snapshot_ref', 'instruction_snapshot_ref')):
                     raise store.Refusal('review run scope changed')
                 _manifest_locked(home, current)
-                for (path, directory), fingerprint in tx['watched'].items():
-                    if _fingerprint(path, directory=directory) != fingerprint:
-                        raise store.Refusal('inspection input changed before publication')
+                _check_watches(tx['watched'], deadline_epoch_ms=deadline)
                 # Read the latest native receipt and journal while holding the lock.
                 _TRANSACTION.reset(token)
                 token = None
@@ -1263,7 +1270,7 @@ def read_target(home, run_id, target_ref):
         with _validation_scope() as watched:
             _validate_target_context(home, manifest, value, deadline=deadline)
             with store.lock(home, deadline_epoch_ms=deadline):
-                _check_watches(watched)
+                _check_watches(watched, deadline_epoch_ms=deadline)
                 current = _read_journal_locked(home, run_id)
                 if current['targets'].get(target_ref) != value or current['manifest_id'] != receipt['manifest_id']:
                     raise store.Refusal('target changed during validation')
@@ -1392,7 +1399,7 @@ def read_journal(home, run_id):
             for target in journal['targets'].values():
                 _validate_target_context(home, manifest, target, deadline=deadline)
             with store.lock(home, deadline_epoch_ms=deadline):
-                _check_watches(watched)
+                _check_watches(watched, deadline_epoch_ms=deadline)
                 current = _read_journal_locked(home, run_id)
                 if current['journal_sha256'] != journal['journal_sha256']:
                     raise store.Refusal('inspection journal changed during validation')

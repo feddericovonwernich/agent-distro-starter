@@ -1320,7 +1320,8 @@ def _select_manifest(home, *, cutoff, config_snapshot, retrospective_review_run_
         from . import reviewer_inspection
         with store.lock(root, deadline_epoch_ms=deadline_epoch_ms):
             _check_deadline(deadline_epoch_ms)
-            reviewer_inspection._check_watches(watched)
+            reviewer_inspection._check_watches(watched, deadline_epoch_ms=deadline_epoch_ms)
+            _check_deadline(deadline_epoch_ms)
             if catalog is not None:
                 publish_immutable(paths(root)['catalogs'] / f"{result['catalog_id']}.json", catalog)
             publish_immutable(paths(root)['selection_details'] / f"{result['details_id']}.json", disclosures)
@@ -1885,7 +1886,7 @@ def _submit_report_v2(home, receipt, request_id, report):
                                ('manifest_id', 'deadline_epoch_ms', 'config_snapshot_ref', 'instruction_snapshot_ref'))):
                     raise store.Refusal('review run changed during report validation')
                 _check_deadline(deadline)
-                inspection._check_watches(watched)
+                inspection._check_watches(watched, deadline_epoch_ms=deadline)
                 if (inspection._read_journal_locked(home, run_id)['journal_sha256'] != journal['journal_sha256']
                         or read_evidence(home, run_id) != evidence):
                     raise store.Refusal('review evidence changed during validation')
