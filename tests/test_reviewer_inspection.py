@@ -1091,8 +1091,13 @@ def test_r1_forged_present_target_and_source_cannot_mint_file_proof():
         assert hook.read_text() == 'actual-owned-version\n'
         with pytest.raises(store.Refusal):
             inspection().read_target(home, run_id, forged_target)
+        journal = inspection().read_journal(home, run_id)
+        assert issued['target_ref'] in journal['targets']
+        assert forged_target not in journal['targets']
+        assert forged_source not in journal['sources']
         with pytest.raises(store.Refusal):
-            inspection().read_journal(home, run_id)
+            target(home, run_id, scope='distro', component='forged-component',
+                   basis_source_ids=(forged_source,))
 
 
 def test_r1_self_addressed_selected_native_source_is_not_exposure():
@@ -1112,9 +1117,13 @@ def test_r1_self_addressed_selected_native_source_is_not_exposure():
         forged['provenance'].update(record_id=source['session_id'] + '-prompt-0',
                                     start=0, end=len(prompt), version_sha256=prompt_hash,
                                     previous_cursor=None, complete=True)
-        _fixture_record(source_dir, forged)
+        forged_id = _fixture_record(source_dir, forged)
+        journal = inspection().read_journal(home, run_id)
+        assert first['source_id'] in journal['sources']
+        assert forged_id not in journal['sources']
         with pytest.raises(store.Refusal):
-            inspection().read_journal(home, run_id)
+            target(home, run_id, scope='distro', component='unexposed-prompt',
+                   basis_source_ids=(forged_id,))
 
 
 def test_r1_evidenced_url_userinfo_is_refused_before_target_receipt():
@@ -1581,9 +1590,12 @@ def test_r1_copied_native_source_is_not_issued_in_another_run():
         copied['run_id'] = second
         copied['manifest_id'] = second_manifest['manifest_id']
         second_dir = reviewer.paths(home)['evidence'] / 'inspection' / second
-        _fixture_record(second_dir, copied)
+        forged_id = _fixture_record(second_dir, copied)
+        journal = inspection().read_journal(home, second)
+        assert forged_id not in journal['sources']
         with pytest.raises(store.Refusal):
-            inspection().read_journal(home, second)
+            target(home, second, scope='distro', component='copied-native-source',
+                   basis_source_ids=(forged_id,))
 
 
 def _inspection_record_bytes(home, run_id):
@@ -1637,3 +1649,216 @@ def test_r1_oversized_historical_skill_envelope_never_commits_an_undelivered_pag
         else:
             bounded(response)
             assert response.get('next_cursor') or response.get('limitations')
+
+
+@pytest.mark.parametrize('interruption', ['sources', 'cursors', 'receipt'])
+def test_r2_interrupted_issuance_preserves_prior_records_and_budget(interruption, monkeypatch):
+    with lab() as (home, _):
+        hooks = home / 'config/hooks'
+        hooks.mkdir(parents=True, exist_ok=True)
+        (hooks / 'prior-hook').write_text('previously admitted target\n')
+        (hooks / 'pending-hook').write_text('PENDING_PAGE_' + 'q' * 5000)
+        source, _, _ = completed_session(home, texts=('previously exposed ' + 'n' * 2500,))
+        run_id, manifest = stage(home)
+        episode = manifest['episodes'][0]
+        prior_page = inspection().inspect(
+            home, run_id, episode['episode_id'], source='native',
+            record_id=source['session_id'] + '-final-0', part='content')
+        assert prior_page['next_cursor']
+        prior_target = target(home, run_id, scope='distro', path='config/hooks/prior-hook')
+        baseline = inspection().read_journal(home, run_id)
+        receipt_path = reviewer.paths(home)['receipts'] / (run_id + '.json')
+        receipt_before = json.loads(receipt_path.read_text())
+        directories = {
+            'sources': reviewer.paths(home)['evidence'] / 'inspection' / run_id,
+            'cursors': reviewer.paths(home)['inspections'] / run_id / 'cursors',
+            'targets': reviewer.paths(home)['inspections'] / run_id / 'targets',
+        }
+        written = {category: [] for category in directories}
+        publish = reviewer.publish_immutable
+        atomic_json = store.atomic_json
+
+        def interrupted_publish(path, value):
+            publish(path, value)
+            path = Path(path)
+            for category, directory in directories.items():
+                if path.parent == directory:
+                    written[category].append(path.stem)
+                    if interruption == category:
+                        raise OSError('injected interruption after immutable publication')
+
+        def interrupted_receipt(path, value):
+            if interruption == 'receipt' and Path(path) == receipt_path:
+                raise OSError('injected interruption before receipt update')
+            return atomic_json(path, value)
+
+        with monkeypatch.context() as fault:
+            fault.setattr(reviewer, 'publish_immutable', interrupted_publish)
+            fault.setattr(store, 'atomic_json', interrupted_receipt)
+            with pytest.raises(OSError):
+                target(home, run_id, scope='distro', path='config/hooks/pending-hook')
+
+        expected = {
+            'sources': {'sources'},
+            'cursors': {'sources', 'cursors'},
+            'receipt': {'sources', 'cursors', 'targets'},
+        }[interruption]
+        assert {category for category, ids in written.items() if ids} == expected
+        assert json.loads(receipt_path.read_text()) == receipt_before
+        for category, ids in written.items():
+            assert all((directories[category] / (ident + '.json')).is_file() for ident in ids)
+
+        # Files written by the interrupted call were never disclosed or issued.
+        journal = inspection().read_journal(home, run_id)
+        assert journal == baseline
+        assert record(home, run_id, prior_target)['target_ref'] == prior_target['target_ref']
+        for category, ids in written.items():
+            assert not set(ids).intersection(journal[category])
+        with pytest.raises(store.Refusal):
+            target(home, run_id, scope='distro', component='undisclosed-source',
+                   basis_source_ids=(written['sources'][0],))
+        if written['cursors']:
+            with pytest.raises(store.Refusal):
+                target(home, run_id, scope='distro', path='config/hooks/pending-hook',
+                       cursor=written['cursors'][0])
+        if written['targets']:
+            with pytest.raises(store.Refusal):
+                inspection().read_target(home, run_id, written['targets'][0])
+
+        # A fresh publication must work without deleting or adopting the orphans.
+        recovered = target(home, run_id, scope='distro', path='config/hooks/pending-hook')
+        assert recovered['text'].startswith('PENDING_PAGE_')
+        assert recovered['next_cursor']
+        assert record(home, run_id, recovered)['guard']['state'] == 'present'
+        journal = inspection().read_journal(home, run_id)
+        for category, ids in written.items():
+            assert not set(ids).intersection(journal[category])
+            assert all((directories[category] / (ident + '.json')).is_file() for ident in ids)
+        assert prior_page['source_id'] in journal['sources']
+        assert prior_page['next_cursor'] in journal['cursors']
+        assert prior_target['target_ref'] in journal['targets']
+        assert recovered['target_ref'] in journal['targets']
+
+        # Spend the exact remaining consumer-visible budget. Orphan bytes do not
+        # count; the next unique supplementary input must then be refused.
+        used = len(json.dumps(manifest, ensure_ascii=False, indent=2).encode()) + manifest['catalog_bytes']
+        used += sum(row['bytes'] for row in journal['sources'].values())
+        used += sum(len(reviewer._json_bytes(row)) for row in journal['targets'].values())
+        remaining = reviewer.read_config(home)['limits']['max_input_bytes'] - used
+        assert remaining > 0
+        full = capture(home, run_id, 'x' * remaining)
+        assert reviewer.read_evidence(home, run_id)['sources'][full]['bytes'] == remaining
+        with pytest.raises(store.Refusal):
+            capture(home, run_id, 'one extra byte')
+
+
+@pytest.mark.parametrize('category', ['sources', 'cursors', 'targets'])
+def test_r2_missing_issued_record_still_refuses(category):
+    with lab() as (home, _):
+        hooks = home / 'config/hooks'
+        hooks.mkdir(parents=True, exist_ok=True)
+        (hooks / 'issued-hook').write_text('issued data ' + 'p' * 5000)
+        completed_session(home)
+        run_id, _ = stage(home)
+        issued = target(home, run_id, scope='distro', path='config/hooks/issued-hook')
+        assert issued['next_cursor']
+        paths = {
+            'sources': (reviewer.paths(home)['evidence'] / 'inspection' / run_id, issued['source_ids'][0]),
+            'cursors': (reviewer.paths(home)['inspections'] / run_id / 'cursors', issued['next_cursor']),
+            'targets': (reviewer.paths(home)['inspections'] / run_id / 'targets', issued['target_ref']),
+        }
+        directory, ident = paths[category]
+        (directory / (ident + '.json')).unlink()
+        with pytest.raises(store.Refusal):
+            inspection().read_journal(home, run_id)
+        with pytest.raises(store.Refusal):
+            inspection().read_target(home, run_id, issued['target_ref'])
+
+
+@pytest.mark.parametrize('collision', ['identical', 'wrong-bytes', 'symlink'])
+def test_r2_interrupted_target_identical_retry_or_unsafe_collision(collision, monkeypatch):
+    with lab() as (home, _):
+        hooks = home / 'config/hooks'
+        hooks.mkdir(parents=True, exist_ok=True)
+        (hooks / 'existing-hook').write_text('previously admitted target\n')
+        source, _, _ = completed_session(home, texts=('previously exposed native answer',))
+        run_id, manifest = stage(home)
+        episode = manifest['episodes'][0]
+        prior_source = inspection().inspect(
+            home, run_id, episode['episode_id'], source='native',
+            record_id=source['session_id'] + '-final-0', part='content')
+        prior_target = target(home, run_id, scope='distro', path='config/hooks/existing-hook')
+        baseline = inspection().read_journal(home, run_id)
+        receipt_path = reviewer.paths(home)['receipts'] / (run_id + '.json')
+        target_dir = reviewer.paths(home)['inspections'] / run_id / 'targets'
+        original_publish = reviewer.publish_immutable
+        original_atomic = store.atomic_json
+        written = []
+
+        # Freeze only after selection and prior issuance, so a newly observed
+        # absence has exactly the same complete record on a subsequent retry.
+        fixed_time = time.time()
+        monkeypatch.setattr(inspection().time, 'time', lambda: fixed_time)
+
+        def record_publication(path, value):
+            original_publish(path, value)
+            path = Path(path)
+            if path.parent == target_dir:
+                written.append(path.stem)
+
+        def interrupt_receipt(path, value):
+            if Path(path) == receipt_path:
+                raise OSError('injected interruption before receipt update')
+            return original_atomic(path, value)
+
+        with monkeypatch.context() as fault:
+            fault.setattr(reviewer, 'publish_immutable', record_publication)
+            fault.setattr(store, 'atomic_json', interrupt_receipt)
+            with pytest.raises(OSError):
+                target(home, run_id, scope='distro', path='config/hooks/new-hook', operation='create')
+
+        assert len(written) == 1
+        orphan_ref = written[0]
+        orphan_path = target_dir / (orphan_ref + '.json')
+        original = orphan_path.read_bytes()
+        assert reviewer._digest(json.loads(original)) == orphan_ref
+        assert not (hooks / 'new-hook').exists()
+        assert inspection().read_journal(home, run_id) == baseline
+        assert record(home, run_id, prior_target)['target_ref'] == prior_target['target_ref']
+        with pytest.raises(store.Refusal):
+            inspection().read_target(home, run_id, orphan_ref)
+
+        if collision == 'identical':
+            # A new request must independently recheck absence, not trust the
+            # unissued file merely because its digest matches.
+            (hooks / 'new-hook').write_text('the formerly absent file now exists')
+            with pytest.raises(store.Refusal):
+                target(home, run_id, scope='distro', path='config/hooks/new-hook', operation='create')
+            (hooks / 'new-hook').unlink()
+            assert inspection().read_journal(home, run_id) == baseline
+            retried = target(home, run_id, scope='distro', path='config/hooks/new-hook', operation='create')
+            assert retried['target_ref'] == orphan_ref
+            assert retried['guard']['state'] == 'absent'
+            assert retried['guard']['observed_at'] == fixed_time
+            assert orphan_path.read_bytes() == original
+            assert record(home, run_id, retried)['target_ref'] == orphan_ref
+            after = inspection().read_journal(home, run_id)
+            assert after['sources'] == baseline['sources']
+            assert after['cursors'] == baseline['cursors']
+            assert set(after['targets']) == set(baseline['targets']) | {orphan_ref}
+            assert prior_source['source_id'] in after['sources']
+            assert prior_target['target_ref'] in after['targets']
+        else:
+            if collision == 'wrong-bytes':
+                orphan_path.write_bytes(b'not the requested immutable record')
+            else:
+                backing = home / 'unsafe-collision-backing.json'
+                backing.write_bytes(original)
+                orphan_path.unlink()
+                orphan_path.symlink_to(backing)
+            with pytest.raises(store.Refusal):
+                target(home, run_id, scope='distro', path='config/hooks/new-hook', operation='create')
+            assert inspection().read_journal(home, run_id) == baseline
+            assert record(home, run_id, prior_target)['target_ref'] == prior_target['target_ref']
+            with pytest.raises(store.Refusal):
+                inspection().read_target(home, run_id, orphan_ref)

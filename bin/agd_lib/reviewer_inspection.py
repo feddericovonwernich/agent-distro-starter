@@ -108,16 +108,14 @@ def _records(home, run_id, category):
     if directory.is_symlink() or not directory.is_dir():
         raise store.Refusal('inspection directory unsafe')
     result = {}
-    for path in sorted(directory.iterdir()):
-        reviewer._hex_id(path.stem)
-        if path.suffix != '.json' or path.is_symlink() or not path.is_file() or path.stem not in expected:
-            raise store.Refusal('inspection record not issued')
+    for ident in sorted(expected):
+        path = directory / (ident + '.json')
+        if path.is_symlink() or not path.is_file():
+            raise store.Refusal('issued inspection record unavailable or unsafe')
         value = _load(path)
-        if not isinstance(value, dict) or reviewer._digest(value) != path.stem:
+        if not isinstance(value, dict) or reviewer._digest(value) != ident:
             raise store.Refusal('inspection record integrity mismatch')
-        result[path.stem] = value
-    if set(result) != expected:
-        raise store.Refusal('issued inspection records unavailable')
+        result[ident] = value
     return result
 
 
@@ -275,7 +273,8 @@ def _save(home, receipt, category, value, *, charge=0):
     tx = _TRANSACTION.get()
     if tx is None or tx['home'] != home or tx['run_id'] != receipt['review_run_id']:
         raise store.Refusal('inspection publication requires an active capture')
-    existing = _records(home, receipt['review_run_id'], category).get(ident)
+    records = _records(home, receipt['review_run_id'], category)
+    existing = records.get(ident)
     if existing is not None:
         if existing != value:
             raise store.Refusal('inspection immutable collision')
