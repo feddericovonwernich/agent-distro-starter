@@ -8,6 +8,7 @@ The trusted request identifies `manifest_id`, `report_schema` (2), `allowed_scop
 
 ```sh
 $AGD_CLI --home "$AGD_HOME" reviewer inspect "$AGD_REVIEW_RUN_ID" --episode EPISODE_ID
+$AGD_CLI --home "$AGD_HOME" reviewer inspect "$AGD_REVIEW_RUN_ID" --episode EPISODE_ID --source native --include-reviewed
 $AGD_CLI --home "$AGD_HOME" reviewer inspect "$AGD_REVIEW_RUN_ID" --episode EPISODE_ID --source native --record MESSAGE_OR_ARTIFACT_ID --part content
 $AGD_CLI --home "$AGD_HOME" reviewer inspect "$AGD_REVIEW_RUN_ID" --episode EPISODE_ID --source langfuse --record OBSERVATION_ID --part output
 $AGD_CLI --home "$AGD_HOME" reviewer inspect "$AGD_REVIEW_RUN_ID" --episode EPISODE_ID --source SOURCE --cursor CURSOR
@@ -17,6 +18,8 @@ $AGD_CLI --home "$AGD_HOME" reviewer inspect "$AGD_REVIEW_RUN_ID" --episode EPIS
 Metadata is the default; details require an explicit source, record and part. Langfuse accepts `input` or `output`, native accepts `content`. Use scoped Langfuse when available and native fallback otherwise. Fetch intent, decisive action/result and outcome/feedback separately; typed native artifact locators are not invented message IDs. Follow bounded cursors only as relevant; preserve ranges, versions and incompleteness. Feedback after cutoff forms a fresh linked basis, not retroactive evidence.
 
 Follow metadata pagination with the returned source (`native` or `langfuse`). A native message row may also return a current-run `resume_cursor` continuing after a prefix exposed in successful runs; use it with that message ID and `--part content`. The cursor itself exposes no content. Omit the cursor to reread from the beginning; never reuse another run's cursor.
+
+Default native metadata, including native fallback, omits fully covered unchanged messages while retaining new or partial material. Full exposure is not a reflected assessment: screened work can remain pending even when its native metadata is empty. Use `--source native --include-reviewed` for bounded discovery of earlier covered context, then explicitly read relevant records to ground reflection. This flag applies only to native metadata, not record details or Langfuse. Follow an expanded-view pagination cursor with `--source native --include-reviewed` again; a default-view cursor cannot be used in the expanded view or vice versa.
 
 Only after a skill hypothesis, inspect the relevant skill/version:
 

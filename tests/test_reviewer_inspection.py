@@ -2929,3 +2929,149 @@ def test_r1_report_v2_destination_collision_selects_unique_evidence_lineage(over
             assert reviewer.report_path(home, report_id).read_bytes() == body
         for revision_hash, body in old_revision_bytes.items():
             assert (reviewer.paths(home)['revisions'] / (revision_hash + '.json')).read_bytes() == body
+
+
+def test_whole_fix_successful_screening_hides_covered_branch_prefix_but_keeps_it_readable():
+    with lab() as (home, _):
+        native, _, _ = completed_session(home, texts=('first outcome', 'second outcome'))
+        first_run, first_manifest = stage(home, cutoff=15)
+        first_id = first_manifest['episodes'][0]['episode_id']
+        prefix_ids = [native['session_id'] + '-prompt-0', native['session_id'] + '-final-0']
+        captures = [inspection().inspect(home, first_run, first_id, source='native',
+                                         record_id=record_id, part='content')
+                    for record_id in prefix_ids]
+        row = {'episode_id': first_id, 'assessment': 'screened',
+               'intent_sources': [captures[0]['source_id']], 'action_sources': [],
+               'outcome_sources': [], 'limitations': []}
+        reviewer.submit_report(home, first_run, str(uuid.uuid4()), report_v2(row))
+        reviewer.finalize_run(home, first_run, 'exited')
+
+        second_run, manifest = stage(home, cutoff=200)
+        by_interaction = {item['interaction_id']: item for item in manifest['episodes']}
+        second_interaction = str(uuid.uuid5(uuid.NAMESPACE_URL, native['session_id'] + '-binding-1'))
+        assert first_id in {item['episode_id'] for item in manifest['episodes']}
+        first_metadata = inspection().inspect(home, second_run, first_id, source='native')
+        assert not [item for item in first_metadata['rows'] if 'message_id' in item]
+        first_expanded = inspection().inspect(home, second_run, first_id, source='native', include_reviewed=True)
+        assert set(prefix_ids) <= {item['message_id'] for item in first_expanded['rows'] if 'message_id' in item}
+        second = by_interaction[second_interaction]
+        metadata = inspection().inspect(home, second_run, second['episode_id'], source='native')
+        ids = {item['message_id'] for item in metadata['rows'] if 'message_id' in item}
+        assert not ids.intersection(prefix_ids)
+        assert native['session_id'] + '-final-1' in ids
+        old = inspection().inspect(home, second_run, second['episode_id'], source='native',
+                                   record_id=prefix_ids[1], part='content')
+        assert old['text'] == 'first outcome'
+
+
+def test_whole_fix_include_reviewed_cli_paginates_and_binds_cursor_view():
+    with lab() as (home, _):
+        native, _ = _wide_native_metadata(home)
+        first_run, first_manifest = stage(home)
+        episode = first_manifest['episodes'][0]
+        old_id = native['session_id'] + '-final-0'
+        captured = inspection().inspect(home, first_run, episode['episode_id'], source='native',
+                                        record_id=old_id, part='content')
+        row = {'episode_id': episode['episode_id'], 'assessment': 'screened',
+               'intent_sources': [captured['source_id']], 'action_sources': [],
+               'outcome_sources': [], 'limitations': []}
+        reviewer.submit_report(home, first_run, str(uuid.uuid4()), report_v2(row))
+        reviewer.finalize_run(home, first_run, 'exited')
+
+        run_id, manifest = stage(home, cutoff=201)
+        selected = next(item for item in manifest['episodes'] if item['episode_id'] == episode['episode_id'])
+        assert selected['progress']['screened'] and not selected['progress']['reflected']
+        base = ['reviewer', 'inspect', run_id, '--episode', episode['episode_id'], '--source', 'native']
+        default_first = command(home, *base)
+        expanded_first = command(home, *base, '--include-reviewed')
+        bounded(default_first)
+        bounded(expanded_first)
+        with pytest.raises(store.Refusal):
+            inspection().inspect(home, run_id, episode['episode_id'], source='auto', include_reviewed=True)
+        assert default_first['next_cursor'] and expanded_first['next_cursor']
+        with pytest.raises(store.Refusal):
+            inspection().inspect(home, run_id, episode['episode_id'], source='native',
+                                 include_reviewed=True, cursor=default_first['next_cursor'])
+        with pytest.raises(store.Refusal):
+            inspection().inspect(home, run_id, episode['episode_id'], source='native',
+                                 cursor=expanded_first['next_cursor'])
+        for kwargs in ({'source': 'langfuse', 'include_reviewed': True},
+                       {'source': 'native', 'record_id': old_id, 'part': 'content',
+                        'include_reviewed': True}):
+            with pytest.raises(store.Refusal):
+                inspection().inspect(home, run_id, episode['episode_id'], **kwargs)
+
+        def all_ids(first, expanded):
+            page, ids = first, set()
+            while True:
+                bounded(page)
+                assert len(page['rows']) <= 20
+                ids.update(item['message_id'] for item in page['rows'] if 'message_id' in item)
+                if not page['next_cursor']:
+                    return ids
+                args = [*base, '--cursor', page['next_cursor']]
+                if expanded:
+                    args.append('--include-reviewed')
+                page = command(home, *args)
+
+        assert old_id not in all_ids(default_first, False)
+        assert old_id in all_ids(expanded_first, True)
+        direct = command(home, *base, '--record', old_id, '--part', 'content')
+        assert direct['text'] == 'bounded final'
+        second_row = {'episode_id': episode['episode_id'], 'assessment': 'screened',
+                      'intent_sources': [default_first['source_id']], 'action_sources': [],
+                      'outcome_sources': [], 'limitations': []}
+        reviewer.submit_report(home, run_id, str(uuid.uuid4()), report_v2(second_row))
+        reviewer.finalize_run(home, run_id, 'exited')
+
+
+@pytest.mark.parametrize('outcome', ['partial', 'failed'])
+def test_whole_fix_successive_branch_keeps_partial_and_failed_material_visible(outcome):
+    with lab() as (home, _):
+        native, path, _ = completed_session(home, texts=('first outcome', 'second outcome'))
+        prompt_id = native['session_id'] + '-prompt-0'
+        final_id = native['session_id'] + '-final-0'
+        text = 'first interaction long prompt α ' * 500
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        next(row for row in rows if row.get('id') == prompt_id)['message']['content'] = text
+        path.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+        first_run, first_manifest = stage(home, cutoff=15)
+        first = first_manifest['episodes'][0]
+        prefix = inspection().inspect(home, first_run, first['episode_id'], source='native',
+                                      record_id=prompt_id, part='content')
+        assert prefix['next_cursor'] and prefix['range']['end'] < len(text.encode())
+        final = inspection().inspect(home, first_run, first['episode_id'], source='native',
+                                     record_id=final_id, part='content')
+        if outcome == 'partial':
+            row = {'episode_id': first['episode_id'], 'assessment': 'screened',
+                   'intent_sources': [prefix['source_id']], 'action_sources': [],
+                   'outcome_sources': [], 'limitations': []}
+            reviewer.submit_report(home, first_run, str(uuid.uuid4()), report_v2(row))
+            reviewer.finalize_run(home, first_run, 'exited')
+        else:
+            reviewer.close_run(home, first_run, 'failed')
+
+        run_id, manifest = stage(home, cutoff=200)
+        assert first['episode_id'] in {item['episode_id'] for item in manifest['episodes']}
+        next_interaction = str(uuid.uuid5(uuid.NAMESPACE_URL, native['session_id'] + '-binding-1'))
+        second = next(item for item in manifest['episodes'] if item['interaction_id'] == next_interaction)
+        metadata = inspection().inspect(home, run_id, second['episode_id'], source='native')
+        ids = {item['message_id'] for item in metadata['rows'] if 'message_id' in item}
+        assert prompt_id in ids
+        assert native['session_id'] + '-final-1' in ids
+        assert (final_id in ids) == (outcome == 'failed')
+        same_episode_meta = inspection().inspect(home, run_id, first['episode_id'], source='native')
+        prompt = next(item for item in same_episode_meta['rows'] if item.get('message_id') == prompt_id)
+        if outcome == 'partial':
+            assert prompt.get('resume_cursor')
+            resumed = inspection().inspect(home, run_id, first['episode_id'], source='native',
+                                           record_id=prompt_id, part='content', cursor=prompt['resume_cursor'])
+            assert resumed['range']['start'] == prefix['range']['end']
+        else:
+            assert not prompt.get('resume_cursor')
+            reread = inspection().inspect(home, run_id, first['episode_id'], source='native',
+                                          record_id=prompt_id, part='content')
+            assert reread['range']['start'] == 0
+        with pytest.raises(store.Refusal):
+            inspection().inspect(home, run_id, first['episode_id'], source='native',
+                                 record_id=prompt_id, part='content', cursor=prefix['next_cursor'])

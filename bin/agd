@@ -190,6 +190,7 @@ def parser():
     inspect_p.add_argument('--record')
     inspect_p.add_argument('--part', choices=('content', 'input', 'output'))
     inspect_p.add_argument('--cursor')
+    inspect_p.add_argument('--include-reviewed', action='store_true')
     reviewer_skills = reviewer_p.add_parser('skills').add_subparsers(dest='reviewer_skills_op', required=True)
     for action in ('list', 'show'):
         op = reviewer_skills.add_parser(action)
@@ -543,7 +544,8 @@ def _dispatch(args, home, fresh):
         if args.reviewer_op == 'inspect':
             from agd_lib import reviewer_inspection
             return reviewer_inspection.inspect(home, args.review_run_id, args.episode, source=args.source,
-                                               record_id=args.record, part=args.part, cursor=args.cursor)
+                                               record_id=args.record, part=args.part, cursor=args.cursor,
+                                               include_reviewed=args.include_reviewed)
         if args.reviewer_op == 'skills':
             from agd_lib import reviewer_inspection
             if args.reviewer_skills_op == 'list':

@@ -1,7 +1,11 @@
 import hashlib
+import builtins
+import io
 import os
 import json
 import sys
+import subprocess
+import threading
 import time
 import uuid
 import resource
@@ -182,6 +186,111 @@ def test_legacy_reviewed_packet_migrates_only_matching_source_scope():
                  'task_id': task['id'], 'incarnation': task['incarnation']}
         assert reviewer._material_id(scope, row) in reviewer._reviewed_material(home, scope)
         assert reviewer._legacy_material_id(row) not in reviewer._reviewed_material(home, scope)
+
+
+
+def test_whole_fix_unchanged_legacy_packet_is_no_work_but_explicit_detail_reopens():
+    with lab() as (home, _):
+        source, native, _ = completed_session(home, texts=('legacy answer',))
+        initial = selection(home)['episodes'][0]
+        source_id, followup = 'c' * 64, 'e' * 64
+        packet = {'schema': 1, 'purpose': 'background-skill-review', 'cutoff': 200,
+                  'episodes': [], 'sources': [{'kind': 'native-jsonl', 'role': 'central',
+                  'session_id': source['session_id'], 'path': str(native.relative_to(home)),
+                  'byte_watermark': 1, 'content_sha256': 'a' * 64, 'material_sha256': 'b' * 64,
+                  'source_id': source_id}],
+                  'excerpts': [{'source_id': source_id, 'message_id': source['session_id'] + '-prompt-0',
+                                'text': 'prompt', 'line_start': 2, 'line_end': 2,
+                                'byte_start': 0, 'byte_end': 1, 'excerpt_id': 'd' * 64},
+                               {'source_id': source_id, 'message_id': source['session_id'] + '-final-0',
+                                'text': 'legacy answer', 'line_start': 3, 'line_end': 3,
+                                'byte_start': 1, 'byte_end': 2, 'excerpt_id': '1' * 64}],
+                  'catalog': [], 'skill_provenance': [], 'coverage': {'followup_id': followup},
+                  'retrospective_review_run_ids': [], 'retrospective_episodes': [],
+                  'config_snapshot_sha256': 'f' * 64}
+        packet_id = reviewer._digest(packet)
+        packet_path = reviewer.paths(home)['packets'] / f'{packet_id}.json'
+        reviewer.publish_immutable(packet_path, packet)
+        store.atomic_json(reviewer.paths(home)['followups'] / f'{followup}.json',
+                          {'schema': 1, 'material_basis': followup, 'state': 'reviewed', 'candidates': []})
+        store.atomic_json(reviewer.paths(home)['checkpoints'] / 'legacy.json',
+                          {'scope': {}, 'packet_id': packet_id, 'material_basis': followup})
+        before = packet_path.read_bytes()
+        assert selection(home, cutoff=201)['episodes'] == []
+        assert packet_path.read_bytes() == before
+        detail = selection(home, cutoff=202, detail=(initial['episode_id'],))
+        reopened = detail['episodes'][0]
+        assert reopened['episode_id'] == initial['episode_id']
+        assert not reopened['progress']['reflected']
+        rows = [json.loads(line) for line in native.read_text().splitlines()]
+        next(row for row in rows if row.get('id') == source['session_id'] + '-prompt-0')['message']['content'] = 'new prompt'
+        native.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+        changed = selection(home, cutoff=203)['episodes'][0]
+        assert changed['episode_id'] == initial['episode_id']
+        assert changed['basis'] != initial['basis']
+        assert not changed['progress']['reflected']
+        assert packet_path.read_bytes() == before
+
+
+def test_whole_fix_legacy_worker_unproved_artifacts_and_new_feedback_remain_actionable():
+    with lab() as (home, _):
+        source, native, task = completed_session(home, role='worker', task_id='legacy-context',
+                                                 texts=('legacy outcome',), alive=True)
+        cutoff = time.time() + 100
+        old = next(item for item in selection(home, cutoff=cutoff)['episodes']
+                   if item.get('task_id') == task['id'])
+        source_id, followup = 'c' * 64, 'e' * 64
+        packet = {'schema': 1, 'purpose': 'background-skill-review', 'cutoff': cutoff,
+                  'episodes': [{'task_id': task['id'], 'incarnation': task['incarnation']}],
+                  'sources': [{'kind': 'native-jsonl', 'task_id': task['id'],
+                               'incarnation': task['incarnation'], 'session_id': source['session_id'],
+                               'path': str(native.relative_to(home)), 'byte_watermark': 1,
+                               'content_sha256': 'a' * 64, 'material_sha256': 'b' * 64,
+                               'source_id': source_id}],
+                  'excerpts': [{'source_id': source_id, 'message_id': source['session_id'] + '-prompt-0',
+                                'text': 'prompt', 'line_start': 2, 'line_end': 2,
+                                'byte_start': 0, 'byte_end': 1, 'excerpt_id': 'd' * 64},
+                               {'source_id': source_id, 'message_id': source['session_id'] + '-final-0',
+                                'text': 'legacy outcome', 'line_start': 3, 'line_end': 3,
+                                'byte_start': 1, 'byte_end': 2, 'excerpt_id': 'f' * 64}],
+                  'catalog': [], 'skill_provenance': [], 'coverage': {'followup_id': followup},
+                  'retrospective_review_run_ids': [], 'retrospective_episodes': [],
+                  'config_snapshot_sha256': '0' * 64}
+        packet_id = reviewer._digest(packet)
+        packet_path = reviewer.paths(home)['packets'] / f'{packet_id}.json'
+        reviewer.publish_immutable(packet_path, packet)
+        store.atomic_json(reviewer.paths(home)['followups'] / f'{followup}.json',
+                          {'schema': 1, 'material_basis': followup, 'state': 'reviewed', 'candidates': []})
+        store.atomic_json(reviewer.paths(home)['checkpoints'] / 'legacy.json',
+                          {'scope': {}, 'packet_id': packet_id, 'material_basis': followup})
+        history = packet_path.read_bytes()
+        scope = reviewer._source_scope(home, {'role': 'worker', 'session_id': source['session_id'],
+                                              'task_id': task['id'], 'incarnation': task['incarnation']})
+        for record_id, text in ((source['session_id'] + '-prompt-0', 'prompt'),
+                                (source['session_id'] + '-final-0', 'legacy outcome')):
+            assert reviewer._material_id(scope, {'message_id': record_id, 'text': text}) in reviewer._reviewed_material(home, scope)
+        unproved = selection(home, cutoff=cutoff + 1)
+        selected = next(item for item in unproved['episodes'] if item['episode_id'] == old['episode_id'])
+        assert not selected['progress']['reflected']
+        assert selected['limitations'] or not unproved['coverage']['complete']
+        brief = tasks.task_file(home, task['id']).parent / 'brief.md'
+        brief.write_text('New intent not proved by the legacy packet.\n')
+        changed = selection(home, cutoff=cutoff + 2)
+        changed_episode = next(item for item in changed['episodes'] if item['episode_id'] == old['episode_id'])
+        assert changed_episode['basis'] != selected['basis']
+        question = brief.parent / 'question.txt'
+        question.write_text('Which?\n')
+        workers.event(home, task['id'], task['incarnation'], 'decision', 'choice', question)
+        supervision.reconcile(home)
+        answer = brief.parent / 'answer.txt'
+        answer.write_text('New linked feedback.\n')
+        supervision.resolve(home, task['id'], 'choice', answer)
+        feedback = selection(home, cutoff=cutoff + 3)
+        feedback_episode = next(item for item in feedback['episodes'] if item['episode_id'] == old['episode_id'])
+        assert feedback_episode['basis'] != changed_episode['basis']
+        assert not feedback_episode['progress']['reflected']
+        assert packet_path.read_bytes() == history
+
 
 def test_retrospective_includes_committed_finalized_report():
     with lab() as (home, _):
@@ -1014,3 +1123,296 @@ def test_historical_assigned_catalog_does_not_exhaust_current_budget():
         record_assessment(home, selected['episodes'][0], 'reflected')
         no_work = reviewer.select_manifest(home, cutoff=202, config_snapshot=config)
         assert no_work['episodes'] == []
+
+
+def test_whole_fix_selection_git_deadline_reaps_child(monkeypatch):
+    with lab() as (home, _):
+        completed_session(home, role='worker', task_id='deadline-git', alive=True)
+        tools = home / 'deadline-bin'
+        tools.mkdir()
+        git = tools / 'git'
+        pid_file = home / 'selection-git.pid'
+        git.write_text('#!/usr/bin/python3\nimport os, time\n'
+                       'open(os.environ["SELECTION_GIT_PID"], "w").write(str(os.getpid()))\n'
+                       'time.sleep(10)\n')
+        git.chmod(0o755)
+        monkeypatch.setenv('SELECTION_GIT_PID', str(pid_file))
+        monkeypatch.setenv('PATH', str(tools) + os.pathsep + os.environ.get('PATH', '/usr/bin:/bin'))
+        started = time.monotonic()
+        with pytest.raises(store.Refusal):
+            reviewer.select_manifest(home, cutoff=200, config_snapshot=reviewer.read_config(home),
+                                     deadline_epoch_ms=int((time.time() + 1) * 1000))
+        assert time.monotonic() - started < 4
+        pid = int(pid_file.read_text())
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+
+
+def test_whole_fix_selection_lock_wait_obeys_deadline():
+    with lab() as (home, _):
+        completed_session(home)
+        bin_path = str(Path(__file__).resolve().parents[1] / 'bin')
+        program = ('import sys\nfrom pathlib import Path\n'
+                   f'sys.path.insert(0, {bin_path!r})\nfrom agd_lib import store\n'
+                   'with store.lock(Path(sys.argv[1])):\n'
+                   ' print("locked", flush=True)\n sys.stdin.read()\n')
+        holder = subprocess.Popen([sys.executable, '-c', program, str(home)],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        result = {}
+        def select():
+            try:
+                reviewer.select_manifest(home, cutoff=200, config_snapshot=reviewer.read_config(home),
+                                         deadline_epoch_ms=int((time.time() + 1) * 1000))
+            except Exception as error:
+                result['error'] = error
+        selector = threading.Thread(target=select)
+        try:
+            assert holder.stdout.readline().strip() == 'locked'
+            selector.start()
+            selector.join(4)
+            timely = not selector.is_alive()
+        finally:
+            holder.stdin.close()
+            holder.wait(timeout=5)
+            holder.stdout.close()
+            holder.stderr.close()
+            if selector.ident is not None:
+                selector.join(5)
+        assert timely, 'selection waited beyond its deadline'
+        assert not selector.is_alive()
+        assert isinstance(result.get('error'), store.Refusal)
+
+
+def test_whole_fix_catalog_acquisition_does_not_block_mutation_or_publish_stale_progress(monkeypatch):
+    with lab() as (home, _):
+        completed_session(home)
+        episode = selection(home)['episodes'][0]
+        entered, release = threading.Event(), threading.Event()
+        original = reviewer._selection_catalog
+        result = {}
+
+        def paused(*args, **kwargs):
+            entered.set()
+            assert release.wait(5)
+            return original(*args, **kwargs)
+
+        def select():
+            try:
+                result['manifest'] = selection(home, cutoff=201)
+            except Exception as error:
+                result['error'] = error
+
+        def mutate():
+            try:
+                record_assessment(home, episode, 'reflected')
+                result['mutated'] = True
+            except Exception as error:
+                result['mutation_error'] = error
+
+        monkeypatch.setattr(reviewer, '_selection_catalog', paused)
+        selector = threading.Thread(target=select)
+        mutator = threading.Thread(target=mutate)
+        selector.start()
+        try:
+            assert entered.wait(5)
+            mutator.start()
+            mutator.join(2)
+            assert not mutator.is_alive(), 'catalog acquisition held the mutation lock'
+            assert result.get('mutated'), result
+        finally:
+            release.set()
+            selector.join(10)
+            if mutator.ident is not None:
+                mutator.join(10)
+        assert not selector.is_alive()
+        assert not mutator.is_alive()
+        if 'manifest' in result:
+            assert episode['episode_id'] not in {item['episode_id'] for item in result['manifest']['episodes']}
+        else:
+            assert isinstance(result.get('error'), store.Refusal)
+
+
+def test_whole_fix_selection_artifact_scan_stops_at_deadline_without_whole_file_read(monkeypatch):
+    with lab() as (home, _):
+        _, _, task = completed_session(home, role='worker', task_id='deadline-artifact', alive=True)
+        brief = tasks.task_file(home, task['id']).parent / 'brief.md'
+        brief.write_bytes(b'x' * (4 * 1024 * 1024))
+        identity = brief.stat()
+        entered, release = threading.Event(), threading.Event()
+        result, observed = {}, {'bytes': 0}
+        original_fdopen, original_read = os.fdopen, os.read
+        original_open, original_io_open = builtins.open, io.open
+
+        def is_brief(fd):
+            try:
+                current = os.fstat(fd)
+                return (current.st_dev, current.st_ino) == (identity.st_dev, identity.st_ino)
+            except OSError:
+                return False
+
+        def account(data):
+            observed['bytes'] += len(data)
+            if data and not entered.is_set():
+                entered.set()
+                assert release.wait(10)
+            return data
+
+        class ObservedStream:
+            def __init__(self, stream):
+                self.stream = stream
+            def __enter__(self):
+                self.stream.__enter__()
+                return self
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+            def read(self, *args, **kwargs):
+                return account(self.stream.read(*args, **kwargs))
+
+        def wrap(stream):
+            if isinstance(stream, ObservedStream):
+                return stream
+            try:
+                selected = is_brief(stream.fileno()) and 'b' in stream.mode
+            except (OSError, ValueError, AttributeError):
+                selected = False
+            return ObservedStream(stream) if selected else stream
+
+        def fdopen(fd, *args, **kwargs):
+            return wrap(original_fdopen(fd, *args, **kwargs))
+
+        def builtin_open(*args, **kwargs):
+            return wrap(original_open(*args, **kwargs))
+
+        def io_open(*args, **kwargs):
+            return wrap(original_io_open(*args, **kwargs))
+
+        def read(fd, size):
+            data = original_read(fd, size)
+            return account(data) if is_brief(fd) else data
+
+        def select():
+            try:
+                result['manifest'] = reviewer.select_manifest(
+                    home, cutoff=200, config_snapshot=config, deadline_epoch_ms=deadline)
+            except Exception as error:
+                result['error'] = error
+
+        config = reviewer.read_config(home)
+        deadline = int((time.time() + 4) * 1000)
+        monkeypatch.setattr(os, 'fdopen', fdopen)
+        monkeypatch.setattr(os, 'read', read)
+        monkeypatch.setattr(builtins, 'open', builtin_open)
+        monkeypatch.setattr(io, 'open', io_open)
+        selector = threading.Thread(target=select)
+        selector.start()
+        try:
+            assert entered.wait(8), 'artifact scan did not reach the controlled read'
+            threading.Event().wait(max(0, deadline / 1000 - time.time()) + 0.05)
+        finally:
+            release.set()
+            selector.join(10)
+        assert not selector.is_alive()
+        assert isinstance(result.get('error'), store.Refusal)
+        assert 0 < observed['bytes'] < identity.st_size
+
+
+def test_whole_fix_selection_refuses_fifo_artifact_without_waiting():
+    with lab() as (home, _):
+        _, _, task = completed_session(home, role='worker', task_id='fifo-artifact', alive=True)
+        brief = tasks.task_file(home, task['id']).parent / 'brief.md'
+        brief.unlink()
+        os.mkfifo(brief)
+        bin_path = str(Path(__file__).resolve().parents[1] / 'bin')
+        program = ('import json, sys, time\nfrom pathlib import Path\n'
+                   f'sys.path.insert(0, {bin_path!r})\nfrom agd_lib import reviewer, store\n'
+                   'home = Path(sys.argv[1])\n'
+                   'try:\n'
+                   ' result = reviewer.select_manifest(home, cutoff=200, config_snapshot=reviewer.read_config(home),'
+                   ' deadline_epoch_ms=int((time.time()+1)*1000))\n'
+                   ' print(json.dumps(result))\n'
+                   'except store.Refusal:\n print("refused")\n')
+        child = subprocess.Popen([sys.executable, '-c', program, str(home)],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            try:
+                stdout, stderr = child.communicate(timeout=4)
+            except subprocess.TimeoutExpired:
+                pytest.fail('selection blocked opening a nonregular artifact')
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate(timeout=5)
+        assert child.returncode == 0, stderr
+        if stdout.strip() != 'refused':
+            selected = json.loads(stdout)
+            assert not selected['coverage']['complete']
+            assert all(locator.get('kind') != 'intent' for episode in selected['episodes']
+                       for locator in episode['locators'])
+
+
+def test_whole_fix_selected_assignment_acquisition_does_not_block_or_publish_stale_snapshot(monkeypatch):
+    with lab() as (home, _):
+        _, _, task = completed_session(home, role='worker', task_id='assignment-race', alive=True)
+        task_dir = tasks.task_file(home, task['id']).parent
+        assigned = worker_skills._manifest(home, task)['skills'][0]
+        skill = Path(assigned['snapshot']) / 'SKILL.md'
+        old_hash = hashlib.sha256(skill.read_bytes()).hexdigest()
+        entered, release = threading.Event(), threading.Event()
+        original = reviewer._manifest
+        baseline = original(home, task_dir, task, {'complete': True, 'unavailable': [], 'withheld': []})
+        assert any(row['snapshot_sha256'] == old_hash for row in baseline)
+        result = {}
+
+        def paused(*args, **kwargs):
+            value = original(*args, **kwargs)
+            if args[2]['id'] == task['id']:
+                entered.set()
+                assert release.wait(5)
+            return value
+
+        def select():
+            try:
+                result['manifest'] = selection(home)
+            except Exception as error:
+                result['error'] = error
+
+        def mutate():
+            try:
+                with store.lock(home):
+                    skill.write_text(skill.read_text() + '\nchanged assignment snapshot\n')
+                result['mutated'] = True
+            except Exception as error:
+                result['mutation_error'] = error
+
+        monkeypatch.setattr(reviewer, '_manifest', paused)
+        selector = threading.Thread(target=select)
+        mutator = threading.Thread(target=mutate)
+        selector.start()
+        try:
+            assert entered.wait(5), 'selected assignment was not acquired'
+            mutator.start()
+            mutator.join(2)
+            assert not mutator.is_alive(), 'assignment acquisition held the mutation lock'
+            assert result.get('mutated'), result
+        finally:
+            release.set()
+            selector.join(10)
+            if mutator.ident is not None:
+                mutator.join(10)
+        assert not selector.is_alive() and not mutator.is_alive()
+        if 'manifest' in result:
+            manifest = result['manifest']
+            if manifest['catalog_id']:
+                catalog = json.loads((reviewer.paths(home)['catalogs'] /
+                                      (manifest['catalog_id'] + '.json')).read_text())
+                rows = [row for group in catalog['assigned'] if group['task_id'] == task['id']
+                        for row in group['skills']]
+                assert all(row['snapshot_sha256'] != old_hash for row in rows)
+                if not rows:
+                    assert not manifest['coverage']['complete']
+            else:
+                assert not manifest['coverage']['complete']
+        else:
+            assert isinstance(result.get('error'), store.Refusal)

@@ -86,6 +86,8 @@ Use `reviewer status`, `reviewer reports list|show ID`, and `reviewer proposals 
 
 Evidence is bounded by a proved **final response**, not process or task lifetime. Screening, reflected assessment and full material coverage are distinct: exposed bytes do not prove understanding, and missing grounding remains a limited hold. An operator can request a bounded detail pass with `reviewer run --detail-episode EPISODE_ID`; it does not bypass selection policy. Only successful finalization advances eligible coverage.
 
+Default native metadata omits fully covered unchanged messages, while screened-but-unreflected work remains eligible. An active run can use `reviewer inspect RUN_ID --episode EPISODE_ID --source native --include-reviewed` for bounded discovery of covered context and explicitly reread a record. Unchanged native-only legacy scope is deduplicated only when retained successful packet evidence proves consumption; unproved worker intent or feedback can require a conservative one-time reflection.
+
 Run-owned supplementary evidence can be captured with `reviewer evidence add RUN_ID --file PATH --label LABEL`; it does not establish native coverage or ownership. Manifest, target, and capture bytes share a cumulative input bound; this is not a model-token or cost cap. Project-specific changes target the registered project; transferable distro guidance must exclude private project details while retaining authorized evidence citations. Target guards distinguish selected project revisions from current distro observations. External or unknown authority does not imply a writable local target.
 
 For execution-only investigation of a registered project, allocate a run-owned probe from an existing local commit:

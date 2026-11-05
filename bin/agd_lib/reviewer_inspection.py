@@ -472,6 +472,17 @@ def _locators(home, manifest, episode):
     return result
 
 
+def _metadata_projection(home, episode, meta, include_reviewed):
+    detail = reviewer._read_selection_detail(home, episode['locators_id'], 'locators')
+    if detail.get('episode_id') != episode['episode_id'] or detail.get('basis') != episode['basis']:
+        raise store.Refusal('selection locator identity mismatch')
+    reviewed = detail.get('reviewed_message_ids', [])
+    if not isinstance(reviewed, list) or any(not isinstance(item, str) for item in reviewed):
+        raise store.Refusal('selection material inventory invalid')
+    covered = set(reviewed)
+    return [item for item in meta['projection'] if include_reviewed or item['message_id'] not in covered]
+
+
 def _safe_home_file(home, relative):
     if not isinstance(relative, str):
         raise store.Refusal('invalid owned path')
@@ -753,9 +764,11 @@ def _telemetry_metadata(home, receipt, episode, window, env, cursor, projection_
                      'complete': token is None, 'next_cursor': token})
 
 
-def inspect(home, run_id, episode_id, *, source='auto', record_id=None, part=None, cursor=None):
+def inspect(home, run_id, episode_id, *, source='auto', record_id=None, part=None, cursor=None, include_reviewed=False):
     if source not in ('auto', 'native', 'langfuse'):
         raise store.Refusal('invalid inspection source')
+    if type(include_reviewed) is not bool or (include_reviewed and (source != 'native' or record_id is not None or part is not None)):
+        raise store.Refusal('include-reviewed requires native metadata')
     if (record_id is None and part is not None) or (record_id is not None and
             (source == 'auto' or part not in (('content',) if source == 'native' else ('input', 'output')))):
         raise store.Refusal('invalid inspection detail')
@@ -809,7 +822,8 @@ def inspect(home, run_id, episode_id, *, source='auto', record_id=None, part=Non
                 reviewer._check_deadline(receipt['deadline_epoch_ms'])
                 limitation = str(error)
         if record_id is None:
-            identity = {'view': 'native-metadata', 'episode_id': episode_id, 'version_sha256': meta['material_sha256']}
+            identity = {'view': 'native-metadata', 'episode_id': episode_id,
+                        'version_sha256': meta['material_sha256'], 'include_reviewed': include_reviewed}
             offset = _resume(home, receipt, cursor, identity)
             artifacts = [{key: item[key] for key in ('kind', 'sha256', 'size') if key in item}
                          for item in locators if item.get('kind') != 'native' and 'sha256' in item]
@@ -818,7 +832,7 @@ def inspect(home, run_id, episode_id, *, source='auto', record_id=None, part=Non
             progress = reviewer._episode_progress(home, episode_id, episode['basis'])
             items = []
             resume_offsets = {}
-            for item in meta['projection']:
+            for item in _metadata_projection(home, episode, meta, include_reviewed):
                 prefix = reviewer._covered_prefix(progress['ranges'], item['message_id'], item['text_sha256'])
                 sizes = {row.get('size') for row in progress['ranges']
                          if row.get('message_id') == item['message_id']

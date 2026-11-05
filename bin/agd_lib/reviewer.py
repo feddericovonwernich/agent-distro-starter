@@ -161,7 +161,7 @@ def _coverage(coverage, bucket, value): coverage['complete'] = False; coverage[b
 
 
 def _read_regular_bytes(path, *, require_current_uid=False):
-    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
     with os.fdopen(fd, 'rb') as stream:
         identity = os.fstat(stream.fileno())
         if not stat.S_ISREG(identity.st_mode) or (require_current_uid and identity.st_uid != os.getuid()):
@@ -419,11 +419,13 @@ def _check_deadline(deadline_epoch_ms):
 def _observation_candidates(home, cutoff, coverage, deadline_epoch_ms=None):
     result = []; home = store.home(home)
     _check_deadline(deadline_epoch_ms)
+    _selection_watch(home, home / 'data' / 'tasks')
     root = observability._existing_private_directory(home, 'data', 'tasks')
     if root is None: return result
     for directory in sorted(root.iterdir()):
         _check_deadline(deadline_epoch_ms)
         task_file = directory / 'task.json'
+        _selection_watch(home, task_file)
         try:
             if observability._existing_private_directory(home, 'data', 'tasks', directory.name) != directory:
                 raise ValueError('unsafe task directory')
@@ -432,9 +434,11 @@ def _observation_candidates(home, cutoff, coverage, deadline_epoch_ms=None):
             task_id = store.validate_id(task.get('id'))
             if task_id != directory.name: raise ValueError('task directory mismatch')
             observations = directory / 'observations'
+            _selection_watch(home, observations)
             if observations.exists() and (observations.is_symlink() or not observations.is_dir()): raise ValueError('unsafe observations')
             for path in sorted(observations.glob('*.json')) if observations.exists() else ():
                 _check_deadline(deadline_epoch_ms)
+                _selection_watch(home, path)
                 try:
                     event = _read_json(path)
                     _check_deadline(deadline_epoch_ms)
@@ -467,9 +471,25 @@ def _fixed_session(root, task_id, incarnation, binding):
 
 
 
+def _selection_watch(home, path):
+    from . import reviewer_inspection
+    path = Path(path)
+    if path.is_relative_to(home):
+        reviewer_inspection._watch(home, path)
+        return
+    watched = reviewer_inspection._VALIDATION_WATCHES.get()
+    if watched is not None:
+        key = (path, False)
+        current = reviewer_inspection._fingerprint(path)
+        if key in watched and watched[key] != current:
+            raise store.Refusal('selection input changed')
+        watched[key] = current
+
+
 def _manifest(home, task_dir, task, coverage, deadline_epoch_ms=None):
     _check_deadline(deadline_epoch_ms)
     path = task_dir / 'worker-skills.json'
+    _selection_watch(home, path)
     if not path.exists(): return []
     try:
         manifest = worker_skills._manifest(home, task)
@@ -477,6 +497,7 @@ def _manifest(home, task_dir, task, coverage, deadline_epoch_ms=None):
         for item in manifest['skills']:
             _check_deadline(deadline_epoch_ms)
             snap = Path(item['snapshot'])
+            _selection_watch(home, snap / 'SKILL.md')
             raw = (snap / 'SKILL.md').read_bytes()
             _check_deadline(deadline_epoch_ms)
             result.append({'id': item['id'], 'snapshot_sha256': hashlib.sha256(raw).hexdigest(),
@@ -529,7 +550,9 @@ def _reviewed_material(home, scope):
     candidate_id = _source_candidate_id(scope)
     reviewed = set()
     followups = paths(root)['followups']
+    _selection_watch(root, followups)
     for path in sorted(followups.glob('*.json')) if followups.exists() else ():
+        _selection_watch(root, path)
         try:
             state = _read_json(path)
         except (OSError, ValueError, json.JSONDecodeError):
@@ -542,6 +565,7 @@ def _reviewed_material(home, scope):
             reviewed.update(candidate.get('material_ids', ()))
             reviewed.update(candidate.get('excerpt_ids', ()))
     candidate_path = paths(root)['candidates'] / f'{candidate_id}.json'
+    _selection_watch(root, candidate_path)
     if candidate_path.exists():
         try:
             state = _read_json(candidate_path)
@@ -552,11 +576,16 @@ def _reviewed_material(home, scope):
             reviewed.update(state.get('reviewed_excerpt_ids', ()))
     # Old packets did not persist semantic IDs. Rebuild them from retained packet rows.
     checkpoints = paths(root)['checkpoints']
+    _selection_watch(root, checkpoints)
     for checkpoint in sorted(checkpoints.glob('*.json')) if checkpoints.exists() else ():
+        _selection_watch(root, checkpoint)
         try:
             saved = _read_json(checkpoint)
+            _selection_watch(root, paths(root)['packets'] / f"{saved.get('packet_id')}.json")
             packet = read_packet(root, saved.get('packet_id'))
             followup = packet.get('coverage', {}).get('followup_id')
+            if followup:
+                _selection_watch(root, followups / f'{followup}.json')
             if followup and material_state(root, followup).get('state') != 'reviewed':
                 continue
         except (OSError, ValueError, json.JSONDecodeError, store.Refusal):
@@ -574,10 +603,39 @@ def _reviewed_material(home, scope):
     return reviewed
 
 
+def _legacy_consumed_material(home, scope):
+    """Retained successful packet evidence, separate from schema-2 material state."""
+    root = store.home(home)
+    reviewed = set()
+    checkpoints = paths(root)['checkpoints']
+    for checkpoint in sorted(checkpoints.glob('*.json')) if checkpoints.exists() else ():
+        try:
+            packet = read_packet(root, _read_json(checkpoint).get('packet_id'))
+            followup = packet.get('coverage', {}).get('followup_id')
+            if packet.get('schema') != 1 or not followup or material_state(root, followup).get('state') != 'reviewed':
+                continue
+            source_ids = {source['source_id'] for source in packet.get('sources', ())
+                          if source.get('kind') == 'native-jsonl' and _source_scope(root, source) == scope}
+            for row in packet.get('excerpts', ()):
+                if row.get('source_id') in source_ids:
+                    reviewed.add(row['material_id'] if isinstance(row.get('material_id'), str)
+                                 else _material_id(scope, row))
+        except (OSError, ValueError, KeyError, TypeError, store.Refusal):
+            continue
+    return reviewed
+
+
 
 
 
 def _completion_candidates(root, cutoff, coverage, deadline_epoch_ms=None):
+    episode_paths = reviewer_episodes._episode_paths(root)
+    _selection_watch(root, episode_paths['sources'])
+    _selection_watch(root, episode_paths['completions'])
+    if episode_paths['sources'].exists():
+        for source_path in episode_paths['sources'].glob('*.json'):
+            _selection_watch(root, source_path)
+            _selection_watch(root, episode_paths['completions'] / source_path.stem)
     for completion in reviewer_episodes.completion_records(root, cutoff, coverage, deadline_epoch_ms):
         source = completion['source']
         native = root / source['path']
@@ -634,23 +692,44 @@ def _validate_project_binding(home, episode, *, deadline_epoch_ms=None):
     return episode['project_binding']
 
 
-def _artifact_locator(home, path, kind):
+def _artifact_locator(home, path, kind, *, deadline_epoch_ms=None):
     path = Path(path)
+    _selection_watch(home, path)
     relative = path.relative_to(home)
     if path.is_symlink() or path.resolve(strict=True) != path:
         raise store.Refusal('unsafe episode artifact')
-    raw = _read_regular_bytes(path)
-    return {'kind': kind, 'path': relative.as_posix(),
-            'sha256': hashlib.sha256(raw).hexdigest(), 'size': len(raw)}
+    _check_deadline(deadline_epoch_ms)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise store.Refusal('unsafe episode artifact')
+        digest, size = hashlib.sha256(), 0
+        while True:
+            _check_deadline(deadline_epoch_ms)
+            chunk = stream.read(65536)
+            _check_deadline(deadline_epoch_ms)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+        after = os.fstat(stream.fileno())
+        current = os.stat(path, follow_symlinks=False)
+        identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        if identity(before) != identity(after) or identity(after) != identity(current):
+            raise store.Refusal('episode artifact changed')
+    return {'kind': kind, 'path': relative.as_posix(), 'sha256': digest.hexdigest(), 'size': size}
 
 
-def _episode_artifacts(home, task, task_dir, incarnation, cutoff, coverage):
+def _episode_artifacts(home, task, task_dir, incarnation, cutoff, coverage, deadline_epoch_ms=None):
     locators = []
     try:
-        locators.append(_artifact_locator(home, task_dir / 'brief.md', 'intent'))
+        locators.append(_artifact_locator(home, task_dir / 'brief.md', 'intent', deadline_epoch_ms=deadline_epoch_ms))
     except (OSError, ValueError, store.Refusal):
+        _check_deadline(deadline_epoch_ms)
         _coverage(coverage, 'unavailable', {'task_id': task['id'], 'reason': 'intent-unavailable'})
     folder = task_dir / 'decisions'
+    _selection_watch(home, folder)
     if folder.is_symlink():
         _coverage(coverage, 'unavailable', {'task_id': task['id'], 'reason': 'feedback-unavailable'})
         return locators
@@ -658,7 +737,10 @@ def _episode_artifacts(home, task, task_dir, incarnation, cutoff, coverage):
         if path.name.endswith('.answer.json'):
             continue
         try:
+            _selection_watch(home, path)
+            _check_deadline(deadline_epoch_ms)
             decision = _read_json(path)
+            _check_deadline(deadline_epoch_ms)
             at = decision.get('resolved_at')
             if (decision.get('incarnation') != incarnation or decision.get('status') != 'resolved'
                     or not isinstance(at, (int, float)) or at > cutoff):
@@ -668,8 +750,9 @@ def _episode_artifacts(home, task, task_dir, incarnation, cutoff, coverage):
                     or '..' in Path(answer_name).parts or Path(answer_name).parts[:1] != ('decisions',)):
                 raise ValueError('answer path')
             answer = task_dir / answer_name
-            link = _artifact_locator(home, path, 'feedback-link')
-            artifact = _artifact_locator(home, answer, 'feedback')
+            link = _artifact_locator(home, path, 'feedback-link', deadline_epoch_ms=deadline_epoch_ms)
+            artifact = _artifact_locator(home, answer, 'feedback', deadline_epoch_ms=deadline_epoch_ms)
+            _check_deadline(deadline_epoch_ms)
             value = _read_json(answer)
             if (value.get('task_id') != task['id'] or value.get('incarnation') != incarnation
                     or value.get('resolved_at') != at or not isinstance(value.get('body'), str)):
@@ -677,6 +760,7 @@ def _episode_artifacts(home, task, task_dir, incarnation, cutoff, coverage):
             artifact.update(link_sha256=link['sha256'], link_path=link['path'], resolved_at=at)
             locators.append(artifact)
         except (OSError, ValueError, TypeError, store.Refusal):
+            _check_deadline(deadline_epoch_ms)
             _coverage(coverage, 'unavailable', {'task_id': task['id'], 'reason': 'feedback-unavailable'})
     return locators
 
@@ -772,9 +856,13 @@ def _record_episode_progress(home, *, episode, assessment, limitations=(), range
 
 def _selection_catalog(home, coverage, deadline_epoch_ms, candidates):
     try:
+        _selection_watch(home, home / 'config' / 'worker-skills')
+        _selection_watch(home, home / '.omp' / 'plugins' / 'installed_plugins.json')
         items = []
         for skill in worker_skills.catalog(home):
             _check_deadline(deadline_epoch_ms)
+            _selection_watch(home, Path(skill['source']).parent)
+            _selection_watch(home, Path(skill['source']) / 'SKILL.md')
             raw = _read_regular_bytes(Path(skill['source']) / 'SKILL.md')
             items.append({'id': skill['id'], 'sha256': hashlib.sha256(raw).hexdigest()})
         assigned = []
@@ -793,13 +881,18 @@ def _selection_catalog(home, coverage, deadline_epoch_ms, candidates):
         return None
 
 
-def _selection_episode(home, item, native, read, config, cutoff, coverage):
+def _selection_episode(home, item, native, read, config, cutoff, coverage, deadline_epoch_ms=None):
     completion = item.get('completion')
     task, event = item.get('task'), item.get('event', {})
     role = completion['source']['role'] if completion else item.get('role', 'worker')
     scope = {'home_id': _read_json(home / 'data' / 'home.json')['home_id'],
              'role': role, 'session_id': read['session_id']}
     if task:
+        _selection_watch(home, item['task_dir'] / 'task.json')
+        if _read_json(item['task_dir'] / 'task.json') != task:
+            raise store.Refusal('selected task changed')
+        _selection_watch(home, projects.record(home, task['project']))
+        _selection_watch(home, home / 'projects' / task['project'] / '.git')
         task_id = store.validate_id(task['id'])
         directory = observability._existing_private_directory(home, 'data', 'tasks', task_id)
         if directory is None or directory != item['task_dir']:
@@ -822,22 +915,24 @@ def _selection_episode(home, item, native, read, config, cutoff, coverage):
                  'completion': {k: v for k, v in completion.items() if k != 'source'} if completion else None}]
     binding = None
     if task:
-        binding = _project_binding(home, task)
-        locators.extend(_episode_artifacts(home, task, item['task_dir'], event['incarnation'], cutoff, coverage))
+        binding = _project_binding(home, task, deadline_epoch_ms=deadline_epoch_ms)
+        locators.extend(_episode_artifacts(home, task, item['task_dir'], event['incarnation'], cutoff, coverage, deadline_epoch_ms))
         if not completion:
             if (event.get('task') != task_id or event.get('key') != 'runner-exit'
                     or str(uuid.UUID(event['id'])) != event['id']):
                 raise store.Refusal('runner exit identity invalid')
             locators.append(_artifact_locator(home, item['task_dir'] / 'observations' /
-                                              (event['id'] + '.json'), 'runner-exit'))
+                                              (event['id'] + '.json'), 'runner-exit', deadline_epoch_ms=deadline_epoch_ms))
     if role == 'reviewer':
         for report_id in item.get('report_ids', ()):
-            locators.append(_artifact_locator(home, report_path(home, report_id), 'reviewer-report'))
+            locators.append(_artifact_locator(home, report_path(home, report_id), 'reviewer-report', deadline_epoch_ms=deadline_epoch_ms))
     basis = _digest({'scope': scope, 'projection_sha256': read['material_sha256'],
                      'boundary': read['boundary'], 'project_binding': binding,
                      'artifacts': locators[1:]})
     limits_sha256 = _digest(config['limits'])
+    _selection_watch(home, _progress_path(home, episode_id, basis))
     progress = _episode_progress(home, episode_id, basis)
+    legacy_complete = False
     if role in ('worker', 'central'):
         material_scope = _source_scope(home, {'role': role, 'session_id': read['session_id'],
                                               'task_id': scope.get('task_id'),
@@ -847,12 +942,19 @@ def _selection_episode(home, item, native, read, config, cutoff, coverage):
             row['message_id'] for row in read['projection']
             if _digest({'scope': material_scope, 'message_id': row['message_id'],
                         'text_sha256': row['text_sha256']}) in reviewed]
+        legacy = _legacy_consumed_material(home, material_scope)
+        legacy_complete = bool(read['projection']) and not read['limited'] and not read['withheld'] and all(
+            _digest({'scope': material_scope, 'message_id': row['message_id'],
+                     'text_sha256': row['text_sha256']}) in legacy for row in read['projection'])
     episode = {**scope, 'episode_id': episode_id, 'basis': basis,
                'closed_at': item['closed_at'], 'boundary': read['boundary'],
                'projection': read['projection'], 'locators': locators,
                'limits_sha256': limits_sha256,
                'progress': {key: value for key, value in progress.items() if key != 'submissions'},
                'limitations': [row['reason'] for row in read['withheld']]}
+    episode['_legacy_native_complete'] = legacy_complete
+    if role == 'worker' and legacy_complete and not progress['screened']:
+        episode['limitations'].append('legacy packet does not prove current intent or feedback scope')
     if binding:
         episode['project_binding'] = binding
     else:
@@ -882,11 +984,12 @@ def _selection_disclosures(held, coverage):
 
 
 def _compact_episode(episode):
-    locators = {'schema': 1, 'kind': 'locators', 'episode_id': episode['episode_id'],
-                'basis': episode['basis'], 'locators': episode['locators']}
     progress = episode['progress']
+    locators = {'schema': 1, 'kind': 'locators', 'episode_id': episode['episode_id'],
+                'basis': episode['basis'], 'locators': episode['locators'],
+                'reviewed_message_ids': progress.get('reviewed_message_ids', [])}
     compact = {key: value for key, value in episode.items()
-               if key not in ('projection', 'locators', 'progress', 'limitations')}
+               if key not in ('projection', 'locators', 'progress', 'limitations', '_legacy_native_complete')}
     compact.update(projection={'sha256': episode['locators'][0]['projection_sha256'],
                                'message_count': len(episode['projection'])},
                    locators=episode['locators'][:4], locators_id=_digest(locators),
@@ -967,7 +1070,7 @@ def read_selection_locators(home, manifest_id, episode_id, *, cursor=0, limit=20
 
 
 def _selection_schedule(home, actionable, requested):
-    """Caller holds store.lock; schedule is saved only after successful admission."""
+    """Compute a tentative schedule; the caller revalidates before publication."""
     path = paths(home)['progress'] / 'schedule.json'
     if path.exists():
         try:
@@ -1011,6 +1114,18 @@ def _selection_schedule(home, actionable, requested):
 
 def select_manifest(home, *, cutoff, config_snapshot, retrospective_review_run_ids=(),
                     detail_episode_ids=(), deadline_epoch_ms=None):
+    from . import reviewer_inspection
+    from .uninstall_state import admission
+    root = store.home(home)
+    with admission(root), reviewer_inspection._validation_scope() as watched:
+        return _select_manifest(root, cutoff=cutoff, config_snapshot=config_snapshot,
+                                retrospective_review_run_ids=retrospective_review_run_ids,
+                                detail_episode_ids=detail_episode_ids, deadline_epoch_ms=deadline_epoch_ms,
+                                watched=watched)
+
+
+def _select_manifest(home, *, cutoff, config_snapshot, retrospective_review_run_ids,
+                     detail_episode_ids, deadline_epoch_ms, watched):
     config = validate_config(config_snapshot)
     if (isinstance(cutoff, bool) or not isinstance(cutoff, (int, float)) or cutoff < 0
             or not isinstance(retrospective_review_run_ids, tuple) or not isinstance(detail_episode_ids, tuple)):
@@ -1021,6 +1136,7 @@ def select_manifest(home, *, cutoff, config_snapshot, retrospective_review_run_i
         _hex_id(episode_id)
     _check_deadline(deadline_epoch_ms)
     root = store.home(home)
+    _selection_watch(root, root / 'data' / 'home.json')
     coverage = {'complete': True, 'unavailable': [], 'withheld': []}
     items = list(_completion_candidates(root, cutoff, coverage, deadline_epoch_ms))
     seen_exit = set()
@@ -1030,7 +1146,9 @@ def select_manifest(home, *, cutoff, config_snapshot, retrospective_review_run_i
             continue
         seen_exit.add(key)
         try:
-            binding = _read_json(root / 'data' / 'observability' / 'tasks' / key[0] / 'omp' / key[1] / 'binding.json')
+            binding_path = root / 'data' / 'observability' / 'tasks' / key[0] / 'omp' / key[1] / 'binding.json'
+            _selection_watch(root, binding_path)
+            binding = _read_json(binding_path)
             directory = _fixed_session(root, *key, binding)
             files = sorted(directory.glob('*.jsonl'))
             if not files:
@@ -1049,6 +1167,7 @@ def select_manifest(home, *, cutoff, config_snapshot, retrospective_review_run_i
         except (ValueError, TypeError, AttributeError) as error:
             raise store.Refusal('invalid retrospective run') from error
         requested.add(rid)
+        _selection_watch(root, paths(root)['receipts'] / f'{rid}.json')
         receipt = _receipt(root, rid)
         closed = receipt.get('closed_at')
         if receipt.get('dispatch_state') != 'final' or not isinstance(closed, (int, float)) or closed > cutoff:
@@ -1056,6 +1175,8 @@ def select_manifest(home, *, cutoff, config_snapshot, retrospective_review_run_i
         directory = observability._existing_private_directory(root, 'data', 'observability', 'reviewer', rid, 'omp')
         if directory is None:
             raise store.Refusal('retrospective native evidence unavailable')
+        _selection_watch(root, directory.parent / 'binding.json')
+        _selection_watch(root, directory)
         binding = _read_json(directory.parent / 'binding.json')
         if binding.get('review_run_id') != rid or binding.get('session_dir') != str(directory):
             raise store.Refusal('retrospective binding invalid')
@@ -1070,6 +1191,17 @@ def select_manifest(home, *, cutoff, config_snapshot, retrospective_review_run_i
     for item in sorted(items, key=lambda row: row['sort']):
         _check_deadline(deadline_epoch_ms)
         native = item['jsonls'][0]
+        _selection_watch(root, native)
+        if item.get('completion'):
+            completion = item['completion']
+            episode_paths = reviewer_episodes._episode_paths(root)
+            source_path = episode_paths['sources'] / (completion['source_id'] + '.json')
+            completion_path = episode_paths['completions'] / completion['source_id'] / (completion['interaction_id'] + '.json')
+            _selection_watch(root, source_path)
+            _selection_watch(root, completion_path)
+            if (_read_json(source_path) != completion['source'] or
+                    _read_json(completion_path) != {key: value for key, value in completion.items() if key != 'source'}):
+                raise store.Refusal('native completion changed')
         try:
             native_cutoff = cutoff if item.get('completion') else min(cutoff, item['closed_at'])
             read = reviewer_episodes.read_native(native, native_cutoff, config['limits']['max_input_bytes'],
@@ -1081,7 +1213,7 @@ def select_manifest(home, *, cutoff, config_snapshot, retrospective_review_run_i
                 _coverage(coverage, 'withheld', {'reason': 'native-proof-incomplete', 'session_id': read['session_id']})
             if not read['projection'] and not (item.get('role') == 'reviewer' and item.get('report_ids')):
                 continue
-            candidates.append(_selection_episode(root, item, native, read, config, cutoff, coverage))
+            candidates.append(_selection_episode(root, item, native, read, config, cutoff, coverage, deadline_epoch_ms))
         except (OSError, ValueError, KeyError, TypeError, store.Refusal):
             _check_deadline(deadline_epoch_ms)
             _coverage(coverage, 'unavailable', {'reason': 'native-or-scope-unavailable'})
@@ -1101,8 +1233,10 @@ def select_manifest(home, *, cutoff, config_snapshot, retrospective_review_run_i
     if len(detail_episode_ids) > config['limits']['max_candidates']:
         raise store.Refusal('detail episodes exceed candidate limit')
     task_items = {item['task']['id']: item for item in items if item.get('task')}
+    _selection_watch(root, INSTRUCTION_FILE)
     instruction_sha256 = hashlib.sha256(_read_regular_bytes(INSTRUCTION_FILE)).hexdigest()
-    with store.lock(root):
+    def build():
+        nonlocal coverage
         _check_deadline(deadline_epoch_ms)
         held, actionable = [], []
         for episode in candidates:
@@ -1112,12 +1246,15 @@ def select_manifest(home, *, cutoff, config_snapshot, retrospective_review_run_i
                 progress['reviewed_message_ids'] = reviewed
             episode['progress'] = {key: value for key, value in progress.items() if key != 'submissions'}
             explicit = episode['episode_id'] in detail_episode_ids
+            legacy_consumed = (episode['role'] == 'central' and episode['_legacy_native_complete']
+                               and not progress['screened'] and not episode['locators'][1:])
             hold = progress.get('hold')
             if not explicit and hold and hold.get('limits_sha256') == episode['limits_sha256']:
                 held.append({'episode_id': episode['episode_id'], 'basis': episode['basis'],
                              'limitations': hold['limitations']})
-            elif explicit or not progress.get('reflected'):
+            elif explicit or (not progress.get('reflected') and not legacy_consumed):
                 actionable.append(episode)
+        _selection_watch(root, paths(root)['progress'] / 'schedule.json')
         schedule_path, schedule, ordered = _selection_schedule(root, actionable, detail_episode_ids)
         selected, locator_bundles = [], []
         catalog = _selection_catalog(root, coverage, deadline_epoch_ms, []) if actionable else None
@@ -1180,17 +1317,22 @@ def select_manifest(home, *, cutoff, config_snapshot, retrospective_review_run_i
             raise store.Refusal('selection limit cannot represent an eligible episode')
         if set(detail_episode_ids) - {episode['episode_id'] for episode in selected}:
             raise store.Refusal('selection limit cannot represent requested detail episodes')
-        _check_deadline(deadline_epoch_ms)
-        if catalog is not None:
-            publish_immutable(paths(root)['catalogs'] / f"{result['catalog_id']}.json", catalog)
-        publish_immutable(paths(root)['selection_details'] / f"{result['details_id']}.json", disclosures)
-        for bundle in locator_bundles:
-            publish_immutable(paths(root)['selection_details'] / f'{_digest(bundle)}.json', bundle)
-        manifest_id = _digest(result)
-        publish_immutable(paths(root)['selections'] / f'{manifest_id}.json', result)
-        _private(schedule_path.parent)
-        store.atomic_json(schedule_path, schedule)
-        return {**result, 'manifest_id': manifest_id}
+        from . import reviewer_inspection
+        with store.lock(root, deadline_epoch_ms=deadline_epoch_ms):
+            _check_deadline(deadline_epoch_ms)
+            reviewer_inspection._check_watches(watched)
+            if catalog is not None:
+                publish_immutable(paths(root)['catalogs'] / f"{result['catalog_id']}.json", catalog)
+            publish_immutable(paths(root)['selection_details'] / f"{result['details_id']}.json", disclosures)
+            for bundle in locator_bundles:
+                publish_immutable(paths(root)['selection_details'] / f'{_digest(bundle)}.json', bundle)
+            manifest_id = _digest(result)
+            publish_immutable(paths(root)['selections'] / f'{manifest_id}.json', result)
+            _private(schedule_path.parent)
+            store.atomic_json(schedule_path, schedule)
+            return {**result, 'manifest_id': manifest_id}
+
+    return build()
 
 
 
@@ -1615,7 +1757,11 @@ def _validate_v2_sources(home, receipt, manifest, report, journal):
                 raise store.Refusal('native metadata version changed')
             artifacts = [{key: item[key] for key in ('kind', 'sha256', 'size') if key in item}
                          for item in locators if item.get('kind') != 'native' and 'sha256' in item]
-            expected = [*meta['projection'], *artifacts][provenance['start']:provenance['end']]
+            include_reviewed = provenance.get('include_reviewed')
+            if type(include_reviewed) is not bool:
+                raise store.Refusal('native metadata view invalid')
+            expected = [*inspection._metadata_projection(home, episode, meta, include_reviewed),
+                        *artifacts][provenance['start']:provenance['end']]
             try:
                 disclosed = [{key: value for key, value in item.items() if key != 'resume_cursor'}
                              for item in json.loads(source['text'])]

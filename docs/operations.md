@@ -126,13 +126,19 @@ Confirmed runner-exit evidence remains available for legacy worker logs without 
 
 Selection deduplicates scoped native material by message ID and text hash. Screening metadata, reflected intent/action/outcome assessment and full material coverage are distinct. Only successful finalization advances applicable progress; limited assessments hold missing grounding rather than claiming full review. `reviewer run --detail-episode EPISODE_ID` requests a bounded manual detail pass subject to the same eligibility and scheduling rules. Direct central episodes remain taskless; linked decisions do not widen central coverage.
 
+Unchanged native-only legacy scope is suppressed as no-work only when retained successful historical packet evidence proves the material was consumed; this does not invent a reflected assessment. Legacy worker packets may not prove the current intent or linked-feedback scope. Such work stays eligible and can require a conservative one-time reflection; changed source, intent or feedback also forms fresh scope. Explicit detail can reopen covered or held context.
+
 Only an operator can request detail, with repeated `--detail-episode` flags for multiple episodes; neither timers nor reviewers initiate it. A current-run native message `resume_cursor` continues after a prior successful partial prefix. Omit it to reread from the start; do not reuse a cursor from another run.
+
+Default native metadata, including native fallback, omits fully covered unchanged messages. Within an active selected run, `reviewer inspect RUN_ID --episode EPISODE_ID --source native --include-reviewed` lists earlier covered context in bounded pages; the flag is for native metadata only and each pagination cursor stays in its originating view. A known native record can still be explicitly reread. Full exposure does not retire a screened-but-unreflected assessment.
 
 To run a manual review from the distro directory, use `./bin/agd --home . reviewer run`. Changed extensions activate only in a fresh native OMP process; `/reload` is not a guaranteed activation boundary. Do not stop agents or fabricate historical completion boundaries.
 
 Capture bounded UTF-8 command or query output beneath the active run artifact root with `reviewer evidence add RUN_ID --file PATH --label LABEL`; listing returns metadata. Captures are immutable, run-scoped and cannot establish native material coverage or target authority. Unsafe paths and credential-bearing inputs are refused. Native evidence is the fallback when optional scoped Langfuse data is unavailable; do not infer a defect from missing telemetry.
 
 The cumulative input limit counts unique admitted manifest, catalog metadata, target and capture bytes; it does not bound all shell output, model tokens or cost. Responses are bounded to 16 KiB and metadata pages to 20 rows; raw CLI output and the run deadline have separate limits. Project targets use the registered identity and selected task revision; distro file targets use a current observed identity/hash and time. Present, absent and described guards record different proof; current source is not proof of historical effective instructions. Applicability and verified-project, verified-distro, external or unknown authority are separate. Retain private project evidence for authorized triage, not global guidance.
+
+Selection propagates the frozen deadline to project Git, streamed regular-file artifact hashing and mutation-lock acquisition. Catalog and selected-assignment acquisition occur outside the global mutation lock; relevant snapshots and scheduling state are revalidated before publication, with stale inputs refused. These checks do not promise a kernel-hard deadline for local filesystem operations.
 
 ### Run-owned probe workspaces
 
