@@ -15,9 +15,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
 from agd_lib import observability, reviewer, reviewer_episodes, store, supervision, tasks, worker_skills, workers
 
 
-def ended_worker(home, task_id, incarnation, rows, status=1):
+def ended_worker(home, task_id, incarnation, rows, status=1, *, project='sample'):
     brief = home / f'{task_id}.md'; brief.write_text('Inspect value.txt.\n')
-    task = command(home, 'task', 'create', task_id, '--project', 'sample', '--brief', str(brief))
+    task = command(home, 'task', 'create', task_id, '--project', project, '--brief', str(brief))
     task.update(executor='worker', incarnation=incarnation, phase='running', worker_alive=False)
     tasks.save(home, task)
     binding = observability.worker_binding(home, task_id, incarnation)
@@ -41,10 +41,10 @@ def packet(home, cutoff=None, limit=262144, retrospective=()):
                                   retrospective_review_run_ids=retrospective)
 
 def completed_session(home, *, role='central', task_id=None, texts=('answer',), cutoff=200.0,
-                      active='unfinished', title=None, start_at=10.0, stable_ids=False, alive=False):
+                      active='unfinished', title=None, start_at=10.0, stable_ids=False, alive=False, project='sample'):
     incarnation = str(uuid.uuid4()) if role == 'worker' else None
     if role == 'worker':
-        task, binding, session_id = ended_worker(home, task_id, incarnation, [], 0)
+        task, binding, session_id = ended_worker(home, task_id, incarnation, [], 0, project=project)
         if alive:
             task.update(worker_alive=True)
             tasks.save(home, task)

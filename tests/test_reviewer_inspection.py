@@ -11,7 +11,7 @@ import pytest
 
 from support import command, lab
 from test_projects import run
-from test_reviewer import append_unfinished, completed_session, message, rewrite_title
+from test_reviewer import append_unfinished, build_report, completed_session, message, produced_run, rewrite_title
 from test_langfuse_cli import _package_files
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
@@ -24,11 +24,14 @@ def inspection():
     return reviewer_inspection
 
 
-def stage(home, *, cutoff=200, limit=None):
+def stage(home, *, cutoff=200, limit=None, max_candidates=None, detail=()):
     config = reviewer.read_config(home)
     if limit is not None:
         config['limits']['max_input_bytes'] = limit
-    manifest = reviewer.select_manifest(home, cutoff=cutoff, config_snapshot=config)
+    if max_candidates is not None:
+        config['limits']['max_candidates'] = max_candidates
+    manifest = reviewer.select_manifest(home, cutoff=cutoff, config_snapshot=config,
+                                        detail_episode_ids=detail)
     now = time.time()
     reservation = reviewer.reserve_run(
         home, reviewer.enqueue_intent(home, kind='manual'), config_snapshot=config,
@@ -1862,3 +1865,920 @@ def test_r2_interrupted_target_identical_retry_or_unsafe_collision(collision, mo
             assert record(home, run_id, prior_target)['target_ref'] == prior_target['target_ref']
             with pytest.raises(store.Refusal):
                 inspection().read_target(home, run_id, orphan_ref)
+
+
+def report_v2_inputs(home, run_id, manifest, native_source):
+    episode = next(item for item in manifest['episodes'] if item['session_id'] == native_source['session_id'])
+    eid = episode['episode_id']
+    prompt = inspection().inspect(home, run_id, eid, source='native',
+                                  record_id=native_source['session_id'] + '-prompt-0', part='content')
+    final = inspection().inspect(home, run_id, eid, source='native',
+                                 record_id=native_source['session_id'] + '-final-0', part='content')
+    row = {'episode_id': eid, 'assessment': 'reflected',
+           'intent_sources': [prompt['source_id']], 'action_sources': [final['source_id']],
+           'outcome_sources': [final['source_id']], 'limitations': []}
+    return row, prompt['source_id'], final['source_id']
+
+
+def report_v2_finding(row, ref, citation, scope):
+    return {'episode_ids': [row['episode_id']], 'target_ref': ref,
+            'finding': 'The observed result omitted validation.',
+            'proposed_change': 'Check the result before reporting.',
+            'expected_benefit': 'Failures become visible.', 'applicability': scope,
+            'scope_rationale': 'The check transfers across executions.' if scope == 'distro' else 'This is a project check.',
+            'citations': [citation], 'counterexamples': [],
+            'alternatives': 'Use manual review.', 'uncertainty': 'No counterexample was available.',
+            'validation': 'Exercise the check on a failed result.',
+            'validation_limits': ['Causality requires human assessment.'],
+            'risks': ['The check may reject valid results.'], 'draft': None}
+
+
+def report_v2(row, findings=()):
+    return {'schema': 2, 'summary': 'Bounded review.', 'episode_reviews': [row],
+            'findings': list(findings)}
+
+
+@pytest.mark.parametrize('kind', ['script', 'agents', 'hook', 'component', 'new-file'])
+def test_report_v2_general_destination_accepts_issued_target(kind):
+    with lab() as (home, project):
+        project_files(project)
+        hook = home / 'config' / 'hooks' / 'report-hook.sh'
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text('printf hook\n')
+        native, _, _ = completed_session(home, role='worker', task_id='reviewed', texts=('PRIVATE_NATIVE_SENTINEL',))
+        run_id, manifest = stage(home)
+        row, _, citation = report_v2_inputs(home, run_id, manifest, native)
+        if kind in ('script', 'agents', 'new-file'):
+            path = {'script': 'check.sh', 'agents': 'AGENTS.md', 'new-file': 'new-check.sh'}[kind]
+            result = target(home, run_id, scope='project', project_id='sample', path=path,
+                            operation='create' if kind == 'new-file' else 'modify')
+            scope = 'project'
+        elif kind == 'hook':
+            result = target(home, run_id, scope='distro', path='config/hooks/report-hook.sh')
+            scope = 'distro'
+        else:
+            result = target(home, run_id, scope='distro', component='model-routing',
+                            basis_source_ids=(citation,), authority_hint='unknown')
+            scope = 'distro'
+        finding = report_v2_finding(row, result['target_ref'], citation, scope)
+        submitted = reviewer.submit_report(home, run_id, str(uuid.uuid4()), report_v2(row, [finding]))
+        stored = json.loads(reviewer.report_path(home, submitted['report_id']).read_text())
+        assert stored['report'] == report_v2(row, [finding])
+        assert len(submitted['proposal_ids']) == 1
+        assert 'PRIVATE_NATIVE_SENTINEL' not in json.dumps(stored)
+        reviewer.finalize_run(home, run_id, 'exited')
+
+
+@pytest.mark.parametrize('invalid', ['root-key', 'row-key', 'finding-key', 'missing-role',
+                                     'metadata-only', 'manifest-citation', 'unknown-target',
+                                     'unreflected', 'unknown-episode', 'bad-draft'])
+def test_report_v2_reflection_rejects_unadmitted_or_invalid_input(invalid):
+    with lab() as (home, _):
+        native, _, _ = completed_session(home, texts=('observed',))
+        run_id, manifest = stage(home)
+        row, _, citation = report_v2_inputs(home, run_id, manifest, native)
+        metadata = inspection().inspect(home, run_id, row['episode_id'], source='native')['source_id']
+        dest = target(home, run_id, scope='distro', component='model-routing',
+                      basis_source_ids=(citation,), authority_hint='unknown')
+        finding = report_v2_finding(row, dest['target_ref'], citation, 'distro')
+        report = report_v2(row, [finding])
+        if invalid == 'root-key':
+            report['extra'] = True
+        elif invalid == 'row-key':
+            row['extra'] = True
+        elif invalid == 'finding-key':
+            finding['target_source_version'] = 'untrusted'
+        elif invalid == 'missing-role':
+            row['intent_sources'] = []
+        elif invalid == 'metadata-only':
+            row.update(intent_sources=[metadata], action_sources=[metadata], outcome_sources=[metadata])
+        elif invalid == 'manifest-citation':
+            finding['citations'] = [manifest['manifest_id']]
+        elif invalid == 'unknown-target':
+            finding['target_ref'] = '0' * 64
+        elif invalid == 'unreflected':
+            row['assessment'] = 'screened'
+        elif invalid == 'unknown-episode':
+            finding['episode_ids'] = ['0' * 64]
+        else:
+            finding['draft'] = {'not': 'text'}
+        with pytest.raises(store.Refusal):
+            reviewer.submit_report(home, run_id, str(uuid.uuid4()), report)
+
+
+def test_report_v2_frozen_commit_refuses_late_capture_and_target():
+    with lab() as (home, _):
+        native, _, _ = completed_session(home)
+        run_id, manifest = stage(home)
+        row, _, citation = report_v2_inputs(home, run_id, manifest, native)
+        reviewer.submit_report(home, run_id, str(uuid.uuid4()), report_v2(row))
+        with pytest.raises(store.Refusal):
+            inspection().inspect(home, run_id, row['episode_id'], source='native')
+        with pytest.raises(store.Refusal):
+            target(home, run_id, scope='distro', component='tool',
+                   basis_source_ids=(citation,), authority_hint='unknown')
+        with pytest.raises(store.Refusal):
+            capture(home, run_id, 'late capture')
+
+
+def test_report_v2_target_guard_revision_uses_cross_run_native_evidence():
+    with lab() as (home, _):
+        hook = home / 'config' / 'hooks' / 'guard.sh'
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text('first version\n')
+        native, _, _ = completed_session(home, texts=('unchanged evidence',))
+        first_run, first_manifest = stage(home)
+        first_row, _, first_citation = report_v2_inputs(home, first_run, first_manifest, native)
+        first_target = target(home, first_run, scope='distro', path='config/hooks/guard.sh')
+        first_guard = record(home, first_run, first_target)['guard']['source_sha256']
+        second_run, second_manifest = stage(home)
+        second_row, _, second_citation = report_v2_inputs(home, second_run, second_manifest, native)
+        first = reviewer.submit_report(home, first_run, str(uuid.uuid4()),
+                                       report_v2(first_row, [report_v2_finding(first_row, first_target['target_ref'], first_citation, 'distro')]))
+        reviewer.finalize_run(home, first_run, 'exited')
+        old_report = reviewer.report_path(home, first['report_id']).read_bytes()
+        hook.write_text('second version\n')
+        assert first_citation != second_citation
+        second_target = target(home, second_run, scope='distro', path='config/hooks/guard.sh')
+        assert first_guard != record(home, second_run, second_target)['guard']['source_sha256']
+        second = reviewer.submit_report(home, second_run, str(uuid.uuid4()),
+                                        report_v2(second_row, [report_v2_finding(second_row, second_target['target_ref'], second_citation, 'distro')]))
+        assert second['proposal_ids'] == first['proposal_ids']
+        proposal = reviewer.read_proposal(home, first['proposal_ids'][0])
+        assert len(proposal['revisions']) == 2
+        assert reviewer.report_path(home, first['report_id']).read_bytes() == old_report
+
+
+def test_report_v2_reflection_revalidates_native_after_exposure():
+    with lab() as (home, _):
+        native, path, _ = completed_session(home, texts=('original answer',))
+        run_id, manifest = stage(home)
+        row, _, _ = report_v2_inputs(home, run_id, manifest, native)
+        path.write_text(path.read_text().replace('original answer', 'rewritten answer'))
+        with pytest.raises(store.Refusal):
+            reviewer.submit_report(home, run_id, str(uuid.uuid4()), report_v2(row))
+        episode = manifest['episodes'][0]
+        assert not reviewer._episode_progress(home, episode['episode_id'], episode['basis'])['reflected']
+
+
+def test_report_v2_destination_rejects_foreign_run_target():
+    with lab() as (home, _):
+        native, _, _ = completed_session(home)
+        first, manifest = stage(home)
+        row, _, citation = report_v2_inputs(home, first, manifest, native)
+        foreign = target(home, first, scope='distro', component='model-routing',
+                         basis_source_ids=(citation,), authority_hint='unknown')
+        second, other_manifest = stage(home)
+        other_row, _, other_citation = report_v2_inputs(home, second, other_manifest, native)
+        finding = report_v2_finding(other_row, foreign['target_ref'], other_citation, 'distro')
+        with pytest.raises(store.Refusal):
+            reviewer.submit_report(home, second, str(uuid.uuid4()), report_v2(other_row, [finding]))
+
+
+@pytest.mark.parametrize('assessment', ['screened', 'limited', 'unassessed'])
+def test_report_v2_coverage_screening_and_hold_do_not_claim_reflection(assessment):
+    with lab() as (home, _):
+        completed_session(home)
+        run_id, manifest = stage(home)
+        episode = manifest['episodes'][0]
+        metadata = inspection().inspect(home, run_id, episode['episode_id'], source='native')['source_id']
+        row = {'episode_id': episode['episode_id'], 'assessment': assessment,
+               'intent_sources': [metadata], 'action_sources': [], 'outcome_sources': [],
+               'limitations': ['Native outcome unavailable.'] if assessment == 'limited' else []}
+        report = {'schema': 2, 'summary': 'Screened.', 'episode_reviews': [] if assessment == 'unassessed' else [row],
+                  'findings': []}
+        reviewer.submit_report(home, run_id, str(uuid.uuid4()), report)
+        before = reviewer._episode_progress(home, episode['episode_id'], episode['basis'])
+        assert not before['screened'] and not before['reflected']
+        reviewer.finalize_run(home, run_id, 'exited')
+        progress = reviewer._episode_progress(home, episode['episode_id'], episode['basis'])
+        assert not progress['reflected']
+        assert progress['screened'] == (assessment != 'unassessed')
+        assert bool(progress['hold']) == (assessment == 'limited')
+        subsequent = reviewer.select_manifest(home, cutoff=201, config_snapshot=reviewer.read_config(home))
+        selected = {item['episode_id'] for item in subsequent['episodes']}
+        if assessment == 'limited':
+            assert episode['episode_id'] not in selected
+            assert any(item['episode_id'] == episode['episode_id'] for item in subsequent['held'])
+            detail = reviewer.select_manifest(home, cutoff=201, config_snapshot=reviewer.read_config(home),
+                                              detail_episode_ids=(episode['episode_id'],))
+            assert episode['episode_id'] in {item['episode_id'] for item in detail['episodes']}
+        else:
+            assert episode['episode_id'] in selected
+
+
+@pytest.mark.parametrize('outcome', ['failed', 'unknown', 'no-work', 'timeout'])
+def test_report_v2_coverage_non_success_never_consumes(outcome):
+    with lab() as (home, _):
+        native, _, _ = completed_session(home)
+        run_id, manifest = stage(home)
+        row, _, _ = report_v2_inputs(home, run_id, manifest, native)
+        reviewer.submit_report(home, run_id, str(uuid.uuid4()), report_v2(row))
+        reviewer.close_run(home, run_id, 'failed' if outcome == 'timeout' else outcome,
+                           error_code='timeout' if outcome == 'timeout' else None)
+        episode = manifest['episodes'][0]
+        progress = reviewer._episode_progress(home, episode['episode_id'], episode['basis'])
+        assert not progress['screened'] and not progress['reflected'] and not progress['ranges']
+
+
+@pytest.mark.parametrize('boundary', ['prepared', 'report', 'receipt', 'progress', 'event'])
+def test_report_v2_coverage_recovers_once_at_write_boundaries(monkeypatch, boundary):
+    with lab() as (home, _):
+        native, _, _ = completed_session(home)
+        run_id, manifest = stage(home)
+        row, _, citation = report_v2_inputs(home, run_id, manifest, native)
+        dest = target(home, run_id, scope='distro', component='model-routing',
+                      basis_source_ids=(citation,), authority_hint='unknown')
+        report = report_v2(row, [report_v2_finding(row, dest['target_ref'], citation, 'distro')])
+        request = str(uuid.uuid4())
+        original_publish, original_atomic = reviewer.publish_immutable, store.atomic_json
+        fired = False
+        def publish(path, value):
+            nonlocal fired
+            original_publish(path, value)
+            if not fired and boundary == 'prepared' and Path(path).parent == reviewer.paths(home)['prepared']:
+                fired = True
+                raise RuntimeError(boundary)
+            if not fired and boundary == 'report' and Path(path).parent == reviewer.paths(home)['reports']:
+                fired = True
+                raise RuntimeError(boundary)
+        def atomic(path, value):
+            nonlocal fired
+            original_atomic(path, value)
+            path = Path(path)
+            match = ((boundary == 'receipt' and path == reviewer.paths(home)['receipts'] / (run_id + '.json')
+                      and value.get('dispatch_state') == 'report-committed') or
+                     (boundary == 'progress' and reviewer.paths(home)['progress'] in path.parents) or
+                     (boundary == 'event' and path.parent == home / 'state' / 'events'))
+            if not fired and match:
+                fired = True
+                raise RuntimeError(boundary)
+        monkeypatch.setattr(reviewer, 'publish_immutable', publish)
+        monkeypatch.setattr(store, 'atomic_json', atomic)
+        with pytest.raises(RuntimeError):
+            reviewer.submit_report(home, run_id, request, report)
+            reviewer.finalize_run(home, run_id, 'exited')
+        assert fired
+        monkeypatch.setattr(reviewer, 'publish_immutable', original_publish)
+        monkeypatch.setattr(store, 'atomic_json', original_atomic)
+        reviewer.recover_submissions(home, run_id)
+        result = reviewer.submit_report(home, run_id, request, report)
+        reviewer.finalize_run(home, run_id, 'exited')
+        episode = manifest['episodes'][0]
+        progress = reviewer._episode_progress(home, episode['episode_id'], episode['basis'])
+        assert progress['reflected']
+        assert len(progress['submissions']) == 1
+        assert len(result['proposal_ids']) == 1
+        assert len(supervision.pending(home)) == 1
+        reviewer.finalize_run(home, run_id, 'exited')
+        assert reviewer._episode_progress(home, episode['episode_id'], episode['basis']) == progress
+        assert len(supervision.pending(home)) == 1
+
+
+def test_report_v2_destination_authority_change_requires_supersession():
+    with lab() as (home, _):
+        native, _, _ = completed_session(home, texts=('vendor/tool observed failure',))
+        first_run, first_manifest = stage(home)
+        first_row, _, first_citation = report_v2_inputs(home, first_run, first_manifest, native)
+        unknown = target(home, first_run, scope='distro', component='model-routing',
+                         basis_source_ids=(first_citation,), authority_hint='unknown')
+        second_run, second_manifest = stage(home)
+        second_row, _, second_citation = report_v2_inputs(home, second_run, second_manifest, native)
+        external = target(home, second_run, scope='distro', component='model-routing',
+                          basis_source_ids=(second_citation,), authority_hint='external',
+                          authority_locator='vendor/tool')
+        first = reviewer.submit_report(home, first_run, str(uuid.uuid4()),
+                                       report_v2(first_row, [report_v2_finding(first_row, unknown['target_ref'], first_citation, 'distro')]))
+        reviewer.finalize_run(home, first_run, 'exited')
+        second = reviewer.submit_report(home, second_run, str(uuid.uuid4()),
+                                        report_v2(second_row, [report_v2_finding(second_row, external['target_ref'], second_citation, 'distro')]))
+        reviewer.finalize_run(home, second_run, 'exited')
+        assert first['proposal_ids'][0] != second['proposal_ids'][0]
+        first_proposal = reviewer.read_proposal(home, first['proposal_ids'][0])
+        second_proposal = reviewer.read_proposal(home, second['proposal_ids'][0])
+        assert 'unknown' in json.dumps(first_proposal)
+        assert 'external' in json.dumps(second_proposal)
+        assert 'vendor/tool' in json.dumps(second_proposal)
+        shown_report = command(home, 'reviewer', 'reports', 'show', second['report_id'])
+        shown_proposal = command(home, 'reviewer', 'proposals', 'show', second['proposal_ids'][0])
+        event = next(item for item in supervision.pending(home) if item['key'] == second_run)
+        for displayed in (shown_report, shown_proposal, event['details']):
+            rendered = json.dumps(displayed).casefold()
+            assert 'distro' in rendered and 'external' in rendered and 'vendor/tool' in rendered
+            assert 'vendor/tool observed failure' not in rendered
+            assert 'upstream' in rendered or 'owner' in rendered or 'routing' in rendered
+            assert '"locally_editable": true' not in rendered
+        unknown_report = command(home, 'reviewer', 'reports', 'show', first['report_id'])
+        unknown_proposal = command(home, 'reviewer', 'proposals', 'show', first['proposal_ids'][0])
+        unknown_event = next(item for item in supervision.pending(home) if item['key'] == first_run)
+        for displayed in (unknown_report, unknown_proposal, unknown_event['details']):
+            rendered = json.dumps(displayed).casefold()
+            assert 'distro' in rendered and 'unknown' in rendered
+            assert 'owner' in rendered or 'routing' in rendered or 'confirmation' in rendered
+            assert '"locally_editable": true' not in rendered
+        assert reviewer.read_triage(home, first['proposal_ids'][0])['current'] != 'superseded'
+        result = reviewer.dispose(home, first['proposal_ids'][0], 'superseded', 'Confirmed upstream ownership.',
+                                  second['proposal_ids'][0], {'uid': os.getuid(), 'identity': str(os.getuid())})
+        assert result['current'] == 'superseded'
+        assert result['history'][-1]['replacement'] == second['proposal_ids'][0]
+
+
+def test_report_v2_coverage_unions_successful_native_ranges_not_manual():
+    with lab() as (home, _):
+        text = 'bounded native content ' * 300
+        native, _, _ = completed_session(home, texts=(text,))
+        first_run, first_manifest = stage(home)
+        second_run, second_manifest = stage(home)
+        first_episode = first_manifest['episodes'][0]
+        second_episode = second_manifest['episodes'][0]
+        rid = native['session_id'] + '-final-0'
+        first_page = inspection().inspect(home, first_run, first_episode['episode_id'],
+                                          source='native', record_id=rid, part='content')
+        assert first_page['next_cursor']
+        manual = capture(home, first_run, text)
+        prompt_first = inspection().inspect(home, first_run, first_episode['episode_id'], source='native',
+                                            record_id=native['session_id'] + '-prompt-0', part='content')
+        row = {'episode_id': first_episode['episode_id'], 'assessment': 'reflected',
+               'intent_sources': [prompt_first['source_id']], 'action_sources': [first_page['source_id']],
+               'outcome_sources': [first_page['source_id']], 'limitations': ['Outcome was partially exposed.']}
+        dest = target(home, first_run, scope='distro', component='model-routing',
+                      basis_source_ids=(manual,), authority_hint='unknown')
+        finding = report_v2_finding(row, dest['target_ref'], manual, 'distro')
+        reviewer.submit_report(home, first_run, str(uuid.uuid4()), report_v2(row, [finding]))
+        reviewer.finalize_run(home, first_run, 'exited')
+        scope = reviewer._source_scope(home, {'role': 'central', 'session_id': native['session_id']})
+        material = reviewer._material_id(scope, {'message_id': rid, 'text': text})
+        assert material not in reviewer._reviewed_material(home, scope)
+        page = inspection().inspect(home, second_run, second_episode['episode_id'],
+                                    source='native', record_id=rid, part='content')
+        ids = [page['source_id']]
+        while page['next_cursor']:
+            page = inspection().inspect(home, second_run, second_episode['episode_id'], source='native',
+                                        record_id=rid, part='content', cursor=page['next_cursor'])
+            ids.append(page['source_id'])
+        prompt = inspection().inspect(home, second_run, second_episode['episode_id'], source='native',
+                                      record_id=native['session_id'] + '-prompt-0', part='content')
+        second_row = {'episode_id': second_episode['episode_id'], 'assessment': 'reflected',
+                      'intent_sources': [prompt['source_id']], 'action_sources': ids,
+                      'outcome_sources': ids, 'limitations': []}
+        reviewer.submit_report(home, second_run, str(uuid.uuid4()), report_v2(second_row))
+        reviewer.finalize_run(home, second_run, 'exited')
+        assert material in reviewer._reviewed_material(home, scope)
+
+
+def test_report_v2_destination_project_context_is_episode_specific():
+    with lab() as (home, _):
+        command(home, 'project', 'add', 'other', '--source', str(home.parent / 'origin.git'))
+        first_native, _, _ = completed_session(home, role='worker', task_id='first', project='sample')
+        second_native, _, _ = completed_session(home, role='worker', task_id='second', project='other')
+        run_id, manifest = stage(home)
+        first_row, _, first_citation = report_v2_inputs(home, run_id, manifest, first_native)
+        second_row, _, second_citation = report_v2_inputs(home, run_id, manifest, second_native)
+        first_target = target(home, run_id, scope='project', project_id='sample', path='value.txt')
+        second_target = target(home, run_id, scope='project', project_id='other', path='value.txt')
+        wrong = report_v2_finding(first_row, second_target['target_ref'], first_citation, 'project')
+        invalid = {'schema': 2, 'summary': 'Wrong project.', 'episode_reviews': [first_row, second_row],
+                   'findings': [wrong]}
+        with pytest.raises(store.Refusal):
+            reviewer.submit_report(home, run_id, str(uuid.uuid4()), invalid)
+        findings = [report_v2_finding(first_row, first_target['target_ref'], first_citation, 'project'),
+                    report_v2_finding(second_row, second_target['target_ref'], second_citation, 'project')]
+        result = reviewer.submit_report(home, run_id, str(uuid.uuid4()),
+                                        {'schema': 2, 'summary': 'Two projects.',
+                                         'episode_reviews': [first_row, second_row], 'findings': findings})
+        assert len(set(result['proposal_ids'])) == 2
+
+
+def test_report_v2_historical_report_and_proposal_bytes_unchanged():
+    with lab() as (home, _):
+        old_run, packet = produced_run(home)
+        old = reviewer.submit_report(home, old_run['review_run_id'], str(uuid.uuid4()), build_report(packet))
+        reviewer.finalize_run(home, old_run['review_run_id'], 'exited')
+        old_report = reviewer.report_path(home, old['report_id'])
+        old_proposal = reviewer.proposal_path(home, old['proposal_ids'][0])
+        saved = old_report.read_bytes(), old_proposal.read_bytes()
+        native, _, _ = completed_session(home, texts=('new schema evidence',))
+        run_id, manifest = stage(home)
+        row, _, citation = report_v2_inputs(home, run_id, manifest, native)
+        dest = target(home, run_id, scope='distro', component='model-routing',
+                      basis_source_ids=(citation,), authority_hint='unknown')
+        reviewer.submit_report(home, run_id, str(uuid.uuid4()),
+                               report_v2(row, [report_v2_finding(row, dest['target_ref'], citation, 'distro')]))
+        reviewer.finalize_run(home, run_id, 'exited')
+        assert (old_report.read_bytes(), old_proposal.read_bytes()) == saved
+
+
+def test_report_v2_coverage_langfuse_content_never_marks_native_material(monkeypatch):
+    with lab() as (home, _):
+        native, _, _ = completed_session(home, texts=('native-answer',))
+        run_id, manifest = stage(home)
+        episode = manifest['episodes'][0]
+        telemetry_fixture(home, monkeypatch, episode)
+        inspection().inspect(home, run_id, episode['episode_id'], source='langfuse')
+        input_page = inspection().inspect(home, run_id, episode['episode_id'], source='langfuse',
+                                          record_id='selected-observation', part='input')
+        output_page = inspection().inspect(home, run_id, episode['episode_id'], source='langfuse',
+                                           record_id='selected-observation', part='output')
+        row = {'episode_id': episode['episode_id'], 'assessment': 'reflected',
+               'intent_sources': [input_page['source_id']], 'action_sources': [output_page['source_id']],
+               'outcome_sources': [output_page['source_id']], 'limitations': []}
+        reviewer.submit_report(home, run_id, str(uuid.uuid4()), report_v2(row))
+        reviewer.finalize_run(home, run_id, 'exited')
+        scope = reviewer._source_scope(home, {'role': 'central', 'session_id': native['session_id']})
+        material = reviewer._material_id(scope, {'message_id': native['session_id'] + '-final-0',
+                                                  'text': 'native-answer'})
+        assert material not in reviewer._reviewed_material(home, scope)
+
+
+def test_report_v2_target_guard_rejects_tampered_issued_target():
+    with lab() as (home, _):
+        hook = home / 'config' / 'hooks' / 'guarded.sh'
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text('guarded content\n')
+        native, _, _ = completed_session(home)
+        run_id, manifest = stage(home)
+        row, _, citation = report_v2_inputs(home, run_id, manifest, native)
+        dest = target(home, run_id, scope='distro', path='config/hooks/guarded.sh')
+        path = reviewer.paths(home)['inspections'] / run_id / 'targets' / (dest['target_ref'] + '.json')
+        saved = json.loads(path.read_text())
+        saved['guard']['source_sha256'] = None
+        path.write_text(json.dumps(saved))
+        finding = report_v2_finding(row, dest['target_ref'], citation, 'distro')
+        with pytest.raises(store.Refusal):
+            reviewer.submit_report(home, run_id, str(uuid.uuid4()), report_v2(row, [finding]))
+
+
+def test_report_v2_destination_same_episode_disjoint_evidence_is_uncertain_distinct():
+    with lab() as (home, _):
+        hook = home / 'config' / 'hooks' / 'same.sh'
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text('hook\n')
+        native, _, _ = completed_session(home, texts=('different outcome evidence',))
+        first_run, first_manifest = stage(home)
+        first_row, first_prompt, _ = report_v2_inputs(home, first_run, first_manifest, native)
+        first_target = target(home, first_run, scope='distro', path='config/hooks/same.sh')
+        second_run, second_manifest = stage(home)
+        second_row, _, second_final = report_v2_inputs(home, second_run, second_manifest, native)
+        second_target = target(home, second_run, scope='distro', path='config/hooks/same.sh')
+        first = reviewer.submit_report(home, first_run, str(uuid.uuid4()),
+                                       report_v2(first_row, [report_v2_finding(first_row, first_target['target_ref'], first_prompt, 'distro')]))
+        reviewer.finalize_run(home, first_run, 'exited')
+        second = reviewer.submit_report(home, second_run, str(uuid.uuid4()),
+                                        report_v2(second_row, [report_v2_finding(second_row, second_target['target_ref'], second_final, 'distro')]))
+        assert first['proposal_ids'][0] != second['proposal_ids'][0]
+        assert reviewer.read_proposal(home, second['proposal_ids'][0])['uncertain_distinct']
+
+
+def test_report_v2_reflection_revalidates_linked_intent_artifact():
+    with lab() as (home, _):
+        native, _, task = completed_session(home, role='worker', task_id='intent')
+        brief = tasks.task_file(home, task['id']).parent / 'brief.md'
+        brief.write_text('Original task intent.\n')
+        run_id, manifest = stage(home, cutoff=time.time() + 100)
+        row, _, _ = report_v2_inputs(home, run_id, manifest, native)
+        episode = next(item for item in manifest['episodes'] if item['episode_id'] == row['episode_id'])
+        locators = reviewer.read_selection_locators(home, manifest['manifest_id'], episode['episode_id'])['rows']
+        intent = next(item for item in locators if item['kind'] == 'intent')
+        page = inspection().inspect(home, run_id, episode['episode_id'], source='native',
+                                    record_id=intent['sha256'], part='content')
+        row['intent_sources'] = [page['source_id']]
+        brief.write_text('Changed task intent.\n')
+        with pytest.raises(store.Refusal):
+            reviewer.submit_report(home, run_id, str(uuid.uuid4()), report_v2(row))
+
+
+@pytest.mark.parametrize('hint', ['unknown', 'external'])
+def test_report_v2_destination_authority_resolution_requires_explicit_supersession(hint):
+    with lab() as (home, _):
+        locator = 'config/hooks/route.sh'
+        hook = home / locator
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text('native owned hook\n')
+        native, _, _ = completed_session(home, texts=('upstream vendor/route failed',))
+        first_run, first_manifest = stage(home)
+        first_row, _, first_citation = report_v2_inputs(home, first_run, first_manifest, native)
+        basis = capture(home, first_run, 'vendor/route describes config/hooks/route.sh')
+        options = {'authority_hint': hint}
+        if hint == 'external':
+            options['authority_locator'] = 'vendor/route'
+        described = target(home, first_run, scope='distro', component=locator,
+                           basis_source_ids=(basis,), **options)
+        second_run, second_manifest = stage(home)
+        second_row, _, second_citation = report_v2_inputs(home, second_run, second_manifest, native)
+        owned = target(home, second_run, scope='distro', path=locator)
+        assert record(home, first_run, described)['identity']['locator'] == record(home, second_run, owned)['identity']['locator']
+        assert record(home, second_run, owned)['identity']['authority']['status'] == 'verified-distro'
+        first = reviewer.submit_report(home, first_run, str(uuid.uuid4()),
+                                       report_v2(first_row, [report_v2_finding(first_row, described['target_ref'], first_citation, 'distro')]))
+        reviewer.finalize_run(home, first_run, 'exited')
+        second = reviewer.submit_report(home, second_run, str(uuid.uuid4()),
+                                        report_v2(second_row, [report_v2_finding(second_row, owned['target_ref'], second_citation, 'distro')]))
+        assert first['proposal_ids'][0] != second['proposal_ids'][0]
+        assert reviewer.read_triage(home, first['proposal_ids'][0])['current'] != 'superseded'
+        result = reviewer.dispose(home, first['proposal_ids'][0], 'superseded', 'Ownership confirmed.',
+                                  second['proposal_ids'][0], {'uid': os.getuid(), 'identity': str(os.getuid())})
+        assert result['current'] == 'superseded'
+        assert result['history'][-1]['replacement'] == second['proposal_ids'][0]
+
+
+def test_report_v2_destination_fingerprint_separates_authority_only():
+    # Pure identity invariant: these inputs are not claimed as admitted targets.
+    finding = {'finding': 'Observed retry failure.', 'applicability': 'distro'}
+    identity = {'scope': 'distro', 'context': {'home_id': 'home', 'project_id': None,
+                                                'identity_sha256': 'a' * 64},
+                'authority': {'status': 'unknown', 'locator': None},
+                'kind': 'component', 'locator': 'logical/tool'}
+    target_record = {'schema': 1, 'identity': identity, 'surface': 'tooling', 'operation': 'modify',
+                     'guard': {'state': 'described', 'revision': None, 'source_sha256': None,
+                               'observed_at': 1.0}, 'basis_source_ids': ['b' * 64]}
+    external = {**target_record, 'identity': {**identity, 'authority': {'status': 'external', 'locator': None}}}
+    verified = {**target_record, 'identity': {**identity, 'authority': {'status': 'verified-distro', 'locator': None}}}
+    fingerprints = {reviewer._finding_fingerprint(finding, target) for target in (target_record, external, verified)}
+    assert len(fingerprints) == 3
+    changed_guard = {**target_record, 'guard': {**target_record['guard'], 'observed_at': 2.0}}
+    assert reviewer._finding_fingerprint(finding, target_record) == reviewer._finding_fingerprint(finding, changed_guard)
+
+
+def test_report_v2_reflection_revalidates_feedback_link_at_submit():
+    with lab() as (home, _):
+        native, _, task = completed_session(home, role='worker', task_id='linked-feedback')
+        task_dir = tasks.task_file(home, task['id']).parent
+        question = task_dir / 'question.txt'
+        question.write_text('Which approach?\n')
+        workers.event(home, task['id'], task['incarnation'], 'decision', 'choice', question)
+        supervision.reconcile(home)
+        answer = task_dir / 'answer.txt'
+        answer.write_text('Original linked feedback.\n')
+        supervision.resolve(home, task['id'], 'choice', answer)
+        run_id, manifest = stage(home, cutoff=time.time() + 100)
+        row, _, _ = report_v2_inputs(home, run_id, manifest, native)
+        locators = reviewer.read_selection_locators(home, manifest['manifest_id'], row['episode_id'])['rows']
+        feedback = next(item for item in locators if item['kind'] == 'feedback')
+        exposed = inspection().inspect(home, run_id, row['episode_id'], source='native',
+                                       record_id=feedback['sha256'], part='content')
+        row['outcome_sources'] = [exposed['source_id']]
+        (home / feedback['link_path']).write_text('{}')
+        with pytest.raises(store.Refusal):
+            reviewer.submit_report(home, run_id, str(uuid.uuid4()), report_v2(row))
+
+
+def test_report_v2_rejects_secret_origin_even_with_consistent_evidence_hash():
+    with lab() as (home, _):
+        native, _, _ = completed_session(home)
+        run_id, manifest = stage(home)
+        row, _, citation = report_v2_inputs(home, run_id, manifest, native)
+        dest = target(home, run_id, scope='distro', component='tool',
+                      basis_source_ids=(citation,), authority_hint='unknown')
+        safe_id = capture(home, run_id, 'nonsecret fixture text')
+        safe = reviewer.read_evidence(home, run_id)['sources'][safe_id]
+        forged = dict(safe)
+        forged['origin'] = {'run_id': run_id, 'path': '.env'}
+        forged['source_id'] = reviewer._digest(reviewer._evidence_identity(run_id, forged['origin'], forged['text_sha256']))
+        forged['integrity_sha256'] = reviewer._evidence_integrity(forged)
+        reviewer.publish_immutable(reviewer.paths(home)['evidence'] / run_id / (forged['source_id'] + '.json'), forged)
+        finding = report_v2_finding(row, dest['target_ref'], forged['source_id'], 'distro')
+        with pytest.raises(store.Refusal):
+            reviewer.submit_report(home, run_id, str(uuid.uuid4()), report_v2(row, [finding]))
+
+
+@pytest.mark.parametrize('change', ['journal', 'deadline', 'run-scope', 'target-baseline'])
+def test_report_v2_freeze_rechecks_journal_scope_and_deadline(monkeypatch, change):
+    with lab() as (home, _):
+        native, _, _ = completed_session(home)
+        run_id, manifest = stage(home)
+        row, _, citation = report_v2_inputs(home, run_id, manifest, native)
+        hook = home / 'config' / 'hooks' / 'race.sh'
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text('original hook\n')
+        dest = target(home, run_id, scope='distro', path='config/hooks/race.sh')
+        report = report_v2(row, [report_v2_finding(row, dest['target_ref'], citation, 'distro')])
+        original = inspection().read_journal
+        invoked = False
+        def race(home_arg, run_arg):
+            nonlocal invoked
+            snapshot = original(home_arg, run_arg)
+            if not invoked:
+                invoked = True
+                if change == 'journal':
+                    inspection().inspect(home, run_id, row['episode_id'], source='native')
+                elif change == 'target-baseline':
+                    hook.write_text('changed hook\n')
+                else:
+                    path = reviewer.paths(home)['receipts'] / (run_id + '.json')
+                    receipt = json.loads(path.read_text())
+                    if change == 'deadline':
+                        receipt['deadline_epoch_ms'] = int((time.time() - 1) * 1000)
+                    else:
+                        receipt['dispatch_state'] = 'final'
+                    store.atomic_json(path, receipt)
+            return snapshot
+        monkeypatch.setattr(inspection(), 'read_journal', race)
+        with pytest.raises(store.Refusal):
+            reviewer.submit_report(home, run_id, str(uuid.uuid4()), report)
+        assert invoked
+        assert not list(reviewer.paths(home)['reports'].glob('*.json'))
+        episode = manifest['episodes'][0]
+        progress = reviewer._episode_progress(home, episode['episode_id'], episode['basis'])
+        assert not progress['screened'] and not progress['reflected']
+
+
+def test_report_v2_coverage_changed_version_gap_and_failed_ranges():
+    with lab() as (home, _):
+        native, path, _ = completed_session(home, texts=('final answer',))
+        old_text = 'old prompt ' * 700
+        new_text = 'new prompt ' * 700
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        prompt_row = next(row for row in rows if row.get('id') == native['session_id'] + '-prompt-0')
+        prompt_row['message']['content'] = old_text
+        path.write_text('\n'.join(json.dumps(item) for item in rows) + '\n')
+        rid = native['session_id'] + '-prompt-0'
+        scope = reviewer._source_scope(home, {'role': 'central', 'session_id': native['session_id']})
+        old_material = reviewer._material_id(scope, {'message_id': rid, 'text': old_text})
+        new_material = reviewer._material_id(scope, {'message_id': rid, 'text': new_text})
+
+        def inspect_pages(run_id, episode, *, all_pages):
+            page = inspection().inspect(home, run_id, episode['episode_id'], source='native',
+                                        record_id=rid, part='content')
+            pages = [page]
+            while all_pages and page['next_cursor']:
+                page = inspection().inspect(home, run_id, episode['episode_id'], source='native',
+                                            record_id=rid, part='content', cursor=page['next_cursor'])
+                pages.append(page)
+            return pages
+
+        def submit_with_prompt(run_id, manifest, pages):
+            episode = manifest['episodes'][0]
+            outcome = inspection().inspect(home, run_id, episode['episode_id'], source='native',
+                                           record_id=native['session_id'] + '-final-0', part='content')
+            row = {'episode_id': episode['episode_id'], 'assessment': 'reflected',
+                   'intent_sources': [pages[-1]['source_id']], 'action_sources': [outcome['source_id']],
+                   'outcome_sources': [outcome['source_id']], 'limitations': ['Prompt may be partial.']}
+            reviewer.submit_report(home, run_id, str(uuid.uuid4()), report_v2(row))
+
+        first, first_manifest = stage(home)
+        pages = inspect_pages(first, first_manifest['episodes'][0], all_pages=False)
+        assert pages[0]['next_cursor']
+        submit_with_prompt(first, first_manifest, pages)
+        reviewer.finalize_run(home, first, 'exited')
+        assert old_material not in reviewer._reviewed_material(home, scope)
+        prompt_row['message']['content'] = new_text
+        path.write_text('\n'.join(json.dumps(item) for item in rows) + '\n')
+        failed, changed = stage(home, cutoff=201)
+        assert changed['episodes'][0]['basis'] != first_manifest['episodes'][0]['basis']
+        failed_pages = inspect_pages(failed, changed['episodes'][0], all_pages=True)
+        assert len(failed_pages) > 2
+        submit_with_prompt(failed, changed, failed_pages)
+        reviewer.close_run(home, failed, 'failed')
+        assert new_material not in reviewer._reviewed_material(home, scope)
+        partial, partial_manifest = stage(home, cutoff=202)
+        partial_pages = inspect_pages(partial, partial_manifest['episodes'][0], all_pages=False)
+        submit_with_prompt(partial, partial_manifest, partial_pages)
+        reviewer.finalize_run(home, partial, 'exited')
+        assert new_material not in reviewer._reviewed_material(home, scope)
+        detail, detail_manifest = stage(home, cutoff=203, detail=(partial_manifest['episodes'][0]['episode_id'],))
+        all_pages = inspect_pages(detail, detail_manifest['episodes'][0], all_pages=True)
+        assert all_pages[0]['range']['end'] < all_pages[-1]['range']['start']
+        submit_with_prompt(detail, detail_manifest, all_pages)
+        reviewer.finalize_run(home, detail, 'exited')
+        assert new_material in reviewer._reviewed_material(home, scope)
+        assert old_material not in reviewer._reviewed_material(home, scope)
+
+
+@pytest.mark.parametrize('reopen', ['limits', 'feedback'])
+def test_report_v2_coverage_successful_limited_hold_reopens_for_new_basis(reopen):
+    with lab() as (home, _):
+        _, _, task = completed_session(home, role='worker', task_id='held')
+        cutoff = time.time() + 100
+        run_id, manifest = stage(home, cutoff=cutoff)
+        episode = next(item for item in manifest['episodes'] if item.get('task_id') == task['id'])
+        meta = inspection().inspect(home, run_id, episode['episode_id'], source='native')
+        row = {'episode_id': episode['episode_id'], 'assessment': 'limited',
+               'intent_sources': [meta['source_id']], 'action_sources': [], 'outcome_sources': [],
+               'limitations': ['Linked feedback unavailable.']}
+        reviewer.submit_report(home, run_id, str(uuid.uuid4()), report_v2(row))
+        reviewer.finalize_run(home, run_id, 'exited')
+        config = reviewer.read_config(home)
+        held = reviewer.select_manifest(home, cutoff=cutoff + 1, config_snapshot=config)
+        assert episode['episode_id'] not in {item['episode_id'] for item in held['episodes']}
+        assert any(item['episode_id'] == episode['episode_id'] for item in held['held'])
+        if reopen == 'limits':
+            config['limits']['max_input_bytes'] += 1024
+        else:
+            task_dir = tasks.task_file(home, task['id']).parent
+            question = task_dir / 'question.txt'
+            question.write_text('Which?\n')
+            workers.event(home, task['id'], task['incarnation'], 'decision', 'choice', question)
+            supervision.reconcile(home)
+            answer = task_dir / 'answer.txt'
+            answer.write_text('Newly linked feedback.\n')
+            supervision.resolve(home, task['id'], 'choice', answer)
+        reopened = reviewer.select_manifest(home, cutoff=cutoff + 2, config_snapshot=config)
+        found = next(item for item in reopened['episodes'] if item['episode_id'] == episode['episode_id'])
+        if reopen == 'feedback':
+            assert found['basis'] != episode['basis']
+        else:
+            assert found['limits_sha256'] != episode['limits_sha256']
+        assert not found['progress']['reflected']
+
+
+def test_report_v2_coverage_successful_screening_feeds_fair_rotation():
+    with lab() as (home, _):
+        completed_session(home, start_at=10)
+        run_id, manifest = stage(home, max_candidates=1)
+        old = manifest['episodes'][0]
+        def screen_and_finalize(current_run, episode):
+            metadata = inspection().inspect(home, current_run, episode['episode_id'], source='native')
+            row = {'episode_id': episode['episode_id'], 'assessment': 'screened',
+                   'intent_sources': [metadata['source_id']], 'action_sources': [], 'outcome_sources': [],
+                   'limitations': []}
+            reviewer.submit_report(home, current_run, str(uuid.uuid4()), report_v2(row))
+            reviewer.finalize_run(home, current_run, 'exited')
+        screen_and_finalize(run_id, old)
+        seen = []
+        for index in range(6):
+            completed_session(home, start_at=20 + index * 20)
+            run_id, manifest = stage(home, cutoff=201 + index, max_candidates=1)
+            episode = manifest['episodes'][0]
+            seen.append(episode['episode_id'])
+            screen_and_finalize(run_id, episode)
+        assert old['episode_id'] in seen
+        assert len(set(seen) - {old['episode_id']}) >= 2
+
+
+def test_report_v2_historical_prepared_recovery_coexists_with_new_submission(monkeypatch):
+    with lab() as (home, _):
+        old_run, packet = produced_run(home)
+        old_report = build_report(packet)
+        request = str(uuid.uuid4())
+        original = reviewer.publish_immutable
+        fired = False
+        def interrupt(path, value):
+            nonlocal fired
+            original(path, value)
+            if not fired and Path(path).parent == reviewer.paths(home)['prepared']:
+                fired = True
+                raise RuntimeError('prepared')
+        monkeypatch.setattr(reviewer, 'publish_immutable', interrupt)
+        with pytest.raises(RuntimeError):
+            reviewer.submit_report(home, old_run['review_run_id'], request, old_report)
+        assert fired
+        monkeypatch.setattr(reviewer, 'publish_immutable', original)
+        prepared_path = reviewer._prepared_path(home, old_run['review_run_id'], request)
+        prepared_bytes = prepared_path.read_bytes()
+        native, _, _ = completed_session(home, texts=('schema two native outcome',))
+        new_run, manifest = stage(home)
+        row, _, citation = report_v2_inputs(home, new_run, manifest, native)
+        dest = target(home, new_run, scope='distro', component='tool',
+                      basis_source_ids=(citation,), authority_hint='unknown')
+        reviewer.submit_report(home, new_run, str(uuid.uuid4()),
+                               report_v2(row, [report_v2_finding(row, dest['target_ref'], citation, 'distro')]))
+        reviewer.recover_submissions(home, old_run['review_run_id'])
+        old_result = reviewer.submit_report(home, old_run['review_run_id'], request, old_report)
+        old_report_path = reviewer.report_path(home, old_result['report_id'])
+        old_proposal_path = reviewer.proposal_path(home, old_result['proposal_ids'][0])
+        preserved = (prepared_path.read_bytes(), old_report_path.read_bytes(), old_proposal_path.read_bytes())
+        assert preserved[0] == prepared_bytes
+        reviewer.finalize_run(home, old_run['review_run_id'], 'exited')
+        reviewer.finalize_run(home, new_run, 'exited')
+        assert (prepared_path.read_bytes(), old_report_path.read_bytes(), old_proposal_path.read_bytes()) == preserved
+
+
+def test_report_v2_coverage_noncontiguous_issued_ranges_leave_middle_gap():
+    with lab() as (home, _):
+        text = 'independent page evidence ' * 400
+        native, _, _ = completed_session(home, texts=(text,))
+        run_id, manifest = stage(home)
+        episode = manifest['episodes'][0]
+        rid = native['session_id'] + '-final-0'
+        page = inspection().inspect(home, run_id, episode['episode_id'], source='native',
+                                    record_id=rid, part='content')
+        pages = [page]
+        while page['next_cursor']:
+            page = inspection().inspect(home, run_id, episode['episode_id'], source='native',
+                                        record_id=rid, part='content', cursor=page['next_cursor'])
+            pages.append(page)
+        assert len(pages) >= 3
+        version = hashlib.sha256(text.encode()).hexdigest()
+        def interval(page):
+            return {'message_id': rid, 'text_sha256': version, **page['range']}
+        first, middle, last = interval(pages[0]), interval(pages[1]), interval(pages[-1])
+        assert first['end'] == middle['start'] and middle['end'] <= last['start']
+        assert reviewer._has_new_exposure([first, last], [middle])
+        assert not reviewer._has_new_exposure([first, middle, last], [middle])
+        other_version = {**middle, 'text_sha256': hashlib.sha256(b'other version').hexdigest()}
+        assert reviewer._has_new_exposure([first, middle, last], [other_version])
+
+
+def test_report_v2_coverage_native_resume_uses_only_successful_prior_ranges():
+    with lab() as (home, _):
+        native, path, _ = completed_session(home, texts=('short final outcome',))
+        rid = native['session_id'] + '-prompt-0'
+        text = 'prompt-α-boundary ' * 500
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        prompt_row = next(item for item in rows if item.get('id') == rid)
+        prompt_row['message']['content'] = text
+        path.write_text('\n'.join(json.dumps(item) for item in rows) + '\n')
+        raw = text.encode()
+        scope = reviewer._source_scope(home, {'role': 'central', 'session_id': native['session_id']})
+        material = reviewer._material_id(scope, {'message_id': rid, 'text': text})
+
+        def metadata_row(run_id, episode_id):
+            cursor = None
+            while True:
+                args = ['reviewer', 'inspect', run_id, '--episode', episode_id, '--source', 'native']
+                if cursor is not None:
+                    args += ['--cursor', cursor]
+                page = command(home, *args)
+                bounded(page)
+                assert text not in json.dumps(page, ensure_ascii=False)
+                match = next((item for item in page['rows'] if item.get('message_id') == rid), None)
+                if match is not None:
+                    return match
+                cursor = page['next_cursor']
+                assert cursor is not None
+
+        def read_page(run_id, episode_id, cursor=None):
+            return inspection().inspect(home, run_id, episode_id, source='native',
+                                        record_id=rid, part='content', cursor=cursor)
+
+        def commit_reflection(run_id, episode, prompt_ids):
+            final = inspection().inspect(home, run_id, episode['episode_id'], source='native',
+                                         record_id=native['session_id'] + '-final-0', part='content')
+            row = {'episode_id': episode['episode_id'], 'assessment': 'reflected',
+                   'intent_sources': prompt_ids, 'action_sources': [final['source_id']],
+                   'outcome_sources': [final['source_id']], 'limitations': ['Prompt is range-bounded.']}
+            reviewer.submit_report(home, run_id, str(uuid.uuid4()), report_v2(row))
+            reviewer.finalize_run(home, run_id, 'exited')
+
+        failed_run, failed_manifest = stage(home)
+        failed_episode = failed_manifest['episodes'][0]
+        failed_prefix = read_page(failed_run, failed_episode['episode_id'])
+        assert failed_prefix['next_cursor']
+        reviewer.close_run(home, failed_run, 'failed')
+
+        first_run, first_manifest = stage(home, cutoff=201)
+        episode = first_manifest['episodes'][0]
+        assert episode['basis'] == failed_episode['basis']
+        first_meta = metadata_row(first_run, episode['episode_id'])
+        assert not first_meta.get('resume_cursor')
+        with pytest.raises(store.Refusal):
+            read_page(first_run, episode['episode_id'], failed_prefix['next_cursor'])
+        prefix = read_page(first_run, episode['episode_id'])
+        assert prefix['range']['start'] == 0 and prefix['range']['end'] < len(raw)
+        assert prefix['text'].encode() == raw[:prefix['range']['end']]
+        commit_reflection(first_run, episode, [prefix['source_id']])
+        assert material not in reviewer._reviewed_material(home, scope)
+
+        resumed_run, resumed_manifest = stage(home, cutoff=202, detail=(episode['episode_id'],))
+        resumed_episode = resumed_manifest['episodes'][0]
+        assert resumed_episode['basis'] == episode['basis']
+        row = metadata_row(resumed_run, episode['episode_id'])
+        resume_cursor = row['resume_cursor']
+        assert isinstance(resume_cursor, str) and resume_cursor != prefix['next_cursor']
+        journal = inspection().read_journal(home, resumed_run)
+        assert all(source.get('provenance', {}).get('view') != 'native-content'
+                   for source in journal['sources'].values())
+        assert material not in reviewer._reviewed_material(home, scope)
+        with pytest.raises(store.Refusal):
+            read_page(resumed_run, episode['episode_id'], prefix['next_cursor'])
+        with pytest.raises(store.Refusal):
+            inspection().inspect(home, resumed_run, episode['episode_id'], source='native',
+                                 record_id=native['session_id'] + '-final-0', part='content', cursor=resume_cursor)
+        page = read_page(resumed_run, episode['episode_id'], resume_cursor)
+        assert page['range']['start'] == prefix['range']['end']
+        pages = [page]
+        while page['next_cursor']:
+            page = read_page(resumed_run, episode['episode_id'], page['next_cursor'])
+            pages.append(page)
+        offset = prefix['range']['end']
+        for page in pages:
+            assert page['range']['start'] == offset
+            assert page['text'].encode() == raw[offset:page['range']['end']]
+            offset = page['range']['end']
+        assert offset == len(raw)
+        journal = inspection().read_journal(home, resumed_run)
+        prompt_ranges = [source['provenance'] for source in journal['sources'].values()
+                         if source.get('provenance', {}).get('view') == 'native-content'
+                         and source['provenance'].get('record_id') == rid]
+        assert prompt_ranges and all(span['start'] >= prefix['range']['end'] for span in prompt_ranges)
+        commit_reflection(resumed_run, resumed_episode, [page['source_id'] for page in pages])
+        assert material in reviewer._reviewed_material(home, scope)
+
+        reread_run, reread_manifest = stage(home, cutoff=203, detail=(episode['episode_id'],))
+        reread = read_page(reread_run, reread_manifest['episodes'][0]['episode_id'])
+        assert reread['range'] == prefix['range'] and reread['text'] == prefix['text']
+        reviewer.close_run(home, reread_run, 'failed')
+
+        prompt_row['message']['content'] = 'changed version ' * 500
+        path.write_text('\n'.join(json.dumps(item) for item in rows) + '\n')
+        changed_run, changed_manifest = stage(home, cutoff=204)
+        changed_episode = changed_manifest['episodes'][0]
+        assert changed_episode['episode_id'] == episode['episode_id']
+        assert changed_episode['basis'] != episode['basis']
+        changed_meta = metadata_row(changed_run, changed_episode['episode_id'])
+        assert not changed_meta.get('resume_cursor')
+        with pytest.raises(store.Refusal):
+            read_page(changed_run, changed_episode['episode_id'], resume_cursor)
+        changed_prefix = read_page(changed_run, changed_episode['episode_id'])
+        assert changed_prefix['range']['start'] == 0
+        assert changed_prefix['text'].startswith('changed version ')

@@ -202,6 +202,9 @@ def _active_receipt(home, run_id, deadline):
     receipt = reviewer._receipt(home, run_id)
     if receipt.get('dispatch_state') != 'begun' or receipt.get('review_run_id') != run_id:
         raise store.Refusal('review run is not active')
+    if any(reviewer._read_json(path).get('schema') == 2
+           for path in reviewer.paths(home)['prepared'].glob(f'{run_id}-*.json')):
+        raise store.Refusal('review report already prepared')
     if receipt.get('deadline_epoch_ms') != deadline:
         raise store.Refusal('review run deadline changed')
     reviewer._check_deadline(deadline)
@@ -810,10 +813,32 @@ def inspect(home, run_id, episode_id, *, source='auto', record_id=None, part=Non
             offset = _resume(home, receipt, cursor, identity)
             artifacts = [{key: item[key] for key in ('kind', 'sha256', 'size') if key in item}
                          for item in locators if item.get('kind') != 'native' and 'sha256' in item]
-            items = [*meta['projection'], *artifacts]
+            progress_path = reviewer._progress_path(home, episode_id, episode['basis'])
+            _watch(home, progress_path)
+            progress = reviewer._episode_progress(home, episode_id, episode['basis'])
+            items = []
+            resume_offsets = {}
+            for item in meta['projection']:
+                prefix = reviewer._covered_prefix(progress['ranges'], item['message_id'], item['text_sha256'])
+                sizes = {row.get('size') for row in progress['ranges']
+                         if row.get('message_id') == item['message_id']
+                         and row.get('text_sha256') == item['text_sha256']}
+                if prefix and len(sizes) == 1 and type(next(iter(sizes))) is int and prefix < next(iter(sizes)):
+                    resume_offsets[item['message_id']] = prefix
+                    items.append({**item, 'resume_cursor': '0' * 64})
+                else:
+                    items.append(item)
+            items.extend(artifacts)
             rows = _row_page(items, offset, {
                 'source': 'native', 'source_id': '0' * 64, 'next_cursor': '0' * 64,
                 'complete': False, 'limitations': [limitation] if limitation else []})
+            for index, item in enumerate(rows):
+                if 'resume_cursor' in item:
+                    cursor_identity = {'view': 'native-content', 'episode_id': episode_id,
+                                       'record_id': item['message_id'], 'version_sha256': item['text_sha256'],
+                                       'projection_sha256': meta['material_sha256'],
+                                       'offset': resume_offsets[item['message_id']], 'resume_basis': episode['basis']}
+                    rows[index] = {**item, 'resume_cursor': _cursor(home, receipt, cursor_identity)}
             next_offset = offset + len(rows)
             rendered = json.dumps(rows, ensure_ascii=False, sort_keys=True)
             source_id = _source(home, receipt, text=rendered, provenance={
@@ -1400,6 +1425,18 @@ def _read_journal_locked(home, run_id):
         if (cursor.get('run_id') != run_id or cursor.get('manifest_id') != receipt['manifest_id'] or
                 type(cursor.get('offset')) is not int or cursor['offset'] < 0):
             raise store.Refusal('inspection cursor invalid')
+        if 'resume_basis' in cursor:
+            episode = next((item for item in manifest['episodes']
+                            if item['episode_id'] == cursor.get('episode_id')), None)
+            if (episode is None or cursor.get('view') != 'native-content'
+                    or cursor['resume_basis'] != episode['basis'] or cursor['offset'] <= 0
+                    or cursor.get('source_id') is not None or cursor.get('previous_cursor') is not None):
+                raise store.Refusal('inspection resume cursor invalid')
+            progress = reviewer._episode_progress(home, episode['episode_id'], episode['basis'])
+            if reviewer._covered_prefix(progress['ranges'], cursor.get('record_id'),
+                                        cursor.get('version_sha256')) < cursor['offset']:
+                raise store.Refusal('inspection resume progress unavailable')
+            continue
         source = sources.get(cursor.get('source_id'))
         provenance = source.get('provenance', {}) if source else {}
         previous = cursor.get('previous_cursor')

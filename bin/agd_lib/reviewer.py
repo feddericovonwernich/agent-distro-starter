@@ -346,6 +346,7 @@ def _capture_evidence_v2(root, run_id, path, label, initial_receipt):
     _check_deadline(deadline)
     with store.lock(root, deadline_epoch_ms=deadline):
         receipt = _receipt(root, run_id)
+        reviewer_inspection._active_receipt(root, run_id, deadline)
         if (receipt.get('dispatch_state') != 'begun' or receipt.get('manifest_id') != initial_receipt['manifest_id']
                 or receipt.get('deadline_epoch_ms') != deadline):
             raise store.Refusal('review run is not active')
@@ -363,6 +364,7 @@ def _capture_evidence_v2(root, run_id, path, label, initial_receipt):
         raise store.Refusal('supplementary artifact is credential-bearing')
     with store.lock(root, deadline_epoch_ms=deadline):
         current = _receipt(root, run_id)
+        reviewer_inspection._active_receipt(root, run_id, deadline)
         if (current.get('dispatch_state') != 'begun' or current.get('manifest_id') != receipt['manifest_id']
                 or current.get('deadline_epoch_ms') != deadline
                 or current.get('config_snapshot_ref') != receipt.get('config_snapshot_ref')
@@ -907,6 +909,20 @@ def _has_new_exposure(existing, incoming):
         if covered < end:
             return True
     return False
+
+
+def _covered_prefix(ranges, message_id, version):
+    spans = sorted((row['start'], row['end']) for row in ranges
+                   if isinstance(row, dict) and row.get('message_id') == message_id
+                   and row.get('text_sha256') == version
+                   and type(row.get('start')) is int and type(row.get('end')) is int
+                   and 0 <= row['start'] < row['end'])
+    end = 0
+    for left, right in spans:
+        if left > end:
+            break
+        end = max(end, right)
+    return end
 
 
 def _record_episode_progress(home, *, episode, assessment, limitations=(), ranges=(), submission_id):
@@ -1690,7 +1706,9 @@ def close_run(home, review_run_id, outcome, *, error_code=None, diagnostic=b'', 
     with store.lock(store.home(home)):
         receipt = _receipt(home, review_run_id)
         if receipt.get('dispatch_state') == 'final': return receipt
-        if receipt.get('dispatch_state') == 'report-committed':
+        if (receipt.get('dispatch_state') == 'report-committed' or
+                (receipt.get('manifest_id') is not None and
+                 any(paths(home)['prepared'].glob(f"{receipt['review_run_id']}-*.json")))):
             needs_finalize = True
         else:
             if packet is not None: receipt['packet_id'] = packet['packet_id']
@@ -1745,10 +1763,13 @@ def list_proposals(home):
     return [read_proposal(home, path.stem) for path in sorted(folder.glob('*.json'))] if folder.exists() else []
 
 
-def _finding_fingerprint(finding):
-    target = normalize(finding['target'])
-    if not target: raise store.Refusal('target')
-    return _digest([1, finding['kind'], target, normalize(finding['finding']), normalize(finding['applicability'])])
+def _finding_fingerprint(finding, target=None):
+    if target is not None:
+        return _digest([2, target['identity'], target['operation'],
+                        normalize(finding['finding']), normalize(finding['applicability'])])
+    target_name = normalize(finding['target'])
+    if not target_name: raise store.Refusal('target')
+    return _digest([1, finding['kind'], target_name, normalize(finding['finding']), normalize(finding['applicability'])])
 
 
 def _revision_hash(proposal_id, finding):
@@ -1802,6 +1823,240 @@ def _validate_report(home, receipt, packet, report, supplementary=None):
                 raise store.Refusal('new skill draft')
     return report
 
+
+def _string_list(value, *, unique=False):
+    return (isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value)
+            and (not unique or len(set(value)) == len(value)))
+
+
+def _validate_report_v2(home, receipt, manifest, report, evidence, targets, journal):
+    if (not isinstance(report, dict) or set(report) != {'schema', 'summary', 'episode_reviews', 'findings'}
+            or type(report['schema']) is not int or report['schema'] != 2
+            or not isinstance(report['summary'], str) or not isinstance(report['episode_reviews'], list)
+            or not isinstance(report['findings'], list)):
+        raise store.Refusal('report schema')
+    config = validate_config(_read_json(paths(home)['manifests'] / f"{receipt['config_snapshot_ref']}.json"))
+    if len(_json_bytes(report)) > config['limits']['max_output_bytes']:
+        raise store.Refusal('report exceeds output limit')
+    episodes = {row['episode_id']: row for row in manifest['episodes']}
+    sources = journal['sources']
+    supplementary = evidence['sources']
+    for source in supplementary.values():
+        origin = source.get('origin', {})
+        if origin.get('run_id') != receipt['review_run_id']:
+            raise store.Refusal('evidence origin')
+        _artifact_path(home, receipt['review_run_id'],
+                       paths(home)['runtime'] / receipt['review_run_id'] / str(origin.get('path', '')))
+        if _EVIDENCE_SECRET_TEXT.search(source['text']):
+            raise store.Refusal('evidence contains credentials')
+    reviews = {}
+    row_keys = {'episode_id', 'assessment', 'intent_sources', 'action_sources', 'outcome_sources', 'limitations'}
+    for row in report['episode_reviews']:
+        if (not isinstance(row, dict) or set(row) != row_keys or not isinstance(row['episode_id'], str)
+                or row['episode_id'] not in episodes
+                or row['episode_id'] in reviews or row['assessment'] not in ('screened', 'reflected', 'limited')
+                or not _string_list(row['limitations'])):
+            raise store.Refusal('episode review schema')
+        if row['assessment'] == 'limited' and not row['limitations']:
+            raise store.Refusal('limited assessment requires a reason')
+        used = []
+        artifacts = {}
+        cursor = 0
+        while cursor is not None:
+            page = read_selection_locators(home, manifest['manifest_id'], row['episode_id'], cursor=cursor)
+            artifacts.update({item['sha256']: item['kind'] for item in page['rows']
+                              if item.get('kind') != 'native' and 'sha256' in item})
+            cursor = page['next_cursor']
+        for key in ('intent_sources', 'action_sources', 'outcome_sources'):
+            ids = row[key]
+            if not _string_list(ids, unique=True):
+                raise store.Refusal('episode sources')
+            for source_id in ids:
+                source = sources.get(source_id)
+                if source is None or source['provenance'].get('episode_id') != row['episode_id']:
+                    raise store.Refusal('episode source scope')
+                if source['provenance'].get('view') not in ('native-content', 'native-metadata',
+                                                              'langfuse-input', 'langfuse-output', 'langfuse-metadata'):
+                    raise store.Refusal('episode source provenance')
+                if source['provenance'].get('view') == 'native-content':
+                    kind = artifacts.get(source['provenance'].get('record_id'))
+                    if kind is not None and (
+                            (key == 'intent_sources' and kind != 'intent') or
+                            key == 'action_sources' or
+                            (key == 'outcome_sources' and kind not in ('feedback', 'runner-exit', 'reviewer-report'))):
+                        raise store.Refusal('artifact incompatible with episode role')
+            if row['assessment'] == 'reflected' and not any(
+                    sources[ident]['provenance']['view'] in ('native-content', 'langfuse-input', 'langfuse-output')
+                    for ident in ids):
+                raise store.Refusal('reflection requires content in each role')
+            used.extend(ids)
+        if row['assessment'] in ('limited', 'screened') and not used:
+            raise store.Refusal('assessment requires exposed evidence')
+        reviews[row['episode_id']] = row
+    finding_keys = {'episode_ids', 'target_ref', 'finding', 'proposed_change', 'expected_benefit',
+                    'applicability', 'scope_rationale', 'citations', 'counterexamples', 'alternatives',
+                    'uncertainty', 'validation', 'validation_limits', 'risks', 'draft'}
+    admitted = set(sources) | set(supplementary)
+    for finding in report['findings']:
+        if not isinstance(finding, dict) or set(finding) != finding_keys:
+            raise store.Refusal('finding schema')
+        ids = finding['episode_ids']
+        if (not _string_list(ids, unique=True) or not ids
+                or any(ident not in reviews or reviews[ident]['assessment'] != 'reflected' for ident in ids)):
+            raise store.Refusal('finding episode grounding')
+        target = targets.get(finding['target_ref']) if isinstance(finding['target_ref'], str) else None
+        if target is None:
+            raise store.Refusal('target not admitted')
+        identity = target['identity']
+        if finding['applicability'] != identity['scope']:
+            raise store.Refusal('target applicability mismatch')
+        if identity['scope'] == 'project':
+            for ident in ids:
+                episode = episodes[ident]
+                bindings = [episode.get('project_binding')] + episode.get('project_bindings', [])
+                if not any(isinstance(binding, dict)
+                           and binding.get('project_id') == identity['context']['project_id']
+                           and binding.get('identity_sha256') == identity['context']['identity_sha256']
+                           for binding in bindings):
+                    raise store.Refusal('target project not linked to finding episode')
+        if not all(isinstance(finding[key], str) and finding[key].strip() for key in
+                   ('finding', 'proposed_change', 'expected_benefit', 'applicability', 'scope_rationale',
+                    'alternatives', 'uncertainty', 'validation')):
+            raise store.Refusal('finding text')
+        for key in ('citations', 'counterexamples'):
+            if not _string_list(finding[key], unique=True) or not set(finding[key]) <= admitted:
+                raise store.Refusal('finding evidence')
+        if not finding['citations'] or not _string_list(finding['risks']) or not _string_list(finding['validation_limits']):
+            raise store.Refusal('finding evidence or risks')
+        if finding['draft'] is not None and not isinstance(finding['draft'], str):
+            raise store.Refusal('finding draft')
+        if (finding['draft'] is not None and target['operation'] == 'create'
+                and identity['kind'] == 'file' and identity['locator'].endswith('/SKILL.md')
+                and not re.match(r'\A---\nname: [^\n]+\ndescription: [^\n]+\n---\n', finding['draft'])):
+            raise store.Refusal('skill draft frontmatter')
+    return report
+
+
+def _validate_v2_sources(home, receipt, manifest, report, journal):
+    """Reprove issued episode content against selected native scope; caller holds validation watches."""
+    from . import reviewer_inspection as inspection
+    assessed = {row['episode_id'] for row in report['episode_reviews']}
+    episodes = {row['episode_id']: row for row in manifest['episodes']}
+    native = {}
+    ranges = {ident: [] for ident in assessed}
+    overlap = {}
+    for source_id, source in journal['sources'].items():
+        provenance = source['provenance']
+        eid = provenance.get('episode_id')
+        if eid is None:
+            continue
+        if eid not in episodes:
+            raise store.Refusal('source episode outside selection')
+        episode = episodes[eid]
+        if eid not in native:
+            if episode.get('project_binding'):
+                inspection._watch(home, projects.record(home, episode['project_binding']['project_id']))
+                inspection._watch(home, home / 'data' / 'tasks' / episode['task_id'] / 'task.json')
+                _validate_project_binding(home, episode, deadline_epoch_ms=receipt['deadline_epoch_ms'])
+            native[eid] = inspection._native(home, receipt, manifest, episode)
+        locator, locators, path, completion, meta = native[eid]
+        if completion is None:
+            for item in locators:
+                if item.get('kind') == 'runner-exit':
+                    inspection._artifact(home, item, offset=0, deadline=receipt['deadline_epoch_ms'])
+        view, record_id = provenance.get('view'), provenance.get('record_id')
+        if view == 'native-content':
+            if provenance.get('projection_sha256') != meta['material_sha256']:
+                raise store.Refusal('native source projection mismatch')
+            start, end = provenance['start'], provenance['end']
+            artifact = next((item for item in locators if item.get('kind') != 'native'
+                             and item.get('sha256') == record_id), None)
+            if artifact:
+                scanned = inspection._artifact(home, artifact, offset=start, deadline=receipt['deadline_epoch_ms'])
+                expected = scanned['text'].encode()[:end - start]
+                if (scanned['sha256'] != provenance.get('version_sha256') or
+                        expected != source['text'].encode() or scanned['end'] != end or
+                        provenance['complete'] != (end == scanned['size'])):
+                    raise store.Refusal('artifact range changed')
+                stable = {'episode_id': eid, 'artifact': artifact['kind'], 'sha256': artifact['sha256'],
+                          'start': start, 'end': end}
+            else:
+                expected_row = next((item for item in meta['projection'] if item['message_id'] == record_id), None)
+                if not expected_row or expected_row['text_sha256'] != provenance.get('version_sha256'):
+                    raise store.Refusal('native range outside projection')
+                read = reviewer_episodes.read_native(path, manifest['cutoff'], inspection.PAGE_BYTES,
+                                                     receipt['deadline_epoch_ms'], completion=completion,
+                                                     content_range=(record_id, start, inspection.PAGE_BYTES),
+                                                     reject_text=_EVIDENCE_SECRET_TEXT.search)
+                result = next((item for item in read['rows'] if item['message_id'] == record_id), None)
+                if (result is None or result['text_sha256'] != provenance['version_sha256']
+                        or result['start'] != start or result['end'] != end or result['text'] != source['text']
+                        or provenance['complete'] != (end == result['size'])):
+                    raise store.Refusal('native range changed')
+                if eid in ranges:
+                    ranges[eid].append({'message_id': record_id, 'text_sha256': result['text_sha256'],
+                                        'start': start, 'end': end, 'size': result['size']})
+                stable = {'episode_id': eid, 'message_id': record_id, 'text_sha256': result['text_sha256'],
+                          'start': start, 'end': end}
+            overlap[source_id] = stable
+        elif view == 'native-metadata':
+            if provenance.get('version_sha256') != meta['material_sha256']:
+                raise store.Refusal('native metadata version changed')
+            artifacts = [{key: item[key] for key in ('kind', 'sha256', 'size') if key in item}
+                         for item in locators if item.get('kind') != 'native' and 'sha256' in item]
+            expected = [*meta['projection'], *artifacts][provenance['start']:provenance['end']]
+            try:
+                disclosed = [{key: value for key, value in item.items() if key != 'resume_cursor'}
+                             for item in json.loads(source['text'])]
+            except (TypeError, ValueError, AttributeError) as error:
+                raise store.Refusal('native metadata invalid') from error
+            if disclosed != expected:
+                raise store.Refusal('native metadata outside selection')
+            overlap[source_id] = {'episode_id': eid, 'view': view, 'version_sha256': meta['material_sha256'],
+                                  'start': provenance['start'], 'end': provenance['end']}
+        elif view in ('langfuse-metadata', 'langfuse-input', 'langfuse-output'):
+            scope = provenance.get('query_scope', {})
+            if scope.get('session_id') != episode['session_id'] or scope.get('window') != inspection._telemetry_window(home, receipt, manifest, episode, meta):
+                raise store.Refusal('telemetry scope mismatch')
+            if view == 'langfuse-metadata':
+                if provenance.get('version_sha256') != _digest({'query_scope': scope, 'projection': meta['material_sha256']}):
+                    raise store.Refusal('telemetry metadata version mismatch')
+                try:
+                    observations = json.loads(source['text'])
+                    if (not isinstance(observations, list)
+                            or len(observations) != provenance['end'] - provenance['start']):
+                        raise ValueError('metadata page')
+                    for observation in observations:
+                        if (not isinstance(observation, dict) or not isinstance(observation.get('id'), str)
+                                or observation.get('sessionId') != episode['session_id']):
+                            raise ValueError('observation scope')
+                        start = reviewer_episodes._epoch(observation.get('startTime'))
+                        end = reviewer_episodes._epoch(observation.get('endTime'))
+                        if not scope['window']['start'] <= start <= end <= scope['window']['end']:
+                            raise ValueError('observation window')
+                        digest = _digest(observation)
+                        if eid in ranges:
+                            ranges[eid].append({'provider': 'langfuse', 'record_id': observation['id'],
+                                                'metadata_sha256': digest, 'source_id': observation['id'],
+                                                'version_sha256': digest, 'start': 0, 'end': 1})
+                except (TypeError, ValueError, KeyError, OverflowError) as error:
+                    raise store.Refusal('telemetry metadata invalid') from error
+            if view != 'langfuse-metadata':
+                matching = []
+                for metadata in journal['sources'].values():
+                    p = metadata.get('provenance', {})
+                    if p.get('view') == 'langfuse-metadata' and p.get('episode_id') == eid and p.get('query_scope') == scope:
+                        matching.extend(item for item in json.loads(metadata['text']) if item.get('id') == record_id)
+                if len(matching) != 1:
+                    raise store.Refusal('telemetry record not admitted')
+                overlap[source_id] = {'episode_id': eid, 'provider': 'langfuse', 'record_id': record_id,
+                                      'metadata_sha256': _digest(matching[0]), 'view': view,
+                                      'version_sha256': provenance['version_sha256'],
+                                      'start': provenance['start'], 'end': provenance['end']}
+        else:
+            raise store.Refusal('unsupported episode provenance')
+    return ranges, overlap
+
 def _prepared_path(home, run_id, request_id):
     return paths(home)['prepared'] / f'{run_id}-{request_id}.json'
 
@@ -1828,6 +2083,111 @@ def _apply_prepared_locked(home, receipt, prepared):
     return result
 
 
+def _evidence_overlap(left, right):
+    for first in left:
+        for second in right:
+            if (first.get('start') is not None and second.get('start') is not None
+                    and {k: v for k, v in first.items() if k not in ('start', 'end')} ==
+                    {k: v for k, v in second.items() if k not in ('start', 'end')}
+                    and first['start'] < second['end'] and second['start'] < first['end']):
+                return True
+            if first == second:
+                return True
+    return False
+
+
+def _target_display(target):
+    authority = target['identity']['authority']
+    routing = ('Upstream routing or owner confirmation required; no local edit authority.'
+               if authority['status'] in ('external', 'unknown')
+               else 'Verified destination; acceptance grants no edit authority.')
+    return {'identity': target['identity'], 'operation': target['operation'],
+            'guard': target['guard'], 'surface': target['surface'], 'routing': routing}
+
+
+def _submit_report_v2(home, receipt, request_id, report):
+    from . import reviewer_inspection as inspection
+    from .uninstall_state import admission
+    home = store.home(home)
+    run_id, deadline = receipt['review_run_id'], receipt.get('deadline_epoch_ms')
+    with admission(home):
+        journal = inspection.read_journal(home, run_id)
+        manifest = read_manifest(home, receipt['manifest_id'])
+        with inspection._validation_scope() as watched:
+            for target in journal['targets'].values():
+                inspection._validate_target_context(home, manifest, target, deadline=deadline)
+            evidence = read_evidence(home, run_id)
+            for source_id in evidence['sources']:
+                inspection._watch(home, paths(home)['evidence'] / run_id / (source_id + '.json'))
+            _validate_report_v2(home, receipt, manifest, report, evidence, journal['targets'], journal)
+            ranges, overlap = _validate_v2_sources(home, receipt, manifest, report, journal)
+            with store.lock(home, deadline_epoch_ms=deadline):
+                current = _receipt(home, run_id)
+                if (current.get('dispatch_state') != 'begun'
+                        or any(current.get(key) != receipt.get(key) for key in
+                               ('manifest_id', 'deadline_epoch_ms', 'config_snapshot_ref', 'instruction_snapshot_ref'))):
+                    raise store.Refusal('review run changed during report validation')
+                _check_deadline(deadline)
+                inspection._check_watches(watched)
+                if (inspection._read_journal_locked(home, run_id)['journal_sha256'] != journal['journal_sha256']
+                        or read_evidence(home, run_id) != evidence):
+                    raise store.Refusal('review evidence changed during validation')
+                if list(paths(home)['prepared'].glob(f'{run_id}-*.json')):
+                    raise store.Refusal('report submission already prepared')
+                report_id = _digest({'review_run_id': run_id, 'request_id': request_id, 'report': report})
+                proposals, revisions, proposal_ids, displays = list_proposals(home), [], [], []
+                for finding in report['findings']:
+                    target = journal['targets'][finding['target_ref']]
+                    display = _target_display(target)
+                    descriptors = [overlap.get(ident, {'source_id': ident}) for ident in finding['citations']]
+                    fingerprint = _finding_fingerprint(finding, target)
+                    matches = [item for item in proposals if item.get('schema') == 2 and item['fingerprint'] == fingerprint]
+                    proposal = (matches[0] if len(matches) == 1 and any(
+                        _evidence_overlap(row.get('evidence_overlap', []), descriptors)
+                        for row in matches[0]['revisions']) else None)
+                    if proposal is None:
+                        proposal = {'schema': 2, 'proposal_id': str(uuid.uuid4()), 'fingerprint': fingerprint,
+                                    'head_revision': None, 'revisions': [], 'uncertain_distinct': bool(matches)}
+                        proposals.append(proposal)
+                    revision_hash = _digest([2, proposal['proposal_id'], finding, target, descriptors])
+                    if revision_hash not in {row['revision_hash'] for row in proposal['revisions']}:
+                        revision = {'schema': 2, 'proposal_id': proposal['proposal_id'], 'revision_hash': revision_hash,
+                                    'report_id': report_id, 'manifest_id': manifest['manifest_id'],
+                                    'inspection_sha256': journal['journal_sha256'], 'basis_source_ids': sorted(finding['citations']),
+                                    'evidence_overlap': descriptors, 'proposed_change': finding, 'target': display,
+                                    'observer': {'model': receipt['model'], 'omp_version': receipt.get('omp_version'),
+                                                 'instruction_snapshot_ref': receipt['instruction_snapshot_ref']},
+                                    'resurfaced': bool(proposal['revisions'])}
+                        revisions.append(revision)
+                        proposal['revisions'].append(revision)
+                        proposal['head_revision'] = revision_hash
+                    proposal_ids.append(proposal['proposal_id'])
+                    displays.append(display)
+                result = {'report_id': report_id, 'proposal_ids': proposal_ids}
+                record = {'schema': 2, 'review_run_id': run_id, 'request_id': request_id, 'report': report,
+                          'manifest_id': manifest['manifest_id'], 'inspection_sha256': journal['journal_sha256'],
+                          'targets': displays, 'proposal_ids': proposal_ids,
+                          'revision_ids': [row['revision_hash'] for row in revisions],
+                          'observer': {'model': receipt['model'], 'omp_version': receipt.get('omp_version'),
+                                       'instruction_snapshot_ref': receipt['instruction_snapshot_ref']}}
+                output_bytes = len(_json_bytes(record))
+                config = validate_config(_read_json(paths(home)['manifests'] / f"{receipt['config_snapshot_ref']}.json"))
+                if output_bytes > config['limits']['max_output_bytes']:
+                    raise store.Refusal('report output exceeds limit')
+                by_id = {episode['episode_id']: episode for episode in manifest['episodes']}
+                coverage = [{'episode': by_id[row['episode_id']], 'assessment': row['assessment'],
+                             'limitations': row['limitations'], 'ranges': ranges[row['episode_id']]}
+                            for row in report['episode_reviews']]
+                prepared = {'schema': 2, 'run_id': run_id, 'request_id': request_id,
+                            'input_digest': _digest(report), 'result': result, 'record': record,
+                            'output_bytes': output_bytes, 'revisions': revisions,
+                            'proposals': [item for item in proposals if item['proposal_id'] in proposal_ids],
+                            'journal_sha256': journal['journal_sha256'],
+                            'evidence_sha256': _digest(evidence), 'coverage': coverage}
+                publish_immutable(_prepared_path(home, run_id, request_id), prepared)
+                return _apply_prepared_locked(home, current, prepared)
+
+
 def submit_report(home, review_run_id, request_id, report):
     try: request_id = str(uuid.UUID(str(request_id)))
     except (ValueError, TypeError, AttributeError) as error: raise store.Refusal('request ID') from error
@@ -1835,6 +2195,17 @@ def submit_report(home, review_run_id, request_id, report):
     if receipt.get('dispatch_state') == 'final' and request_id in receipt.get('report_requests', {}):
         if receipt['report_requests'][request_id] != _digest(report): raise store.Refusal('conflicting request reuse')
         return receipt['report_results'][request_id]
+    if receipt.get('manifest_id') is not None:
+        path = _prepared_path(home, receipt['review_run_id'], request_id)
+        if path.exists():
+            prepared = _read_json(path)
+            if prepared.get('input_digest') != _digest(report):
+                raise store.Refusal('conflicting request reuse')
+            recover_submissions(home, review_run_id)
+            return _receipt(home, review_run_id)['report_results'][request_id]
+        if receipt.get('dispatch_state') != 'begun':
+            raise store.Refusal('reviewer report already frozen')
+        return _submit_report_v2(home, receipt, request_id, report)
     if receipt.get('dispatch_state') not in ('begun', 'report-committed'): raise store.Refusal('reviewer receipt cannot accept a report')
     packet = read_packet(home, receipt.get('packet_id'))
     supplementary = read_evidence(home, receipt['review_run_id'])
@@ -1878,10 +2249,26 @@ def recover_submissions(home, review_run_id):
         for path in paths(home)['prepared'].glob(f"{receipt['review_run_id']}-*.json"):
             prepared = _read_json(path)
             if prepared['request_id'] not in receipt.get('report_requests', {}):
-                packet = read_packet(home, receipt.get('packet_id'))
-                _validate_report(
-                    home, receipt, packet, prepared['record']['report'],
-                    supplementary=read_evidence(home, receipt['review_run_id']))
+                if prepared.get('schema') == 2:
+                    if (receipt.get('manifest_id') != prepared['record'].get('manifest_id')
+                            or prepared.get('run_id') != receipt['review_run_id']
+                            or prepared.get('input_digest') != _digest(prepared['record']['report'])
+                            or receipt.get('dispatch_state') != 'begun'):
+                        raise store.Refusal('prepared reviewer submission invalid')
+                    from . import reviewer_inspection as inspection
+                    run_id = receipt['review_run_id']
+                    frozen = {'schema': 1, 'run_id': run_id, 'manifest_id': receipt['manifest_id'],
+                              'sources': inspection._read_sources(home, receipt),
+                              'cursors': inspection._records(home, run_id, 'cursors'),
+                              'targets': inspection._records(home, run_id, 'targets')}
+                    if (_digest(frozen) != prepared['journal_sha256']
+                            or _digest(read_evidence(home, run_id)) != prepared['evidence_sha256']):
+                        raise store.Refusal('prepared reviewer evidence changed')
+                else:
+                    packet = read_packet(home, receipt.get('packet_id'))
+                    _validate_report(
+                        home, receipt, packet, prepared['record']['report'],
+                        supplementary=read_evidence(home, receipt['review_run_id']))
                 receipt = _receipt(home, review_run_id)
                 _apply_prepared_locked(home, receipt, prepared)
     return _receipt(home, review_run_id)
@@ -1909,18 +2296,78 @@ def _review_event(home, receipt):
     event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, _digest([receipt['review_run_id'], receipt.get('report_ids', []), proposal_ids])))
     pending, handled = store.home(home) / 'state' / 'events' / f'{event_id}.json', store.home(home) / 'state' / 'events-handled' / f'{event_id}.json'
     if not pending.exists() and not handled.exists():
+        details = {'purpose': 'background-skill-review', 'review_run_id': receipt['review_run_id'],
+                   'report_ids': receipt.get('report_ids', []), 'proposal_ids': proposal_ids,
+                   'report_count': len(receipt.get('report_ids', [])), 'proposal_count': len(proposal_ids)}
+        if receipt.get('manifest_id') is not None:
+            details['manifest_id'] = receipt['manifest_id']
+            details['targets'] = [target for report_id in receipt.get('report_ids', [])
+                                  for target in _read_json(report_path(home, report_id)).get('targets', [])]
         store.atomic_json(pending, {'schema': 1, 'id': event_id, 'kind': 'background-skill-review',
-                                    'key': receipt['review_run_id'], 'observed_at': time.time(),
-                                    'details': {'purpose': 'background-skill-review', 'review_run_id': receipt['review_run_id'],
-                                                'report_ids': receipt.get('report_ids', []), 'proposal_ids': proposal_ids,
-                                                'report_count': len(receipt.get('report_ids', [])), 'proposal_count': len(proposal_ids)}})
+                                    'key': receipt['review_run_id'], 'observed_at': time.time(), 'details': details})
     return event_id
+
+
+def _commit_v2_coverage_locked(home, receipt):
+    for path in paths(home)['prepared'].glob(f"{receipt['review_run_id']}-*.json"):
+        prepared = _read_json(path)
+        if prepared.get('schema') != 2:
+            continue
+        for item in prepared['coverage']:
+            episode = item['episode']
+            state = _record_episode_progress(home, episode=episode, assessment=item['assessment'],
+                                             limitations=item['limitations'], ranges=item['ranges'],
+                                             submission_id=prepared['request_id'])
+            if episode.get('role') not in ('worker', 'central'):
+                continue
+            scope = _source_scope(home, episode)
+            candidate_id = _source_candidate_id(scope)
+            candidate_path = paths(home)['candidates'] / f'{candidate_id}.json'
+            prior = _read_json(candidate_path) if candidate_path.exists() else {}
+            reviewed = set(prior.get('reviewed_material_ids', ())) | set(prior.get('reviewed_excerpt_ids', ()))
+            for span in state['ranges']:
+                if (not isinstance(span, dict) or type(span.get('size')) is not int
+                        or not isinstance(span.get('message_id'), str)
+                        or not isinstance(span.get('text_sha256'), str)):
+                    continue
+                if _covered_prefix(state['ranges'], span['message_id'], span['text_sha256']) >= span['size']:
+                    reviewed.add(_digest({'scope': scope, 'message_id': span['message_id'],
+                                          'text_sha256': span['text_sha256']}))
+            if reviewed:
+                store.atomic_json(candidate_path, {**prior, 'schema': 1, 'candidate_id': candidate_id,
+                                                  'state': 'reviewed',
+                                                  'reviewed_material_ids': sorted(reviewed),
+                                                  'reviewed_excerpt_ids': sorted(reviewed)})
+
+
+def _finalize_v2(home, review_run_id, outcome):
+    with store.lock(store.home(home)):
+        receipt = _receipt(home, review_run_id)
+        if receipt.get('dispatch_state') == 'final':
+            outcome = receipt.get('outcome')
+        elif receipt.get('finalization_outcome') is not None:
+            outcome = receipt['finalization_outcome']
+        else:
+            receipt['finalization_outcome'] = outcome
+            store.atomic_json(paths(home)['receipts'] / f'{review_run_id}.json', receipt)
+        if outcome == 'exited':
+            _commit_v2_coverage_locked(home, receipt)
+            event_id = _review_event(home, receipt)
+        else:
+            event_id = None
+        if receipt.get('dispatch_state') != 'final':
+            receipt.update(dispatch_state='final', outcome=outcome, state=outcome,
+                           closed_at=time.time(), event_id=event_id)
+            store.atomic_json(paths(home)['receipts'] / f'{review_run_id}.json', receipt)
+    return _receipt(home, review_run_id)
 
 
 def finalize_run(home, review_run_id, outcome):
     if not isinstance(outcome, str) or not outcome: raise store.Refusal('outcome')
     receipt = recover_submissions(home, review_run_id)
     if receipt.get('dispatch_state') not in ('report-committed', 'final'): raise store.Refusal('report is not committed')
+    if receipt.get('manifest_id') is not None:
+        return _finalize_v2(home, review_run_id, outcome)
     with store.lock(store.home(home)):
         receipt = _receipt(home, review_run_id)
         event_id = _review_event(home, receipt)
