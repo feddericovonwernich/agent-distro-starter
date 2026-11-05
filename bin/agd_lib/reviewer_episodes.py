@@ -294,17 +294,17 @@ class _MetadataIndex:
         return self._connection.execute('SELECT 1 FROM selected_chain WHERE id=?', (ident,)).fetchone() is not None
 
 
-def read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_ms: int | None = None, *, completion: dict | None = None, skip_row=None) -> dict:
+def read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_ms: int | None = None, *, completion: dict | None = None, skip_row=None, metadata_only=False) -> dict:
     index = None
     try:
         index = _MetadataIndex() if completion is not None else None
-        return _read_native(session_path, cutoff, budget, deadline_epoch_ms, completion=completion, skip_row=skip_row, _index=index)
+        return _read_native(session_path, cutoff, budget, deadline_epoch_ms, completion=completion, skip_row=skip_row, metadata_only=metadata_only, _index=index)
     finally:
         if index is not None:
             index.close()
 
 
-def _read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_ms: int | None = None, *, completion: dict | None = None, skip_row=None, _index=None) -> dict:
+def _read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_ms: int | None = None, *, completion: dict | None = None, skip_row=None, metadata_only=False, _index=None) -> dict:
     if not isinstance(cutoff, (int, float)) or isinstance(cutoff, bool) or not math.isfinite(cutoff):
         raise store.Refusal('native cutoff is invalid')
     state = {'header': None, 'header_record': None, 'header_index': None,
@@ -317,6 +317,13 @@ def _read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_
                                   **({'message_id': message_id} if message_id is not None else {})})
 
     def retain(value, record, text):
+        if metadata_only:
+            message = value['message']
+            _, unsupported = _render_content(message.get('content'))
+            state['rows'].append({'message_id': value['id'], 'parent_id': value.get('parentId'),
+                                  'role': message.get('role'), 'unsupported': unsupported,
+                                  'text_sha256': hashlib.sha256(text.encode()).hexdigest()})
+            return
         row = {'message_id': value['id'], 'text': text,
                'line_start': record['line_start'], 'line_end': record['line_start'],
                'byte_start': record['byte_start'], 'byte_end': record['byte_end']}
@@ -406,7 +413,11 @@ def _read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_
     result['withheld'] = state['withheld']
     if completion is None:
         result['rows'] = state['rows']
-        result['material_sha256'] = _material_digest(header['id'], result['rows'])
+        if metadata_only:
+            result['projection'] = result.pop('rows')
+            result['material_sha256'] = hashlib.sha256(_json_bytes({'session_id': header['id'], 'projection': result['projection']})).hexdigest()
+        else:
+            result['material_sha256'] = _material_digest(header['id'], result['rows'])
         return result
     if not isinstance(completion, dict):
         raise store.Refusal('completion provenance is invalid')
@@ -488,7 +499,11 @@ def _read_native(session_path: Path, cutoff: float, budget: int, deadline_epoch_
     result['content_sha256'] = digest
     result['rows'] = state['rows']
     result['limited'] = state['limited']
-    result['material_sha256'] = _material_digest(header['id'], result['rows'])
+    if metadata_only:
+        result['projection'] = result.pop('rows')
+        result['material_sha256'] = hashlib.sha256(_json_bytes({'session_id': header['id'], 'projection': result['projection']})).hexdigest()
+    else:
+        result['material_sha256'] = _material_digest(header['id'], result['rows'])
     result['late'] = False
     result['withheld'] = [item for item in result['withheld']
                           if item['line_start'] <= boundary_record['line_start']]

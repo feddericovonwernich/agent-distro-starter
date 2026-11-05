@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from . import observability, reviewer_episodes, store, worker_skills
+from . import observability, projects, reviewer_episodes, store, worker_skills
 INSTRUCTION_FILE = Path(__file__).resolve().parents[2] / 'lib' / 'agd-reviewer-instructions.md'
 DEFAULT_LIMITS = {'max_candidates': 20, 'max_input_bytes': 262144,
                   'max_output_bytes': 65536, 'max_runtime_seconds': 1800}
@@ -24,6 +24,8 @@ def paths(home):
     return {'config': data / 'config.json', 'packets': data / 'packets', 'evidence': data / 'evidence',
             'reports': data / 'reports', 'proposals': data / 'proposals', 'revisions': data / 'revisions',
             'manifests': data / 'manifests', 'triage': data / 'triage', 'intents': state / 'intents',
+            'selections': data / 'selections', 'catalogs': data / 'catalogs',
+            'inspections': state / 'inspections', 'progress': state / 'progress',
             'receipts': state / 'receipts', 'prepared': state / 'prepared',
             'pending': state / 'pending', 'checkpoints': state / 'checkpoints',
             'followups': state / 'followups', 'candidates': state / 'candidates',
@@ -146,6 +148,17 @@ def read_packet(home, packet_id):
     if not isinstance(value, dict): raise store.Refusal('invalid packet')
     value['packet_id'] = packet_id
     return value
+
+
+def read_manifest(home, manifest_id):
+    _hex_id(manifest_id)
+    try:
+        value = _read_json(paths(home)['selections'] / f'{manifest_id}.json')
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise store.Refusal('unknown selection manifest') from error
+    if not isinstance(value, dict) or _digest(value) != manifest_id:
+        raise store.Refusal('invalid selection manifest')
+    return {**value, 'manifest_id': manifest_id}
 
 
 def _coverage(coverage, bucket, value): coverage['complete'] = False; coverage[bucket].append(value)
@@ -698,6 +711,343 @@ def _completion_candidates(root, cutoff, coverage, deadline_epoch_ms=None):
                         completion.get('interaction_id', '')),
                'source_scope': scope, 'completion': completion, 'task': task,
                'task_dir': task_dir, 'event': event, 'jsonls': [native]}
+
+
+def _project_binding(home, task):
+    project_id = store.validate_id(task['project'])
+    record = projects.read(home, project_id)
+    if record.get('id') != project_id:
+        raise store.Refusal('project registry identity mismatch')
+    revision = task.get('start')
+    if not isinstance(revision, str) or not re.fullmatch(r'[0-9a-f]{40,64}', revision):
+        raise store.Refusal('task start revision invalid')
+    if store.git(record['path'], 'rev-parse', '--verify', revision + '^{commit}') != revision:
+        raise store.Refusal('task start revision unavailable')
+    identity = {key: record[key] for key in ('id', 'path', 'common_dir', 'source')}
+    home_id = _read_json(home / 'data' / 'home.json')['home_id']
+    return {'home_id': home_id, 'project_id': project_id,
+            'identity_sha256': _digest(identity), 'task_revision': revision}
+
+
+def _validate_project_binding(home, episode):
+    """Revalidate the frozen worker project and revision before project retrieval."""
+    root = store.home(home)
+    task_id = store.validate_id(episode['task_id'])
+    directory = observability._existing_private_directory(root, 'data', 'tasks', task_id)
+    if directory is None:
+        raise store.Refusal('selected task unavailable')
+    task = _read_json(directory / 'task.json')
+    if task.get('id') != task_id or _project_binding(root, task) != episode.get('project_binding'):
+        raise store.Refusal('selected project identity changed')
+    return episode['project_binding']
+
+
+def _artifact_locator(home, path, kind):
+    path = Path(path)
+    relative = path.relative_to(home)
+    if path.is_symlink() or path.resolve(strict=True) != path:
+        raise store.Refusal('unsafe episode artifact')
+    raw = _read_regular_bytes(path)
+    return {'kind': kind, 'path': relative.as_posix(),
+            'sha256': hashlib.sha256(raw).hexdigest(), 'size': len(raw)}
+
+
+def _episode_artifacts(home, task, task_dir, incarnation, cutoff, coverage):
+    locators = []
+    try:
+        locators.append(_artifact_locator(home, task_dir / 'brief.md', 'intent'))
+    except (OSError, ValueError, store.Refusal):
+        _coverage(coverage, 'unavailable', {'task_id': task['id'], 'reason': 'intent-unavailable'})
+    folder = task_dir / 'decisions'
+    if folder.is_symlink():
+        _coverage(coverage, 'unavailable', {'task_id': task['id'], 'reason': 'feedback-unavailable'})
+        return locators
+    for path in sorted(folder.glob('*.json')) if folder.is_dir() else ():
+        if path.name.endswith('.answer.json'):
+            continue
+        try:
+            decision = _read_json(path)
+            at = decision.get('resolved_at')
+            if (decision.get('incarnation') != incarnation or decision.get('status') != 'resolved'
+                    or not isinstance(at, (int, float)) or at > cutoff):
+                continue
+            answer_name = decision.get('answer')
+            if (not isinstance(answer_name, str) or Path(answer_name).is_absolute()
+                    or '..' in Path(answer_name).parts or Path(answer_name).parts[:1] != ('decisions',)):
+                raise ValueError('answer path')
+            answer = task_dir / answer_name
+            link = _artifact_locator(home, path, 'feedback-link')
+            artifact = _artifact_locator(home, answer, 'feedback')
+            value = _read_json(answer)
+            if (value.get('task_id') != task['id'] or value.get('incarnation') != incarnation
+                    or value.get('resolved_at') != at or not isinstance(value.get('body'), str)):
+                raise ValueError('answer provenance')
+            artifact.update(link_sha256=link['sha256'], link_path=link['path'], resolved_at=at)
+            locators.append(artifact)
+        except (OSError, ValueError, TypeError, store.Refusal):
+            _coverage(coverage, 'unavailable', {'task_id': task['id'], 'reason': 'feedback-unavailable'})
+    return locators
+
+
+def _progress_path(home, episode_id, basis):
+    _hex_id(episode_id); _hex_id(basis)
+    return paths(home)['progress'] / episode_id / f'{basis}.json'
+
+
+def _episode_progress(home, episode_id, basis):
+    path = _progress_path(home, episode_id, basis)
+    if not path.exists():
+        return {'screened': False, 'reflected': False, 'ranges': [], 'hold': None, 'last_assessed': 0}
+    try:
+        value = _read_json(path)
+        if value['episode_id'] != episode_id or value['basis'] != basis:
+            raise ValueError('progress identity')
+        return value
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise store.Refusal('episode progress invalid') from error
+
+
+def _record_episode_progress(home, *, episode, assessment, limitations=(), ranges=(), submission_id):
+    """Apply a validated successful submission while the caller holds store.lock."""
+    if assessment not in ('screened', 'reflected', 'limited') or not isinstance(submission_id, str) or not submission_id:
+        raise store.Refusal('invalid episode progress')
+    if assessment == 'limited' and not limitations:
+        raise store.Refusal('limited assessment requires a reason')
+    episode_id, basis = episode['episode_id'], episode['basis']
+    state = _episode_progress(home, episode_id, basis)
+    applied = state.get('submissions', [])
+    if submission_id in applied:
+        return state
+    state.update(episode_id=episode_id, basis=basis, screened=True,
+                 reflected=state['reflected'] or assessment == 'reflected',
+                 last_assessed=time.time(), submissions=[*applied, submission_id])
+    state['ranges'] = list(state.get('ranges', [])) + [item for item in ranges if item not in state.get('ranges', [])]
+    if assessment == 'limited':
+        state['hold'] = {'limits_sha256': episode['limits_sha256'], 'limitations': list(limitations)}
+    elif assessment == 'reflected':
+        state['hold'] = None
+    path = _progress_path(home, episode_id, basis)
+    _private(path.parent)
+    store.atomic_json(path, state)
+    return state
+
+
+def _selection_catalog(home, coverage, deadline_epoch_ms, candidates):
+    try:
+        items = []
+        for skill in worker_skills.catalog(home):
+            _check_deadline(deadline_epoch_ms)
+            raw = _read_regular_bytes(Path(skill['source']) / 'SKILL.md')
+            items.append({'id': skill['id'], 'sha256': hashlib.sha256(raw).hexdigest()})
+        assigned = []
+        tasks_seen = set()
+        for candidate in candidates:
+            task = candidate.get('task')
+            if task and task['id'] not in tasks_seen:
+                tasks_seen.add(task['id'])
+                assigned.append({'task_id': task['id'],
+                                 'skills': _manifest(home, candidate['task_dir'], task, coverage, deadline_epoch_ms),
+                                 'usage': 'unknown'})
+        value = {'schema': 1, 'skills': items, 'assigned': assigned}
+        catalog_id = _digest(value)
+        publish_immutable(paths(home)['catalogs'] / f'{catalog_id}.json', value)
+        return catalog_id
+    except (OSError, ValueError, store.Refusal):
+        _check_deadline(deadline_epoch_ms)
+        _coverage(coverage, 'unavailable', {'reason': 'catalog-unavailable'})
+        return None
+
+
+def _selection_episode(home, item, native, read, config, cutoff, coverage):
+    completion = item.get('completion')
+    task, event = item.get('task'), item.get('event', {})
+    role = completion['source']['role'] if completion else item.get('role', 'worker')
+    scope = {'home_id': _read_json(home / 'data' / 'home.json')['home_id'],
+             'role': role, 'session_id': read['session_id']}
+    if task:
+        task_id = store.validate_id(task['id'])
+        directory = observability._existing_private_directory(home, 'data', 'tasks', task_id)
+        if directory is None or directory != item['task_dir']:
+            raise store.Refusal('selected task directory invalid')
+        observability._incarnation(event['incarnation'])
+        if completion and (completion['source'].get('task_id') != task_id or
+                           completion['source'].get('incarnation') != event['incarnation']):
+            raise store.Refusal('selected task source mismatch')
+        scope.update(task_id=task['id'], incarnation=event['incarnation'])
+    if completion:
+        scope['interaction_id'] = completion['interaction_id']
+    elif role == 'reviewer':
+        scope['review_run_id'] = item['review_run_id']
+    else:
+        scope['exit_observation_id'] = event.get('id')
+    episode_id = _digest(scope)
+    locators = [{'kind': 'native', 'path': str(native.relative_to(home)),
+                 'session_id': read['session_id'], 'projection_sha256': read['material_sha256'],
+                 'source_id': completion['source_id'] if completion else None,
+                 'completion': {k: v for k, v in completion.items() if k != 'source'} if completion else None}]
+    binding = None
+    if task:
+        binding = _project_binding(home, task)
+        locators.extend(_episode_artifacts(home, task, item['task_dir'], event['incarnation'], cutoff, coverage))
+        if not completion:
+            if (event.get('task') != task_id or event.get('key') != 'runner-exit'
+                    or str(uuid.UUID(event['id'])) != event['id']):
+                raise store.Refusal('runner exit identity invalid')
+            locators.append(_artifact_locator(home, item['task_dir'] / 'observations' /
+                                              (event['id'] + '.json'), 'runner-exit'))
+    if role == 'reviewer':
+        for report_id in item.get('report_ids', ()):
+            locators.append(_artifact_locator(home, report_path(home, report_id), 'reviewer-report'))
+    basis = _digest({'scope': scope, 'projection_sha256': read['material_sha256'],
+                     'boundary': read['boundary'], 'project_binding': binding,
+                     'artifacts': locators[1:]})
+    limits_sha256 = _digest(config['limits'])
+    progress = _episode_progress(home, episode_id, basis)
+    if role in ('worker', 'central'):
+        material_scope = _source_scope(home, {'role': role, 'session_id': read['session_id'],
+                                              'task_id': scope.get('task_id'),
+                                              'incarnation': scope.get('incarnation')})
+        reviewed = _reviewed_material(home, material_scope)
+        progress['reviewed_message_ids'] = [
+            row['message_id'] for row in read['projection']
+            if _digest({'scope': material_scope, 'message_id': row['message_id'],
+                        'text_sha256': row['text_sha256']}) in reviewed]
+    episode = {**scope, 'episode_id': episode_id, 'basis': basis,
+               'closed_at': item['closed_at'], 'boundary': read['boundary'],
+               'projection': read['projection'], 'locators': locators,
+               'limits_sha256': limits_sha256,
+               'progress': {key: value for key, value in progress.items() if key != 'submissions'},
+               'limitations': [row['reason'] for row in read['withheld']]}
+    if binding:
+        episode['project_binding'] = binding
+    else:
+        episode['project_bindings'] = []
+    return episode
+
+
+def select_manifest(home, *, cutoff, config_snapshot, retrospective_review_run_ids=(),
+                    detail_episode_ids=(), deadline_epoch_ms=None):
+    config = validate_config(config_snapshot)
+    if (isinstance(cutoff, bool) or not isinstance(cutoff, (int, float)) or cutoff < 0
+            or not isinstance(retrospective_review_run_ids, tuple) or not isinstance(detail_episode_ids, tuple)):
+        raise store.Refusal('manifest scope is invalid')
+    if config['limits']['max_input_bytes'] < 512:
+        raise store.Refusal('selection limit cannot encode required metadata')
+    for episode_id in detail_episode_ids:
+        _hex_id(episode_id)
+    _check_deadline(deadline_epoch_ms)
+    root = store.home(home)
+    coverage = {'complete': True, 'unavailable': [], 'withheld': []}
+    items = list(_completion_candidates(root, cutoff, coverage, deadline_epoch_ms))
+    seen_exit = set()
+    for observed_at, task, event, task_dir in _observation_candidates(root, cutoff, coverage, deadline_epoch_ms):
+        key = (task['id'], event['incarnation'])
+        if key in seen_exit:
+            continue
+        seen_exit.add(key)
+        try:
+            binding = _read_json(root / 'data' / 'observability' / 'tasks' / key[0] / 'omp' / key[1] / 'binding.json')
+            directory = _fixed_session(root, *key, binding)
+            files = sorted(directory.glob('*.jsonl'))
+            if not files:
+                raise ValueError('missing session')
+            for native in files:
+                items.append({'closed_at': observed_at, 'sort': (observed_at, 'worker~exit', '', event.get('id', '')),
+                              'task': task, 'task_dir': task_dir, 'event': event, 'jsonls': [native]})
+        except (OSError, ValueError, store.Refusal):
+            _check_deadline(deadline_epoch_ms)
+            _coverage(coverage, 'unavailable', {'task_id': key[0], 'reason': 'native-jsonl-unavailable'})
+    requested = set()
+    for rid in retrospective_review_run_ids:
+        try:
+            if str(uuid.UUID(rid)) != rid or rid in requested:
+                raise ValueError('review run ID')
+        except (ValueError, TypeError, AttributeError) as error:
+            raise store.Refusal('invalid retrospective run') from error
+        requested.add(rid)
+        receipt = _receipt(root, rid)
+        closed = receipt.get('closed_at')
+        if receipt.get('dispatch_state') != 'final' or not isinstance(closed, (int, float)) or closed > cutoff:
+            raise store.Refusal('retrospective run is not finalized before cutoff')
+        directory = observability._existing_private_directory(root, 'data', 'observability', 'reviewer', rid, 'omp')
+        if directory is None:
+            raise store.Refusal('retrospective native evidence unavailable')
+        binding = _read_json(directory.parent / 'binding.json')
+        if binding.get('review_run_id') != rid or binding.get('session_dir') != str(directory):
+            raise store.Refusal('retrospective binding invalid')
+        files = sorted(directory.glob('*.jsonl'))
+        if not files:
+            raise store.Refusal('retrospective native evidence unavailable')
+        for native in files:
+            items.append({'closed_at': closed, 'sort': (closed, 'reviewer', rid, native.name),
+                          'role': 'reviewer', 'review_run_id': rid, 'jsonls': [native],
+                          'report_ids': receipt.get('report_ids', [])})
+    candidates = []
+    for item in sorted(items, key=lambda row: row['sort']):
+        _check_deadline(deadline_epoch_ms)
+        native = item['jsonls'][0]
+        try:
+            native_cutoff = cutoff if item.get('completion') else min(cutoff, item['closed_at'])
+            read = reviewer_episodes.read_native(native, native_cutoff, config['limits']['max_input_bytes'],
+                                                 deadline_epoch_ms, completion=item.get('completion'), metadata_only=True)
+            if read['status'] != 'ready':
+                _coverage(coverage, 'unavailable', {'reason': 'native-proof-pending'})
+                continue
+            if read['limited'] or read['withheld']:
+                _coverage(coverage, 'withheld', {'reason': 'native-proof-incomplete', 'session_id': read['session_id']})
+            if not read['projection'] and not (item.get('role') == 'reviewer' and item.get('report_ids')):
+                continue
+            candidates.append(_selection_episode(root, item, native, read, config, cutoff, coverage))
+        except (OSError, ValueError, KeyError, TypeError, store.Refusal):
+            _check_deadline(deadline_epoch_ms)
+            _coverage(coverage, 'unavailable', {'reason': 'native-or-scope-unavailable'})
+    proved = {}
+    for episode in candidates:
+        if episode.get('interaction_id'):
+            key = (episode['role'], episode['session_id'], episode.get('task_id'), episode.get('incarnation'))
+            proved.setdefault(key, set()).update((row['message_id'], row['text_sha256']) for row in episode['projection'])
+    candidates = [episode for episode in candidates
+                  if not episode.get('exit_observation_id') or
+                  not set((row['message_id'], row['text_sha256']) for row in episode['projection']).issubset(
+                      proved.get((episode['role'], episode['session_id'], episode.get('task_id'), episode.get('incarnation')), set()))]
+    if set(detail_episode_ids) - {episode['episode_id'] for episode in candidates}:
+        raise store.Refusal('detail episode is not eligible')
+    held, actionable = [], []
+    for episode in candidates:
+        progress = episode['progress']
+        explicit = episode['episode_id'] in detail_episode_ids
+        hold = progress.get('hold')
+        if not explicit and hold and hold.get('limits_sha256') == episode['limits_sha256']:
+            held.append({'episode_id': episode['episode_id'], 'basis': episode['basis'], 'limitations': hold['limitations']})
+        elif explicit or not progress.get('reflected'):
+            actionable.append(episode)
+    actionable.sort(key=lambda e: (e['progress'].get('last_assessed', 0), e['closed_at'], e['episode_id']))
+    catalog_id = _selection_catalog(root, coverage, deadline_epoch_ms, items)
+    result = {'schema': 2, 'purpose': 'bounded-behavioral-reflection', 'home_id': _read_json(root / 'data' / 'home.json')['home_id'],
+              'cutoff': cutoff, 'config_snapshot_sha256': _digest(config), 'catalog_id': catalog_id,
+              'instruction_sha256': hashlib.sha256(_read_regular_bytes(INSTRUCTION_FILE)).hexdigest(),
+              'episodes': [], 'held': held, 'omitted_pending': len(actionable),
+              'coverage': coverage, 'retrospective_review_run_ids': list(retrospective_review_run_ids)}
+    catalog_bytes = len(_read_regular_bytes(paths(root)['catalogs'] / f'{catalog_id}.json')) if catalog_id else 0
+    byte_limit = min(16384, config['limits']['max_input_bytes'] - catalog_bytes)
+    for episode in actionable:
+        if len(result['episodes']) >= config['limits']['max_candidates']:
+            break
+        result['episodes'].append(episode)
+        result['omitted_pending'] -= 1
+        size = len(json.dumps({**result, 'manifest_id': '0' * 64}, ensure_ascii=False, indent=2).encode())
+        if size > byte_limit:
+            result['episodes'].pop()
+            result['omitted_pending'] += 1
+            break
+    if actionable and not result['episodes']:
+        raise store.Refusal('selection limit cannot represent an eligible episode')
+    if len(json.dumps({**result, 'manifest_id': '0' * 64}, ensure_ascii=False, indent=2).encode()) > byte_limit:
+        raise store.Refusal('selection metadata exceeds limit')
+    _check_deadline(deadline_epoch_ms)
+    manifest_id = _digest(result)
+    publish_immutable(paths(root)['selections'] / f'{manifest_id}.json', result)
+    return {**result, 'manifest_id': manifest_id}
 
 
 def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids=(), deadline_epoch_ms=None):

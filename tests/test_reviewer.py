@@ -1408,3 +1408,171 @@ def test_runtime_ancestor_swap_never_captures_external_artifact(monkeypatch):
             source = _evidence_source(
                 reviewer.read_evidence(home, run['review_run_id']), captured['source_id'])
             assert source['text'] == 'owned artifact'
+
+
+def selection(home, *, cutoff=200.0, max_candidates=20, detail=()):
+    config = reviewer.read_config(home)
+    config['limits']['max_candidates'] = max_candidates
+    return reviewer.select_manifest(home, cutoff=cutoff, config_snapshot=config,
+                                    detail_episode_ids=detail)
+
+
+def record_assessment(home, episode, assessment, *, limitations=()):
+    # Simulates the successful-finalization consumer; failed runs must not call it.
+    with store.lock(home):
+        reviewer._record_episode_progress(
+            home, episode=episode, assessment=assessment, limitations=list(limitations),
+            submission_id=str(uuid.uuid4()))
+
+
+def test_manifest_keeps_live_final_episode_and_excludes_live_tail():
+    with lab() as (home, _):
+        source, _, _ = completed_session(home, role='worker', task_id='living',
+                                         texts=('FINAL_SENTINEL',), active='TAIL_SENTINEL',
+                                         alive=True)
+        selected = selection(home)
+        matching = [e for e in selected['episodes'] if e.get('interaction_id') ==
+                    str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source['session_id']}-binding-0"))]
+        assert len(matching) == 1
+        assert matching[0]['boundary']['entry_id'] == f"{source['session_id']}-final-0"
+        assert 'TAIL_SENTINEL' not in json.dumps(selected)
+        assert reviewer.read_manifest(home, selected['manifest_id']) == selected
+
+
+def test_manifest_freezes_project_identity_not_langfuse_project():
+    with lab() as (home, project):
+        _, _, task = completed_session(home, role='worker', task_id='identity')
+        selected = selection(home)
+        episode = next(e for e in selected['episodes'] if e.get('task_id') == task['id'])
+        binding = episode['project_binding']
+        assert binding['project_id'] == 'sample'
+        assert binding['home_id']
+        assert binding['task_revision'] == task['start']
+        assert len(binding['identity_sha256']) == 64
+        registry = home / 'data' / 'projects' / 'sample.json'
+        record = json.loads(registry.read_text())
+        record['base'] = 'another-base'
+        record['trusted'] = not record.get('trusted', False)
+        registry.write_text(json.dumps(record))
+        again = selection(home, cutoff=201)
+        other = next(e for e in again['episodes'] if e.get('task_id') == task['id'])
+        assert other['project_binding']['identity_sha256'] == binding['identity_sha256']
+        assert str(project) not in binding['project_id']
+        record['source'] = 'changed-origin'
+        registry.write_text(json.dumps(record))
+        changed = selection(home, cutoff=202)
+        changed_episode = next(e for e in changed['episodes'] if e.get('task_id') == task['id'])
+        assert changed_episode['project_binding']['identity_sha256'] != binding['identity_sha256']
+
+
+def test_central_unknown_project_does_not_gain_target_scope():
+    with lab() as (home, _):
+        completed_session(home, texts=('Please modify project sample and its AGENTS.md',))
+        episode = next(e for e in selection(home)['episodes'] if e['role'] == 'central')
+        assert episode.get('task_id') is None
+        assert episode['project_bindings'] == []
+
+
+def test_selection_has_locators_not_body_sentinels():
+    with lab() as (home, _):
+        _, _, task = completed_session(home, role='worker', task_id='locators',
+                                       texts=('TERMINAL_PRIVATE_SENTINEL',))
+        brief = tasks.task_file(home, task['id']).parent / 'brief.md'
+        brief.write_text('INTENT_PRIVATE_SENTINEL')
+        selected = selection(home)
+        episode = next(e for e in selected['episodes'] if e.get('task_id') == task['id'])
+        serialized = json.dumps(selected)
+        assert 'TERMINAL_PRIVATE_SENTINEL' not in serialized
+        assert 'INTENT_PRIVATE_SENTINEL' not in serialized
+        assert episode['locators']
+        assert len(json.dumps(selected, indent=2, ensure_ascii=False).encode()) <= 16384
+
+
+def test_semantic_rewrite_changes_basis_but_title_append_does_not():
+    with lab() as (home, _):
+        _, native, _ = completed_session(home)
+        first = selection(home)['episodes'][0]
+        rewrite_title(native, 'new title')
+        append_unfinished(native, 'later unfinished')
+        second = selection(home, cutoff=201)['episodes'][0]
+        assert second['basis'] == first['basis']
+        rows = [json.loads(line) for line in native.read_text().splitlines()]
+        prompt = next(row for row in rows if row.get('type') == 'message' and
+                      row['message']['role'] == 'user' and row['message']['content'] == 'prompt')
+        prompt['message']['content'] = 'rewritten prompt'
+        native.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+        changed = selection(home, cutoff=202)['episodes'][0]
+        assert changed['basis'] != first['basis']
+
+
+def test_screened_episode_remains_pending_reflection():
+    with lab() as (home, _):
+        completed_session(home)
+        episode = selection(home)['episodes'][0]
+        record_assessment(home, episode, 'screened')
+        next_episode = selection(home, cutoff=201)['episodes'][0]
+        assert next_episode['episode_id'] == episode['episode_id']
+        assert next_episode['progress']['screened'] is True
+        assert next_episode['progress']['reflected'] is False
+
+
+def test_unfinished_old_episode_does_not_starve_new_episode():
+    with lab() as (home, _):
+        completed_session(home, start_at=10)
+        old = selection(home, max_candidates=1)['episodes'][0]
+        record_assessment(home, old, 'screened')
+        completed_session(home, start_at=40)
+        next_episode = selection(home, cutoff=201, max_candidates=1)['episodes'][0]
+        assert next_episode['episode_id'] != old['episode_id']
+        later = selection(home, cutoff=202, max_candidates=2)
+        assert old['episode_id'] in {e['episode_id'] for e in later['episodes']}
+
+
+def test_unchanged_limited_basis_holds_without_paid_redispatch():
+    with lab() as (home, _):
+        completed_session(home)
+        episode = selection(home)['episodes'][0]
+        record_assessment(home, episode, 'limited', limitations=('intent unavailable',))
+        held = selection(home, cutoff=201)
+        assert episode['episode_id'] not in {e['episode_id'] for e in held['episodes']}
+        assert any(h['episode_id'] == episode['episode_id'] for h in held['held'])
+
+
+def test_new_feedback_or_explicit_detail_reopens_hold():
+    with lab() as (home, _):
+        _, _, task = completed_session(home, role='worker', task_id='feedback')
+        episode = next(e for e in selection(home, cutoff=time.time() + 100)['episodes']
+                       if e.get('task_id') == task['id'])
+        record_assessment(home, episode, 'limited', limitations=('feedback unavailable',))
+        detail = selection(home, cutoff=time.time() + 101, detail=(episode['episode_id'],))
+        assert episode['episode_id'] in {e['episode_id'] for e in detail['episodes']}
+        question = tasks.task_file(home, task['id']).parent / 'question.txt'
+        question.write_text('Which?\n')
+        workers.event(home, task['id'], task['incarnation'], 'decision', 'choice', question)
+        supervision.reconcile(home)
+        answer = question.parent / 'answer.txt'
+        answer.write_text('New linked feedback.\n')
+        supervision.resolve(home, task['id'], 'choice', answer)
+        changed = selection(home, cutoff=time.time() + 102)
+        reopened = next(e for e in changed['episodes'] if e.get('task_id') == task['id'])
+        assert reopened['episode_id'] == episode['episode_id']
+        assert reopened['basis'] != episode['basis']
+
+
+def test_manifest_candidate_cap_reports_omitted_pending_work():
+    with lab() as (home, _):
+        completed_session(home, start_at=10)
+        completed_session(home, start_at=40)
+        selected = selection(home, max_candidates=1)
+        assert len(selected['episodes']) == 1
+        assert selected['omitted_pending'] == 1
+        assert len(selection(home, cutoff=201, max_candidates=2)['episodes']) == 2
+
+
+def test_manifest_refuses_budget_that_cannot_fit_eligible_episode():
+    with lab() as (home, _):
+        completed_session(home)
+        config = reviewer.read_config(home)
+        config['limits']['max_input_bytes'] = 128
+        with pytest.raises(store.Refusal):
+            reviewer.select_manifest(home, cutoff=200, config_snapshot=config)
