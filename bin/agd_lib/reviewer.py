@@ -26,6 +26,7 @@ def paths(home):
             'manifests': data / 'manifests', 'triage': data / 'triage', 'intents': state / 'intents',
             'selections': data / 'selections', 'catalogs': data / 'catalogs',
             'inspections': state / 'inspections', 'progress': state / 'progress',
+            'selection_details': data / 'selection-details',
             'receipts': state / 'receipts', 'prepared': state / 'prepared',
             'pending': state / 'pending', 'checkpoints': state / 'checkpoints',
             'followups': state / 'followups', 'candidates': state / 'candidates',
@@ -807,6 +808,36 @@ def _episode_progress(home, episode_id, basis):
         raise store.Refusal('episode progress invalid') from error
 
 
+def _has_new_exposure(existing, incoming):
+    """Compare validated half-open byte ranges within the same versioned source."""
+    for item in incoming:
+        if not isinstance(item, dict):
+            continue
+        start, end = item.get('start'), item.get('end')
+        if type(start) is not int or type(end) is not int or start < 0 or end <= start:
+            continue
+        identity = {key: value for key, value in item.items() if key not in ('start', 'end')}
+        version = next((identity[key] for key in ('text_sha256', 'source_sha256', 'version_sha256')
+                        if isinstance(identity.get(key), str)
+                        and re.fullmatch(r'[0-9a-f]{64}', identity[key])), None)
+        if not version or not isinstance(identity.get('message_id', identity.get('source_id')), str):
+            continue
+        intervals = sorted((row['start'], row['end']) for row in existing
+                           if isinstance(row, dict) and type(row.get('start')) is int
+                           and type(row.get('end')) is int
+                           and {k: v for k, v in row.items() if k not in ('start', 'end')} == identity)
+        covered = start
+        for left, right in intervals:
+            if left > covered:
+                break
+            covered = max(covered, right)
+            if covered >= end:
+                break
+        if covered < end:
+            return True
+    return False
+
+
 def _record_episode_progress(home, *, episode, assessment, limitations=(), ranges=(), submission_id):
     """Apply a validated successful submission while the caller holds store.lock."""
     if assessment not in ('screened', 'reflected', 'limited') or not isinstance(submission_id, str) or not submission_id:
@@ -821,10 +852,12 @@ def _record_episode_progress(home, *, episode, assessment, limitations=(), range
     state.update(episode_id=episode_id, basis=basis, screened=True,
                  reflected=state['reflected'] or assessment == 'reflected',
                  last_assessed=time.time(), submissions=[*applied, submission_id])
-    state['ranges'] = list(state.get('ranges', [])) + [item for item in ranges if item not in state.get('ranges', [])]
+    previous_ranges = state.get('ranges', [])
+    advanced = _has_new_exposure(previous_ranges, ranges)
+    state['ranges'] = list(previous_ranges) + [item for item in ranges if item not in previous_ranges]
     if assessment == 'limited':
         state['hold'] = {'limits_sha256': episode['limits_sha256'], 'limitations': list(limitations)}
-    elif assessment == 'reflected':
+    elif assessment == 'reflected' or advanced:
         state['hold'] = None
     path = _progress_path(home, episode_id, basis)
     _private(path.parent)
@@ -848,10 +881,7 @@ def _selection_catalog(home, coverage, deadline_epoch_ms, candidates):
                 assigned.append({'task_id': task['id'],
                                  'skills': _manifest(home, candidate['task_dir'], task, coverage, deadline_epoch_ms),
                                  'usage': 'unknown'})
-        value = {'schema': 1, 'skills': items, 'assigned': assigned}
-        catalog_id = _digest(value)
-        publish_immutable(paths(home)['catalogs'] / f'{catalog_id}.json', value)
-        return catalog_id
+        return {'schema': 1, 'skills': items, 'assigned': assigned}
     except (OSError, ValueError, store.Refusal):
         _check_deadline(deadline_epoch_ms)
         _coverage(coverage, 'unavailable', {'reason': 'catalog-unavailable'})
@@ -923,6 +953,137 @@ def _selection_episode(home, item, native, read, config, cutoff, coverage):
     else:
         episode['project_bindings'] = []
     return episode
+
+
+def _bounded_notice(value):
+    if isinstance(value, str):
+        return value if len(value) <= 256 else value[:256] + '…'
+    if isinstance(value, list):
+        return [_bounded_notice(item) for item in value[:4]]
+    if isinstance(value, dict):
+        return {key: _bounded_notice(item) for key, item in value.items()}
+    return value
+
+
+def _selection_disclosures(held, coverage):
+    details = {'schema': 1, 'kind': 'disclosures', 'held': held,
+               'unavailable': coverage['unavailable'], 'withheld': coverage['withheld']}
+    summary = {'complete': coverage['complete'],
+               'unavailable_count': len(coverage['unavailable']),
+               'withheld_count': len(coverage['withheld']),
+               'unavailable': [_bounded_notice(item) for item in coverage['unavailable'][:3]],
+               'withheld': [_bounded_notice(item) for item in coverage['withheld'][:3]]}
+    return details, summary
+
+
+def _compact_episode(episode):
+    locators = {'schema': 1, 'kind': 'locators', 'episode_id': episode['episode_id'],
+                'basis': episode['basis'], 'locators': episode['locators']}
+    progress = episode['progress']
+    compact = {key: value for key, value in episode.items()
+               if key not in ('projection', 'locators', 'progress', 'limitations')}
+    compact.update(projection={'sha256': episode['locators'][0]['projection_sha256'],
+                               'message_count': len(episode['projection'])},
+                   locators=episode['locators'][:4], locators_id=_digest(locators),
+                   locator_count=len(episode['locators']),
+                   progress={'screened': progress['screened'], 'reflected': progress['reflected'],
+                             'last_assessed': progress.get('last_assessed', 0),
+                             'hold': _bounded_notice(progress.get('hold')),
+                             'range_count': len(progress.get('ranges', [])),
+                             'reviewed_message_count': len(progress.get('reviewed_message_ids', []))},
+                   limitations=[_bounded_notice(item) for item in episode['limitations'][:4]],
+                   limitation_count=len(episode['limitations']))
+    return compact, locators
+
+
+def _read_selection_detail(home, detail_id, kind):
+    _hex_id(detail_id)
+    try:
+        value = _read_json(paths(home)['selection_details'] / f'{detail_id}.json')
+        if not isinstance(value, dict) or value.get('kind') != kind or _digest(value) != detail_id:
+            raise ValueError('detail identity')
+        return value
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise store.Refusal('invalid selection details') from error
+
+
+def _selection_page(rows, cursor, limit, *, notices):
+    if type(cursor) is not int or cursor < 0 or cursor > len(rows) or type(limit) is not int or not 1 <= limit <= 20:
+        raise store.Refusal('selection detail cursor invalid')
+    result = {'rows': [], 'next_cursor': None, 'total': len(rows)}
+    for index in range(cursor, min(cursor + limit, len(rows))):
+        result['rows'].append(_bounded_notice(rows[index]) if notices else rows[index])
+        result['next_cursor'] = index + 1 if index + 1 < len(rows) else None
+        if len(json.dumps(result, ensure_ascii=False, indent=2).encode()) > 16384:
+            result['rows'].pop()
+            result['next_cursor'] = index
+            break
+    if cursor < len(rows) and not result['rows']:
+        raise store.Refusal('selection detail row exceeds limit')
+    return result
+
+
+def read_selection_disclosures(home, manifest_id, category, *, cursor=0, limit=20):
+    if category not in ('held', 'unavailable', 'withheld'):
+        raise store.Refusal('selection disclosure category invalid')
+    manifest = read_manifest(home, manifest_id)
+    details = _read_selection_detail(home, manifest['details_id'], 'disclosures')
+    return _selection_page(details[category], cursor, limit, notices=True)
+
+
+def read_selection_locators(home, manifest_id, episode_id, *, cursor=0, limit=20):
+    _hex_id(episode_id)
+    manifest = read_manifest(home, manifest_id)
+    episode = next((row for row in manifest['episodes'] if row['episode_id'] == episode_id), None)
+    if episode is None:
+        raise store.Refusal('episode is not selected')
+    details = _read_selection_detail(home, episode['locators_id'], 'locators')
+    if details['episode_id'] != episode_id or details['basis'] != episode['basis']:
+        raise store.Refusal('selection locator identity mismatch')
+    return _selection_page(details['locators'], cursor, limit, notices=False)
+
+
+def _selection_schedule(home, actionable, requested):
+    """Caller holds store.lock; schedule is saved only after successful admission."""
+    path = paths(home)['progress'] / 'schedule.json'
+    if path.exists():
+        try:
+            state = _read_json(path)
+            if (state.get('schema') != 1 or type(state.get('sequence')) is not int
+                    or state['sequence'] < 0 or not isinstance(state.get('order'), dict)
+                    or state.get('turn') not in ('new', 'pending')
+                    or any(not isinstance(key, str) or not re.fullmatch(r'[0-9a-f]{64}', key)
+                           or type(value) is not int or not 0 <= value <= state['sequence']
+                           for key, value in state['order'].items())):
+                raise ValueError('schedule')
+        except (OSError, ValueError, TypeError) as error:
+            raise store.Refusal('selection schedule invalid') from error
+    else:
+        state = {'schema': 1, 'sequence': 0, 'order': {}, 'turn': 'new'}
+    by_id = {episode['episode_id']: episode for episode in actionable}
+    state['order'] = {key: value for key, value in state['order'].items() if key in by_id}
+    for episode in sorted(actionable, key=lambda row: (row['closed_at'], row['episode_id'])):
+        ident = episode['episode_id']
+        if ident not in state['order']:
+            state['sequence'] += 1
+            state['order'][ident] = state['sequence']
+    explicit = [by_id[ident] for ident in requested]
+    groups = {'new': [], 'pending': []}
+    for episode in actionable:
+        if episode['episode_id'] not in requested:
+            groups['pending' if episode['progress']['screened'] else 'new'].append(episode)
+    for group in groups.values():
+        group.sort(key=lambda row: (state['order'][row['episode_id']], row['closed_at'], row['episode_id']))
+    ordered = [(episode, None) for episode in explicit]
+    turn = state['turn']
+    while groups['new'] or groups['pending']:
+        both = bool(groups['new'] and groups['pending'])
+        chosen = turn if both else ('new' if groups['new'] else 'pending')
+        next_turn = ('pending' if chosen == 'new' else 'new') if both else None
+        ordered.append((groups[chosen].pop(0), next_turn))
+        if both:
+            turn = 'pending' if chosen == 'new' else 'new'
+    return path, state, ordered
 
 
 def select_manifest(home, *, cutoff, config_snapshot, retrospective_review_run_ids=(),
@@ -1012,42 +1173,100 @@ def select_manifest(home, *, cutoff, config_snapshot, retrospective_review_run_i
                       proved.get((episode['role'], episode['session_id'], episode.get('task_id'), episode.get('incarnation')), set()))]
     if set(detail_episode_ids) - {episode['episode_id'] for episode in candidates}:
         raise store.Refusal('detail episode is not eligible')
-    held, actionable = [], []
-    for episode in candidates:
-        progress = episode['progress']
-        explicit = episode['episode_id'] in detail_episode_ids
-        hold = progress.get('hold')
-        if not explicit and hold and hold.get('limits_sha256') == episode['limits_sha256']:
-            held.append({'episode_id': episode['episode_id'], 'basis': episode['basis'], 'limitations': hold['limitations']})
-        elif explicit or not progress.get('reflected'):
-            actionable.append(episode)
-    actionable.sort(key=lambda e: (e['progress'].get('last_assessed', 0), e['closed_at'], e['episode_id']))
-    catalog_id = _selection_catalog(root, coverage, deadline_epoch_ms, items)
-    result = {'schema': 2, 'purpose': 'bounded-behavioral-reflection', 'home_id': _read_json(root / 'data' / 'home.json')['home_id'],
-              'cutoff': cutoff, 'config_snapshot_sha256': _digest(config), 'catalog_id': catalog_id,
-              'instruction_sha256': hashlib.sha256(_read_regular_bytes(INSTRUCTION_FILE)).hexdigest(),
-              'episodes': [], 'held': held, 'omitted_pending': len(actionable),
-              'coverage': coverage, 'retrospective_review_run_ids': list(retrospective_review_run_ids)}
-    catalog_bytes = len(_read_regular_bytes(paths(root)['catalogs'] / f'{catalog_id}.json')) if catalog_id else 0
-    byte_limit = min(16384, config['limits']['max_input_bytes'] - catalog_bytes)
-    for episode in actionable:
-        if len(result['episodes']) >= config['limits']['max_candidates']:
-            break
-        result['episodes'].append(episode)
-        result['omitted_pending'] -= 1
-        size = len(json.dumps({**result, 'manifest_id': '0' * 64}, ensure_ascii=False, indent=2).encode())
-        if size > byte_limit:
-            result['episodes'].pop()
-            result['omitted_pending'] += 1
-            break
-    if actionable and not result['episodes']:
-        raise store.Refusal('selection limit cannot represent an eligible episode')
-    if len(json.dumps({**result, 'manifest_id': '0' * 64}, ensure_ascii=False, indent=2).encode()) > byte_limit:
-        raise store.Refusal('selection metadata exceeds limit')
-    _check_deadline(deadline_epoch_ms)
-    manifest_id = _digest(result)
-    publish_immutable(paths(root)['selections'] / f'{manifest_id}.json', result)
-    return {**result, 'manifest_id': manifest_id}
+    if len(set(detail_episode_ids)) != len(detail_episode_ids):
+        raise store.Refusal('duplicate detail episode')
+    if len(detail_episode_ids) > config['limits']['max_candidates']:
+        raise store.Refusal('detail episodes exceed candidate limit')
+    task_items = {item['task']['id']: item for item in items if item.get('task')}
+    instruction_sha256 = hashlib.sha256(_read_regular_bytes(INSTRUCTION_FILE)).hexdigest()
+    with store.lock(root):
+        _check_deadline(deadline_epoch_ms)
+        held, actionable = [], []
+        for episode in candidates:
+            reviewed = episode['progress'].get('reviewed_message_ids')
+            progress = _episode_progress(root, episode['episode_id'], episode['basis'])
+            if reviewed is not None:
+                progress['reviewed_message_ids'] = reviewed
+            episode['progress'] = {key: value for key, value in progress.items() if key != 'submissions'}
+            explicit = episode['episode_id'] in detail_episode_ids
+            hold = progress.get('hold')
+            if not explicit and hold and hold.get('limits_sha256') == episode['limits_sha256']:
+                held.append({'episode_id': episode['episode_id'], 'basis': episode['basis'],
+                             'limitations': hold['limitations']})
+            elif explicit or not progress.get('reflected'):
+                actionable.append(episode)
+        schedule_path, schedule, ordered = _selection_schedule(root, actionable, detail_episode_ids)
+        selected, locator_bundles = [], []
+        catalog = _selection_catalog(root, coverage, deadline_epoch_ms, []) if actionable else None
+
+        def envelope(episodes, catalog_value, current_coverage):
+            details, summary = _selection_disclosures(held, current_coverage)
+            value = {'schema': 2, 'purpose': 'bounded-behavioral-reflection',
+                     'home_id': _read_json(root / 'data' / 'home.json')['home_id'],
+                     'cutoff': cutoff, 'config_snapshot_sha256': _digest(config),
+                     'catalog_id': _digest(catalog_value) if catalog_value is not None else None,
+                     'instruction_sha256': instruction_sha256, 'episodes': episodes,
+                     'held': [_bounded_notice(item) for item in held[:3]], 'held_count': len(held),
+                     'details_id': _digest(details), 'omitted_pending': len(actionable) - len(episodes),
+                     'coverage': summary, 'retrospective_review_run_ids': list(retrospective_review_run_ids)}
+            return value, details
+
+        def fits(value, catalog_value):
+            size = len(json.dumps({**value, 'manifest_id': '0' * 64}, ensure_ascii=False, indent=2).encode())
+            catalog_size = len(_json_bytes(catalog_value)) if catalog_value is not None else 0
+            return size <= 16384 and size + catalog_size <= config['limits']['max_input_bytes']
+
+        result, disclosures = envelope(selected, catalog, coverage)
+        if not fits(result, catalog) and catalog is not None:
+            _coverage(coverage, 'unavailable', {'reason': 'catalog-input-limit'})
+            catalog = None
+            result, disclosures = envelope(selected, catalog, coverage)
+        if not fits(result, catalog):
+            raise store.Refusal('selection metadata exceeds limit')
+        for episode, next_turn in ordered:
+            if len(selected) >= config['limits']['max_candidates']:
+                break
+            _check_deadline(deadline_epoch_ms)
+            compact, bundle = _compact_episode(episode)
+            trial_coverage = {**coverage, 'unavailable': list(coverage['unavailable']),
+                              'withheld': list(coverage['withheld'])}
+            trial_catalog = catalog
+            task_id = episode.get('task_id')
+            if catalog is not None and task_id and not any(row['task_id'] == task_id for row in catalog['assigned']):
+                item = task_items[task_id]
+                assigned = {'task_id': task_id,
+                            'skills': _manifest(root, item['task_dir'], item['task'], trial_coverage, deadline_epoch_ms),
+                            'usage': 'unknown'}
+                trial_catalog = {**catalog, 'assigned': [*catalog['assigned'], assigned]}
+            trial, trial_disclosures = envelope([*selected, compact], trial_catalog, trial_coverage)
+            if not fits(trial, trial_catalog) and not selected and trial_catalog is not None:
+                _coverage(trial_coverage, 'unavailable', {'reason': 'catalog-input-limit'})
+                trial_catalog = None
+                trial, trial_disclosures = envelope([*selected, compact], trial_catalog, trial_coverage)
+            if not fits(trial, trial_catalog):
+                break
+            selected.append(compact)
+            locator_bundles.append(bundle)
+            result, disclosures, catalog, coverage = trial, trial_disclosures, trial_catalog, trial_coverage
+            schedule['sequence'] += 1
+            schedule['order'][episode['episode_id']] = schedule['sequence']
+            if next_turn is not None:
+                schedule['turn'] = next_turn
+        if actionable and not selected:
+            raise store.Refusal('selection limit cannot represent an eligible episode')
+        if set(detail_episode_ids) - {episode['episode_id'] for episode in selected}:
+            raise store.Refusal('selection limit cannot represent requested detail episodes')
+        _check_deadline(deadline_epoch_ms)
+        if catalog is not None:
+            publish_immutable(paths(root)['catalogs'] / f"{result['catalog_id']}.json", catalog)
+        publish_immutable(paths(root)['selection_details'] / f"{result['details_id']}.json", disclosures)
+        for bundle in locator_bundles:
+            publish_immutable(paths(root)['selection_details'] / f'{_digest(bundle)}.json', bundle)
+        manifest_id = _digest(result)
+        publish_immutable(paths(root)['selections'] / f'{manifest_id}.json', result)
+        _private(schedule_path.parent)
+        store.atomic_json(schedule_path, schedule)
+        return {**result, 'manifest_id': manifest_id}
 
 
 def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids=(), deadline_epoch_ms=None):

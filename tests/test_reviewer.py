@@ -1417,12 +1417,12 @@ def selection(home, *, cutoff=200.0, max_candidates=20, detail=()):
                                     detail_episode_ids=detail)
 
 
-def record_assessment(home, episode, assessment, *, limitations=()):
+def record_assessment(home, episode, assessment, *, limitations=(), ranges=()):
     # Simulates the successful-finalization consumer; failed runs must not call it.
     with store.lock(home):
         reviewer._record_episode_progress(
             home, episode=episode, assessment=assessment, limitations=list(limitations),
-            submission_id=str(uuid.uuid4()))
+            ranges=list(ranges), submission_id=str(uuid.uuid4()))
 
 
 def test_manifest_keeps_live_final_episode_and_excludes_live_tail():
@@ -1576,3 +1576,189 @@ def test_manifest_refuses_budget_that_cannot_fit_eligible_episode():
         config['limits']['max_input_bytes'] = 128
         with pytest.raises(store.Refusal):
             reviewer.select_manifest(home, cutoff=200, config_snapshot=config)
+
+
+def test_fixed_cap_rotation_serves_old_reflection_with_continuous_arrivals():
+    with lab() as (home, _):
+        completed_session(home, start_at=10)
+        old = selection(home, max_candidates=1)['episodes'][0]
+        record_assessment(home, old, 'screened')
+        selected_ids = []
+        for number in range(6):
+            completed_session(home, start_at=20 + number * 20)
+            manifest = selection(home, cutoff=200 + number, max_candidates=1)
+            episode = manifest['episodes'][0]
+            selected_ids.append(episode['episode_id'])
+            record_assessment(home, episode, 'screened')
+        assert old['episode_id'] in selected_ids
+        assert len({e for e in selected_ids if e != old['episode_id']}) >= 2
+
+
+def test_explicit_held_detail_is_not_displaced_by_new_work():
+    with lab() as (home, _):
+        completed_session(home, start_at=10)
+        old = selection(home, max_candidates=1)['episodes'][0]
+        record_assessment(home, old, 'limited', limitations=('intent unavailable',))
+        completed_session(home, start_at=40)
+        selected = selection(home, cutoff=201, max_candidates=1, detail=(old['episode_id'],))
+        assert [episode['episode_id'] for episode in selected['episodes']] == [old['episode_id']]
+        assert selected['omitted_pending'] >= 1
+
+
+def test_large_native_episode_is_bounded_and_remains_recoverable():
+    with lab() as (home, _):
+        source, native, _ = completed_session(home, start_at=10)
+        rows = [json.loads(line) for line in native.read_text().splitlines()]
+        binding_index = next(i for i, row in enumerate(rows) if row.get('customType') == 'agd:episode-binding')
+        binding = rows[binding_index]
+        parent = binding['parentId']
+        inserted = []
+        for number in range(180):
+            row = message(f'bounded native material {number}', 10.5)
+            row.update(id=f'bulk-{number:04d}', parentId=parent)
+            parent = row['id']
+            inserted.append(row)
+        binding['parentId'] = parent
+        rows[binding_index:binding_index] = inserted
+        native.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+        completed_session(home, start_at=40)
+        first = selection(home, max_candidates=1)
+        episode = first['episodes'][0]
+        assert episode['session_id'] == source['session_id']
+        assert len(json.dumps(first, ensure_ascii=False, indent=2).encode()) <= 16384
+        locator_page = reviewer.read_selection_locators(home, first['manifest_id'], episode['episode_id'])
+        assert locator_page['rows'][0]['projection_sha256'] == episode['projection']['sha256']
+        completion = next(c for c in reviewer_episodes.completion_records(
+            home, 200, {'complete': True, 'unavailable': []}) if c['source_id'] == source['source_id'])
+        proof = reviewer_episodes.read_native(native, 200, 262144, completion=completion, metadata_only=True)
+        assert {'bulk-0000', 'bulk-0179'} <= {row['message_id'] for row in proof['projection']}
+        record_assessment(home, episode, 'reflected')
+        following = selection(home, cutoff=201, max_candidates=1)
+        assert following['episodes'][0]['session_id'] != source['session_id']
+        detail = selection(home, cutoff=202, max_candidates=1, detail=(episode['episode_id'],))
+        assert detail['episodes'][0]['episode_id'] == episode['episode_id']
+
+
+def test_large_successful_range_history_does_not_block_selection():
+    with lab() as (home, _):
+        source, _, _ = completed_session(home, texts=('x' * 1000,))
+        episode = selection(home, max_candidates=1)['episodes'][0]
+        final_id = f"{source['session_id']}-final-0"
+        ranges = [{'message_id': final_id, 'start': index * 3, 'end': index * 3 + 2,
+                   'text_sha256': hashlib.sha256(('x' * 1000).encode()).hexdigest()}
+                  for index in range(250)]
+        record_assessment(home, episode, 'screened', ranges=ranges)
+        completed_session(home, start_at=40)
+        detail = selection(home, cutoff=201, max_candidates=1, detail=(episode['episode_id'],))
+        assert detail['episodes'][0]['episode_id'] == episode['episode_id']
+        assert len(json.dumps(detail, ensure_ascii=False, indent=2).encode()) <= 16384
+        saved = reviewer._episode_progress(home, episode['episode_id'], episode['basis'])
+        assert saved['ranges'] == ranges
+
+
+def test_many_held_and_invalid_sources_disclose_counts_and_allow_work():
+    with lab() as (home, _):
+        held_ids = []
+        for number in range(45):
+            completed_session(home, start_at=10)
+            episode = selection(home, cutoff=200 + number, max_candidates=1)['episodes'][0]
+            held_ids.append(episode['episode_id'])
+            record_assessment(home, episode, 'limited', limitations=('missing ' + 'x' * 400,))
+        sources = reviewer_episodes._episode_paths(home)['sources']
+        for number in range(100):
+            (sources / f'{number:064x}.json').write_text('{}')
+        no_work = selection(home, cutoff=300, max_candidates=1)
+        assert no_work['episodes'] == []
+        assert no_work['held_count'] == len(held_ids)
+        assert no_work['coverage']['unavailable_count'] >= 100
+        assert no_work['coverage']['complete'] is False
+        assert len(json.dumps(no_work, ensure_ascii=False, indent=2).encode()) <= 16384
+        seen, cursor = set(), 0
+        while cursor is not None:
+            held_page = reviewer.read_selection_disclosures(home, no_work['manifest_id'], 'held', cursor=cursor)
+            assert held_page['total'] == len(held_ids)
+            assert len(json.dumps(held_page, ensure_ascii=False, indent=2).encode()) <= 16384
+            seen.update(row['episode_id'] for row in held_page['rows'])
+            cursor = held_page['next_cursor']
+        assert seen == set(held_ids)
+        completed_session(home, start_at=40)
+        actionable = selection(home, cutoff=301, max_candidates=1)
+        assert len(actionable['episodes']) == 1
+        assert actionable['held_count'] == len(held_ids)
+        recovered = selection(home, cutoff=302, max_candidates=1, detail=(held_ids[-1],))
+        assert recovered['episodes'][0]['episode_id'] == held_ids[-1]
+
+
+def test_successful_detail_with_new_ranges_clears_no_progress_hold():
+    with lab() as (home, _):
+        source, _, _ = completed_session(home, texts=('outcome with more material',))
+        episode = selection(home, max_candidates=1)['episodes'][0]
+        record_assessment(home, episode, 'limited', limitations=('outcome unavailable',))
+        detail = selection(home, cutoff=201, max_candidates=1, detail=(episode['episode_id'],))['episodes'][0]
+        record_assessment(home, detail, 'screened')
+        assert selection(home, cutoff=201.5, max_candidates=1)['episodes'] == []
+        exposed = {'message_id': f"{source['session_id']}-final-0", 'start': 0, 'end': 7,
+                   'text_sha256': hashlib.sha256(b'outcome with more material').hexdigest()}
+        record_assessment(home, detail, 'screened', ranges=[exposed])
+        resumed = selection(home, cutoff=202, max_candidates=1)
+        assert resumed['episodes'][0]['episode_id'] == episode['episode_id']
+        assert resumed['episodes'][0]['progress']['reflected'] is False
+        saved = reviewer._episode_progress(home, episode['episode_id'], episode['basis'])
+        assert exposed in saved['ranges'] and saved['hold'] is None
+
+
+def test_historical_assigned_catalog_does_not_exhaust_current_budget():
+    with lab() as (home, _):
+        source, native, task = completed_session(home, role='worker', task_id='catalog-template', alive=True)
+        initial = selection(home, max_candidates=1)['episodes'][0]
+        record_assessment(home, initial, 'reflected')
+        completed_session(home, start_at=40)
+        config = reviewer.read_config(home)
+        config['limits'].update(max_candidates=1, max_input_bytes=8192)
+        baseline = reviewer.select_manifest(home, cutoff=200, config_snapshot=config)
+        current = baseline['episodes'][0]
+        assert current['role'] == 'central'
+        episode_paths = reviewer_episodes._episode_paths(home)
+        rows_template = [json.loads(line) for line in native.read_text().splitlines()]
+        binding = next(row for row in rows_template if row.get('customType') == 'agd:episode-binding')
+        interaction = binding['details']['interaction_id']
+        original = json.loads((episode_paths['completions'] / source['source_id'] /
+                               f'{interaction}.json').read_text())
+        for number in range(150):
+            task_id = f'history-{number:03d}'
+            incarnation = str(uuid.uuid4())
+            session_id = str(uuid.uuid4())
+            folder = home / 'data' / 'tasks' / task_id
+            folder.mkdir(parents=True)
+            historical_task = {**task, 'id': task_id, 'incarnation': incarnation}
+            (folder / 'task.json').write_text(json.dumps(historical_task))
+            (folder / 'brief.md').write_text('Historical task intent.\n')
+            session = home / 'data' / 'observability' / 'tasks' / task_id / 'omp' / incarnation / f'{session_id}.jsonl'
+            session.parent.mkdir(parents=True)
+            historical_source = {**source, 'task_id': task_id, 'incarnation': incarnation,
+                                 'session_id': session_id, 'path': str(session.relative_to(home))}
+            historical_source['source_id'] = reviewer_episodes.source_fingerprint(historical_source)
+            rows = json.loads(json.dumps(rows_template))
+            next(row for row in rows if row.get('type') == 'session')['id'] = session_id
+            next(row for row in rows if row.get('customType') == 'agd:episode-binding')['details']['source_id'] = historical_source['source_id']
+            session.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+            completion = {**original, 'source_id': historical_source['source_id']}
+            reviewer_episodes._publish_immutable(
+                episode_paths['sources'] / f"{historical_source['source_id']}.json", historical_source)
+            reviewer_episodes._publish_immutable(
+                episode_paths['completions'] / historical_source['source_id'] / f'{interaction}.json', completion)
+            attached = {**completion, 'source': historical_source}
+            native_proof = reviewer_episodes.read_native(session, 200, 8192, completion=attached, metadata_only=True)
+            item = {'completion': attached, 'task': historical_task, 'task_dir': folder,
+                    'event': {'incarnation': incarnation}, 'closed_at': completion['recorded_at']}
+            historical = reviewer._selection_episode(
+                home, item, session, native_proof, config, 200,
+                {'complete': True, 'unavailable': [], 'withheld': []})
+            record_assessment(home, historical, 'reflected')
+        selected = reviewer.select_manifest(home, cutoff=201, config_snapshot=config)
+        assert [e['episode_id'] for e in selected['episodes']] == [current['episode_id']]
+        catalog = json.loads((reviewer.paths(home)['catalogs'] / f"{selected['catalog_id']}.json").read_text())
+        assert not any(row['task_id'].startswith('history-') for row in catalog['assigned'])
+        record_assessment(home, selected['episodes'][0], 'reflected')
+        no_work = reviewer.select_manifest(home, cutoff=202, config_snapshot=config)
+        assert no_work['episodes'] == []
