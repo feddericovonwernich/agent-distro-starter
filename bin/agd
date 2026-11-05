@@ -154,6 +154,7 @@ def parser():
     central.add_argument('omp_args', nargs=argparse.REMAINDER)
     reviewer_p = sub.add_parser('reviewer').add_subparsers(dest='reviewer_op', required=True)
     run_p = reviewer_p.add_parser('run'); run_p.add_argument('--timer', action='store_true'); run_p.add_argument('--retrospective-review-run', type=lambda value: str(uuid.UUID(value)), action='append', default=[])
+    run_p.add_argument('--detail-episode', action='append', default=[])
     execute_p = reviewer_p.add_parser('execute'); execute_p.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value)))
     bind_p = reviewer_p.add_parser('session-bind'); bind_p.add_argument('review_run_id', type=lambda value: str(uuid.UUID(value))); bind_p.add_argument('--session-id', required=True); bind_p.add_argument('--session-file', required=True)
     reviewer_p.add_parser('status')
@@ -511,13 +512,15 @@ def _dispatch(args, home, fresh):
         if args.reviewer_op == 'session-bind':
             return reviewer_runner.bind_session(home, args.review_run_id, args.session_id, Path(args.session_file))
         if args.reviewer_op == 'run':
-            if args.timer and args.retrospective_review_run: raise store.Refusal('timer runs cannot be retrospective')
+            if args.timer and (args.retrospective_review_run or args.detail_episode):
+                raise store.Refusal('timer runs cannot request retrospective or detail scope')
             if args.timer: return reviewer_runner.launch_timer(home)
             selected = tuple(args.retrospective_review_run)
             return reviewer_runner.run_native_reviewer(
                 home, reviewer.enqueue_intent(
                     home, kind='retrospective' if selected else 'manual',
-                    retrospective_review_run_ids=selected))
+                    retrospective_review_run_ids=selected,
+                    detail_episode_ids=tuple(args.detail_episode)))
         if args.reviewer_op == 'workspace':
             if args.workspace_op == 'create':
                 return reviewer_workspaces.create(home, args.review_run_id, args.project, args.commit)

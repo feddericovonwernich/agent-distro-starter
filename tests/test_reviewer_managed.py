@@ -16,10 +16,28 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / 'bin'), str(ROOT / 'tests')]
 from agd_lib import installer, omp_runtime, reviewer, reviewer_runner, reviewer_timer, store, supervision  # noqa: E402
 from support import command, write_native_plugins  # noqa: E402
-from test_reviewer import ended_worker, message  # noqa: E402
+from test_reviewer import completed_session, message  # noqa: E402
 
 
-def test_public_timer_managed_native_run_waits_for_exit_and_cleans_endpoint():
+def seed_reflection(home, task_id):
+    source, native, _ = completed_session(
+        home, role='worker', task_id=task_id,
+        texts=('AGD_NATIVE_REVIEWER_SENTINEL: reported completion without validation',),
+        active='AGD_UNRELATED_PRIVATE_SENTINEL', cutoff=time.time() + 3600)
+    rows = [json.loads(line) for line in native.read_text().splitlines()]
+    prompt = next(row for row in rows if row.get('id') == source['session_id'] + '-prompt-0')
+    prompt['message']['content'] = 'AGD_NATIVE_REVIEWER_CONSTRAINT: validate value.txt before reporting.'
+    final = next(row for row in rows if row.get('id') == source['session_id'] + '-final-0')
+    action = message('AGD_NATIVE_REVIEWER_ACTION: changed value.txt without validation.',
+                     11.5, role='assistant')
+    action.update(id=source['session_id'] + '-action-0', parentId=final['parentId'])
+    final['parentId'] = action['id']
+    rows.insert(rows.index(final), action)
+    native.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+    return source
+
+
+def test_manifest_public_timer_managed_native_run_waits_for_exit_and_cleans_endpoint():
     binaries = {name: shutil.which(name) for name in ('omp', 'herdr', 'treehouse')}
     if not all(binaries.values()):
         pytest.skip('standalone OMP, Herdr, and Treehouse are required')
@@ -82,6 +100,8 @@ def test_public_timer_managed_native_run_waits_for_exit_and_cleans_endpoint():
                        capture_output=True, text=True)
         command(home, 'project', 'add', 'sample', '--source', str(origin))
         write_native_plugins(home)
+        for skill in (home / 'data/omp/xdg/data/omp/plugins/cache/plugins').glob('*/skills/*/SKILL.md'):
+            skill.write_text(skill.read_text() + '\nAGD_PRIVATE_PLUGIN_SENTINEL\n')
         subprocess.run(['/usr/bin/git', 'init', '--quiet', str(home)], check=True,
                        capture_output=True, text=True)
         subprocess.run(['/usr/bin/git', '-C', str(home), '-c', 'user.name=Owned Native Smoke',
@@ -106,8 +126,7 @@ def test_public_timer_managed_native_run_waits_for_exit_and_cleans_endpoint():
         config['schedule'] = {'mode': 'interval', 'timezone': None, 'calendar': None,
                               'interval_hours': 1}
         store.atomic_json(reviewer.paths(home)['config'], config)
-        ended_worker(home, 'managed-timer-seed', str(uuid.uuid4()),
-                     [message('AGD_NATIVE_REVIEWER_SENTINEL: synthetic completed execution evidence')])
+        seed_reflection(home, 'managed-timer-seed')
         reviewer_timer.enable(home, config, xdg_config_home=root / 'xdg-config',
                               command_runner=lambda _argv: None, now=1)
         reviewer_timer.timer_tick(home, now=3601)
@@ -151,8 +170,7 @@ def test_public_timer_managed_native_run_waits_for_exit_and_cleans_endpoint():
         def start_public_run(kind):
             barrier.unlink(missing_ok=True)
             release.unlink(missing_ok=True)
-            ended_worker(home, kind, str(uuid.uuid4()),
-                         [message('AGD_NATIVE_REVIEWER_SENTINEL: synthetic execution evidence')])
+            seed_reflection(home, kind)
             return subprocess.Popen(
                 [sys.executable, str(ROOT / 'bin' / 'agd'), '--home', str(home),
                  'reviewer', 'run'],
@@ -170,6 +188,10 @@ def test_public_timer_managed_native_run_waits_for_exit_and_cleans_endpoint():
                 time.sleep(.05)
             assert barrier.exists(), process.stderr.read() if process.poll() is not None else 'barrier missing'
             assert not list(reviewer.paths(home)['reports'].glob('*.json'))
+            pending = [json.loads(path.read_text()) for path in reviewer.paths(home)['receipts'].glob('*.json')
+                       if json.loads(path.read_text()).get('coordinator', {}).get('pid') == process.pid]
+            assert len(pending) == 1 and pending[0].get('endpoint') and pending[0].get('child')
+            assert supervision.process_identity(pending[0]['child']['pid'])
             release.write_text('release\n')
             stdout, stderr = process.communicate(timeout=80)
             assert process.returncode == 0, (stdout, stderr)
@@ -180,16 +202,38 @@ def test_public_timer_managed_native_run_waits_for_exit_and_cleans_endpoint():
             assert len(reports) == 1
             assert reports[0]['review_run_id'] == result['review_run_id']
             payload = reports[0]['report']
-            packet = reviewer.read_packet(home, result['packet_id'])
-            seed_source_id = next(excerpt['source_id'] for excerpt in packet['excerpts']
-                                  if 'AGD_NATIVE_REVIEWER_SENTINEL' in excerpt['text'])
-            supplementary = reviewer.read_evidence(home, result['review_run_id'])
-            assert len(supplementary['sources']) == 1
-            supplement_source_id = next(iter(supplementary['sources']))
+            assert payload['schema'] == 2
+            assert result['manifest_id']
+            receipt = reviewer._receipt(home, result['review_run_id'])
+            assert receipt['manifest_id'] == result['manifest_id'] and receipt['report_schema'] == 2
+            runtime = reviewer.paths(home)['runtime'] / result['review_run_id']
+            exit_record = json.loads((runtime / 'exit.json').read_text())
+            assert exit_record['code'] == 0 and exit_record['process_absent'] is True
+            assert reviewer_runner._lifecycle_proved_absent(receipt, exit_record)
+            request = json.loads((runtime / 'request.json').read_text())
+            manifest = json.loads((runtime / 'selection-manifest.json').read_text())
+            assert request['manifest_id'] == manifest['manifest_id'] == result['manifest_id']
+            assert not (runtime / 'packet.json').exists() and not (runtime / 'catalog.json').exists()
+            conversation = (runtime / 'native-provider-transcript.json').read_text()
+            context = (runtime / 'native-provider-context.json').read_text()
+            assert 'AGD_UNRELATED_PRIVATE_SENTINEL' not in conversation
+            assert 'AGD_PRIVATE_PLUGIN_SENTINEL' not in conversation + context
+            tool_calls = [call for row in json.loads(conversation) if row.get('role') == 'assistant'
+                          for call in row.get('tool_calls', [])]
+            called = json.dumps(tool_calls)
+            assert 'reviewer skills list' not in called and 'reviewer skills show' not in called
+            assert 'skill://agd-reviewer' not in called
+            assert all(marker in conversation for marker in (
+                'AGD_NATIVE_REVIEWER_CONSTRAINT', 'AGD_NATIVE_REVIEWER_ACTION',
+                'AGD_NATIVE_REVIEWER_SENTINEL'))
+            assert len(payload['episode_reviews']) == 1
+            review = payload['episode_reviews'][0]
+            assert review['assessment'] == 'reflected'
+            assert all(review[key] for key in ('intent_sources', 'action_sources', 'outcome_sources'))
             finding = payload['findings']
-            assert len(finding) == 1
-            assert finding[0]['target'] == 'agd-reviewer-execution-trace'
-            assert finding[0]['citations'] == [seed_source_id, supplement_source_id]
+            assert len(finding) == 1 and finding[0]['target_ref']
+            assert set(finding[0]['citations']) == set(
+                review['intent_sources'] + review['action_sources'] + review['outcome_sources'])
             control_status = subprocess.run([str(tools / 'herdr'), '--session', control_session,
                                              'status', 'server'], cwd=home, env=environment,
                                             capture_output=True, text=True)

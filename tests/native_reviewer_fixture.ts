@@ -3,105 +3,25 @@ import { resolve } from 'node:path';
 import { createServer } from 'node:http';
 import type { ServerResponse } from 'node:http';
 
-const SENTINEL = 'AGD_NATIVE_REVIEWER_SENTINEL';
-const SHELL_MARKER = 'AGD_NATIVE_REVIEWER_SHELL';
-
-function reportFor(evidence: string, shell: string, sourceId: string, supplementId: string): string {
-  return JSON.stringify({
-    schema: 1,
-    summary: `Native process evidence: ${evidence.slice(0, 160)}; shell: ${shell.slice(0, 160)}`,
-    findings: [{
-      kind: 'new-skill',
-      target: 'agd-reviewer-execution-trace',
-      finding: `The native run read the reserved reviewer contract and observed ${SENTINEL} plus ${SHELL_MARKER}.`,
-      applicability: 'native reviewer execution traces',
-      citations: [sourceId, supplementId],
-      counterexamples: [],
-      uncertainty: 'The deterministic local provider proves tool/result plumbing, not model judgement.',
-      resolution: 'Add an AGD-authored process-trace review checklist covering tool evidence and bounded report handoff.',
-      validation: `Read result contained ${SENTINEL}; shell result contained ${SHELL_MARKER}; write result was returned.`,
-      validation_limits: ['Local scripted provider; no real-provider quality or policy claim.'],
-      new_skill: {
-        id: 'agd-reviewer-execution-trace',
-        draft: '---\nname: agd-reviewer-execution-trace\ndescription: Use when reviewing native execution traces for process improvements\n---\n# Execution-trace review\n',
-        triggers: ['native execution trace', 'review process evidence'],
-        scope: 'AGD reviewer process traces',
-        prerequisites: ['A bounded native session and durable tool results.'],
-      },
-    }],
-  });
-}
-
-function resultText(value: unknown): string {
+function text(value: unknown): string {
   if (typeof value === 'string') return value;
-  if (Array.isArray(value)) {
-    return value.filter((block): block is Record<string, unknown> =>
-      !!block && typeof block === 'object' && (block as Record<string, unknown>).type === 'text')
-      .map((block) => typeof block.text === 'string' ? block.text : '')
-      .join('\n');
-  }
+  if (Array.isArray(value)) return value.filter((row): row is Record<string, unknown> =>
+    !!row && typeof row === 'object' && (row as Record<string, unknown>).type === 'text')
+    .map(row => typeof row.text === 'string' ? row.text : '').join('\n');
   return value && typeof value === 'object' ? JSON.stringify(value) : '';
 }
-
-function toolResult(messages: unknown[], callId: string): Record<string, unknown> | undefined {
+function result(messages: unknown[], id: string): Record<string, unknown> | undefined {
   return messages.find((row): row is Record<string, unknown> => {
     if (!row || typeof row !== 'object') return false;
-    const value = row as Record<string, unknown>;
-    const role = value.role;
-    const id = value.tool_call_id ?? value.toolCallId;
-    return (role === 'tool' || role === 'toolResult') && id === callId;
+    const v = row as Record<string, unknown>;
+    return (v.role === 'tool' || v.role === 'toolResult') && (v.tool_call_id ?? v.toolCallId) === id;
   });
 }
-
-function toolText(messages: unknown[]): string {
-  return messages.filter((row): row is Record<string, unknown> => {
-    if (!row || typeof row !== 'object') return false;
-    const role = (row as Record<string, unknown>).role;
-    return role === 'tool' || role === 'toolResult';
-  }).map((row) => resultText(row.content)).join('\n');
+function parsed<T>(messages: unknown[], id: string): T {
+  const row = result(messages, id);
+  if (!row || row.isError === true) throw new Error(`missing tool result ${id}`);
+  return JSON.parse(text(row.content));
 }
-
-function hasToolCall(messages: unknown[], name: string, argument?: string): boolean {
-  return messages.some((row) => {
-    if (!row || typeof row !== 'object') return false;
-    const value = row as Record<string, unknown>;
-    const calls = value.tool_calls;
-    if (!Array.isArray(calls)) return false;
-    return calls.some((call) => {
-      if (!call || typeof call !== 'object') return false;
-      const callValue = call as Record<string, unknown>;
-      const functionValue = callValue.function;
-      if (!functionValue || typeof functionValue !== 'object') return false;
-      const functionRecord = functionValue as Record<string, unknown>;
-      if (functionRecord.name !== name) return false;
-      return argument === undefined || JSON.stringify(functionRecord.arguments).includes(argument);
-    });
-  });
-}
-
-function sourceId(messages: unknown[]): string | undefined {
-  const packet = resultText(toolResult(messages, 'read-packet')?.content);
-  try {
-    const value = JSON.parse(packet) as { sources?: Array<{ source_id?: unknown }> };
-    const source = value.sources?.find(item => typeof item.source_id === 'string');
-    return source?.source_id as string | undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-
-function supplementaryId(messages: unknown[]): string | undefined {
-  const result = resultText(toolResult(messages, 'capture-evidence')?.content);
-  try {
-    const value = JSON.parse(result) as { source_id?: unknown };
-    return typeof value.source_id === 'string' ? value.source_id : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-
 function sse(res: ServerResponse, payload: object) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
   res.write('data: [DONE]\n\n');
@@ -112,156 +32,87 @@ export default async function fixture(pi: {
   registerProvider: (name: string, config: object) => void;
   on: (event: string, handler: (value: Record<string, unknown>) => void) => void;
 }) {
-  const toolErrors = new Set<string>();
-  let contextCaptured = false;
+  const errors = new Set<string>();
   pi.on('tool_result', event => {
-    if (event.isError === true && typeof event.toolCallId === 'string') {
-      toolErrors.add(event.toolCallId);
-    }
+    if (event.isError === true && typeof event.toolCallId === 'string') errors.add(event.toolCallId);
   });
-  const contextArtifact = resolve(process.cwd(), 'native-provider-context.json');
   const server = createServer(async (req, res) => {
     if (req.method !== 'POST' || !req.url?.endsWith('/chat/completions')) {
-      res.writeHead(404).end();
-      return;
+      res.writeHead(404).end(); return;
     }
     let body = '';
     for await (const chunk of req) body += chunk;
     const messages = (JSON.parse(body).messages ?? []) as unknown[];
-    if (!contextCaptured) {
-      const contextMessages = messages.filter((row): row is Record<string, unknown> => {
-        if (!row || typeof row !== 'object') return false;
-        const role = (row as Record<string, unknown>).role;
-        return role === 'system' || role === 'developer';
-      });
-      const contextBody = JSON.stringify({ schema: 1, messages: contextMessages });
-      if (contextMessages.length > 0 && Buffer.byteLength(contextBody, 'utf8') <= 65536) {
-        try {
-          writeFileSync(contextArtifact, contextBody + '\n', { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-          contextCaptured = true;
-        } catch {
-          // A pre-existing artifact belongs to another disposable run.
-          contextCaptured = true;
-        }
-      }
-    }
+    const context = messages.filter(row => !!row && typeof row === 'object' &&
+      ['system', 'developer'].includes(String((row as Record<string, unknown>).role)));
+    if (context.length) writeFileSync(resolve(process.cwd(), 'native-provider-context.json'), JSON.stringify(context));
+    writeFileSync(resolve(process.cwd(), 'native-provider-transcript.json'), JSON.stringify(messages));
     const id = `fixture-${Date.now()}`;
-    const send = (payload: object) => {
+    const call = (callId: string, name: string, args: object) => {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
-      sse(res, payload);
+      sse(res, { id, object: 'chat.completion.chunk', choices: [{ index: 0,
+        delta: { role: 'assistant', tool_calls: [{ index: 0, id: callId, type: 'function',
+          function: { name, arguments: JSON.stringify(args) } }] }, finish_reason: 'tool_calls' }] });
     };
-    const skillResult = toolResult(messages, 'read-reviewer-skill');
-    const skillRead = hasToolCall(messages, 'read', 'skill://agd-reviewer/references/commands.md');
-    if (hasToolCall(messages, 'read')
-      && (!skillRead || !skillResult || toolErrors.has('read-reviewer-skill'))) {
-      res.writeHead(502).end('reserved agd-reviewer core skill read failed');
-      return;
-    }
-    const requestResult = toolResult(messages, 'read-request');
-    const packetResult = toolResult(messages, 'read-packet');
-    const catalogResult = toolResult(messages, 'read-catalog');
-    const bashResult = toolResult(messages, 'shell-diagnostic');
-    const writeResult = toolResult(messages, 'write-report');
-    const captureResult = toolResult(messages, 'capture-evidence');
-    if (hasToolCall(messages, 'read', 'request.json')
-      && (!requestResult || toolErrors.has('read-request')
-        || !resultText(requestResult.content).includes('review_run_id'))) {
-      res.writeHead(502).end('request read failed or lacked run identity');
-      return;
-    }
-    const packetText = resultText(packetResult?.content);
-    if (hasToolCall(messages, 'read', 'packet.json')
-      && (!packetResult || toolErrors.has('read-packet')
-        || !packetText.includes(SENTINEL))) {
-      res.writeHead(502).end('packet read failed or lacked sentinel');
-      return;
-    }
-    if (hasToolCall(messages, 'read', 'catalog.json')
-      && (!catalogResult || toolErrors.has('read-catalog'))) {
-      res.writeHead(502).end('catalog read failed');
-      return;
-    }
-    if (hasToolCall(messages, 'bash')
-      && (!bashResult || toolErrors.has('shell-diagnostic')
-        || !resultText(bashResult.content).includes(SHELL_MARKER))) {
-      res.writeHead(502).end('bash diagnostic failed or lacked marker');
-      return;
-    }
-    if (hasToolCall(messages, 'bash', 'reviewer evidence add')
-      && (!captureResult || toolErrors.has('capture-evidence') || !supplementaryId(messages))) {
-      res.writeHead(502).end('supplementary evidence capture failed');
-      return;
-    }
-    if (hasToolCall(messages, 'write', 'report-draft.json')
-      && (!writeResult || toolErrors.has('write-report') || !resultText(writeResult.content).trim())) {
-      res.writeHead(502).end('report write failed');
-      return;
-    }
-    if (!hasToolCall(messages, 'read')) {
-      send({ id, object: 'chat.completion.chunk', choices: [{ index: 0,
-        delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'read-reviewer-skill', type: 'function',
-          function: { name: 'read', arguments: JSON.stringify({
-            path: 'skill://agd-reviewer/references/commands.md',
-          }) } }] },
-        finish_reason: 'tool_calls' }] });
-    } else if (!hasToolCall(messages, 'read', 'request.json')) {
-      send({ id, object: 'chat.completion.chunk', choices: [{ index: 0,
-        delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'read-request', type: 'function',
-          function: { name: 'read', arguments: JSON.stringify({ path: 'request.json:raw' }) } }] },
-        finish_reason: 'tool_calls' }] });
-    } else if (!hasToolCall(messages, 'read', 'packet.json')) {
-      send({ id, object: 'chat.completion.chunk', choices: [{ index: 0,
-        delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'read-packet', type: 'function',
-          function: { name: 'read', arguments: JSON.stringify({ path: 'packet.json:raw' }) } }] },
-        finish_reason: 'tool_calls' }] });
-    } else if (!hasToolCall(messages, 'read', 'catalog.json')) {
-      send({ id, object: 'chat.completion.chunk', choices: [{ index: 0,
-        delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'read-catalog', type: 'function',
-          function: { name: 'read', arguments: JSON.stringify({ path: 'catalog.json:raw' }) } }] },
-        finish_reason: 'tool_calls' }] });
-    } else if (!hasToolCall(messages, 'bash')) {
-      send({ id, object: 'chat.completion.chunk', choices: [{ index: 0,
-        delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'shell-diagnostic', type: 'function',
-          function: { name: 'bash', arguments: JSON.stringify({
-            command: `printf '${SHELL_MARKER}\\n'`,
-          }) } }] },
-        finish_reason: 'tool_calls' }] });
-    } else if (!hasToolCall(messages, 'write', 'investigation.txt')) {
-      send({ id, object: 'chat.completion.chunk', choices: [{ index: 0,
-        delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'write-evidence', type: 'function',
-          function: { name: 'write', arguments: JSON.stringify({
-            path: 'investigation.txt',
-            content: JSON.stringify({ shell: SHELL_MARKER, purpose: 'bounded native investigation artifact' }) + '\n',
-          }) } }] },
-        finish_reason: 'tool_calls' }] });
-    } else if (!hasToolCall(messages, 'bash', 'reviewer evidence add')) {
-      send({ id, object: 'chat.completion.chunk', choices: [{ index: 0,
-        delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'capture-evidence', type: 'function',
-          function: { name: 'bash', arguments: JSON.stringify({
-            command: '"$AGD_CLI" --home "$AGD_HOME" reviewer evidence add "$AGD_REVIEW_RUN_ID" --file "$PWD/investigation.txt" --label "native shell investigation"',
-          }) } }] },
-        finish_reason: 'tool_calls' }] });
-    } else if (!hasToolCall(messages, 'write', 'report-draft.json')) {
-      const source = sourceId(messages);
-      const supplement = supplementaryId(messages);
-      if (!source || !supplement || !packetText.includes(SENTINEL)) {
-        res.writeHead(502).end('fixture did not receive packet and supplementary evidence');
-        return;
+    try {
+      if (errors.size) throw new Error(`tool failure: ${Array.from(errors).join(', ')}`);
+      if (!result(messages, 'read-request')) return call('read-request', 'read', { path: 'request.json:raw' });
+      const request = parsed<{ schema: number; report_schema: number; manifest_id: string }>(messages, 'read-request');
+      if (request.schema !== 2 || request.report_schema !== 2 || !request.manifest_id) throw new Error('bad request');
+      if (!result(messages, 'read-manifest')) return call('read-manifest', 'read', { path: 'selection-manifest.json:raw' });
+      const manifestText = text(result(messages, 'read-manifest')?.content);
+      const manifest: { manifest_id: string; episodes: Array<{ task_id?: string; session_id: string; episode_id: string }> } = JSON.parse(manifestText);
+      if (manifest.manifest_id !== request.manifest_id || Buffer.byteLength(manifestText) > 16384 ||
+          manifestText.includes('AGD_NATIVE_REVIEWER_SENTINEL') || manifestText.includes('AGD_UNRELATED_PRIVATE_SENTINEL')) {
+        throw new Error('manifest was not metadata-only');
       }
-      send({ id, object: 'chat.completion.chunk', choices: [{ index: 0,
-        delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'write-report', type: 'function',
-          function: { name: 'write', arguments: JSON.stringify({
-            path: 'report-draft.json', content: reportFor(packetText, SHELL_MARKER, source, supplement),
-          }) } }] },
-        finish_reason: 'tool_calls' }] });
-    } else {
-      if (!writeResult || writeResult.isError === true || !resultText(writeResult.content).trim()) {
-        res.writeHead(502).end('fixture did not receive write result');
-        return;
+      const episode = manifest.episodes.find(row => row.task_id?.startsWith('managed-'));
+      if (!episode) throw new Error('selected episode missing');
+      const base = '"$AGD_CLI" --home "$AGD_HOME" reviewer';
+      if (!result(messages, 'metadata')) return call('metadata', 'bash', {
+        command: `[ ! -e packet.json ] && [ ! -e catalog.json ] && ${base} inspect "$AGD_REVIEW_RUN_ID" --episode ${episode.episode_id}`,
+      });
+      const metadata = parsed<{ source: string; rows: Array<{ message_id?: string }> }>(messages, 'metadata');
+      if (metadata.source !== 'native' || JSON.stringify(metadata).includes('AGD_UNRELATED_PRIVATE_SENTINEL')) {
+        throw new Error('native fallback or scope failure');
       }
-      send({ id, object: 'chat.completion.chunk', choices: [{ index: 0,
-        delta: { role: 'assistant', content: 'Native skill, file, shell, supplementary evidence, and report-write evidence was verified.' },
-        finish_reason: 'stop' }] });
+      const ids = [`${episode.session_id}-prompt-0`, `${episode.session_id}-action-0`, `${episode.session_id}-final-0`];
+      if (!ids.every(id => metadata.rows.some(row => row.message_id === id))) throw new Error('metadata locators missing');
+      const names = ['intent', 'action', 'outcome'];
+      for (let index = 0; index < names.length; index++) {
+        if (!result(messages, names[index])) return call(names[index], 'bash', {
+          command: `${base} inspect "$AGD_REVIEW_RUN_ID" --episode ${episode.episode_id} --source native --record ${ids[index]} --part content`,
+        });
+      }
+      type Page = { text: string; source_id: string };
+      const intent = parsed<Page>(messages, 'intent'), action = parsed<Page>(messages, 'action'), outcome = parsed<Page>(messages, 'outcome');
+      if (!intent.text.includes('AGD_NATIVE_REVIEWER_CONSTRAINT') || !action.text.includes('AGD_NATIVE_REVIEWER_ACTION') ||
+          !outcome.text.includes('AGD_NATIVE_REVIEWER_SENTINEL')) throw new Error('bounded content missing');
+      if (!result(messages, 'target')) return call('target', 'bash', {
+        command: `${base} target inspect "$AGD_REVIEW_RUN_ID" --scope project --project sample --path value.txt --operation modify --surface tooling`,
+      });
+      const target = parsed<{ target_ref: string }>(messages, 'target');
+      if (!target.target_ref) throw new Error('target missing');
+      if (!result(messages, 'write-report')) {
+        const review = { episode_id: episode.episode_id, assessment: 'reflected',
+          intent_sources: [intent.source_id], action_sources: [action.source_id],
+          outcome_sources: [outcome.source_id], limitations: [] };
+        const finding = { episode_ids: [episode.episode_id], target_ref: target.target_ref,
+          finding: 'The observed action omitted the required validation.', proposed_change: 'Add validation to the project tool.',
+          expected_benefit: 'The missing validation becomes visible.', applicability: 'project',
+          scope_rationale: 'The check concerns the selected project tool.', citations: [intent.source_id, action.source_id, outcome.source_id],
+          counterexamples: [], alternatives: 'Use a manual check.', uncertainty: 'No counterexample was observed; causality is unproven.',
+          validation: 'Exercise the project tool with an invalid result.', validation_limits: ['Synthetic fixture only.'],
+          risks: ['The check may reject valid results.'], draft: null };
+        return call('write-report', 'write', { path: 'report-draft.json',
+          content: JSON.stringify({ schema: 2, summary: 'Bounded native fixture.', episode_reviews: [review], findings: [finding] }) });
+      }
+      if (!text(result(messages, 'write-report')?.content).trim()) throw new Error('report write not acknowledged');
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      sse(res, { id, object: 'chat.completion.chunk', choices: [{ index: 0,
+        delta: { role: 'assistant', content: 'Bounded native review draft written.' }, finish_reason: 'stop' }] });
+    } catch (error) {
+      res.writeHead(502).end(String(error));
     }
   });
   const listening = Promise.withResolvers<void>();
@@ -270,13 +121,9 @@ export default async function fixture(pi: {
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('fixture endpoint did not bind');
   pi.registerProvider('agd-fixture', {
-    baseUrl: `http://127.0.0.1:${address.port}/v1`,
-    api: 'openai-completions',
-    apiKey: 'local-only',
-    models: [{ id: 'reviewer', name: 'AGD local-only reviewer', reasoning: false,
-      input: ['text'], supportsTools: true,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 32768, maxTokens: 2048 }],
+    baseUrl: `http://127.0.0.1:${address.port}/v1`, api: 'openai-completions', apiKey: 'local-only',
+    models: [{ id: 'reviewer', name: 'AGD local-only reviewer', reasoning: false, input: ['text'], supportsTools: true,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32768, maxTokens: 2048 }],
   });
   pi.on('session_shutdown', () => server.close());
 }

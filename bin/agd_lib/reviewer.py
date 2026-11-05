@@ -55,13 +55,8 @@ def _json_bytes(value): return json.dumps(value, sort_keys=True, separators=(','
 def _digest(value): return hashlib.sha256(_json_bytes(value)).hexdigest()
 
 
-def _native_material_identity(value):
-    return {key: item for key, item in value.items() if key not in ('byte_watermark', 'content_sha256')}
 
 
-def _native_excerpt_id(source_id, row):
-    return _digest({'source_id': source_id, 'message_id': row['message_id'],
-                    'text_sha256': hashlib.sha256(row['text'].encode()).hexdigest()})
 
 
 
@@ -407,52 +402,9 @@ def _capture_evidence(home, review_run_id, path, label):
         raise store.Refusal('supplementary evidence label is credential-bearing')
     root = store.home(home)
     initial_receipt = _receipt(root, review_run_id)
-    if initial_receipt.get('manifest_id') is not None:
-        return _capture_evidence_v2(root, review_run_id, path, label, initial_receipt)
-    with store.lock(root):
-        receipt = _receipt(root, review_run_id)
-        schema2 = receipt.get('manifest_id') is not None
-        if (receipt.get('dispatch_state') != 'begun' if schema2 else
-                receipt.get('dispatch_state') not in ('begun', 'report-committed')):
-            raise store.Refusal('review run is not active')
-        if schema2:
-            _check_deadline(receipt.get('deadline_epoch_ms'))
-        try:
-            config = validate_config(_read_json(paths(root)['manifests'] / f"{receipt['config_snapshot_ref']}.json"))
-            if schema2:
-                from . import reviewer_inspection
-                seed_bytes = reviewer_inspection._input_used_locked(root, receipt)
-            else:
-                packet_id = receipt.get('packet_id')
-                _hex_id(packet_id)
-                seed_bytes = len(_read_regular_bytes(paths(root)['packets'] / f'{packet_id}.json'))
-        except (OSError, ValueError, json.JSONDecodeError, store.Refusal) as error:
-            raise store.Refusal('reviewer seed is unavailable') from error
-        records = _evidence_records(root, review_run_id)
-        used = seed_bytes if schema2 else seed_bytes + sum(item['bytes'] for item in records.values())
-        remaining = max(0, config['limits']['max_input_bytes'] - used)
-        _, relative = _artifact_path(root, review_run_id, path)
-        origin_path = relative.as_posix()
-        origin = {'run_id': review_run_id, 'path': origin_path}
-        duplicate_sizes = {
-            item['bytes'] for item in records.values() if item['origin'] == origin}
-        origin_path, body, text, text_sha256, _ = _read_owned_artifact(
-            root, review_run_id, path, remaining, duplicate_sizes)
-        source_id = _digest(_evidence_identity(review_run_id, origin, text_sha256))
-        existing = records.get(source_id)
-        if existing is not None:
-            return existing
-        total = len(body)
-        if _EVIDENCE_SECRET_TEXT.search(text):
-            raise store.Refusal('supplementary artifact is credential-bearing')
-        if used + total > config['limits']['max_input_bytes']:
-            raise store.Refusal('cumulative reviewer input exceeds limit')
-        record = {'schema': 1, 'source_id': source_id, 'review_run_id': review_run_id,
-                  'origin': origin, 'label': label.strip(), 'captured_at': time.time(),
-                  'bytes': total, 'text': text, 'text_sha256': text_sha256}
-        record['integrity_sha256'] = _evidence_integrity(record)
-        publish_immutable(paths(root)['evidence'] / review_run_id / f'{source_id}.json', record)
-    return record
+    if initial_receipt.get('manifest_id') is None:
+        raise store.Refusal('legacy reviewer runs cannot capture new evidence')
+    return _capture_evidence_v2(root, review_run_id, path, label, initial_receipt)
 
 
 def deadline_remaining_seconds(deadline_epoch_ms):
@@ -514,25 +466,6 @@ def _fixed_session(root, task_id, incarnation, binding):
     return expected
 
 
-def _catalog(home, coverage, deadline_epoch_ms=None):
-    try:
-        result = []
-        for item in worker_skills.catalog(home):
-            _check_deadline(deadline_epoch_ms)
-            raw = (Path(item['source']) / 'SKILL.md').read_bytes()
-            excerpt = raw[:256].decode('utf-8', 'replace')
-            result.append({'id': item['id'], 'description': item['description'],
-                           'catalog_sha256': hashlib.sha256(raw).hexdigest(), 'snapshot_excerpt': excerpt,
-                           'snapshot_total_bytes': len(raw), 'snapshot_truncated': len(raw) > 256,
-                           'snapshot_invalid_utf8': '\ufffd' in excerpt})
-        return result
-    except store.Refusal:
-        if deadline_epoch_ms is not None and deadline_remaining_seconds(deadline_epoch_ms) <= 0: raise
-        _coverage(coverage, 'unavailable', {'category': 'skill-catalog', 'reason': 'catalog-unavailable'})
-        return []
-    except OSError:
-        _coverage(coverage, 'unavailable', {'category': 'skill-catalog', 'reason': 'catalog-unavailable'})
-        return []
 
 def _manifest(home, task_dir, task, coverage, deadline_epoch_ms=None):
     _check_deadline(deadline_epoch_ms)
@@ -558,26 +491,8 @@ def _manifest(home, task_dir, task, coverage, deadline_epoch_ms=None):
         return []
 
 
-def _central(task_dir, task_id, incarnation, cutoff, coverage, deadline_epoch_ms=None):
-    sources, excerpts = [], []; folder = task_dir / 'decisions'
-    if not folder.exists(): return sources, excerpts
-    for path in sorted(folder.glob('*.json')):
-        _check_deadline(deadline_epoch_ms)
-        if path.name.endswith('.answer.json'): continue
-        try:
-            decision = _read_json(path); at = decision.get('resolved_at')
-            if decision.get('incarnation') != incarnation or decision.get('status') != 'resolved' or not isinstance(at, (int, float)) or at > cutoff or not isinstance(decision.get('answer'), str): continue
-            answer = task_dir / decision['answer']
-            answer_value = _read_json(answer); body = answer_value.get('body')
-            if answer_value.get('task_id') != task_id or answer_value.get('incarnation') != incarnation or answer_value.get('resolved_at') != at or not isinstance(body, str): raise ValueError('answer')
-            source = {'kind': 'central-decision', 'linked_task_id': task_id, 'incarnation': incarnation, 'decision_key': decision.get('key'), 'resolved_at': at, 'decision_sha256': hashlib.sha256(path.read_bytes()).hexdigest(), 'answer_sha256': hashlib.sha256(answer.read_bytes()).hexdigest(), 'byte_watermark': answer.stat().st_size}
-            source['source_id'] = _digest(source); sources.append(source)
-            excerpt = {'source_id': source['source_id'], 'message_id': decision.get('message_id', decision.get('key')), 'text': body, 'line_start': 1, 'line_end': 1, 'byte_start': 0, 'byte_end': len(body.encode())}; excerpt['excerpt_id'] = _digest(excerpt); excerpts.append(excerpt)
-        except (OSError, ValueError, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'task_id': task_id, 'reason': 'linked-central-decision-unavailable'})
-    return sources, excerpts
 
 
-def _candidate_id(task_id, incarnation): return _digest({'task_id': task_id, 'incarnation': incarnation})
 
 
 def _source_scope(root, source):
@@ -659,104 +574,7 @@ def _reviewed_material(home, scope):
     return reviewed
 
 
-def _candidate_material(root, task, event, task_dir, jsonls, cutoff, limit, coverage,
-                        deadline_epoch_ms=None, *, completion=None, skip_material=()):
-    key = (task.get('id'), event.get('incarnation')) if task else (None, None)
-    source_scope = None
-    if completion is not None:
-        source_scope = _source_scope(root, completion['source'])
-    sources, excerpts = [], []
-    for jsonl in jsonls:
-        _check_deadline(deadline_epoch_ms)
-        try:
-            kwargs = {}
-            row_skip = set(skip_material)
-            if completion is not None:
-                source_scope = _source_scope(root, completion['source'])
-            else:
-                header = reviewer_episodes._native_header(jsonl)
-                source_scope = {'home': str(Path(root).resolve()), 'role': 'worker',
-                                'session_id': header['id'], 'task_id': key[0], 'incarnation': key[1]}
-                row_skip.update(_reviewed_material(root, source_scope))
-            row_scope = source_scope
-            kwargs['skip_row'] = lambda row: _material_id(row_scope, row) in row_skip
-            if completion is not None:
-                kwargs['completion'] = completion
-            read = reviewer_episodes.read_native(jsonl, cutoff, limit, deadline_epoch_ms, **kwargs)
-            if read.get('status') != 'ready':
-                if completion is not None:
-                    _coverage(coverage, 'unavailable', {
-                        'source_id': completion.get('source_id'),
-                        'interaction_id': completion.get('interaction_id'),
-                        'reason': 'native-proof-pending'})
-                continue
-            sid, watermark, digest = read['session_id'], read['byte_watermark'], read['content_sha256']
-            rows, late, limited, withheld = read['rows'], read['late'], read['limited'], read['withheld']
-            source = {'kind': 'native-jsonl', 'role': 'worker' if completion is None else completion['source']['role'],
-                      'session_id': sid, 'path': str(jsonl.relative_to(root)), 'byte_watermark': watermark,
-                      'content_sha256': digest, 'material_sha256': read['material_sha256']}
-            if source['role'] == 'worker':
-                source.update(task_id=key[0] if completion is None else completion['source']['task_id'],
-                              incarnation=key[1] if completion is None else completion['source']['incarnation'])
-            if completion is not None:
-                source['completion'] = read.get('boundary')
-            scope = _source_scope(root, source)
-            source['candidate_id'] = _source_candidate_id(scope)
-            source['source_id'] = _digest(_native_material_identity(source)); sources.append(source)
-            for row in rows:
-                excerpt = {'source_id': source['source_id'], **row, 'material_id': _material_id(scope, row)}
-                excerpt['excerpt_id'] = _native_excerpt_id(source['source_id'], row); excerpts.append(excerpt)
-            for row in withheld: _coverage(coverage, 'withheld', row)
-            if limited: _coverage(coverage, 'late_basis', {'task_id': key[0], 'session_id': sid, 'reason': 'input-limit'})
-            if late: _coverage(coverage, 'late_basis', {'task_id': key[0], 'session_id': sid, 'reason': 'post-cutoff-native-row'})
-        except store.Refusal:
-            if deadline_epoch_ms is not None and deadline_remaining_seconds(deadline_epoch_ms) <= 0: raise
-            _coverage(coverage, 'unavailable', {'task_id': key[0], 'incarnation': key[1], 'reason': 'native-jsonl-malformed'})
-        except (OSError, json.JSONDecodeError):
-            _coverage(coverage, 'unavailable', {'task_id': key[0], 'incarnation': key[1], 'reason': 'native-jsonl-malformed'})
-    if completion is None:
-        extra_sources, extra_excerpts = _central(task_dir, key[0], key[1], cutoff, coverage, deadline_epoch_ms)
-        if extra_sources:
-            sources.extend(extra_sources); excerpts.extend(extra_excerpts)
-            coverage['central_feedback'] = 'active-partial'; coverage['complete'] = False
-    admitted = {'sources': sources, 'excerpts': excerpts, 'coverage': {'late_basis': []}}
-    _cap(admitted, limit)
-    return admitted['sources'], admitted['excerpts'], _digest({
-        'sources': [source['source_id'] for source in admitted['sources']],
-        'excerpts': [excerpt['excerpt_id'] for excerpt in admitted['excerpts']],
-        'max_input_bytes': limit})
 
-def _cap(packet, limit):
-    # Remove newest evidence until the complete frozen packet—not merely text—fits the cap.
-    def prune_episodes():
-        if 'episodes' not in packet:
-            return
-        retained = {excerpt['source_id'] for excerpt in packet['excerpts']}
-        packet['episodes'] = [episode for episode in packet['episodes'] if (
-            bool(set(episode.get('source_ids', ())) & retained)
-            or (episode.get('source_id') in retained)
-            or (not episode.get('source_ids') and not episode.get('source_id') and any(
-                source['source_id'] in retained
-                and ((episode.get('role') == 'central' and source.get('role') == 'central'
-                      and source.get('session_id') == episode.get('session_id'))
-                     or (episode.get('role') != 'central'
-                         and ((source.get('task_id') == episode.get('task_id')
-                               and source.get('incarnation') == episode.get('incarnation'))
-                              or (source.get('linked_task_id') == episode.get('task_id')
-                                  and source.get('incarnation') == episode.get('incarnation')))))
-                for source in packet['sources'])))]
-    while len(_json_bytes(packet)) > limit and packet['excerpts']:
-        removed = packet['excerpts'].pop()
-        if not any(excerpt['source_id'] == removed['source_id'] for excerpt in packet['excerpts']):
-            packet['sources'][:] = [source for source in packet['sources']
-                                    if source['source_id'] != removed['source_id']]
-            prune_episodes()
-        _coverage(packet['coverage'], 'late_basis', {'reason': 'input-limit'})
-    while len(_json_bytes(packet)) > limit and packet['sources']:
-        packet['sources'].pop()
-        prune_episodes()
-        _coverage(packet['coverage'], 'late_basis', {'reason': 'input-limit'})
-    if len(_json_bytes(packet)) > limit: raise store.Refusal('max_input_bytes cannot encode required coverage')
 
 
 def _completion_candidates(root, cutoff, coverage, deadline_epoch_ms=None):
@@ -1357,222 +1175,6 @@ def select_manifest(home, *, cutoff, config_snapshot, retrospective_review_run_i
         return {**result, 'manifest_id': manifest_id}
 
 
-def select_packet(home, *, cutoff, config_snapshot, retrospective_review_run_ids=(), deadline_epoch_ms=None):
-    config = validate_config(config_snapshot)
-    if not isinstance(cutoff, (int, float)) or cutoff < 0 or not isinstance(retrospective_review_run_ids, tuple): raise store.Refusal('packet scope is invalid')
-    _check_deadline(deadline_epoch_ms)
-    root = store.home(home)
-    packet_scope = {'schema': 1, 'cutoff': cutoff, 'config_snapshot_sha256': _digest(config), 'retrospective_review_run_ids': list(retrospective_review_run_ids)}
-    scope_id = _digest(packet_scope)
-    checkpoint = paths(root)['checkpoints'] / f'{scope_id}.json'
-    if checkpoint.exists():
-        saved = _read_json(checkpoint)
-        if saved.get('scope') != packet_scope: raise store.Refusal('reviewer checkpoint collision')
-        return read_packet(root, saved['packet_id'])
-    coverage = {'complete': True, 'withheld': [], 'unavailable': [], 'unknown': [], 'langfuse_index': 'unused', 'late_basis': [], 'central_feedback': 'unknown', 'retrospective_excluded': []}
-    episodes, sources, excerpts, provenance = [], [], [], []
-    completion_items = list(_completion_candidates(root, cutoff, coverage, deadline_epoch_ms))
-    candidates_input = completion_items
-    exit_keys = set()
-    for observed_at, task, event, task_dir in _observation_candidates(root, cutoff, coverage, deadline_epoch_ms):
-        key = (task.get('id'), event.get('incarnation'))
-        if key in exit_keys:
-            continue
-        exit_keys.add(key)
-        candidates_input.append({'closed_at': observed_at, 'sort': (observed_at, 'worker~exit', '', event.get('id', '')),
-                                 'source_scope': None, 'completion': None, 'task': task,
-                                 'task_dir': task_dir, 'event': event, 'jsonls': None, 'key': key})
-    candidates_input.sort(key=lambda item: item['sort'])
-    packet_material = set()
-    for item in candidates_input:
-        _check_deadline(deadline_epoch_ms)
-        task, event, task_dir = item['task'], item['event'], item['task_dir']
-        if item['completion'] is None:
-            key = item['key']
-            try:
-                binding = _read_json(root / 'data' / 'observability' / 'tasks' / key[0] / 'omp' / key[1] / 'binding.json')
-                session_dir = _fixed_session(root, key[0], key[1], binding)
-                item['jsonls'] = sorted(session_dir.glob('*.jsonl'))
-                if not item['jsonls']:
-                    raise ValueError('no JSONL')
-            except (OSError, ValueError, json.JSONDecodeError):
-                _coverage(coverage, 'unavailable', {'task_id': key[0], 'incarnation': key[1], 'reason': 'native-jsonl-unavailable'})
-                continue
-        skip_material = set(packet_material)
-        if item['source_scope'] is not None:
-            skip_material.update(_reviewed_material(root, item['source_scope']))
-        candidate_sources, candidate_excerpts, _ = _candidate_material(
-            root, task, event, task_dir, item['jsonls'], cutoff, config['limits']['max_input_bytes'],
-            coverage, deadline_epoch_ms, completion=item['completion'], skip_material=skip_material)
-        worker_source = next((source for source in candidate_sources
-                              if source.get('kind') == 'native-jsonl' and source.get('role') == 'worker'), None)
-        worker_context = _source_scope(root, worker_source) if worker_source is not None else None
-        worker_reviewed = _reviewed_material(root, worker_context) if worker_context is not None else set()
-        filtered = []
-        for excerpt in candidate_excerpts:
-            source = next((source for source in candidate_sources if source['source_id'] == excerpt['source_id']), None)
-            if source is None:
-                continue
-            if source.get('kind') == 'native-jsonl':
-                material_scope = _source_scope(root, source)
-                material_id = excerpt.get('material_id', _legacy_material_id(excerpt))
-                reviewed = _reviewed_material(root, material_scope)
-            else:
-                material_id = _legacy_material_id(excerpt)
-                reviewed = worker_reviewed
-            if material_id in reviewed or material_id in packet_material:
-                continue
-            filtered.append(excerpt)
-        candidate_excerpts = filtered
-        candidate_sources = [source for source in candidate_sources if any(
-            excerpt['source_id'] == source['source_id'] for excerpt in candidate_excerpts)]
-        if worker_source is not None and candidate_excerpts and worker_source not in candidate_sources:
-            candidate_sources.insert(0, worker_source)
-        if not candidate_excerpts or len(episodes) >= config['limits']['max_candidates']:
-            continue
-        primary = candidate_sources[0]
-        source_scope = _source_scope(root, primary)
-        if source_scope['role'] == 'worker':
-            episode = {'role': 'worker', 'task_id': source_scope['task_id'], 'incarnation': source_scope['incarnation'],
-                       'closed_at': item['closed_at']}
-            if item['completion'] is None:
-                episode['exit_observation_id'] = event.get('id')
-                episode['source_ids'] = [source['source_id'] for source in candidate_sources]
-            else:
-                episode['interaction_id'] = item['completion']['interaction_id']
-                episode['boundary'] = primary.get('completion')
-                episode['source_id'] = primary['source_id']
-            provenance.append({'task_id': source_scope['task_id'],
-                               'assigned': _manifest(root, task_dir, task, coverage, deadline_epoch_ms),
-                               'usage': 'unknown'})
-        else:
-            episode = {'role': 'central', 'session_id': source_scope['session_id'], 'closed_at': item['closed_at'],
-                       'interaction_id': item['completion']['interaction_id'],
-                       'boundary': primary.get('completion'), 'source_id': primary['source_id']}
-            provenance.append({'role': 'central', 'usage': 'unknown'})
-        episodes.append(episode)
-        sources.extend(candidate_sources)
-        excerpts.extend(candidate_excerpts)
-        packet_material.update(excerpt.get('material_id', _legacy_material_id(excerpt))
-                               for excerpt in candidate_excerpts)
-    if coverage['central_feedback'] == 'unknown': coverage['unknown'].append({'category': 'central-feedback', 'reason': 'no explicit retained links'})
-    retrospective = []
-    if retrospective_review_run_ids:
-        try: requested = {str(uuid.UUID(item)) for item in retrospective_review_run_ids}
-        except (ValueError, TypeError, AttributeError) as error: raise store.Refusal('invalid retrospective run') from error
-        if set(retrospective_review_run_ids) != requested: raise store.Refusal('invalid retrospective run')
-        for receipt_path in sorted(paths(root)['receipts'].glob('*.json')):
-            _check_deadline(deadline_epoch_ms)
-            receipt = _read_json(receipt_path); rid = receipt.get('review_run_id'); closed = receipt.get('closed_at')
-            try: canonical_rid = str(uuid.UUID(rid))
-            except (ValueError, TypeError, AttributeError) as error: raise store.Refusal('retrospective receipt ID is invalid') from error
-            if canonical_rid != rid or receipt_path.stem != rid: raise store.Refusal('retrospective receipt ID is invalid')
-            if isinstance(closed, (int, float)) and closed > cutoff: coverage['retrospective_excluded'].append(rid)
-            if rid not in requested: continue
-            if receipt.get('dispatch_state') != 'final' or not isinstance(closed, (int, float)) or closed > cutoff: raise store.Refusal('retrospective run is not finalized before cutoff')
-            try:
-                session_dir = observability._existing_private_directory(root, 'data', 'observability', 'reviewer', rid, 'omp')
-                if session_dir is None: raise ValueError('session')
-                binding = _read_json(session_dir.parent / 'binding.json')
-                if binding.get('review_run_id') != rid or binding.get('session_dir') != str(session_dir): raise ValueError('binding')
-                jsonls = sorted(session_dir.glob('*.jsonl'))
-                if not jsonls: raise ValueError('session')
-            except (OSError, ValueError, store.Refusal, json.JSONDecodeError) as error: raise store.Refusal('retrospective native evidence is unavailable') from error
-            retrospective.append({'review_run_id': rid, 'closed_at': closed, 'source_count': len(jsonls)})
-            for jsonl in jsonls:
-                _check_deadline(deadline_epoch_ms)
-                try:
-                    read = reviewer_episodes.read_native(jsonl, cutoff, config['limits']['max_input_bytes'], deadline_epoch_ms)
-                    sid, watermark, digest = read['session_id'], read['byte_watermark'], read['content_sha256']
-                    rows, late, limited, withheld = read['rows'], read['late'], read['limited'], read['withheld']
-                    source = {'kind': 'reviewer-native-jsonl', 'review_run_id': rid, 'session_id': sid,
-                              'path': str(jsonl.relative_to(root)), 'byte_watermark': watermark,
-                              'content_sha256': digest, 'material_sha256': read['material_sha256']}
-                    source['source_id'] = _digest(_native_material_identity(source)); sources.append(source)
-                    for row in rows:
-                        excerpt = {'source_id': source['source_id'], **row}
-                        excerpt['excerpt_id'] = _native_excerpt_id(source['source_id'], row); excerpts.append(excerpt)
-                    if limited: _coverage(coverage, 'late_basis', {'review_run_id': rid, 'reason': 'input-limit'})
-                    if late: _coverage(coverage, 'late_basis', {'review_run_id': rid, 'reason': 'post-cutoff-native-row'})
-                    for row in withheld: _coverage(coverage, 'withheld', row)
-                except store.Refusal:
-                    if deadline_epoch_ms is not None and deadline_remaining_seconds(deadline_epoch_ms) <= 0: raise
-                    _coverage(coverage, 'unavailable', {'review_run_id': rid, 'reason': 'retrospective-native-jsonl-malformed'})
-                except (OSError, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'review_run_id': rid, 'reason': 'retrospective-native-jsonl-malformed'})
-            for report_id in receipt.get('report_ids', []):
-                _check_deadline(deadline_epoch_ms)
-                try:
-                    report = _read_json(report_path(root, report_id))
-                    source = {'kind': 'reviewer-report', 'review_run_id': rid, 'report_id': report_id, 'content_sha256': hashlib.sha256(_json_bytes(report)).hexdigest()}
-                    source['source_id'] = _digest(source); sources.append(source)
-                    excerpt = {'source_id': source['source_id'], 'message_id': report_id, 'text': json.dumps(report, sort_keys=True), 'line_start': 1, 'line_end': 1, 'byte_start': 0, 'byte_end': len(_json_bytes(report))}
-                    excerpt['excerpt_id'] = _digest(excerpt); excerpts.append(excerpt)
-                except (OSError, ValueError, json.JSONDecodeError): _coverage(coverage, 'unavailable', {'review_run_id': rid, 'reason': 'committed-report-unavailable'})
-        if {item['review_run_id'] for item in retrospective} != requested: raise store.Refusal('unknown retrospective run')
-    coverage['followup_id'] = '0' * 64  # reserve final metadata before the sole shared cap
-    packet = {'schema': 1, 'purpose': 'background-skill-review', 'cutoff': cutoff, 'episodes': episodes, 'sources': sources, 'excerpts': excerpts, 'catalog': _catalog(root, coverage, deadline_epoch_ms), 'skill_provenance': provenance, 'coverage': coverage, 'retrospective_review_run_ids': list(retrospective_review_run_ids), 'retrospective_episodes': retrospective, 'config_snapshot_sha256': _digest(config)}
-    _cap(packet, config['limits']['max_input_bytes'])
-    retained_source_ids = {excerpt['source_id'] for excerpt in packet['excerpts']}
-    packet['episodes'] = [episode for episode in packet['episodes'] if (
-        bool(set(episode.get('source_ids', ())) & retained_source_ids)
-        or episode.get('source_id') in retained_source_ids
-        or (not episode.get('source_ids') and not episode.get('source_id') and any(
-            source['source_id'] in retained_source_ids
-            and ((episode.get('role') == 'central' and source.get('role') == 'central'
-                  and source.get('session_id') == episode.get('session_id'))
-                 or (episode.get('role') != 'central'
-                     and ((source.get('task_id') == episode.get('task_id')
-                           and source.get('incarnation') == episode.get('incarnation'))
-                          or (source.get('linked_task_id') == episode.get('task_id')
-                              and source.get('incarnation') == episode.get('incarnation')))))
-            for source in packet['sources'])))]
-    candidates = []
-    for episode in packet['episodes']:
-        _check_deadline(deadline_epoch_ms)
-        retained_by_candidate = {}
-        for excerpt in packet['excerpts']:
-            source = next((source for source in packet['sources'] if source['source_id'] == excerpt['source_id']), None)
-            if source is None:
-                continue
-            if episode.get('role') == 'central':
-                matches = source.get('role') == 'central' and source.get('session_id') == episode.get('session_id')
-            elif episode.get('source_id') or episode.get('source_ids'):
-                matches = source['source_id'] in set(episode.get('source_ids', ())) | {episode.get('source_id')}
-            else:
-                matches = ((source.get('task_id') == episode.get('task_id') and source.get('incarnation') == episode.get('incarnation'))
-                           or (source.get('linked_task_id') == episode.get('task_id') and source.get('incarnation') == episode.get('incarnation')))
-            if not matches:
-                continue
-            if source.get('kind') == 'central-decision' and episode.get('role') != 'central':
-                contextual = next((candidate_source for candidate_source in packet['sources']
-                                   if candidate_source.get('role') == 'worker'
-                                   and candidate_source.get('task_id') == episode.get('task_id')
-                                   and candidate_source.get('incarnation') == episode.get('incarnation')),
-                                  None)
-                candidate_id = contextual.get('candidate_id') if contextual else _candidate_id(
-                    episode.get('task_id'), episode.get('incarnation'))
-            else:
-                candidate_id = source.get('candidate_id', _candidate_id(
-                    episode.get('task_id'), episode.get('incarnation')))
-            retained_by_candidate.setdefault(candidate_id, []).append(
-                excerpt.get('material_id', _legacy_material_id(excerpt)))
-        for candidate_id, retained in retained_by_candidate.items():
-            candidates.append({'candidate_id': candidate_id, 'material_basis': _digest(retained),
-                               'excerpt_ids': sorted(set(retained)), 'material_ids': sorted(set(retained))})
-    material_basis = _digest({'sources': [(source['source_id'], source.get('material_sha256', source.get('content_sha256')),
-                                            source.get('answer_sha256')) for source in packet['sources']],
-                              'excerpts': [excerpt['excerpt_id'] for excerpt in packet['excerpts']]})
-    packet['coverage']['followup_id'] = material_basis
-    with store.lock(root):
-        _check_deadline(deadline_epoch_ms)
-        state_path = paths(root)['followups'] / f'{material_basis}.json'
-        if not state_path.exists():
-            store.atomic_json(state_path, {'schema': 1, 'material_basis': material_basis, 'state': 'pending', 'candidates': candidates})
-    _check_deadline(deadline_epoch_ms)
-    packet_id = _digest(packet); publish_immutable(paths(root)['packets'] / f'{packet_id}.json', packet)
-    _check_deadline(deadline_epoch_ms)
-    store.atomic_json(checkpoint, {'scope': packet_scope, 'packet_id': packet_id, 'material_basis': material_basis})
-    packet['packet_id'] = packet_id; return packet
 
 
 def material_state(home, material_basis):
@@ -1611,10 +1213,20 @@ def mark_material_reviewed(home, material_basis):
         return state
 
 
-def _enqueue_intent_locked(home, *, kind, retrospective_review_run_ids=()):
-    if kind not in ('default', 'manual', 'timer', 'retrospective') or not isinstance(retrospective_review_run_ids, tuple): raise store.Refusal('invalid reviewer intent')
+def _enqueue_intent_locked(home, *, kind, retrospective_review_run_ids=(), detail_episode_ids=()):
+    if (kind not in ('default', 'manual', 'timer', 'retrospective')
+            or not isinstance(retrospective_review_run_ids, tuple)
+            or not isinstance(detail_episode_ids, tuple)):
+        raise store.Refusal('invalid reviewer intent')
     if kind == 'retrospective' and not retrospective_review_run_ids: raise store.Refusal('retrospective intent needs explicit closed runs')
-    scope = {'kind': kind, 'retrospective_review_run_ids': list(retrospective_review_run_ids)}
+    if detail_episode_ids and kind != 'manual':
+        raise store.Refusal('detail episodes require a manual run')
+    for episode_id in detail_episode_ids:
+        _hex_id(episode_id)
+    if len(set(detail_episode_ids)) != len(detail_episode_ids):
+        raise store.Refusal('duplicate detail episode')
+    scope = {'kind': kind, 'retrospective_review_run_ids': list(retrospective_review_run_ids),
+             'detail_episode_ids': list(detail_episode_ids)}
     if kind in ('default', 'timer'):
         for path in paths(home)['intents'].glob('*.json') if paths(home)['intents'].exists() else ():
             existing = _read_json(path); pending = paths(home)['pending'] / f'{existing["intent_id"]}.json'
@@ -1625,11 +1237,13 @@ def _enqueue_intent_locked(home, *, kind, retrospective_review_run_ids=()):
     return intent
 
 
-def enqueue_intent(home, *, kind, retrospective_review_run_ids=()):
+def enqueue_intent(home, *, kind, retrospective_review_run_ids=(), detail_episode_ids=()):
     from .uninstall_state import admission
     with admission(home):
         with store.lock(store.home(home)):
-            return _enqueue_intent_locked(store.home(home), kind=kind, retrospective_review_run_ids=retrospective_review_run_ids)
+            return _enqueue_intent_locked(store.home(home), kind=kind,
+                                          retrospective_review_run_ids=retrospective_review_run_ids,
+                                          detail_episode_ids=detail_episode_ids)
 
 
 def timer_intent(home, *, now=None):
@@ -1673,18 +1287,6 @@ def reserve_run(home, intent, *, config_snapshot, instruction_snapshot, started_
     return run
 
 
-def begin_run(home, run, packet, *, model, observed_omp_version):
-    if not isinstance(run, dict) or not isinstance(run.get('review_run_id'), str) or not isinstance(model, str) or not model.strip() or not isinstance(observed_omp_version, str) or not observed_omp_version.strip(): raise store.Refusal('invalid reviewer dispatch')
-    packet_id = packet.get('packet_id') if isinstance(packet, dict) else None; _hex_id(packet_id); receipt = paths(home)['receipts'] / f'{run["review_run_id"]}.json'
-    with store.lock(store.home(home)):
-        stored = _read_json(receipt)
-        if stored.get('dispatch_state') != 'reserved' or stored.get('review_run_id') != run['review_run_id']:
-            raise store.Refusal('reviewer receipt is not reservable')
-        if stored.get('packet_id') not in (None, packet_id): raise store.Refusal('reviewer packet mismatch')
-        stored['packet_id'] = packet_id
-        stored.update(model=model, omp_version=observed_omp_version, dispatch_state='begun')
-        store.atomic_json(receipt, stored)
-    return stored
 
 
 def _sanitize_diagnostic(value):
@@ -1699,7 +1301,7 @@ def _sanitize_diagnostic(value):
         text)
     return text[:4096].encode('utf-8', errors='replace')
 
-def close_run(home, review_run_id, outcome, *, error_code=None, diagnostic=b'', packet=None):
+def close_run(home, review_run_id, outcome, *, error_code=None, diagnostic=b''):
     diagnostic = _sanitize_diagnostic(diagnostic)
     if outcome not in ('no-work', 'failed', 'unknown'): raise store.Refusal('reviewer outcome')
     needs_finalize = False
@@ -1711,7 +1313,6 @@ def close_run(home, review_run_id, outcome, *, error_code=None, diagnostic=b'', 
                  any(paths(home)['prepared'].glob(f"{receipt['review_run_id']}-*.json")))):
             needs_finalize = True
         else:
-            if packet is not None: receipt['packet_id'] = packet['packet_id']
             receipt.update(dispatch_state='final', outcome=outcome, closed_at=time.time())
             if outcome == 'no-work': receipt['state'] = 'no-work'
             if error_code:
@@ -1763,19 +1364,11 @@ def list_proposals(home):
     return [read_proposal(home, path.stem) for path in sorted(folder.glob('*.json'))] if folder.exists() else []
 
 
-def _finding_fingerprint(finding, target=None):
-    if target is not None:
-        return _digest([2, target['identity'], target['operation'],
-                        normalize(finding['finding']), normalize(finding['applicability'])])
-    target_name = normalize(finding['target'])
-    if not target_name: raise store.Refusal('target')
-    return _digest([1, finding['kind'], target_name, normalize(finding['finding']), normalize(finding['applicability'])])
+def _finding_fingerprint(finding, target):
+    return _digest([2, target['identity'], target['operation'],
+                    normalize(finding['finding']), normalize(finding['applicability'])])
 
 
-def _revision_hash(proposal_id, finding):
-    return _digest([proposal_id, sorted(finding['citations']), sorted(finding['counterexamples']), finding['resolution'],
-                    finding['validation'], finding['validation_limits'], finding.get('new_skill'), finding['uncertainty'],
-                    finding.get('target_source_version')])
 
 
 def _receipt(home, review_run_id):
@@ -2207,42 +1800,14 @@ def submit_report(home, review_run_id, request_id, report):
         if receipt.get('dispatch_state') != 'begun':
             raise store.Refusal('reviewer report already frozen')
         return _submit_report_v2(home, receipt, request_id, report)
-    if receipt.get('dispatch_state') not in ('begun', 'report-committed'): raise store.Refusal('reviewer receipt cannot accept a report')
-    packet = read_packet(home, receipt.get('packet_id'))
-    supplementary = read_evidence(home, receipt['review_run_id'])
-    report = _validate_report(home, receipt, packet, report, supplementary=supplementary)
-    report_id = _digest({'review_run_id': receipt['review_run_id'], 'request_id': request_id, 'report': report})
-    result = {'report_id': report_id, 'proposal_ids': []}
-    with store.lock(store.home(home)):
-        receipt = _receipt(home, review_run_id); digest = _digest(report)
-        if request_id in receipt.get('report_requests', {}):
-            if receipt['report_requests'][request_id] != digest: raise store.Refusal('conflicting request reuse')
-            return receipt['report_results'][request_id]
-        path = _prepared_path(home, receipt['review_run_id'], request_id)
-        if path.exists():
-            prepared = _read_json(path)
-            if prepared['input_digest'] != digest: raise store.Refusal('conflicting request reuse')
-            return _apply_prepared_locked(home, receipt, prepared)
-        proposals, revisions, proposal_ids = list_proposals(home), [], []
-        for finding in report['findings']:
-            fingerprint = _finding_fingerprint(finding); matches = [row for row in proposals if row['fingerprint'] == fingerprint]
-            proposal = matches[0] if len(matches) == 1 and any(set(row['basis_source_ids']) & set(finding['citations']) or row['proposed_change'] == finding for row in matches[0]['revisions']) else None
-            if proposal is None:
-                proposal = {'schema': 1, 'proposal_id': str(uuid.uuid4()), 'fingerprint': fingerprint, 'head_revision': None, 'revisions': [], 'uncertain_distinct': bool(matches)}
-                proposals.append(proposal)
-            revision = _revision_hash(proposal['proposal_id'], finding)
-            if revision not in {row['revision_hash'] for row in proposal['revisions']}:
-                row = {'schema': 1, 'proposal_id': proposal['proposal_id'], 'revision_hash': revision, 'report_id': report_id, 'packet_id': receipt['packet_id'], 'basis_source_ids': sorted(finding['citations']), 'proposed_change': finding, 'observer': {'model': receipt['model'], 'omp_version': receipt.get('omp_version'), 'instruction_snapshot_ref': receipt['instruction_snapshot_ref']}, 'resurfaced': bool(proposal['revisions'])}
-                revisions.append(row); proposal['revisions'].append(row); proposal['head_revision'] = revision
-            proposal_ids.append(proposal['proposal_id'])
-        result = {'report_id': report_id, 'proposal_ids': proposal_ids}
-        record = {'schema': 1, 'review_run_id': receipt['review_run_id'], 'request_id': request_id, 'report': report, 'packet_id': receipt['packet_id'], 'proposal_ids': proposal_ids, 'revision_ids': [row['revision_hash'] for row in revisions], 'observer': {'model': receipt['model'], 'omp_version': receipt.get('omp_version'), 'instruction_snapshot_ref': receipt['instruction_snapshot_ref'], 'catalog_versions': [{'id': row['id'], 'catalog_sha256': row['catalog_sha256']} for row in packet['catalog']]}}
-        output_bytes = len(_json_bytes(record))
-        used = sum(_read_json(old)['output_bytes'] for old in paths(home)['prepared'].glob(f"{receipt['review_run_id']}-*.json"))
-        if used + output_bytes > _read_json(paths(home)['manifests'] / f"{receipt['config_snapshot_ref']}.json")['limits']['max_output_bytes']: raise store.Refusal('cumulative report output exceeds limit')
-        prepared = {'schema': 1, 'run_id': receipt['review_run_id'], 'request_id': request_id, 'input_digest': digest, 'result': result, 'record': record, 'output_bytes': output_bytes, 'revisions': revisions, 'proposals': proposals}
-        publish_immutable(path, prepared)
-        return _apply_prepared_locked(home, receipt, prepared)
+    path = _prepared_path(home, receipt['review_run_id'], request_id)
+    if not path.exists():
+        raise store.Refusal('legacy reviewer runs cannot accept new reports')
+    prepared = _read_json(path)
+    if prepared.get('input_digest') != _digest(report):
+        raise store.Refusal('conflicting request reuse')
+    recover_submissions(home, review_run_id)
+    return _receipt(home, review_run_id)['report_results'][request_id]
 
 def recover_submissions(home, review_run_id):
     with store.lock(store.home(home)):

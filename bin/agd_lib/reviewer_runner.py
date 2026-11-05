@@ -30,7 +30,33 @@ def _native_runtime_boundary(home, review_run_id):
 
 
 _REVIEWER_EXTENSION = Path(__file__).resolve().parents[2] / 'lib' / 'omp-reviewer.ts'
+
+def _reserved_snapshots(home, receipt):
+    config_ref = receipt.get('config_snapshot_ref')
+    instruction_ref = receipt.get('instruction_snapshot_ref')
+    reviewer._hex_id(config_ref)
+    reviewer._hex_id(instruction_ref)
+    try:
+        config = reviewer._read_json(reviewer.paths(home)['manifests'] / f'{config_ref}.json')
+        instruction = reviewer._read_json(reviewer.paths(home)['manifests'] / f'{instruction_ref}.json')
+        text = instruction['text']
+        if (not isinstance(text, str) or instruction.get('raw_utf8_sha256') != instruction_ref
+                or hashlib.sha256(text.encode('utf-8')).hexdigest() != instruction_ref
+                or reviewer._digest(config) != config_ref):
+            raise ValueError('snapshot digest')
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+        raise store.Refusal('reviewer reserved snapshot is invalid') from error
+    return config, text
+
 _REVIEWER_SKILL = Path(__file__).resolve().parents[2] / 'bundled' / 'reviewer-skills' / 'agd-reviewer'
+
+def _inspection_bounds():
+    from . import reviewer_inspection
+    return {'response_bytes': reviewer_inspection.MAX_RESPONSE, 'metadata_rows': 20,
+            'content_page_bytes': reviewer_inspection.PAGE_BYTES,
+            'cli_stdout_bytes': reviewer_inspection.MAX_RAW}
+
+
 
 
 def _native_request(home, review_run_id):
@@ -45,26 +71,35 @@ def _native_request(home, review_run_id):
         receipt = reviewer._receipt(home, canonical_id)
     except (OSError, ValueError, json.JSONDecodeError, store.Refusal) as error:
         raise store.Refusal('reviewer request is unavailable') from error
-    if (not isinstance(request, dict) or request.get('schema') != 1
+    if (not isinstance(request, dict) or request.get('schema') != 2
+            or request.get('report_schema') != 2 or receipt.get('report_schema') != 2
             or request.get('review_run_id') != canonical_id
             or request.get('home') != str(store.home(home).resolve())
             or not isinstance(request.get('cwd'), str)
             or Path(request['cwd']).resolve() != runtime.resolve()
-            or request.get('packet_id') != receipt.get('packet_id')
+            or request.get('manifest_id') != receipt.get('manifest_id')
             or request.get('config_snapshot_ref') != receipt.get('config_snapshot_ref')
             or request.get('instruction_snapshot_ref') != receipt.get('instruction_snapshot_ref')
+            or request.get('deadline_epoch_ms') != receipt.get('deadline_epoch_ms')
             or request.get('report_path') != str(runtime / 'report-draft.json')
-            or (request.get('evidence') is not None
-                and request.get('evidence') != {'artifact_root': str(runtime), 'capture_run_id': canonical_id})):
+            or request.get('evidence') != {'artifact_root': str(runtime), 'capture_run_id': canonical_id}):
         raise store.Refusal('reviewer request scope is invalid')
     try:
-        reviewer._hex_id(request['packet_id'])
-        packet = reviewer.read_packet(home, request['packet_id'])
-    except (KeyError, store.Refusal) as error:
-        raise store.Refusal('reviewer request packet is invalid') from error
-    allowed = request.get('allowed_scope')
-    if (not isinstance(allowed, dict)
-            or allowed.get('source_ids') != sorted(source['source_id'] for source in packet['sources'])):
+        manifest = reviewer.read_manifest(home, request['manifest_id'])
+        materialized = reviewer._read_json(runtime / 'selection-manifest.json')
+        config, _ = _reserved_snapshots(home, receipt)
+    except (KeyError, OSError, ValueError, json.JSONDecodeError, store.Refusal) as error:
+        raise store.Refusal('reviewer request manifest is invalid') from error
+    scope = [{'episode_id': row['episode_id'],
+              'project_binding': row.get('project_binding'),
+              'project_bindings': row.get('project_bindings', [])} for row in manifest['episodes']]
+    if (materialized != manifest or manifest['instruction_sha256'] != receipt['instruction_snapshot_ref']
+            or manifest['config_snapshot_sha256'] != receipt['config_snapshot_ref']
+            or reviewer._digest(config) != receipt['config_snapshot_ref']
+            or request.get('inspection_bounds') != _inspection_bounds()
+            or request.get('langfuse_query') not in ({'available': True}, {'available': False})
+            or request.get('allowed_scope') != {'episodes': scope}
+            or request.get('limits') != config['limits']):
         raise store.Refusal('reviewer request scope is invalid')
     return runtime, request
 
@@ -147,14 +182,15 @@ def launch_argv(home: Path, review_run_id: str, *, omp_binary: str = 'omp',
     return argv
 
 
-def _begin_native_run(home, receipt, packet, *, model_selector, omp_version):
-    packet_id = packet.get('packet_id') if isinstance(packet, dict) else None
-    reviewer._hex_id(packet_id)
+def _begin_native_run(home, receipt, manifest, *, model_selector, omp_version):
+    manifest_id = manifest.get('manifest_id') if isinstance(manifest, dict) else None
+    reviewer._hex_id(manifest_id)
     with store.lock(store.home(home)):
         stored = reviewer._receipt(home, receipt['review_run_id'])
-        if stored.get('dispatch_state') != 'reserved' or stored.get('packet_id') not in (None, packet_id):
+        if (stored.get('dispatch_state') != 'reserved' or stored.get('manifest_id') != manifest_id
+                or stored.get('report_schema') != 2):
             raise store.Refusal('reviewer receipt is not reservable')
-        stored.update(packet_id=packet_id, model=None, model_selector=model_selector,
+        stored.update(model=None, model_selector=model_selector,
                       omp_version=omp_version, dispatch_state='begun')
         store.atomic_json(reviewer.paths(home)['receipts'] / f"{receipt['review_run_id']}.json", stored)
     return stored
@@ -188,13 +224,13 @@ def execute(home: Path, review_run_id: str) -> int:
         raise store.Refusal('reviewer runtime home identity changed')
     if receipt.get('dispatch_state') != 'reserved':
         raise store.Refusal('reviewer run is already dispatched')
-    packet = reviewer.read_packet(home, request['packet_id'])
+    manifest = reviewer.read_manifest(home, request['manifest_id'])
     binary = omp_runtime.executable(home)
     with admission(home):
         _native_runtime_boundary(home, review_run_id)
         _materialize_reviewer_skill(runtime)
         _verify_reviewer_skill(runtime)
-    config = reviewer._read_json(reviewer.paths(home)['manifests'] / f"{receipt['config_snapshot_ref']}.json")
+    config, instruction = _reserved_snapshots(home, receipt)
     model_selector = config.get('review_model')
     from . import installer
     dependencies = installer.read_dependencies(home)
@@ -202,7 +238,7 @@ def execute(home: Path, review_run_id: str) -> int:
     omp_version = omp_entry.get('version') if isinstance(omp_entry, dict) else None
     with admission(home):
         receipt = _begin_native_run(
-            home, receipt, packet, model_selector=model_selector, omp_version=omp_version)
+            home, receipt, manifest, model_selector=model_selector, omp_version=omp_version)
         with store.lock(store.home(home)):
             receipt = reviewer._receipt(home, review_run_id)
             receipt['supervisor'] = process_identity(os.getpid())
@@ -213,16 +249,10 @@ def execute(home: Path, review_run_id: str) -> int:
         with admission(home):
             _write_exit(runtime, None, False, True, b'', b'', supervisor=receipt['supervisor'])
         return 124
-    with admission(home):
-        _write_private_bytes(runtime / 'packet.json', json.dumps(
-            packet, sort_keys=True, separators=(',', ':')).encode())
-        _write_private_bytes(runtime / 'catalog.json', json.dumps(
-            packet.get('catalog', []), sort_keys=True, separators=(',', ':')).encode())
-    instruction = reviewer._read_json(
-        reviewer.paths(home)['manifests'] / f"{receipt['instruction_snapshot_ref']}.json")['text']
-    prompt = (f"{instruction}\n\nReview run {review_run_id}. First read the trusted request.json, "
-              "then read the admitted packet.json and catalog.json with native tools before inspecting "
-              f"evidence for packet {request['packet_id']}; write report-draft.json only after those results.")
+    prompt = (f"{instruction}\n\nReview run {review_run_id}. Read trusted request.json and "
+              "selection-manifest.json first. Inspect bounded relevant evidence using the reviewer "
+              "commands; use current-run resume cursors for remaining content. Write report-draft.json "
+              "only after inspection.")
     argv = launch_argv(home, review_run_id, omp_binary=binary, remaining_seconds=remaining)
     inherited = {key: value for key, value in os.environ.items() if not key.startswith('LANGFUSE_')}
     env, _, _ = observability.reviewer_environment(home, review_run_id)
@@ -403,16 +433,15 @@ def _collect_native_result(home, review_run_id):
     runtime, request = _native_request(home, review_run_id)
     exit_bytes = _same_uid_file(runtime / 'exit.json', 8192)
     if exit_bytes is None:
-        return reviewer.close_run(home, review_run_id, 'failed', error_code='exit-proof', packet=reviewer.read_packet(home, receipt['packet_id']))
+        return reviewer.close_run(home, review_run_id, 'failed', error_code='exit-proof')
     try:
         exit_record = json.loads(exit_bytes)
     except (TypeError, ValueError, json.JSONDecodeError):
-        return reviewer.close_run(home, review_run_id, 'failed', error_code='exit-proof', packet=reviewer.read_packet(home, receipt['packet_id']))
-    packet = reviewer.read_packet(home, receipt.get('packet_id') or request['packet_id'])
+        return reviewer.close_run(home, review_run_id, 'failed', error_code='exit-proof')
     outcome = 'unknown' if exit_record.get('timed_out') else 'failed'
     if (exit_record.get('schema') != 1 or exit_record.get('code') != 0
             or not _lifecycle_proved_absent(receipt, exit_record)):
-        return reviewer.close_run(home, review_run_id, outcome, error_code='nonzero', packet=packet)
+        return reviewer.close_run(home, review_run_id, outcome, error_code='nonzero')
     binding_path = store.home(home) / 'data' / 'observability' / 'reviewer' / review_run_id / 'binding.json'
     binding = None
     try:
@@ -421,39 +450,39 @@ def _collect_native_result(home, review_run_id):
         pass
     if (not isinstance(binding, dict) or binding.get('review_run_id') != review_run_id
             or binding.get('session_dir') != str(observability.reviewer_session_dir(home, review_run_id))):
-        return reviewer.close_run(home, review_run_id, 'failed', error_code='binding', packet=packet)
+        return reviewer.close_run(home, review_run_id, 'failed', error_code='binding')
     bind_bytes = _same_uid_file(runtime / 'session-bind.json', 8192)
     if bind_bytes is None:
-        return reviewer.close_run(home, review_run_id, 'failed', error_code='binding', packet=packet)
+        return reviewer.close_run(home, review_run_id, 'failed', error_code='binding')
     try:
         bind_record = json.loads(bind_bytes)
     except (TypeError, ValueError, json.JSONDecodeError):
-        return reviewer.close_run(home, review_run_id, 'failed', error_code='binding', packet=packet)
+        return reviewer.close_run(home, review_run_id, 'failed', error_code='binding')
     try:
         bind_file_parent = Path(bind_record['session_file']).resolve().parent
     except (KeyError, OSError, TypeError):
         bind_file_parent = None
     if (not isinstance(bind_record, dict) or bind_record.get('session_id') != binding.get('native_session_id')
             or bind_file_parent != Path(binding['session_dir']).resolve()):
-        return reviewer.close_run(home, review_run_id, 'failed', error_code='binding', packet=packet)
+        return reviewer.close_run(home, review_run_id, 'failed', error_code='binding')
     limits = reviewer._read_json(
         reviewer.paths(home)['manifests'] / f"{receipt['config_snapshot_ref']}.json")['limits']
     max_output = limits.get('max_output_bytes', 65536)
     draft_bytes = _same_uid_file(runtime / 'report-draft.json', max_output)
     if draft_bytes is None:
-        return reviewer.close_run(home, review_run_id, 'failed', error_code='report', packet=packet)
+        return reviewer.close_run(home, review_run_id, 'failed', error_code='report')
     try:
         draft = json.loads(draft_bytes)
     except (TypeError, ValueError, json.JSONDecodeError):
-        return reviewer.close_run(home, review_run_id, 'failed', error_code='report', packet=packet)
+        return reviewer.close_run(home, review_run_id, 'failed', error_code='report')
     request_id = _native_request_uuid(review_run_id)
     try:
         reviewer.submit_report(home, review_run_id, request_id, draft)
     except store.Refusal as error:
         return reviewer.close_run(home, review_run_id, 'failed', error_code='report',
-                                  diagnostic=str(error), packet=packet)
+                                  diagnostic=str(error))
     except (ValueError, TypeError, KeyError, json.JSONDecodeError):
-        return reviewer.close_run(home, review_run_id, 'failed', error_code='report', packet=packet)
+        return reviewer.close_run(home, review_run_id, 'failed', error_code='report')
     return _finalize_with_workspace_disclosure(home, review_run_id, 'exited')
 
 
@@ -515,44 +544,54 @@ def bind_session(home: Path, review_run_id: str, session_id: str, session_file: 
     })
     return result
 
-def _prepare_native_request(home, run, packet, config, *, langfuse_query=None):
-    packet_id = packet.get('packet_id') if isinstance(packet, dict) else None
-    reviewer._hex_id(packet_id)
+def _bind_manifest(home, run, manifest, config):
+    manifest_id = manifest.get('manifest_id') if isinstance(manifest, dict) else None
+    reviewer._hex_id(manifest_id)
+    if reviewer.read_manifest(home, manifest_id) != manifest:
+        raise store.Refusal('reviewer selection manifest mismatch')
     with store.lock(store.home(home)):
         receipt = reviewer._receipt(home, run['review_run_id'])
+        saved_config, _ = _reserved_snapshots(home, receipt)
         if (receipt.get('dispatch_state') != 'reserved'
                 or receipt.get('config_snapshot_ref') != run['config_snapshot_ref']
                 or receipt.get('instruction_snapshot_ref') != run['instruction_snapshot_ref']
-                or receipt.get('packet_id') not in (None, packet_id)):
+                or manifest.get('config_snapshot_sha256') != receipt['config_snapshot_ref']
+                or manifest.get('instruction_sha256') != receipt['instruction_snapshot_ref']
+                or saved_config != reviewer.validate_config(config)
+                or reviewer._digest(reviewer.validate_config(config)) != receipt['config_snapshot_ref']
+                or receipt.get('manifest_id') not in (None, manifest_id)):
             raise store.Refusal('reviewer request scope is not reservable')
-        receipt['packet_id'] = packet_id
+        receipt.update(manifest_id=manifest_id, report_schema=2)
         store.atomic_json(
             reviewer.paths(home)['receipts'] / f"{run['review_run_id']}.json", receipt)
+
+
+def _prepare_native_request(home, run, manifest, config, *, langfuse_query=None):
+    _bind_manifest(home, run, manifest, config)
+    manifest_id = manifest['manifest_id']
     runtime = _native_runtime_boundary(home, run['review_run_id'])
     _materialize_reviewer_skill(runtime)
     _verify_reviewer_skill(runtime)
+    scope = [{'episode_id': row['episode_id'],
+              'project_binding': row.get('project_binding'),
+              'project_bindings': row.get('project_bindings', [])} for row in manifest['episodes']]
     request = {
-        'schema': 1, 'review_run_id': run['review_run_id'],
+        'schema': 2, 'report_schema': 2, 'review_run_id': run['review_run_id'],
         'home': str(store.home(home).resolve()), 'cwd': str(runtime),
-        'packet_id': packet['packet_id'],
+        'manifest_id': manifest_id,
         'config_snapshot_ref': run['config_snapshot_ref'],
         'instruction_snapshot_ref': run['instruction_snapshot_ref'],
         'report_path': str(runtime / 'report-draft.json'),
         'evidence': {'artifact_root': str(runtime), 'capture_run_id': run['review_run_id']},
-        'allowed_scope': {'source_ids': sorted(source['source_id'] for source in packet['sources'])},
+        'allowed_scope': {'episodes': scope}, 'limits': config['limits'],
+        'deadline_epoch_ms': run['deadline_epoch_ms'],
+        'inspection_bounds': _inspection_bounds(),
+        'langfuse_query': {'available': isinstance(langfuse_query, dict)
+                           and langfuse_query.get('available') is True},
     }
-    if isinstance(langfuse_query, dict):
-        request['langfuse_query'] = {
-            key: value for key, value in langfuse_query.items()
-            if key not in {'secret_key', 'public_key', 'base_url', 'host'}
-        }
-    else:
-        request['langfuse_query'] = {'available': False}
     reviewer.publish_immutable(runtime / 'request.json', request)
-    _write_private_bytes(runtime / 'packet.json', json.dumps(
-        packet, sort_keys=True, separators=(',', ':')).encode())
-    _write_private_bytes(runtime / 'catalog.json', json.dumps(
-        packet.get('catalog', []), sort_keys=True, separators=(',', ':')).encode())
+    _write_private_bytes(runtime / 'selection-manifest.json',
+                         json.dumps(manifest, ensure_ascii=False, indent=2).encode())
     return runtime
 
 
@@ -680,24 +719,25 @@ def run_native_reviewer(home, intent, *, omp_binary='omp'):
                 store.atomic_json(reviewer.paths(home)['receipts'] / f"{run['review_run_id']}.json", receipt)
         backend = endpoint = None
         try:
-            packet = reviewer.select_packet(
+            manifest = reviewer.select_manifest(
                 home, cutoff=started, config_snapshot=config,
                 retrospective_review_run_ids=tuple(intent.get('retrospective_review_run_ids', ())),
+                detail_episode_ids=tuple(intent.get('detail_episode_ids', ())),
                 deadline_epoch_ms=run['deadline_epoch_ms'])
+            _bind_manifest(home, run, manifest, config)
         except store.Refusal:
             if reviewer.deadline_remaining_seconds(run['deadline_epoch_ms']) <= 0:
                 return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='timeout')
             raise
         if reviewer.deadline_remaining_seconds(run['deadline_epoch_ms']) <= 0:
-            return reviewer.close_run(home, run['review_run_id'], 'failed',
-                                     error_code='timeout', packet=packet)
-        if not packet['excerpts']:
-            return reviewer.close_run(home, run['review_run_id'], 'no-work', packet=packet)
+            return reviewer.close_run(home, run['review_run_id'], 'failed', error_code='timeout')
+        if not manifest['episodes']:
+            return reviewer.close_run(home, run['review_run_id'], 'no-work')
         try:
             env, _, _ = observability.reviewer_environment(home, run['review_run_id'])
             query = observability.reviewer_query_status(home, env)
             runtime = _prepare_native_request(
-                home, run, packet, config, langfuse_query=query)
+                home, run, manifest, config, langfuse_query=query)
             backend_name = launcher.resolve_backend(home, None)
             backend = _reviewer_backend(home, backend_name)
             command = [str(Path(__file__).resolve().parents[1] / 'agd'),
@@ -748,7 +788,7 @@ def run_native_reviewer(home, intent, *, omp_binary='omp'):
                     pass
             return reviewer.close_run(home, run['review_run_id'], 'failed',
                                      error_code='preparation',
-                                     diagnostic=str(error).encode(), packet=packet)
+                                     diagnostic=str(error).encode())
         try:
             if not _wait_backend_absent(home, backend, endpoint, run['deadline_epoch_ms']):
                 _record_backend_diagnostic(home, run['review_run_id'], backend, endpoint)
@@ -757,7 +797,7 @@ def run_native_reviewer(home, intent, *, omp_binary='omp'):
                 except Exception:
                     pass
                 return reviewer.close_run(home, run['review_run_id'], 'unknown',
-                                         error_code='timeout', packet=packet)
+                                         error_code='timeout')
             _record_backend_diagnostic(home, run['review_run_id'], backend, endpoint)
             backend.reviewer_close(home, endpoint)
             return _collect_native_result(home, run['review_run_id'])
@@ -769,7 +809,7 @@ def run_native_reviewer(home, intent, *, omp_binary='omp'):
                 pass
             return reviewer.close_run(home, run['review_run_id'], 'unknown',
                                      error_code='backend',
-                                     diagnostic=str(error).encode(), packet=packet)
+                                     diagnostic=str(error).encode())
 
 
 def launch_timer(home, *, now=None):

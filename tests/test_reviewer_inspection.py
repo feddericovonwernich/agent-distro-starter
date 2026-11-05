@@ -11,7 +11,8 @@ import pytest
 
 from support import command, lab
 from test_projects import run
-from test_reviewer import append_unfinished, build_report, completed_session, message, produced_run, rewrite_title
+from test_reviewer import append_unfinished, completed_session, message, rewrite_title
+from reviewer_history_fixture import historical_final, historical_prepared
 from test_langfuse_cli import _package_files
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
@@ -39,12 +40,10 @@ def stage(home, *, cutoff=200, limit=None, max_candidates=None, detail=()):
         deadline_epoch_ms=int((now + 1800) * 1000))
     assert manifest['instruction_sha256'] == reservation['instruction_snapshot_ref']
     assert manifest['config_snapshot_sha256'] == reservation['config_snapshot_ref']
-    # Task 4 will produce this binding. Reserve the real receipt and snapshots now,
-    # then stage the schema-2 dispatch transition without using legacy packet APIs.
-    receipt = reviewer.paths(home)['receipts'] / (reservation['review_run_id'] + '.json')
-    reservation.update(manifest_id=manifest['manifest_id'], report_schema=2,
-                       model='fixture/model', omp_version='fixture', dispatch_state='begun')
-    store.atomic_json(receipt, reservation)
+    from agd_lib import reviewer_runner
+    reviewer_runner._prepare_native_request(home, reservation, manifest, config)
+    reviewer_runner._begin_native_run(home, reviewer._receipt(home, reservation['review_run_id']),
+                                      manifest, model_selector='fixture/model', omp_version='fixture')
     return reservation['review_run_id'], manifest
 
 
@@ -2251,9 +2250,7 @@ def test_report_v2_destination_project_context_is_episode_specific():
 
 def test_report_v2_historical_report_and_proposal_bytes_unchanged():
     with lab() as (home, _):
-        old_run, packet = produced_run(home)
-        old = reviewer.submit_report(home, old_run['review_run_id'], str(uuid.uuid4()), build_report(packet))
-        reviewer.finalize_run(home, old_run['review_run_id'], 'exited')
+        old_run, old = historical_final(home)
         old_report = reviewer.report_path(home, old['report_id'])
         old_proposal = reviewer.proposal_path(home, old['proposal_ids'][0])
         saved = old_report.read_bytes(), old_proposal.read_bytes()
@@ -2605,24 +2602,9 @@ def test_report_v2_coverage_successful_screening_feeds_fair_rotation():
         assert len(set(seen) - {old['episode_id']}) >= 2
 
 
-def test_report_v2_historical_prepared_recovery_coexists_with_new_submission(monkeypatch):
+def test_report_v2_historical_prepared_recovery_coexists_with_new_submission():
     with lab() as (home, _):
-        old_run, packet = produced_run(home)
-        old_report = build_report(packet)
-        request = str(uuid.uuid4())
-        original = reviewer.publish_immutable
-        fired = False
-        def interrupt(path, value):
-            nonlocal fired
-            original(path, value)
-            if not fired and Path(path).parent == reviewer.paths(home)['prepared']:
-                fired = True
-                raise RuntimeError('prepared')
-        monkeypatch.setattr(reviewer, 'publish_immutable', interrupt)
-        with pytest.raises(RuntimeError):
-            reviewer.submit_report(home, old_run['review_run_id'], request, old_report)
-        assert fired
-        monkeypatch.setattr(reviewer, 'publish_immutable', original)
+        old_run, request, old_report, _ = historical_prepared(home)
         prepared_path = reviewer._prepared_path(home, old_run['review_run_id'], request)
         prepared_bytes = prepared_path.read_bytes()
         native, _, _ = completed_session(home, texts=('schema two native outcome',))
@@ -2634,6 +2616,8 @@ def test_report_v2_historical_prepared_recovery_coexists_with_new_submission(mon
                                report_v2(row, [report_v2_finding(row, dest['target_ref'], citation, 'distro')]))
         reviewer.recover_submissions(home, old_run['review_run_id'])
         old_result = reviewer.submit_report(home, old_run['review_run_id'], request, old_report)
+        with pytest.raises(store.Refusal):
+            reviewer.submit_report(home, old_run['review_run_id'], str(uuid.uuid4()), old_report)
         old_report_path = reviewer.report_path(home, old_result['report_id'])
         old_proposal_path = reviewer.proposal_path(home, old_result['proposal_ids'][0])
         preserved = (prepared_path.read_bytes(), old_report_path.read_bytes(), old_proposal_path.read_bytes())

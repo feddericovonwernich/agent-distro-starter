@@ -359,7 +359,7 @@ def test_uninstall_inventories_probe_work_loss_before_removal(monkeypatch):
     from support import lab
     from agd_lib import reviewer_workspaces, uninstall
     from test_projects import run
-    from test_reviewer import produced_run
+    from test_reviewer_workspaces import _workspace_run
     with lab() as (home, project):
         private_home = home.parent / 'probe-user-home'
         private_config = home.parent / 'probe-user-config'
@@ -372,7 +372,7 @@ def test_uninstall_inventories_probe_work_loss_before_removal(monkeypatch):
         (project / 'later.txt').write_text('second existing commit\n')
         run(['git', 'add', 'later.txt'], cwd=project)
         run(['git', 'commit', '-m', 'second fixture commit'], cwd=project)
-        review_run, _ = produced_run(home)
+        review_run, _ = _workspace_run(home)
         result = reviewer_workspaces.create(
             home, review_run['review_run_id'], 'sample', commit)
         inventory = uninstall.inventory(home)

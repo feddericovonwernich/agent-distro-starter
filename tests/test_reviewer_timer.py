@@ -31,6 +31,30 @@ def home(tmp_path):
     return root
 
 
+@pytest.mark.parametrize('alias_target, accepted', [('selected', True), ('different', False)])
+def test_manifest_timer_runtime_accepts_only_alias_to_selected_binary(tmp_path, monkeypatch, alias_target, accepted):
+    from agd_lib import launcher
+    root = home(tmp_path)
+    tools, selected = tmp_path / 'tools', tmp_path / 'selected'
+    tools.mkdir()
+    selected.mkdir()
+    omp = tools / 'omp'
+    herdr = selected / 'herdr'
+    other = selected / 'other'
+    for binary in (omp, herdr, other):
+        binary.write_text('#!/bin/sh\nexit 0\n')
+        binary.chmod(0o700)
+    (tools / 'herdr').symlink_to(herdr if alias_target == 'selected' else other)
+    monkeypatch.setattr(omp_runtime, 'executable', lambda _home: str(omp))
+    monkeypatch.setattr(installer, 'read_dependencies', lambda _home: {'herdr': {'path': str(herdr)}})
+    monkeypatch.setattr(launcher, 'resolve_backend', lambda *_args: 'herdr')
+    if accepted:
+        assert str(tools) in reviewer_timer.runtime_environment(root)['path'].split(os.pathsep)
+    else:
+        with pytest.raises(store.DependencyError):
+            reviewer_timer.runtime_environment(root)
+
+
 def test_timer_minimal_environment_runs_selected_tools_from_distinct_receipt_dirs(tmp_path):
     root = home(tmp_path)
     selected = tmp_path / 'selected'

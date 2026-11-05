@@ -51,8 +51,14 @@ def runtime_environment(home):
     path = os.pathsep.join(dict.fromkeys([*parents, *os.defpath.split(os.pathsep)]))
     for name, selected_executable in selected:
         lookup = selected_executable.name if name == 'omp' else name
-        if shutil.which(lookup, path=path) != str(selected_executable):
-            raise store.DependencyError(f'reviewer runtime search path changed {name} identity')
+        try:
+            found = shutil.which(lookup, path=path)
+            if found is None or Path(found).resolve(strict=True) != selected_executable.resolve(strict=True):
+                raise OSError('selected executable identity changed')
+            if not os.path.samefile(found, selected_executable):
+                raise OSError('selected executable identity changed')
+        except OSError as error:
+            raise store.DependencyError(f'reviewer runtime search path changed {name} identity') from error
     return {'python': str(Path(sys.executable).resolve()), 'path': path}
 
 

@@ -69,24 +69,51 @@ function reviewerBridge(repo: string, home: string, cutoff: number, finalize: bo
   const script = String.raw`
 import json, sys, time, uuid
 from pathlib import Path
-from agd_lib import reviewer
+from agd_lib import reviewer, reviewer_runner, reviewer_inspection
 home = Path(sys.argv[1])
 cutoff = float(sys.argv[2])
 finalize = sys.argv[3] == '1'
 config = reviewer.read_config(home)
-packet = reviewer.select_packet(home, cutoff=cutoff, config_snapshot=config)
-result = {'packet': packet}
-if finalize:
+manifest = reviewer.select_manifest(home, cutoff=cutoff, config_snapshot=config)
+result = {'manifest': manifest, 'pages': []}
+if finalize and manifest['episodes']:
     started = time.time()
     intent = reviewer.enqueue_intent(home, kind='manual')
     run = reviewer.reserve_run(home, intent, config_snapshot=config,
-                               instruction_snapshot=b'native-episode-bridge',
+                               instruction_snapshot=reviewer.INSTRUCTION_FILE.read_bytes(),
                                started_at=started,
                                deadline_epoch_ms=int((started + 1800) * 1000))
-    reviewer.begin_run(home, run, packet, model='fixture/native-bridge',
-                       observed_omp_version='native-test')
+    reviewer_runner._prepare_native_request(home, run, manifest, config)
+    reviewer_runner._begin_native_run(home, reviewer._receipt(home, run['review_run_id']), manifest,
+                                      model_selector='fixture/native-bridge', omp_version='native-test')
+    reviews = []
+    for episode in manifest['episodes']:
+        rows, cursor = [], None
+        while True:
+            metadata = reviewer_inspection.inspect(home, run['review_run_id'], episode['episode_id'],
+                                                   source='native', cursor=cursor)
+            rows.extend(row for row in metadata['rows'] if 'message_id' in row)
+            cursor = metadata['next_cursor']
+            if not cursor:
+                break
+        sources = []
+        for item in rows:
+            cursor = None
+            while True:
+                page = reviewer_inspection.inspect(home, run['review_run_id'], episode['episode_id'],
+                    source='native', record_id=item['message_id'], part='content', cursor=cursor)
+                result['pages'].append({'episode_id': episode['episode_id'],
+                                        'message_id': item['message_id'], 'text': page['text']})
+                sources.append(page['source_id'])
+                cursor = page['next_cursor']
+                if not cursor:
+                    break
+        if sources:
+            reviews.append({'episode_id': episode['episode_id'], 'assessment': 'reflected',
+                            'intent_sources': [sources[0]], 'action_sources': [sources[-1]],
+                            'outcome_sources': [sources[-1]], 'limitations': []})
     reviewer.submit_report(home, run['review_run_id'], str(uuid.uuid4()),
-                           {'schema': 1, 'summary': 'native lifecycle proof', 'findings': []})
+        {'schema': 2, 'summary': 'Native lifecycle proof.', 'episode_reviews': reviews, 'findings': []})
     result['final'] = reviewer.finalize_run(home, run['review_run_id'], 'exited')
 print(json.dumps(result, separators=(',', ':')))
 `;
@@ -614,30 +641,21 @@ async function nativeProbe(role: 'worker' | 'central') {
     })();
     assert(producerAlive);
     const firstBridge = reviewerBridge(repo, data.home, Date.now() / 1000 + 5, true);
-    const firstPacket = firstBridge.packet as Record<string, unknown>;
-    const firstExcerpts = (Array.isArray(firstPacket.excerpts) ? firstPacket.excerpts : []) as Array<Record<string, unknown>>;
-    const firstSources = (Array.isArray(firstPacket.sources) ? firstPacket.sources : []) as Array<Record<string, unknown>>;
-    const firstEpisodes = (Array.isArray(firstPacket.episodes) ? firstPacket.episodes : []) as Array<Record<string, unknown>>;
-    assert(firstExcerpts.length > 0);
-    const firstSentinelExcluded = !JSON.stringify(firstExcerpts).includes(heldPromptSentinel);
+    const firstManifest = firstBridge.manifest as Record<string, unknown>;
+    const firstPages = firstBridge.pages as Array<Record<string, unknown>>;
+    const firstEpisodes = firstManifest.episodes as Array<Record<string, unknown>>;
+    assert(firstPages.length > 0);
+    const firstSentinelExcluded = !JSON.stringify(firstPages).includes(heldPromptSentinel);
     assert(firstSentinelExcluded);
-    const firstSource = firstSources.find(source =>
-      source.session_id === currentReceipt.session_id && source.role === data.role);
+    const firstSource = firstEpisodes.find(episode =>
+      episode.session_id === currentReceipt.session_id && episode.role === data.role);
     const firstSourceScoped = firstSource !== undefined;
     assert(firstSourceScoped);
-    assert.equal(firstSource.role, data.role);
-    assert(firstExcerpts.some(row => row.source_id === firstSource.source_id));
     const episodeRoleScoped = data.role === 'worker'
-      ? firstEpisodes.some(episode => episode.role === 'worker' &&
-          episode.task_id === data.task?.id && episode.source_id === firstSource.source_id)
-      : firstEpisodes.some(episode => episode.role === 'central' &&
-          episode.source_id === firstSource.source_id && (!('task_id' in episode) || episode.task_id == null));
+      ? firstEpisodes.some(episode => episode.role === 'worker' && episode.task_id === data.task?.id)
+      : firstEpisodes.some(episode => episode.role === 'central' && !episode.task_id);
     assert(episodeRoleScoped);
-    if (data.role === 'worker') assert.equal(firstSource.task_id, data.task?.id);
-    else assert(!('task_id' in firstSource) || firstSource.task_id == null);
-    assert(firstExcerpts.every(row => typeof row.material_id === 'string'));
-    const firstMaterialIds = new Set(firstExcerpts.map(row => row.material_id as string));
-    assert(firstMaterialIds.size === firstExcerpts.length);
+    const firstMaterialIds = new Set(firstPages.map(row => `${row.episode_id}:${row.message_id}`));
     const firstFinalized = typeof firstBridge.final === 'object' && firstBridge.final !== null;
     assert(firstFinalized);
     releaseHeld.resolve();
@@ -656,20 +674,17 @@ async function nativeProbe(role: 'worker' | 'central') {
     assert(heldFinalPersisted);
     assert(completionRecords(completionDir).length > heldCompletionCount);
     const secondBridge = reviewerBridge(repo, data.home, Date.now() / 1000 + 5, true);
-    const secondPacket = secondBridge.packet as Record<string, unknown>;
-    const secondExcerpts = (Array.isArray(secondPacket.excerpts) ? secondPacket.excerpts : []) as Array<Record<string, unknown>>;
-    assert(secondExcerpts.every(row => typeof row.material_id === 'string'));
-    const secondMaterialIds = new Set(secondExcerpts.map(row => row.material_id as string));
+    const secondPages = secondBridge.pages as Array<Record<string, unknown>>;
+    const secondMaterialIds = new Set(secondPages.map(row => `${row.episode_id}:${row.message_id}`));
     const incrementalMaterialDisjoint = secondMaterialIds.size > 0 &&
-      secondMaterialIds.size === secondExcerpts.length &&
       [...secondMaterialIds].every(id => !firstMaterialIds.has(id));
     const secondFinalized = typeof secondBridge.final === 'object' && secondBridge.final !== null;
     assert(incrementalMaterialDisjoint);
     assert(secondFinalized);
-    assert(JSON.stringify(secondExcerpts).includes(heldFinalText));
+    assert(JSON.stringify(secondPages).includes(heldFinalText));
     const thirdBridge = reviewerBridge(repo, data.home, Date.now() / 1000 + 5, false);
-    const thirdPacket = thirdBridge.packet as Record<string, unknown>;
-    const freshPacketEmpty = Array.isArray(thirdPacket.excerpts) && thirdPacket.excerpts.length === 0;
+    const thirdManifest = thirdBridge.manifest as Record<string, unknown>;
+    const freshPacketEmpty = Array.isArray(thirdManifest.episodes) && thirdManifest.episodes.length === 0;
     assert(freshPacketEmpty);
     mode = 'final';
     return { role: data.role, sourceCount: readdirSync(sourceDir).length, completionCount: completionRecords(completionDir).length,
