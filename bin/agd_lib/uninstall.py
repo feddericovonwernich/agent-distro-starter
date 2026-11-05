@@ -13,7 +13,7 @@ from . import store, uninstall_state as state
 
 MODULES = (
     'github', 'harnesses', 'herdr', 'installer', 'langfuse_cli', 'launcher', 'observability', 'omp_runtime',
-    'pr', 'projects', 'relay', 'relay_reviews', 'review_feedback', 'reviewer', 'reviewer_episodes',
+    'pr', 'projects', 'relay', 'relay_reviews', 'review_feedback', 'reviewer', 'reviewer_episodes', 'reviewer_inspection',
     'reviewer_runner', 'reviewer_timer', 'reviewer_workspaces', 'store', 'supervision', 'tasks', 'tmux',
     'uninstall', 'uninstall_state', 'worker_skills', 'workers',
 )
